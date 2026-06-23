@@ -29,9 +29,40 @@
 //! ```
 
 use include_dir::{include_dir, Dir};
+use std::sync::OnceLock;
 
 /// The `src-misc/` directory, embedded at compile time.
 static MISC: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../src-misc");
+
+static WANDERER: OnceLock<Vec<String>> = OnceLock::new();
+
+/// The whimsical plan lead-in corpus from `src-misc/wanderer.json`
+/// (falls back to a single word if missing/unparseable).
+fn wanderer_corpus() -> &'static Vec<String> {
+    WANDERER.get_or_init(|| {
+        MISC.get_file("wanderer.json")
+            .and_then(|f| f.contents_utf8())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["planning".to_string()])
+    })
+}
+
+/// A random capitalized lead-in word for the plan step (e.g. "Wondering").
+pub fn wanderer_word() -> String {
+    let corpus = wanderer_corpus();
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % corpus.len();
+    let w = &corpus[idx];
+    let mut chars = w.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Planning".to_string(),
+    }
+}
 
 const FALLBACK_SYSTEM: &str = "You are a precise, concise coding assistant.";
 const FALLBACK_PERSONALITY: &str = "Be direct. No filler. No emoji.";

@@ -1,22 +1,22 @@
 //! View – in-app settings form (Settings mode).
 //!
-//! A single bordered form opened with `/settings` (alias `/config`). Every
-//! editable field is shown inline — selected row is prefixed with `› ` and
-//! drawn in accent colour; others are dim. A footer shows context-sensitive
+//! A minimalist settings screen opened with `/settings` (alias `/config`).
+//! Every editable field is shown inline — selected row is prefixed with `› `
+//! and drawn in accent colour; others are dim. A footer shows context-sensitive
 //! key hints.
 //!
 //! Layout:
 //! ```text
-//! ┌ settings ───────────────────────────────────────┐
-//! │                                                  │
-//! │  › API key       sk-or-v1-abc…                   │
-//! │    Model         openai/gpt-oss-120b             │
-//! │    Provider      groq                            │
-//! │    Theme         dark   ·   accent green         │
-//! │    Session name  my project                      │
-//! │    Workdir       /home/user/project              │
-//! │                                                  │
-//! └──────────────────────────────────────────────────┘
+//!  settings
+//! ──────────────────────────────────────────────────
+//!
+//!   › API key       sk-or-v1-abc…
+//!     Model         openai/gpt-oss-120b
+//!     Provider      groq
+//!     Theme         dark   ·   accent green
+//!     Session name  my project
+//!     Workdir       /home/user/project
+//!
 //!  ↑/↓ move · Enter edit/toggle · ←/→ accent · Esc save & close
 //! ```
 //!
@@ -25,10 +25,10 @@
 //! [`controller::input::handle_settings`].
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Margin},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Padding, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 use crate::app::mode::SettingsState;
@@ -57,30 +57,39 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// All colours flow through `palette` — no hardcoded `Color::` values.
 pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
-    // Outer vertical split: form box (flex) | footer (1).
+    // Three-zone vertical split: title row | form (flex) | footer.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // form box
+            Constraint::Length(2), // title + bottom rule
+            Constraint::Min(0),    // form rows (flat)
             Constraint::Length(1), // footer / key hints
         ])
         .split(frame.area());
 
-    // Bordered form box titled " settings ".
-    let block = Block::bordered()
-        .title(" settings ")
+    // Title header: bottom rule only, matching the chat screen's header style.
+    let title_block = Block::new()
+        .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim))
-        .title_style(Style::default().fg(palette.dim))
-        .padding(Padding::new(2, 2, 1, 1));
+        .padding(Padding::horizontal(2));
 
-    let inner = block.inner(outer[0]);
+    let title_inner = title_block.inner(outer[0]);
+    frame.render_widget(title_block, outer[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled("settings", Style::default().fg(palette.dim))),
+        title_inner,
+    );
 
-    // Compute available width for values: inner width minus marker(2) + label(14) = 16.
-    let inner_w = inner.width as usize;
-    let value_w = inner_w.saturating_sub(16);
+    // Form rows — flat, no surrounding block.
+    // Inset horizontally to align under the title text.
+    let form_area = outer[1].inner(Margin { horizontal: 2, vertical: 0 });
+
+    // Compute available width for values: form width minus marker(2) + label(14) = 16.
+    let form_w = form_area.width as usize;
+    let value_w = form_w.saturating_sub(16);
 
     // Build one Line per field.
-    let mut lines: Vec<Line> = Vec::with_capacity(LABELS.len() * 2);
+    let mut lines: Vec<Line> = Vec::with_capacity(LABELS.len());
 
     for (i, label) in LABELS.iter().enumerate() {
         let selected = i == st.selected;
@@ -121,7 +130,7 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
                 _ => st.name.as_str(),
             };
             let editing_here = st.editing && selected;
-            // Reserve 1 char for cursor when editing so it doesn't push past the box.
+            // Reserve 1 char for cursor when editing so it doesn't push past the edge.
             let truncate_w = if editing_here {
                 value_w.saturating_sub(1)
             } else {
@@ -140,11 +149,11 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
         lines.push(Line::from(spans));
     }
 
-    // Render the form block and the rows inside it.
-    frame.render_widget(block, outer[0]);
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), form_area);
 
     // Footer: hints differ between navigating and editing.
+    // Inset to match form alignment.
+    let footer_area = outer[2].inner(Margin { horizontal: 2, vertical: 0 });
     let footer = if st.editing {
         "type to edit · Enter/Esc done"
     } else {
@@ -152,6 +161,6 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(palette.dim)),
-        outer[1],
+        footer_area,
     );
 }

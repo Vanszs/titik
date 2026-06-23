@@ -158,6 +158,11 @@ pub struct AppStateRest {
     /// True while a risky call is paused waiting for the user's `y/n`. The event
     /// loop routes keys to the approval modal while this is set.
     pub awaiting_approval: bool,
+    /// Set at the start of every new user turn; cleared once the plan nudge is
+    /// delivered. While true, the first tool round is intercepted and each
+    /// requested call is answered with `PLAN_NUDGE` instead of being executed,
+    /// forcing the model to state its plan before actually running tools.
+    pub needs_plan: bool,
 }
 
 impl AppState {
@@ -215,6 +220,7 @@ impl AppStateRest {
             tool_idx: 0,
             tool_results: Vec::new(),
             awaiting_approval: false,
+            needs_plan: false,
         }
     }
 

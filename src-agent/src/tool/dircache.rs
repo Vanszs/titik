@@ -46,6 +46,25 @@ pub fn reindex(root: PathBuf, cache: Arc<RwLock<DirCache>>) {
 }
 
 impl DirCache {
+    /// Immediate children (files + subfolders) of a workspace-relative directory,
+    /// derived from the cached file list. `dir` may be "", ".", "src", "src/".
+    /// Files are basenames; subfolders end with "/". Sorted, deduped.
+    pub fn children(&self, dir: &str) -> Vec<String> {
+        let d = dir.trim().trim_start_matches("./").trim_end_matches('/');
+        let prefix = if d.is_empty() || d == "." { String::new() } else { format!("{d}/") };
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in &self.files {
+            if let Some(rest) = f.strip_prefix(&prefix) {
+                if rest.is_empty() { continue; }
+                match rest.find('/') {
+                    None => { set.insert(rest.to_string()); }              // file
+                    Some(j) => { set.insert(format!("{}/", &rest[..j])); } // subfolder
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// Immediate children (files + subfolders) for the path being typed after
     /// `@`. `partial` is split into a directory prefix (up to and including the
     /// last `/`) and a filename fragment (after it). Returns files directly in

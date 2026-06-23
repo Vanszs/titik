@@ -63,6 +63,8 @@ pub(super) fn apply_action(
             state.rest.awaiting_approval = false;
             state.rest.tool_idx = 0;
             state.rest.tool_results.clear();
+            // Every new user turn must plan before running tools.
+            state.rest.needs_plan = true;
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
         }

@@ -10,7 +10,8 @@ use crate::service::openrouter::OpenRouterClient;
 
 /// Hard cap on tool-call rounds within a single user turn. Once exceeded the
 /// turn is stopped so a misbehaving model can't loop indefinitely.
-const MAX_AGENT_STEPS: usize = 25;
+const MAX_AGENT_STEPS: usize = 40;
+
 
 /// Finalize a finished stream: commit any buffered assistant text, clear the
 /// waiting flag + task handle, set the status line. `error` is Some on stream
@@ -137,11 +138,39 @@ pub(super) fn advance_turn(
     }
     state.rest.agent_steps += 1;
 
-    // 5. Hand off to the tool-approval state machine. The pending calls were
-    //    already stashed into `state.rest.pending_tool_calls` by the event loop
-    //    (`StreamEvent::ToolCalls`); `process_tools` walks them from index 0,
-    //    running safe calls inline and — in Normal mode — pausing on the first
-    //    risky one for a `y/n`. `pending` (the local copy) is no longer needed.
+    // 5a. Plan gate: on the FIRST tool round of a new user turn, make sure the
+    //     model stated a plan before tools run. The System message already steers
+    //     it to lead with a whimsical word (see `stream_complete`), so it usually
+    //     plans on its own — in which case we just run the tools (no duplicate
+    //     plan). Only when it jumped straight to tools with NO text do we answer
+    //     each call with a silent nudge and re-stream; that nudge carries the
+    //     hide-marker so it's fed to the model but never shown in the transcript.
+    //     Every pending call gets a result, so there are no dangling tool_call IDs.
+    if state.rest.needs_plan {
+        state.rest.needs_plan = false;
+        let planned = buf.as_deref().is_some_and(|b| !b.trim().is_empty());
+        if !planned {
+            state.rest.tool_idx = 0;
+            state.rest.tool_results.clear();
+            let nudge = format!(
+                "{}First state a brief plan: restate what the user wants in one line, then list your steps. Then make your tool calls (batch where possible — dir_list accepts multiple paths).",
+                crate::dto::chat::PLAN_NUDGE_MARK
+            );
+            let ids: Vec<String> = state.rest.pending_tool_calls.iter().map(|c| c.id.clone()).collect();
+            for id in ids {
+                state.rest.tool_results.push((id, nudge.clone()));
+            }
+            finish_tool_round(state, client, handle);
+            return;
+        }
+        // else: model already planned → fall through to the normal tool run below
+    }
+
+    // 5b. Hand off to the tool-approval state machine. The pending calls were
+    //     already stashed into `state.rest.pending_tool_calls` by the event loop
+    //     (`StreamEvent::ToolCalls`); `process_tools` walks them from index 0,
+    //     running safe calls inline and — in Normal mode — pausing on the first
+    //     risky one for a `y/n`. `pending` (the local copy) is no longer needed.
     drop(pending);
     state.rest.tool_idx = 0;
     state.rest.tool_results.clear();
@@ -276,11 +305,24 @@ pub(super) fn abort_current(rest: &mut AppStateRest) {
 /// receiver in state, and hands the sender to the task — so this request's
 /// events are isolated from any previous one (no generation tagging needed).
 pub(super) fn start_stream_task(
-    history: Vec<ChatMessage>,
+    mut history: Vec<ChatMessage>,
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
+    // Self-awareness: tell the model the project's top-level layout every request
+    // (so it's present after compaction too). Pulled from the live dir cache.
+    if let Some(first) = history.first_mut() {
+        if first.role == Role::System {
+            if let Ok(cache) = state.rest.dir_cache.read() {
+                let listing = cache.children(".");
+                if !listing.is_empty() {
+                    first.content.push_str("\n\n# Project files (top level)\n");
+                    first.content.push_str(&listing.join("\n"));
+                }
+            }
+        }
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     state.rest.active_rx = Some(rx);
     let c = Arc::clone(client.as_ref().unwrap());

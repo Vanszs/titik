@@ -3,21 +3,21 @@
 //! Displays the list of saved sessions filtered in real time as the user
 //! types.  Layout (top to bottom):
 //!
-//! 1. Bordered search box — title ` search `, cursor appended.
-//! 2. Bordered session list — title ` sessions (N) `, columns aligned.
+//! 1. Top+bottom rule search bar — title ` search ` on the TOP rule, cursor appended.
+//! 2. Flat (borderless) session list — columns aligned, scrollable.
 //!    The selected row is highlighted with `palette.sel_fg` on `palette.sel_bg`.
 //!    The list scrolls to keep the selection visible.
-//! 3. One-line keybinding hint.
+//! 3. One-line keybinding hint with session count.
 //!
 //! Filtering and selection state live in [`app::mode::PickerState`].
 //! Keystroke handling lives in [`controller::input::handle_picker`].
 
 use std::time::SystemTime;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Margin},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Padding, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 use crate::app::mode::PickerState;
@@ -67,17 +67,18 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // search box (border + 1 line + border)
-            Constraint::Min(1),    // session list box
+            Constraint::Length(3), // search: top+bottom rules
+            Constraint::Min(1),    // flat session list
             Constraint::Length(1), // keybinding hint line
         ])
         .split(frame.area());
 
-    // --- Search box ---
-    // Bordered block titled " search ", dim border + title, accent cursor.
-    let search_block = Block::bordered()
-        .title(Span::styled(" search ", Style::default().fg(palette.dim)))
+    // --- Search bar ---
+    // Top+bottom rules only — title " search " sits on the TOP rule, dim style.
+    let search_block = Block::new()
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim))
+        .title(Span::styled(" search ", Style::default().fg(palette.dim)))
         .padding(Padding::horizontal(1));
 
     let search_inner = search_block.inner(chunks[0]);
@@ -89,16 +90,9 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
     frame.render_widget(search_block, chunks[0]);
     frame.render_widget(Paragraph::new(search_line), search_inner);
 
-    // --- Session list box ---
-    // Bordered block titled " sessions (N) ", dim border + title.
-    let count = picker.filtered_idx.len();
-    let list_title = format!(" sessions ({count}) ");
-    let list_block = Block::bordered()
-        .title(Span::styled(list_title, Style::default().fg(palette.dim)))
-        .border_style(Style::default().fg(palette.dim))
-        .padding(Padding::horizontal(1));
-
-    let list_inner = list_block.inner(chunks[1]);
+    // --- Session list (flat, no borders) ---
+    // Render rows directly into the inset area (1 char horizontal margin).
+    let inner = chunks[1].inner(Margin { horizontal: 1, vertical: 0 });
 
     // Build one styled Line per filtered entry with aligned columns.
     //
@@ -106,7 +100,7 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
     //
     // `name_w` is derived from the inner width so the right columns always
     // land at the same horizontal offset regardless of name length.
-    let inner_w = list_inner.width as usize;
+    let inner_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     for (i, &j) in picker.filtered_idx.iter().enumerate() {
@@ -132,18 +126,19 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
         lines.push(Line::styled(row, style));
     }
 
-    // Scroll so the selected row stays visible within the box inner height.
-    let list_height = list_inner.height as usize;
+    // Scroll so the selected row stays visible within the inner height.
+    let list_height = inner.height as usize;
     let scroll = picker
         .selected
         .saturating_sub(list_height.saturating_sub(1)) as u16;
 
-    frame.render_widget(list_block, chunks[1]);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_inner);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 
-    // --- Keybinding hint ---
-    let instructions =
-        Paragraph::new("↑↓ select · type to filter · Enter open · Esc/Ctrl+C quit")
-            .style(Style::default().fg(palette.dim));
+    // --- Keybinding hint (flat, with session count prepended) ---
+    let hint = format!(
+        "{} sessions · ↑↓ select · type to filter · Enter open · Esc/Ctrl+C quit",
+        picker.filtered_idx.len()
+    );
+    let instructions = Paragraph::new(hint).style(Style::default().fg(palette.dim));
     frame.render_widget(instructions, chunks[2]);
 }

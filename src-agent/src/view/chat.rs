@@ -177,6 +177,15 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     render_block(logical, "● ", palette.fg, wrap_w, false)
                 }
                 Role::Tool => {
+                    // Harness-internal tool results (the silent "plan first"
+                    // nudge) carry a hide-marker: fed to the model, never shown.
+                    // Cache an EMPTY block (not `continue`) so the cache stays
+                    // index-aligned with `committed`; empty blocks are skipped
+                    // entirely during frame assembly (no block, no separator).
+                    if msg.content.starts_with(crate::dto::chat::PLAN_NUDGE_MARK) {
+                        cache.blocks.push(Vec::new());
+                        continue;
+                    }
                     // Compact dim block: just the first line of the tool output,
                     // truncated. Tool results are not markdown-rendered.
                     let first = msg.content.lines().next().unwrap_or("");
@@ -199,6 +208,11 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut first = true;
         for block in &cache.blocks {
+            // Empty blocks (hidden harness messages) leave no visual trace: skip
+            // both the block AND its blank separator so the transcript is clean.
+            if block.is_empty() {
+                continue;
+            }
             if !first {
                 lines.push(Line::from(""));
             }

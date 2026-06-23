@@ -17,47 +17,59 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing required string argument '{key}'"))
 }
 
-/// List the immediate entries of a workspace-relative directory.
+/// List directory contents from the indexed file tree (cache-backed, multi-path).
 pub struct DirList;
 impl Tool for DirList {
     fn name(&self) -> &'static str { "dir_list" }
     fn description(&self) -> &'static str {
-        "List files and directories directly under a workspace-relative path. Cannot access paths outside the workspace."
+        "List the contents of one or more workspace directories from the indexed file tree (folders end with '/'). Pass `paths` (an array) to list several directories in one call — prefer this over many separate calls."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative directory path (defaults to \".\")"
-                }
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Workspace-relative directory paths to list. Use [\".\"] for the workspace root."
+                },
+                "path": { "type": "string", "description": "A single directory (alternative to `paths`)." }
             }
         })
     }
     fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
-        let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let dir = resolve(&ctx.workspace, rel)?;
-        if !dir.is_dir() {
-            bail!("'{rel}' is not a directory");
-        }
-        let mut entries: Vec<String> = Vec::new();
-        for ent in std::fs::read_dir(&dir).with_context(|| format!("reading directory '{rel}'"))? {
-            let ent = ent?;
-            let mut name = ent.file_name().to_string_lossy().into_owned();
-            // Append `/` to directory names. Use the dir-entry file type, which
-            // does not follow symlinks; fall back to a stat when unavailable.
-            let is_dir = match ent.file_type() {
-                Ok(t) => t.is_dir(),
-                Err(_) => ent.path().is_dir(),
-            };
-            if is_dir {
-                name.push('/');
+        // Accept `paths` (array) or a single `path`; default to the workspace root.
+        let mut dirs: Vec<String> = Vec::new();
+        if let Some(arr) = args.get("paths").and_then(Value::as_array) {
+            for v in arr {
+                if let Some(s) = v.as_str() { dirs.push(s.to_string()); }
             }
-            entries.push(name);
         }
-        entries.sort();
-        Ok(entries.join("\n"))
+        if let Some(s) = args.get("path").and_then(Value::as_str) {
+            dirs.push(s.to_string());
+        }
+        if dirs.is_empty() { dirs.push(".".to_string()); }
+
+        let cache = ctx.dir_cache.read().map_err(|_| anyhow::anyhow!("dir cache unavailable"))?;
+        let mut out = String::new();
+        for dir in &dirs {
+            // sandbox the path even though we read from the cache, to reject escapes
+            let _ = resolve(&ctx.workspace, dir)?;
+            let children = cache.children(dir);
+            let label = if dir.is_empty() || dir == "." { "." } else { dir.as_str() };
+            out.push_str(&format!("{label}:\n"));
+            if children.is_empty() {
+                out.push_str("  (empty or not indexed)\n");
+            } else {
+                for c in &children {
+                    out.push_str("  ");
+                    out.push_str(c);
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+        }
+        Ok(out.trim_end().to_string())
     }
 }
 
@@ -145,6 +157,7 @@ impl Tool for Write {
         }
         std::fs::write(&path, content.as_bytes())
             .with_context(|| format!("writing file '{rel}'"))?;
+        super::dircache::reindex(ctx.workspace.clone(), ctx.dir_cache.clone());
         Ok(format!("Wrote {} bytes to {}.", content.len(), rel))
     }
 }
@@ -175,6 +188,7 @@ impl Tool for Delete {
             bail!("'{rel}' does not exist");
         }
         std::fs::remove_file(&path).with_context(|| format!("deleting file '{rel}'"))?;
+        super::dircache::reindex(ctx.workspace.clone(), ctx.dir_cache.clone());
         Ok(format!("Deleted {rel}."))
     }
 }

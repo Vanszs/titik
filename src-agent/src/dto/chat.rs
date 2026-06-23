@@ -8,6 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Prefix marking a tool result as a harness-internal message (e.g. the silent
+/// "plan first" nudge) that should be fed to the model but NOT shown in the
+/// transcript. An invisible char so it never affects what the model reads.
+pub const PLAN_NUDGE_MARK: &str = "\u{2063}";
+
 /// Which participant authored a message.
 ///
 /// Serialised as lowercase strings (`"system"`, `"user"`, `"assistant"`) to

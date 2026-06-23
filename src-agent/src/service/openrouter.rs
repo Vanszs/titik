@@ -98,9 +98,21 @@ impl OpenRouterClient {
     /// `Ok(())`. The caller (a spawned task) discards the return value.
     pub async fn stream_complete(
         &self,
-        messages: Vec<ChatMessage>,
+        mut messages: Vec<ChatMessage>,
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
+        // Steer the model to lead its FIRST plan with a random whimsical corpus
+        // word (instead of "Plan:"). Injected per request into the System
+        // message so the model plans up front and the runtime needs no separate
+        // "plan first" nudge round in the common case.
+        if let Some(first) = messages.first_mut() {
+            if first.role == crate::dto::chat::Role::System {
+                let word = crate::resources::wanderer_word();
+                first.content.push_str(&format!(
+                    "\n\nWhen you write your plan for this task, lead with the single word \"{word}:\" (a whimsical lead-in) instead of \"Plan:\"."
+                ));
+            }
+        }
         let url = format!("{}/chat/completions", self.base_url);
         // Expose the built-in tool set to the model. Each tool maps to an
         // OpenAI/OpenRouter `function` definition (name + description + raw
