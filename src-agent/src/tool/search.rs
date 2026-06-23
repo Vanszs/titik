@@ -1,0 +1,202 @@
+//! Search tools: grep (regex file search) and glob (file-path pattern match).
+//!
+//! Both are read-only and safe — they auto-run without approval in Normal mode.
+//! Paths are sandboxed via [`super::resolve`]; file walks use the `ignore` crate
+//! (gitignore-aware), matching [`super::dircache`].
+
+use anyhow::Result;
+use serde_json::{json, Value};
+use super::{resolve, Tool, ToolCtx};
+
+/// Search file contents by regular expression.
+pub struct Grep;
+impl Tool for Grep {
+    fn name(&self) -> &'static str { "grep" }
+    fn description(&self) -> &'static str {
+        "Search file contents by regular expression. Returns matching lines as path:line: text."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "A Rust regex pattern to search for."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search (workspace-relative, default '.')."
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional glob filter for filenames/paths (e.g. '*.rs')."
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+    fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
+        let pattern = args.get("pattern")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing required string argument 'pattern'"))?;
+
+        // Compile the regex; return a clean error on failure.
+        let re = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(e) => return Ok(format!("invalid regex: {e}")),
+        };
+
+        let search_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let base = resolve(&ctx.workspace, search_path)?;
+
+        // Optional glob filter.
+        let glob_matcher: Option<globset::GlobMatcher> = match args.get("glob").and_then(Value::as_str) {
+            Some(g) => {
+                let glob = globset::Glob::new(g)
+                    .map_err(|e| anyhow::anyhow!("invalid glob '{g}': {e}"))?;
+                Some(glob.compile_matcher())
+            }
+            None => None,
+        };
+
+        const MAX_MATCHES: usize = 200;
+        const MAX_LINE_CHARS: usize = 300;
+
+        let mut matches: Vec<String> = Vec::new();
+        let mut truncated = false;
+
+        let walk = ignore::WalkBuilder::new(&base).build();
+        'outer: for entry in walk.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let abs_path = entry.path();
+
+            // Apply glob filter against the workspace-relative path.
+            if let Some(ref m) = glob_matcher {
+                let rel = abs_path.strip_prefix(&ctx.workspace).unwrap_or(abs_path);
+                if !m.is_match(rel) {
+                    continue;
+                }
+            }
+
+            // Skip binary files: try reading as UTF-8.
+            let content = match std::fs::read_to_string(abs_path) {
+                Ok(s) => s,
+                Err(_) => continue, // binary or unreadable
+            };
+
+            let rel_display = abs_path
+                .strip_prefix(&ctx.workspace)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| abs_path.to_string_lossy().into_owned());
+
+            for (lineno, line) in content.lines().enumerate() {
+                if re.is_match(line) {
+                    let display_line = if line.chars().count() > MAX_LINE_CHARS {
+                        let truncated_line: String = line.chars().take(MAX_LINE_CHARS).collect();
+                        format!("{}…", truncated_line)
+                    } else {
+                        line.to_string()
+                    };
+                    matches.push(format!("{}:{}: {}", rel_display, lineno + 1, display_line));
+                    if matches.len() >= MAX_MATCHES {
+                        truncated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok("no matches".to_string());
+        }
+        let mut out = matches.join("\n");
+        if truncated {
+            out.push_str("\n... (truncated at 200 matches)");
+        }
+        Ok(out)
+    }
+}
+
+/// Find files by glob pattern.
+pub struct Glob;
+impl Tool for Glob {
+    fn name(&self) -> &'static str { "glob" }
+    fn description(&self) -> &'static str {
+        "Find files by glob pattern (e.g. **/*.rs). Returns matching paths."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match (e.g. '**/*.rs', 'src/**/*.toml')."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Base directory to search (workspace-relative, default '.')."
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+    fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
+        let pattern = args.get("pattern")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing required string argument 'pattern'"))?;
+
+        let base_rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let _base = resolve(&ctx.workspace, base_rel)?; // sandbox check
+
+        let matcher = globset::Glob::new(pattern)
+            .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?
+            .compile_matcher();
+
+        const MAX_RESULTS: usize = 200;
+
+        // Prefer the live dir cache — it's already gitignore-aware and sorted.
+        let cache_files: Vec<String> = {
+            let cache = ctx.dir_cache.read().map_err(|_| anyhow::anyhow!("dir cache unavailable"))?;
+            cache.files.clone()
+        };
+
+        let mut results: Vec<String> = if !cache_files.is_empty() {
+            cache_files
+                .into_iter()
+                .filter(|f| matcher.is_match(f.as_str()))
+                .collect()
+        } else {
+            // Cache empty: fall back to a fresh walk from the base path.
+            let base_abs = resolve(&ctx.workspace, base_rel)?;
+            let mut v: Vec<String> = Vec::new();
+            for entry in ignore::WalkBuilder::new(&base_abs).build().flatten() {
+                if entry.file_type().is_some_and(|t| t.is_file()) {
+                    let abs = entry.path();
+                    let rel = abs
+                        .strip_prefix(&ctx.workspace)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| abs.to_string_lossy().into_owned());
+                    if matcher.is_match(rel.as_str()) {
+                        v.push(rel);
+                    }
+                }
+            }
+            v.sort();
+            v
+        };
+
+        let truncated = results.len() > MAX_RESULTS;
+        results.truncate(MAX_RESULTS);
+
+        if results.is_empty() {
+            return Ok("no files match".to_string());
+        }
+        let mut out = results.join("\n");
+        if truncated {
+            out.push_str("\n... (truncated at 200 results)");
+        }
+        Ok(out)
+    }
+}

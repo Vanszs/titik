@@ -535,6 +535,50 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                         Span::styled(path.to_string(), Style::default().fg(palette.fg)),
                     ]));
                 }
+                "edit" => {
+                    let path = v["path"].as_str().unwrap_or("?");
+                    let old = v["old"].as_str().unwrap_or("");
+                    let new = v["new"].as_str().unwrap_or("");
+                    rows.push(Line::from(vec![
+                        Span::styled(" target:  ", Style::default().fg(palette.dim)),
+                        Span::styled(path.to_string(), Style::default().fg(palette.fg)),
+                    ]));
+                    rows.push(Line::from(vec![
+                        Span::styled(" payload: ", Style::default().fg(palette.dim)),
+                        Span::styled(
+                            format!(
+                                "{} → {}",
+                                truncate_chars(old, inner_w / 2),
+                                truncate_chars(new, inner_w / 2)
+                            ),
+                            Style::default().fg(palette.fg),
+                        ),
+                    ]));
+                }
+                "bash" => {
+                    let cmd = v["command"].as_str().unwrap_or("?");
+                    rows.push(Line::from(vec![
+                        Span::styled(" command: ", Style::default().fg(palette.dim)),
+                        Span::styled(
+                            truncate_chars(cmd, inner_w),
+                            Style::default().fg(palette.fg),
+                        ),
+                    ]));
+                    // Show additional lines of multi-line commands.
+                    let lines: Vec<&str> = cmd.lines().collect();
+                    for line in lines.iter().skip(1).take(6) {
+                        rows.push(Line::from(Span::styled(
+                            format!("   {}", truncate_chars(line, inner_w)),
+                            Style::default().fg(palette.dim),
+                        )));
+                    }
+                    if lines.len() > 7 {
+                        rows.push(Line::from(Span::styled(
+                            format!("   … (+{} more lines)", lines.len() - 7),
+                            Style::default().fg(palette.dim),
+                        )));
+                    }
+                }
                 _ => {
                     rows.push(Line::from(Span::styled(
                         format!(" {}", truncate_chars(&call.function.arguments, 120)),

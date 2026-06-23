@@ -177,10 +177,11 @@ pub(super) fn advance_turn(
     process_tools(state, client, handle);
 }
 
-/// True for tools that mutate the workspace and therefore require approval in
-/// Normal mode. Deterministic, name-based — no classifier / network call.
+/// True for tools that mutate the workspace (or run arbitrary shell commands)
+/// and therefore require approval in Normal mode. Deterministic, name-based —
+/// no classifier / network call.
 fn tool_is_risky(name: &str) -> bool {
-    matches!(name, "write" | "delete")
+    matches!(name, "write" | "delete" | "edit" | "bash")
 }
 
 /// Drive the tool-approval state machine for the current round.

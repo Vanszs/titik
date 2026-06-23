@@ -18,6 +18,8 @@ use serde_json::Value;
 
 pub mod dircache;
 pub mod fs;
+pub mod search;
+pub mod shell;
 
 pub use dircache::DirCache;
 
@@ -42,11 +44,15 @@ pub trait Tool: Send + Sync {
 /// The built-in tool set.
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(dircache::DirCacheUpdate),
-        Box::new(fs::DirList),
         Box::new(fs::Read),
+        Box::new(search::Grep),
+        Box::new(search::Glob),
         Box::new(fs::Write),
+        Box::new(fs::Edit),
         Box::new(fs::Delete),
+        Box::new(shell::Bash),
+        Box::new(fs::DirList),
+        Box::new(dircache::DirCacheUpdate),
     ]
 }
 
