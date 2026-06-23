@@ -141,6 +141,14 @@ pub enum SettingField {
     AwarenessModel,
     /// Text: dedicated awareness provider (ignored when the source is "inherit").
     AwarenessProvider,
+    /// Toggle: master switch for the safety harness ("Pass B").
+    ClassifierEnabled,
+    /// Text: model used for the safety classifier.
+    ClassifierModel,
+    /// Text: provider slug (strict-pinned) for the safety classifier.
+    ClassifierProvider,
+    /// Text: extra allowed folders (comma-separated) for the workspace check.
+    AllowedFolders,
 }
 
 impl SettingField {
@@ -158,6 +166,10 @@ impl SettingField {
             SettingField::AwarenessSource   => "Model source",
             SettingField::AwarenessModel    => "Aware model",
             SettingField::AwarenessProvider => "Aware provider",
+            SettingField::ClassifierEnabled  => "Harness",
+            SettingField::ClassifierModel    => "Class. model",
+            SettingField::ClassifierProvider => "Class. provider",
+            SettingField::AllowedFolders     => "Allowed dirs",
         }
     }
 }
@@ -192,6 +204,15 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
             SettingField::AwarenessSource,
             SettingField::AwarenessModel,
             SettingField::AwarenessProvider,
+        ],
+    },
+    SettingCategory {
+        name: "Harness",
+        fields: &[
+            SettingField::ClassifierEnabled,
+            SettingField::ClassifierModel,
+            SettingField::ClassifierProvider,
+            SettingField::AllowedFolders,
         ],
     },
 ];
@@ -238,6 +259,16 @@ pub struct SettingsState {
     pub awareness_model: String,
     /// Draft: dedicated awareness provider (used when `awareness_inherit` is false).
     pub awareness_provider: String,
+    /// Draft: safety-harness master switch.
+    pub classifier_enabled: bool,
+    /// Draft: safety-classifier model.
+    pub classifier_model: String,
+    /// Draft: safety-classifier provider slug.
+    pub classifier_provider: String,
+    /// Draft: extra allowed folders as comma-separated text for editing. Seeded
+    /// from `settings.allowed_folders.join(", ")` and parsed back to a
+    /// `Vec<String>` (split on ',', trim, drop empties) on save.
+    pub allowed_folders: String,
 }
 
 impl SettingsState {
@@ -263,6 +294,10 @@ impl SettingsState {
             awareness_inherit: session.settings.awareness_inherit,
             awareness_model: session.settings.awareness_model.clone(),
             awareness_provider: session.settings.awareness_provider.clone(),
+            classifier_enabled: session.settings.classifier_enabled,
+            classifier_model: session.settings.classifier_model.clone(),
+            classifier_provider: session.settings.classifier_provider.clone(),
+            allowed_folders: session.settings.allowed_folders.join(", "),
         }
     }
 
@@ -291,12 +326,16 @@ impl SettingsState {
             SettingField::AwarenessProvider if !self.awareness_inherit => {
                 Some(&mut self.awareness_provider)
             }
+            SettingField::ClassifierModel    => Some(&mut self.classifier_model),
+            SettingField::ClassifierProvider => Some(&mut self.classifier_provider),
+            SettingField::AllowedFolders     => Some(&mut self.allowed_folders),
             SettingField::Theme
             | SettingField::Accent
             | SettingField::AwarenessEnabled
             | SettingField::AwarenessSource
             | SettingField::AwarenessModel
-            | SettingField::AwarenessProvider => None,
+            | SettingField::AwarenessProvider
+            | SettingField::ClassifierEnabled => None,
         }
     }
 
@@ -388,6 +427,9 @@ impl SettingsState {
                 if !self.awareness_inherit {
                     self.editing = true;
                 }
+            }
+            SettingField::ClassifierEnabled => {
+                self.classifier_enabled = !self.classifier_enabled;
             }
             _ => {
                 self.editing = true;

@@ -24,8 +24,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crate::config::{
-    DEFAULT_AWARENESS_MODEL, DEFAULT_AWARENESS_PROVIDER, DEFAULT_MODEL, DEFAULT_PRESERVE_N,
-    DEFAULT_PROVIDER,
+    DEFAULT_AWARENESS_MODEL, DEFAULT_AWARENESS_PROVIDER, DEFAULT_CLASSIFIER_MODEL,
+    DEFAULT_CLASSIFIER_PROVIDER, DEFAULT_MODEL, DEFAULT_PRESERVE_N, DEFAULT_PROVIDER,
 };
 
 /// Controls conversation compaction behaviour (the `/compact` command).
@@ -99,6 +99,26 @@ pub struct Settings {
     /// `awareness_inherit` is false. Empty means OpenRouter default routing.
     #[serde(default = "default_awareness_provider")]
     pub awareness_provider: String,
+    /// Master switch for the safety harness ("Pass B"). When false (the
+    /// default), the agentic loop behaves EXACTLY as it did before the harness
+    /// existed: no workspace check, no prompt/tool-call classification, no
+    /// secondary-model calls. Opt-in only.
+    #[serde(default = "default_classifier_enabled")]
+    pub classifier_enabled: bool,
+    /// Model used for the safety classifier (prompt + tool-call verdicts).
+    /// A dedicated safeguard model judges whether a request/call is safe.
+    #[serde(default = "default_classifier_model")]
+    pub classifier_model: String,
+    /// Provider slug (strict-pinned) for the classifier call. Empty means
+    /// OpenRouter default routing.
+    #[serde(default = "default_classifier_provider")]
+    pub classifier_provider: String,
+    /// Extra folders the session is allowed to operate in, beyond the launch
+    /// directory (which is always allowed at runtime). The workspace check (WC)
+    /// passes when the session workdir is the launch dir OR appears here. Empty
+    /// by default; ignored entirely when `classifier_enabled` is false.
+    #[serde(default)]
+    pub allowed_folders: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -121,6 +141,18 @@ fn default_awareness_provider() -> String {
     DEFAULT_AWARENESS_PROVIDER.to_string()
 }
 
+fn default_classifier_enabled() -> bool {
+    false
+}
+
+fn default_classifier_model() -> String {
+    DEFAULT_CLASSIFIER_MODEL.to_string()
+}
+
+fn default_classifier_provider() -> String {
+    DEFAULT_CLASSIFIER_PROVIDER.to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -134,6 +166,10 @@ impl Default for Settings {
             awareness_inherit: default_awareness_inherit(),
             awareness_model: DEFAULT_AWARENESS_MODEL.to_string(),
             awareness_provider: DEFAULT_AWARENESS_PROVIDER.to_string(),
+            classifier_enabled: default_classifier_enabled(),
+            classifier_model: DEFAULT_CLASSIFIER_MODEL.to_string(),
+            classifier_provider: DEFAULT_CLASSIFIER_PROVIDER.to_string(),
+            allowed_folders: Vec::new(),
         }
     }
 }

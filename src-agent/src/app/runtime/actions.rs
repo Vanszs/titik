@@ -43,6 +43,9 @@ pub(super) fn apply_action(
                 state.rest.status = "busy — wait for response".into();
                 return Ok(());
             }
+            // Prompt-classifier (PC): keep a copy of the user's prompt to
+            // classify in the background once the turn is kicked off.
+            let pc_prompt = text.clone();
             let history = {
                 let sess = state.rest.session.as_mut().unwrap();
                 let _ = msglog::append(&sess.path, Role::User, &text, None);
@@ -67,6 +70,32 @@ pub(super) fn apply_action(
             state.rest.needs_plan = true;
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
+
+            // Prompt-classifier (PC), advisory + non-blocking: once per turn, if
+            // the harness is enabled, classify the user prompt on a background
+            // task. It sends one HarnessVerdict on a dedicated channel (drained
+            // in run_loop) — it NEVER gates the stream that just started. Drop
+            // any stale receiver from a prior turn first.
+            state.rest.harness_rx = None;
+            let pc_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
+                (Some(c), Some(sess)) if sess.settings.classifier_enabled => {
+                    Some((Arc::clone(c), sess.settings.clone()))
+                }
+                _ => None,
+            };
+            if let Some((c, settings)) = pc_inputs {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                state.rest.harness_rx = Some(rx);
+                handle.spawn(async move {
+                    let v = crate::app::harness::classify_prompt(&c, &settings, &pc_prompt).await;
+                    // A dropped receiver (turn superseded / app closing) makes
+                    // this a no-op — same contract as the streaming channel.
+                    let _ = tx.send(crate::service::StreamEvent::HarnessVerdict {
+                        allow: v.allow,
+                        reason: v.reason,
+                    });
+                });
+            }
         }
 
         Action::Slash(cmd) => {
@@ -85,6 +114,7 @@ pub(super) fn apply_action(
                 state.rest.pending_tool_calls.clear();
                 state.rest.agent_steps = 0;
                 state.rest.awaiting_approval = false;
+                state.rest.approval_reason = None;
                 state.rest.tool_idx = 0;
                 state.rest.tool_results.clear();
                 // Take any captured usage unconditionally so a partial turn's
@@ -142,6 +172,7 @@ pub(super) fn apply_action(
             // finish the round). Clone the call out first so `run_tool`'s mutable
             // borrow of `state` doesn't overlap the `pending_tool_calls` read.
             state.rest.awaiting_approval = false;
+            state.rest.approval_reason = None;
             if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
                 let result = run_tool(state, &call);
                 state.rest.tool_results.push((call.id.clone(), result));
@@ -152,6 +183,7 @@ pub(super) fn apply_action(
 
         Action::DenyTool => {
             state.rest.awaiting_approval = false;
+            state.rest.approval_reason = None;
             // Denial halts the turn. Answer the denied call AND every remaining
             // pending call with "denied by user" (so the conversation stays
             // API-valid: every tool_call gets a result), commit any results
@@ -329,6 +361,10 @@ pub(super) fn apply_action(
                     s.awareness_inherit,
                     s.awareness_model.clone(),
                     s.awareness_provider.clone(),
+                    s.classifier_enabled,
+                    s.classifier_model.clone(),
+                    s.classifier_provider.clone(),
+                    s.allowed_folders.clone(),
                 )),
                 _ => None,
             };
@@ -344,6 +380,10 @@ pub(super) fn apply_action(
                 awareness_inherit,
                 awareness_model,
                 awareness_provider,
+                classifier_enabled,
+                classifier_model,
+                classifier_provider,
+                allowed_folders,
             )) = drafts
             {
                 // Detect whether the OpenRouter-relevant creds changed so we only
@@ -360,6 +400,15 @@ pub(super) fn apply_action(
                 //    awareness settings ride along here too; they don't affect
                 //    the chat client (the awareness call uses `complete_with`
                 //    per invocation), so no client rebuild is keyed off them.
+                // Parse the comma-separated allowed-folders text into a Vec:
+                // split on ',', trim each entry, drop empties. This is the seam
+                // where the editable text becomes the stored `Vec<String>`.
+                let allowed_folders_vec: Vec<String> = allowed_folders
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 if let Some(sess) = state.rest.session.as_mut() {
                     sess.settings.api_key = api_key;
                     sess.settings.model = model;
@@ -369,6 +418,14 @@ pub(super) fn apply_action(
                     sess.settings.awareness_inherit = awareness_inherit;
                     sess.settings.awareness_model = awareness_model;
                     sess.settings.awareness_provider = awareness_provider;
+                    // Harness settings ride along here too; like awareness they
+                    // don't affect the chat client (the classifier uses
+                    // `complete_with` per invocation), so no client rebuild is
+                    // keyed off them.
+                    sess.settings.classifier_enabled = classifier_enabled;
+                    sess.settings.classifier_model = classifier_model;
+                    sess.settings.classifier_provider = classifier_provider;
+                    sess.settings.allowed_folders = allowed_folders_vec;
                 }
                 // b) Apply global theme/accent and persist config.json. Best-effort:
                 //    a write failure surfaces to the status line but does not abort

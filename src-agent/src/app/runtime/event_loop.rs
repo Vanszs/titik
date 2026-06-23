@@ -116,6 +116,7 @@ pub(super) fn run_loop(
                         state.rest.agent_steps = 0;
                         state.rest.pending_tool_calls.clear();
                         state.rest.awaiting_approval = false;
+                        state.rest.approval_reason = None;
                         state.rest.tool_idx = 0;
                         state.rest.tool_results.clear();
                         still_streaming = false;
@@ -153,10 +154,39 @@ pub(super) fn run_loop(
                         still_streaming = false;
                         break;
                     }
+                    // The advisory PC verdict is delivered on the dedicated
+                    // `harness_rx` channel (drained below), never on a streaming
+                    // request's channel — so this arm is unreachable here. Ignore
+                    // it to keep the match exhaustive without affecting the stream.
+                    StreamEvent::HarnessVerdict { .. } => {}
                 }
             }
             if still_streaming {
                 state.rest.active_rx = Some(rx);
+            }
+        }
+
+        // 1b. Drain the advisory prompt-classifier (PC) channel. This is fully
+        //     independent of streaming: a BLOCK verdict only raises a toast; the
+        //     turn already proceeded and is never cancelled here. Take() the
+        //     receiver so the match can mutate state.rest; put it back unless the
+        //     PC task has finished (channel closed) or delivered its verdict.
+        if let Some(mut hrx) = state.rest.harness_rx.take() {
+            let mut keep = true;
+            while let Ok(event) = hrx.try_recv() {
+                if let StreamEvent::HarnessVerdict { allow, reason } = event {
+                    if !allow {
+                        let reason = if reason.is_empty() { "flagged".into() } else { reason };
+                        state.rest.set_toast(format!("harness flagged: {reason}"));
+                        dirty = true;
+                    }
+                    // One verdict per turn; stop listening on this channel.
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                state.rest.harness_rx = Some(hrx);
             }
         }
 

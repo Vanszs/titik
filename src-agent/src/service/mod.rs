@@ -42,4 +42,9 @@ pub enum StreamEvent {
         summary: String,
         kept_tail: Vec<ChatMessage>,
     },
+    /// Advisory prompt-classifier (PC) verdict for the current turn. Produced by
+    /// a background task spawned at turn start and delivered on the harness
+    /// channel. `allow = false` surfaces a toast; the turn is NEVER blocked by it
+    /// (the stream already proceeded). `allow = true` is silent.
+    HarnessVerdict { allow: bool, reason: String },
 }

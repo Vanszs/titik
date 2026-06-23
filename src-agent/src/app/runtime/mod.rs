@@ -139,6 +139,12 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // later write config.json). Falls back to AppConfig::default() on any error.
     state.rest.config = AppConfig::load();
 
+    // Capture the process launch directory for the harness workspace check (WC).
+    // This folder is always an allowed workspace regardless of the allow-list.
+    if let Ok(cwd) = std::env::current_dir() {
+        state.rest.launch_dir = cwd;
+    }
+
     // If a session is already active (returning-user / startup-create path),
     // kick off a background index of its workspace so the file cache is warm.
     // Picker / first-run paths have no session yet; they trigger this later.

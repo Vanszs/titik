@@ -138,6 +138,32 @@ pub(super) fn advance_turn(
     }
     state.rest.agent_steps += 1;
 
+    // 4b. Workspace check (WC): the deterministic harness gate. When the harness
+    //     is enabled and the session workdir is NOT an allowed folder (the launch
+    //     dir or an allow-list entry), refuse to run ANY tool this turn. Every
+    //     pending call is answered with a refusal (so the conversation stays
+    //     API-valid — no dangling tool_call ids) and the turn is stopped. When
+    //     the harness is disabled this is skipped entirely (zero behaviour
+    //     change). The check runs once per round, before the plan gate / tools.
+    let wc_blocked = state
+        .rest
+        .session
+        .as_ref()
+        .is_some_and(|sess| {
+            sess.settings.classifier_enabled
+                && !crate::app::harness::workspace_allowed(
+                    &sess.settings,
+                    &sess.workdir(),
+                    &state.rest.launch_dir,
+                )
+        });
+    if wc_blocked {
+        deny_all_pending(state, "workspace not in allowed folders");
+        state.rest.set_toast("workspace not in allowed folders".into());
+        state.rest.status = "stopped: workspace not allowed".into();
+        return;
+    }
+
     // 5a. Plan gate: on the FIRST tool round of a new user turn, make sure the
     //     model stated a plan before tools run. The System message already steers
     //     it to lead with a whimsical word (see `stream_complete`), so it usually
@@ -184,6 +210,24 @@ fn tool_is_risky(name: &str) -> bool {
     matches!(name, "write" | "delete" | "edit" | "bash")
 }
 
+/// Inputs for a tool-call-classifier (TAC) call, or `None` when TAC should not
+/// run: the harness is disabled, or there's no client/session. Returning `None`
+/// makes the caller fall through to the normal human approval prompt — the safe
+/// default (and the unchanged behaviour when the harness is off). The `Settings`
+/// and client `Arc` are cloned out so the caller's `block_on` doesn't hold a
+/// borrow of `state`.
+fn tac_inputs(
+    state: &AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+) -> Option<(Arc<OpenRouterClient>, crate::model::settings::Settings)> {
+    match (client.as_ref(), state.rest.session.as_ref()) {
+        (Some(c), Some(sess)) if sess.settings.classifier_enabled => {
+            Some((Arc::clone(c), sess.settings.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Drive the tool-approval state machine for the current round.
 ///
 /// Walks `pending_tool_calls` from `tool_idx`, running each call and collecting
@@ -204,10 +248,35 @@ pub(super) fn process_tools(
     while state.rest.tool_idx < state.rest.pending_tool_calls.len() {
         let call = state.rest.pending_tool_calls[state.rest.tool_idx].clone();
         if mode == AgentMode::Normal && tool_is_risky(&call.function.name) {
-            // Pause the turn for the user's decision; resumed by Approve/Deny.
-            state.rest.awaiting_approval = true;
-            state.rest.status = format!("approve {}? [y/n]", call.function.name);
-            return;
+            // Tool-call classifier (TAC): in Normal mode, a risky call is the
+            // decision point. When the harness is enabled, ask the classifier
+            // whether this specific call is safe to AUTO-RUN. A "safe" verdict
+            // upgrades the call to auto (skip the prompt); a "block" verdict — or
+            // any classifier error (fail-to-approval) — falls through to the
+            // human y/n. When the harness is DISABLED this whole branch is
+            // skipped and a risky call always prompts (unchanged behaviour).
+            let tac = tac_inputs(state, client);
+            let auto_ok = if let Some((c, settings)) = tac {
+                let verdict = handle.block_on(crate::app::harness::classify_toolcall(
+                    &c,
+                    &settings,
+                    &call.function.name,
+                    &call.function.arguments,
+                ));
+                // Stash the reason so a forced approval shows WHY it's asked.
+                state.rest.approval_reason =
+                    if verdict.allow { None } else { Some(verdict.reason) };
+                verdict.allow
+            } else {
+                false
+            };
+            if !auto_ok {
+                // Pause the turn for the user's decision; resumed by Approve/Deny.
+                state.rest.awaiting_approval = true;
+                state.rest.status = format!("approve {}? [y/n]", call.function.name);
+                return;
+            }
+            // TAC said safe → fall through and run it inline (no prompt).
         }
         let result = run_tool(state, &call);
         state.rest.tool_results.push((call.id.clone(), result));
@@ -289,6 +358,44 @@ pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
         }
     }
     format!("error: unknown tool '{}'", call.function.name)
+}
+
+/// Halt the current turn by answering every still-pending tool call with
+/// `reason` (and flushing any results already collected this round), so the
+/// stored conversation keeps every `tool_call` id answered — then reset the
+/// agentic-loop machine and end the turn WITHOUT re-streaming.
+///
+/// Shares the shape of [`super::actions`]'s `DenyTool` handler; used by the
+/// harness workspace check (WC) to refuse a turn whose workspace isn't allowed.
+/// Pending calls from `tool_idx` onward are the unanswered ones.
+pub(super) fn deny_all_pending(state: &mut AppState, reason: &str) {
+    let results = state.rest.tool_results.clone();
+    let pending_ids: Vec<String> = state
+        .rest
+        .pending_tool_calls
+        .iter()
+        .skip(state.rest.tool_idx)
+        .map(|c| c.id.clone())
+        .collect();
+    if let Some(sess) = state.rest.session.as_mut() {
+        for (id, result) in &results {
+            let _ = crate::model::msglog::append(&sess.path, Role::Tool, result, None);
+            sess.conversation.push_tool(id.clone(), result.clone());
+        }
+        for id in &pending_ids {
+            let _ = crate::model::msglog::append(&sess.path, Role::Tool, reason, None);
+            sess.conversation.push_tool(id.clone(), reason.to_string());
+        }
+        let _ = sess.save();
+    }
+    state.rest.pending_tool_calls.clear();
+    state.rest.tool_idx = 0;
+    state.rest.tool_results.clear();
+    state.rest.agent_steps = 0;
+    state.rest.awaiting_approval = false;
+    state.rest.approval_reason = None;
+    state.rest.waiting = false;
+    state.rest.current_task = None;
 }
 
 /// Abort the in-flight task and stop listening to it: aborts the task handle,

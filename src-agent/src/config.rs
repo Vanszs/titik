@@ -32,6 +32,16 @@ pub const DEFAULT_AWARENESS_MODEL: &str = "openai/gpt-oss-20b";
 /// serves the default awareness model fast and cheap.
 pub const DEFAULT_AWARENESS_PROVIDER: &str = "groq";
 
+/// Default safety-classifier model (the harness "Pass B"). A dedicated
+/// safeguard model that judges whether a user prompt / tool call is safe to
+/// proceed. Routed via OpenRouter (see `DEFAULT_CLASSIFIER_PROVIDER`).
+pub const DEFAULT_CLASSIFIER_MODEL: &str = "openai/gpt-oss-safeguard-20b";
+
+/// Default provider slug for the safety-classifier call (strict-pinned). Groq
+/// serves the safeguard model fast and cheap, which keeps the per-call latency
+/// low enough to gate tool execution synchronously.
+pub const DEFAULT_CLASSIFIER_PROVIDER: &str = "groq";
+
 /// Value sent as the `HTTP-Referer` header with every OpenRouter request.
 ///
 /// OpenRouter uses this to attribute usage to the originating project.

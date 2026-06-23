@@ -493,6 +493,16 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                 format!(" ⚙ {name}"),
                 Style::default().fg(warn).add_modifier(Modifier::BOLD),
             )));
+            // When the harness (TAC) forced this approval, show its reason so the
+            // user knows WHY the call was flagged rather than auto-run.
+            if let Some(reason) = rest.approval_reason.as_ref() {
+                if !reason.is_empty() {
+                    rows.push(Line::from(Span::styled(
+                        format!(" harness: {reason}"),
+                        Style::default().fg(palette.dim),
+                    )));
+                }
+            }
             let v: serde_json::Value =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
             let inner_w = (chunks[2].width as usize)

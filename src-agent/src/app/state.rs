@@ -170,6 +170,22 @@ pub struct AppStateRest {
     /// `None` when awareness is disabled, no docs exist, or the call failed —
     /// it is recomputed per session, never persisted.
     pub awareness_summary: Option<String>,
+    /// Process working directory captured at startup. The deterministic
+    /// workspace check (WC) always allows this directory regardless of the
+    /// allow-list, so running the agent in the folder you want to work in just
+    /// works. Set once in `runtime::run`; never mutated afterwards.
+    pub launch_dir: std::path::PathBuf,
+    /// Receiver for advisory prompt-classifier (PC) verdicts. Each new turn
+    /// (when the classifier is enabled) opens a fresh channel here and spawns a
+    /// background task that sends one [`StreamEvent::HarnessVerdict`]. Drained in
+    /// `run_loop` independently of the streaming channel, so PC never blocks or
+    /// interferes with streaming. `None` when no PC task is in flight.
+    pub harness_rx: Option<UnboundedReceiver<StreamEvent>>,
+    /// Reason the tool-call classifier (TAC) flagged the currently-paused call,
+    /// shown in the approval overlay so the user sees WHY approval is asked.
+    /// `None` for an approval that wasn't classifier-driven. Cleared when the
+    /// approval resolves.
+    pub approval_reason: Option<String>,
 }
 
 impl AppState {
@@ -229,6 +245,9 @@ impl AppStateRest {
             awaiting_approval: false,
             needs_plan: false,
             awareness_summary: None,
+            launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            harness_rx: None,
+            approval_reason: None,
         }
     }
 
