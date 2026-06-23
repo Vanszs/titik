@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -15,3 +14,7 @@ include_dir = "0.7"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 futures-util = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ignore = "0.4"

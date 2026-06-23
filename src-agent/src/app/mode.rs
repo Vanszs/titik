@@ -126,7 +126,7 @@ impl KeyInputForm {
 ///
 /// Holds editable *drafts* of every settable value; nothing is persisted until
 /// the user saves (Esc), at which point the runtime reads these fields back out
-/// and applies them. `selected` indexes the five sections in display order:
+/// and applies them. `selected` indexes the six sections in display order:
 ///
 /// | index | section      | kind            |
 /// |-------|--------------|-----------------|
@@ -135,13 +135,14 @@ impl KeyInputForm {
 /// | 2     | Provider     | text            |
 /// | 3     | Theme        | toggle + cycle  |
 /// | 4     | Session name | text            |
+/// | 5     | Workdir      | text            |
 ///
-/// Text rows (0/1/2/4) are edited in place once `editing` is set; the Theme row
+/// Text rows (0/1/2/4/5) are edited in place once `editing` is set; the Theme row
 /// (3) never enters `editing` — Enter toggles dark/light and ←/→ cycle the
 /// accent instead.
 #[derive(Debug, Clone)]
 pub struct SettingsState {
-    /// Active section (0=API key, 1=Model, 2=Provider, 3=Theme, 4=Session name).
+    /// Active section (0=API key, 1=Model, 2=Provider, 3=Theme, 4=Session name, 5=Workdir).
     pub selected: usize,
     /// `true` while typing into a text row; `false` while navigating sections.
     pub editing: bool,
@@ -157,6 +158,8 @@ pub struct SettingsState {
     pub theme: ThemeMode,
     /// Draft global accent name (one of [`ACCENTS`]).
     pub accent: String,
+    /// Draft working directory for this session.
+    pub workdir: String,
 }
 
 impl SettingsState {
@@ -175,6 +178,7 @@ impl SettingsState {
             name: session.name.clone(),
             theme: config.theme.clone(),
             accent: config.accent.clone(),
+            workdir: session.settings.workdir.clone(),
         }
     }
 
@@ -186,9 +190,9 @@ impl SettingsState {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// Move the section cursor down one row (clamps at the last section, 4).
+    /// Move the section cursor down one row (clamps at the last section, 5).
     pub fn down(&mut self) {
-        if self.selected < 4 {
+        if self.selected < 5 {
             self.selected += 1;
         }
     }
@@ -218,6 +222,7 @@ impl SettingsState {
             1 => self.model.push(c),
             2 => self.provider.push(c),
             4 => self.name.push(c),
+            5 => self.workdir.push(c),
             _ => {}
         }
     }
@@ -231,6 +236,7 @@ impl SettingsState {
             1 => { self.model.pop(); }
             2 => { self.provider.pop(); }
             4 => { self.name.pop(); }
+            5 => { self.workdir.pop(); }
             _ => {}
         };
     }

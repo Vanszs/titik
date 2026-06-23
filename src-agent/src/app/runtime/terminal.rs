@@ -2,8 +2,8 @@
 
 use std::io::stdout;
 
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+use ratatui::crossterm::{
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,7 +16,7 @@ pub(super) struct TerminalGuard;
 impl TerminalGuard {
     pub(super) fn enter() -> anyhow::Result<Self> {
         enable_raw_mode()?;
-        if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -26,8 +26,8 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), crossterm::cursor::Show);
+        let _ = execute!(stdout(), ratatui::crossterm::cursor::Show);
     }
 }

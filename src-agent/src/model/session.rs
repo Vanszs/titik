@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crate::dto::chat::ChatMessage;
 use crate::model::conversation::Conversation;
-use crate::model::memory::load_memory;
+use crate::model::memory::{load_agents, load_memory};
 use crate::model::settings::Settings;
 use crate::resources;
 
@@ -141,6 +141,16 @@ impl Session {
         Ok(())
     }
 
+    /// The session's working directory: the `workdir` setting if set, else the
+    /// process's current dir.
+    pub fn workdir(&self) -> std::path::PathBuf {
+        if self.settings.workdir.trim().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            std::path::PathBuf::from(self.settings.workdir.trim())
+        }
+    }
+
     /// Rebuild the system prompt and push it into the conversation.
     ///
     /// Called on session load and after the user edits `MEMORY.md` at runtime.
@@ -150,7 +160,8 @@ impl Session {
     /// `Conversation::set_system` to insert or replace `messages[0]`.
     pub fn rebuild_system(&mut self) {
         let mem = load_memory(&self.path);
-        let sys = resources::build_system_prompt(mem.as_deref());
+        let agents = load_agents(&self.workdir());
+        let sys = resources::build_system_prompt(mem.as_deref(), agents.as_deref());
         self.conversation.set_system(sys);
     }
 }

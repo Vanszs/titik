@@ -18,6 +18,9 @@
 //!
 //! <personality>
 //!
+//! # Project Instructions
+//! <agents>       ← only present when AGENT.md / AGENTS.md exists in workdir
+//!
 //! # Memory
 //! <memory>       ← only present when the session has saved memory
 //! ```
@@ -55,13 +58,22 @@ pub fn system_personality() -> &'static str {
 
 /// Assemble the full system prompt string for the OpenRouter `system` field.
 ///
-/// Structure: `prompt + "\n\n" + personality [+ "\n\n# Memory\n" + memory]`.
-/// The memory section is omitted when `memory` is `None` or blank.
-pub fn build_system_prompt(memory: Option<&str>) -> String {
+/// Structure: `prompt + "\n\n" + personality [+ "\n\n# Project Instructions\n" + agents]
+/// [+ "\n\n# Memory\n" + memory]`.
+/// Both optional sections are omitted when their argument is `None` or blank.
+pub fn build_system_prompt(memory: Option<&str>, agents: Option<&str>) -> String {
     let mut s = String::new();
     s.push_str(system_prompt());
     s.push_str("\n\n");
     s.push_str(system_personality());
+    if let Some(ag) = agents {
+        let ag = ag.trim();
+        if !ag.is_empty() {
+            // Project-level instructions from AGENT.md / AGENTS.md in the workdir.
+            s.push_str("\n\n# Project Instructions\n");
+            s.push_str(ag);
+        }
+    }
     if let Some(mem) = memory {
         let mem = mem.trim();
         if !mem.is_empty() {

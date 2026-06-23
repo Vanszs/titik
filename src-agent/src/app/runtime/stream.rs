@@ -5,30 +5,204 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::app::state::{AppState, AppStateRest};
-use crate::dto::chat::ChatMessage;
+use crate::dto::chat::{ChatMessage, Role, ToolCall};
 use crate::service::openrouter::OpenRouterClient;
+
+/// Hard cap on tool-call rounds within a single user turn. Once exceeded the
+/// turn is stopped so a misbehaving model can't loop indefinitely.
+const MAX_AGENT_STEPS: usize = 25;
 
 /// Finalize a finished stream: commit any buffered assistant text, clear the
 /// waiting flag + task handle, set the status line. `error` is Some on stream
 /// failure; a save error is surfaced only if the stream itself succeeded.
 pub(super) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
+    // Take the in-flight usage unconditionally so it can never leak into the
+    // next turn, even when the buffer is empty or there's no session to commit.
+    let usage = rest.pending_usage.take();
     let mut save_err = None;
     if let Some(buf) = rest.take_stream() {
         if !buf.is_empty() {
             if let Some(sess) = rest.session.as_mut() {
+                let _ = crate::model::msglog::append(
+                    &sess.path,
+                    crate::dto::chat::Role::Assistant,
+                    &buf,
+                    usage,
+                );
                 sess.conversation.push_assistant(buf);
                 if let Err(e) = sess.save() {
                     save_err = Some(e.to_string());
+                }
+                // tokens_in = current context size (latest prompt), not cumulative.
+                // tokens_out and cost are cumulative (each turn adds new spend).
+                if let Some((pt, ct, cost)) = usage {
+                    rest.tokens_in = pt;        // current context size, not a sum
+                    rest.tokens_out += ct;
+                    rest.cost += cost;
                 }
             }
         }
     }
     rest.waiting = false;
     rest.current_task = None;
-    rest.status = match error.or(save_err) {
-        Some(e) => format!("error: {e}"),
-        None => "ready".into(),
+    match error.or(save_err) {
+        Some(e) => {
+            rest.set_toast(e.clone());
+            rest.status = format!("error: {e}");
+        }
+        None => rest.status = "ready".into(),
+    }
+}
+
+/// Advance a turn after a stream finished cleanly (`StreamEvent::Done`).
+///
+/// A single user turn may span several model calls when the model requests
+/// tools. This commits the just-finished assistant message, then EITHER:
+/// - ends the turn (no tool calls → the model gave its final answer), or
+/// - runs the requested tools, appends their results, and starts the next
+///   model call to continue the turn (`waiting` stays true throughout).
+///
+/// Mirrors the usage/counter bookkeeping of [`finish_stream`]: `tokens_in` is
+/// the latest prompt size (current context), `tokens_out` / `cost` accumulate.
+pub(super) fn advance_turn(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
+    // 1. Take the stashed tool calls + the streamed text + the in-flight usage
+    //    out of state up front so nothing leaks into the next model call.
+    let pending = std::mem::take(&mut state.rest.pending_tool_calls);
+    let buf = state.rest.take_stream();
+    let usage = state.rest.pending_usage.take();
+
+    // 2. Commit the assistant message (and log + count it). The assistant text
+    //    may be empty on a tool-call turn — we still record the row so usage
+    //    accounting stays correct across rounds.
+    let mut save_err = None;
+    {
+        let rest = &mut state.rest;
+        if let Some(sess) = rest.session.as_mut() {
+            if !pending.is_empty() {
+                let content = buf.clone().unwrap_or_default();
+                let _ = crate::model::msglog::append(&sess.path, Role::Assistant, &content, usage);
+                sess.conversation
+                    .push_assistant_with_tools(content, pending.clone());
+                if let Err(e) = sess.save() {
+                    save_err = Some(e.to_string());
+                }
+            } else if let Some(b) = buf.as_ref() {
+                if !b.is_empty() {
+                    let _ = crate::model::msglog::append(&sess.path, Role::Assistant, b, usage);
+                    sess.conversation.push_assistant(b.clone());
+                    if let Err(e) = sess.save() {
+                        save_err = Some(e.to_string());
+                    }
+                }
+            }
+            // Counter update: disjoint fields of `rest`, accessed after the
+            // session push so the borrows don't overlap problematically.
+            if let Some((pt, ct, cost)) = usage {
+                rest.tokens_in = pt; // current context size, not a sum
+                rest.tokens_out += ct;
+                rest.cost += cost;
+            }
+        }
+    }
+
+    // 3. No tool calls → the model produced its final answer; the turn is done.
+    if pending.is_empty() {
+        state.rest.waiting = false;
+        state.rest.current_task = None;
+        state.rest.agent_steps = 0;
+        state.rest.status = match save_err {
+            Some(e) => {
+                state.rest.set_toast(e.clone());
+                format!("error: {e}")
+            }
+            None => "ready".into(),
+        };
+        return;
+    }
+
+    // 4. Step cap: stop the turn if the model keeps asking for tools forever.
+    if state.rest.agent_steps >= MAX_AGENT_STEPS {
+        if let Some(sess) = state.rest.session.as_mut() {
+            let _ = sess.save();
+        }
+        state.rest.waiting = false;
+        state.rest.current_task = None;
+        state.rest.agent_steps = 0;
+        state.rest.status = "stopped: max tool steps".into();
+        return;
+    }
+    state.rest.agent_steps += 1;
+
+    // 5. Run each requested tool, collecting (id, result) FIRST so the
+    //    immutable read of the session inside `run_tool` never overlaps the
+    //    mutable push below.
+    let mut results: Vec<(String, String)> = Vec::with_capacity(pending.len());
+    for call in &pending {
+        let result = run_tool(state, call);
+        results.push((call.id.clone(), result));
+    }
+    // Now push the tool results into the conversation + log them.
+    if let Some(sess) = state.rest.session.as_mut() {
+        for (id, result) in &results {
+            let _ = crate::model::msglog::append(&sess.path, Role::Tool, result, None);
+            sess.conversation.push_tool(id.clone(), result.clone());
+        }
+        let _ = sess.save();
+    }
+
+    // 6. Continue the turn: hand the updated history back to the model. The
+    //    streaming buffer is re-armed so the next assistant text accumulates
+    //    cleanly. `waiting` stays true (the turn isn't finished yet).
+    //
+    //    Bail cleanly if there is no session or no client to continue against
+    //    (defensive — a turn in flight normally implies both are present).
+    let history = match (state.rest.session.as_ref(), client.as_ref()) {
+        (Some(sess), Some(_)) => sess.conversation.history(),
+        _ => {
+            state.rest.waiting = false;
+            state.rest.current_task = None;
+            state.rest.agent_steps = 0;
+            state.rest.status = "no active session".into();
+            return;
+        }
     };
+    state.rest.status = "running tools…".into();
+    state.rest.begin_stream();
+    start_stream_task(history, state, client, handle);
+}
+
+/// Run a single tool call against the session workspace and return its result
+/// string (an `error: …` line on failure / unknown tool). Reads the session for
+/// the workspace path and clones the shared dir cache up front, then dispatches
+/// to the matching [`crate::tool::Tool`].
+fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
+    let workspace = state
+        .rest
+        .session
+        .as_ref()
+        .map(|s| s.workdir())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let ctx = crate::tool::ToolCtx {
+        workspace,
+        dir_cache: state.rest.dir_cache.clone(),
+    };
+    // OpenAI/OpenRouter send `arguments` as a JSON-encoded string; an empty or
+    // malformed payload degrades to `{}` so the tool sees no arguments.
+    let args: serde_json::Value =
+        serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+    for tool in crate::tool::all_tools() {
+        if tool.name() == call.function.name {
+            return match tool.run(&ctx, &args) {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            };
+        }
+    }
+    format!("error: unknown tool '{}'", call.function.name)
 }
 
 /// Abort the in-flight task and stop listening to it: aborts the task handle,

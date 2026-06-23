@@ -100,7 +100,10 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
                         lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
                     sess.settings.provider = lp.clone().unwrap_or_default();
                     let _ = sess.save();
+                    let sess_path = sess.path.clone();
                     st.rest.session = Some(sess);
+                    // Fresh startup session → totals 0; harmless and explicit.
+                    st.rest.load_token_totals(&sess_path);
                 }
                 Err(e) => {
                     // Couldn't create the session dir — fall back to the prompt.
@@ -135,6 +138,13 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // Load global config now that ensure_dirs has run (so the dir exists if we
     // later write config.json). Falls back to AppConfig::default() on any error.
     state.rest.config = AppConfig::load();
+
+    // If a session is already active (returning-user / startup-create path),
+    // kick off a background index of its workspace so the file cache is warm.
+    // Picker / first-run paths have no session yet; they trigger this later.
+    if let Some(sess) = state.rest.session.as_ref() {
+        crate::tool::dircache::reindex(sess.workdir(), state.rest.dir_cache.clone());
+    }
 
     // Terminal setup. Guard created BEFORE the Terminal so its Drop covers a
     // failing Terminal::new, any later `?`-error, and panic-unwind.

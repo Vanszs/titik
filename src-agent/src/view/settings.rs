@@ -32,7 +32,7 @@ use crate::model::app_config::ThemeMode;
 use crate::view::theme::Palette;
 
 /// Section labels in display order; index matches `SettingsState::selected`.
-const SECTIONS: &[&str] = &["API key", "Model", "Provider", "Theme", "Session name"];
+const SECTIONS: &[&str] = &["API key", "Model", "Provider", "Theme", "Session name", "Workdir"];
 
 /// Render the settings dashboard for `st` using the given colour `palette`.
 ///
@@ -130,6 +130,8 @@ fn draw_detail(frame: &mut Frame, st: &SettingsState, palette: &Palette, area: r
                 0 => ("API key", st.api_key.as_str()),
                 1 => ("Model", st.model.as_str()),
                 2 => ("Provider", st.provider.as_str()),
+                4 => ("Session name", st.name.as_str()),
+                5 => ("Workdir", st.workdir.as_str()),
                 _ => ("Session name", st.name.as_str()),
             };
             let editing_this = st.editing; // selected == sel by construction here

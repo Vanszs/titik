@@ -20,7 +20,7 @@
 //!          -> Session::save() -> messages.json
 //! ```
 
-use crate::dto::chat::{ChatMessage, Role};
+use crate::dto::chat::{ChatMessage, Role, ToolCall};
 
 /// In-memory chat history for one session.
 ///
@@ -55,6 +55,19 @@ impl Conversation {
     /// Append an assistant turn (used for both streamed and non-streamed replies).
     pub fn push_assistant(&mut self, content: impl Into<String>) {
         self.messages.push(ChatMessage::new(Role::Assistant, content));
+    }
+
+    /// Append an assistant turn that requested tool calls. `content` is the
+    /// assistant text accompanying the calls (often empty).
+    pub fn push_assistant_with_tools(&mut self, content: String, tool_calls: Vec<ToolCall>) {
+        self.messages
+            .push(ChatMessage::assistant_with_tools(content, tool_calls));
+    }
+
+    /// Append a `tool`-role result message answering `tool_call_id`.
+    pub fn push_tool(&mut self, tool_call_id: String, content: String) {
+        self.messages
+            .push(ChatMessage::tool_result(tool_call_id, content));
     }
 
     /// Borrow the full message list (system + turns). Passed directly to the

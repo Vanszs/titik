@@ -10,16 +10,37 @@
 //! one in-flight request. The runtime drains it each tick and folds the events
 //! in here; dropping it cancels delivery from a superseded task.
 
+use std::cell::RefCell;
+use ratatui::text::Line;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::AbortHandle;
 use crate::app::mode::Mode;
 use crate::model::app_config::AppConfig;
 use crate::model::session::Session;
 use crate::service::StreamEvent;
+use crate::view::theme::Palette;
 
 pub struct AppState {
     pub mode: Mode,
     pub rest: AppStateRest,
+}
+
+/// Per-frame cache of the transcript's rendered visual lines.
+///
+/// Markdown rendering (pulldown-cmark + syntect highlighting) and span-wrapping
+/// are expensive and would otherwise re-run for every committed message on every
+/// redraw (every streamed token, every scroll). This caches each NON-system
+/// message's fully-rendered visual lines so they are computed once and reused
+/// across frames; only NEW messages are rendered. The cache is keyed by the wrap
+/// width + palette, so a resize or theme change forces a full rebuild; a shrink
+/// of the message list (compaction / resend) also forces a rebuild.
+#[derive(Default)]
+pub struct TranscriptCache {
+    pub width: usize,
+    pub palette: Option<Palette>,
+    /// One entry per NON-system message, in order; each is that message's
+    /// rendered visual lines (bullet+indent applied, no separator).
+    pub blocks: Vec<Vec<Line<'static>>>,
 }
 
 pub struct AppStateRest {
@@ -27,9 +48,18 @@ pub struct AppStateRest {
     /// Saved (session) before a /new or reconfigure prompt; restored on cancel.
     pub prev_session: Option<Session>,
     pub input: String,
+    /// Bash-style input history: index into the sent-user-message list while
+    /// recalling (None = editing live input).
+    pub hist_idx: Option<usize>,
+    /// Live input stashed when history recall starts; restored on recall past
+    /// the newest entry.
+    pub input_stash: String,
     /// Selected row in the `/` command palette (index into the filtered list).
     pub palette_sel: usize,
     pub status: String,
+    /// Transient error toast: (message, expiry instant). Shown at the top of the
+    /// transcript and auto-dismissed once the instant passes.
+    pub toast: Option<(String, std::time::Instant)>,
     /// True while the `/help` overlay is shown. Any key closes it.
     pub help_open: bool,
     pub waiting: bool,
@@ -56,6 +86,34 @@ pub struct AppStateRest {
     /// Global application config (theme, accent). Loaded once at startup after
     /// `ensure_dirs`; defaults to `AppConfig::default()` until then.
     pub config: AppConfig,
+    /// Set by `/select`; the event loop performs the terminal hand-off next tick.
+    pub select_pending: bool,
+    /// True while the conversation is dumped to the normal terminal for copying.
+    pub select_active: bool,
+    /// Cumulative session token/cost totals (summed from messages.sqlite on
+    /// open, incremented per response). Survive /compact.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost: f64,
+    /// Usage for the in-flight response, captured from the StreamEvent::Usage
+    /// chunk and consumed when the assistant message is committed.
+    pub pending_usage: Option<(u64, u64, f64)>,
+    /// Cache of each committed message's rendered visual lines, reused across
+    /// frames so markdown/syntect highlighting doesn't re-run every redraw.
+    /// Borrowed mutably by the chat renderer through a shared `&rest` (the UI is
+    /// single-threaded, so `RefCell` is fine).
+    pub transcript_cache: RefCell<TranscriptCache>,
+    /// Background-refreshed index of the active session's workspace files
+    /// (gitignore-respecting). Re-indexed off-thread; shared with the tool layer.
+    pub dir_cache: std::sync::Arc<std::sync::RwLock<crate::tool::DirCache>>,
+    /// Tool calls emitted by the in-flight stream, stashed on
+    /// `StreamEvent::ToolCalls` and consumed by `advance_turn` once the stream
+    /// finalises. Empty when the model returned a plain (final) answer.
+    pub pending_tool_calls: Vec<crate::dto::chat::ToolCall>,
+    /// Number of tool-call rounds taken in the current turn. Reset to 0 when a
+    /// new user turn starts / the turn ends; bounded so a runaway model can't
+    /// loop forever.
+    pub agent_steps: usize,
 }
 
 impl AppState {
@@ -79,8 +137,11 @@ impl AppStateRest {
             session: None,
             prev_session: None,
             input: String::new(),
+            hist_idx: None,
+            input_stash: String::new(),
             palette_sel: 0,
             status: "ready".into(),
+            toast: None,
             help_open: false,
             waiting: false,
             streaming: None,
@@ -94,21 +155,78 @@ impl AppStateRest {
             current_task: None,
             active_rx: None,
             config: AppConfig::default(),
+            select_pending: false,
+            select_active: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost: 0.0,
+            pending_usage: None,
+            transcript_cache: RefCell::new(TranscriptCache::default()),
+            dir_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::tool::DirCache::default(),
+            )),
+            pending_tool_calls: Vec::new(),
+            agent_steps: 0,
         }
+    }
+
+    /// Load cumulative token/cost totals for `session_dir` from its sqlite log
+    /// (0 if absent). Called when a session becomes active.
+    pub fn load_token_totals(&mut self, session_dir: &std::path::Path) {
+        let (i, o, c) = crate::model::msglog::totals(session_dir).unwrap_or((0, 0, 0.0));
+        self.tokens_in = i;
+        self.tokens_out = o;
+        self.cost = c;
     }
 
     // input editing
     pub fn push_char(&mut self, c: char) {
         self.input.push(c);
         self.palette_sel = 0;
+        self.hist_idx = None;
     }
     pub fn backspace(&mut self) {
         self.input.pop();
         self.palette_sel = 0;
+        self.hist_idx = None;
     }
     pub fn take_input(&mut self) -> String {
         self.palette_sel = 0;
+        self.hist_idx = None;
         std::mem::take(&mut self.input)
+    }
+
+    /// Recall the previous (older) sent user message into the input. `users` is
+    /// the session's user messages oldest-first.
+    pub fn history_prev(&mut self, users: &[String]) {
+        if users.is_empty() {
+            return;
+        }
+        let next = match self.hist_idx {
+            None => {
+                self.input_stash = self.input.clone();
+                users.len() - 1
+            }
+            Some(0) => return, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.hist_idx = Some(next);
+        self.input = users[next].clone();
+    }
+    /// Recall the next (newer) sent user message; past the newest, restore the
+    /// stashed live input and leave recall mode.
+    pub fn history_next(&mut self, users: &[String]) {
+        match self.hist_idx {
+            Some(i) if i + 1 < users.len() => {
+                self.hist_idx = Some(i + 1);
+                self.input = users[i + 1].clone();
+            }
+            Some(_) => {
+                self.hist_idx = None;
+                self.input = std::mem::take(&mut self.input_stash);
+            }
+            None => {}
+        }
     }
 
     // scroll. `scroll` is an offset-from-top used only when NOT following;
@@ -153,5 +271,21 @@ impl AppStateRest {
         self.last_key = Some(key.to_string());
         self.last_model = Some(model.to_string());
         self.last_provider = Some(provider.to_string());
+    }
+
+    /// Show an error toast for ~6 seconds.
+    pub fn set_toast(&mut self, msg: String) {
+        self.toast = Some((msg, std::time::Instant::now() + std::time::Duration::from_secs(6)));
+    }
+    /// Clear the toast if it has expired. Returns true if it was just cleared
+    /// (so the caller can mark the frame dirty).
+    pub fn tick_toast(&mut self) -> bool {
+        if let Some((_, until)) = &self.toast {
+            if std::time::Instant::now() >= *until {
+                self.toast = None;
+                return true;
+            }
+        }
+        false
     }
 }

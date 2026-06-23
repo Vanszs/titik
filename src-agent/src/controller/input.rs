@@ -1,6 +1,6 @@
 //! Controller – keyboard input handler ("C" in MVC).
 //!
-//! Every raw [`crossterm::event::KeyEvent`] that the event loop receives is
+//! Every raw [`ratatui::crossterm::event::KeyEvent`] that the event loop receives is
 //! passed to [`handle_key`], which dispatches to one of three mode-specific
 //! handlers depending on [`Mode`]:
 //!
@@ -12,7 +12,7 @@
 //! `app::runtime`) acts on.  No state is mutated here beyond the fields
 //! belonging to the active mode and `AppStateRest`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::app::mode::{KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::{AppState, AppStateRest};
 use crate::controller::command::{self, Command};
@@ -74,10 +74,57 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
     }
 }
 
+/// Insert pasted text into the active input. In Chat the text is inserted
+/// verbatim (newlines kept → multiline input, never a submit); single-line
+/// fields strip newlines. `\r` is always dropped (paste may use CRLF).
+pub fn handle_paste(state: &mut AppState, text: &str) {
+    match &mut state.mode {
+        Mode::Chat => {
+            for c in text.chars() {
+                if c != '\r' {
+                    state.rest.push_char(c); // '\n' kept → newline in the input
+                }
+            }
+        }
+        Mode::KeyInput(form) => {
+            for c in text.chars() {
+                if c != '\r' && c != '\n' {
+                    form.push_char(c);
+                }
+            }
+        }
+        Mode::Settings(s) => {
+            if s.editing {
+                for c in text.chars() {
+                    if c != '\r' && c != '\n' {
+                        s.push_char(c);
+                    }
+                }
+            }
+        }
+        Mode::SessionPicker(_) => {}
+    }
+}
+
 /// Returns `true` when `key` is the given ASCII `c` held with Ctrl.
 fn is_ctrl(key: &KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(x) if x == c)
+}
+
+/// This session's sent user messages, oldest-first (for bash-style recall).
+fn user_messages(rest: &AppStateRest) -> Vec<String> {
+    rest.session
+        .as_ref()
+        .map(|s| {
+            s.conversation
+                .messages()
+                .iter()
+                .filter(|m| m.role == crate::dto::chat::Role::User)
+                .map(|m| m.content.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Handle a key press while the app is in Chat mode.
@@ -107,6 +154,12 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             Action::Resend
         };
     }
+    // Ctrl+J: insert a newline (reliable multiline trigger; unlike Shift+Enter
+    // this works on every terminal since Ctrl+J is literally the LF control code).
+    if is_ctrl(&key, 'j') {
+        rest.push_char('\n');
+        return Action::None;
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -117,6 +170,14 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Enter => {
+            // Shift+Enter inserts a newline instead of submitting — but only when
+            // the terminal actually reports the SHIFT modifier on Enter (many do
+            // not). Ctrl+J above is the always-works fallback. Plain Enter falls
+            // through to the palette/slash/submit logic unchanged.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                rest.push_char('\n');
+                return Action::None;
+            }
             let cmd_matches = command::palette_matches(&rest.input);
             if !cmd_matches.is_empty() {
                 // Palette open: run the highlighted command, not the raw text.
@@ -138,11 +199,13 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Up => {
-            // Navigate the command palette if it's open; otherwise scroll.
+            // Navigate the command palette if it's open; otherwise recall the
+            // previous sent user message (bash-style history).
             if !command::palette_matches(&rest.input).is_empty() {
                 rest.palette_sel = rest.palette_sel.saturating_sub(1);
             } else {
-                rest.scroll_up();
+                let users = user_messages(rest);
+                rest.history_prev(&users);
             }
             Action::None
         }
@@ -151,7 +214,8 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             if n > 0 {
                 rest.palette_sel = (rest.palette_sel + 1).min(n - 1);
             } else {
-                rest.scroll_down();
+                let users = user_messages(rest);
+                rest.history_next(&users);
             }
             Action::None
         }
@@ -162,6 +226,23 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 rest.input = format!("{} ", cmd_matches[sel].0);
                 rest.palette_sel = 0;
             }
+            Action::None
+        }
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                rest.scroll_up();
+            }
+            Action::None
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                rest.scroll_down();
+            }
+            Action::None
+        }
+        // End / Ctrl+End: jump to the bottom and resume following.
+        KeyCode::End => {
+            rest.reset_scroll();
             Action::None
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {

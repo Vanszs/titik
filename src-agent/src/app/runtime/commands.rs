@@ -69,6 +69,9 @@ pub(super) fn apply_slash(
 
         Command::New => {
             abort_current(&mut state.rest);
+            // Halt any in-flight agentic loop before swapping sessions.
+            state.rest.pending_tool_calls.clear();
+            state.rest.agent_steps = 0;
             let _ = state.rest.take_stream(); // discard partial; belongs to old session
             let mut sess = match store::create_session() {
                 Ok(s) => s,
@@ -102,7 +105,11 @@ pub(super) fn apply_slash(
                 ));
             } else {
                 *client = Some(super::build_client(&sess));
+                let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
+                // Fresh session → totals are 0; calling is harmless and keeps the
+                // readout reset when switching sessions.
+                state.rest.load_token_totals(&sess_path);
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
             }
@@ -134,6 +141,18 @@ pub(super) fn apply_slash(
             };
             let st = SettingsState::from(session, &state.rest.config);
             state.mode = Mode::Settings(st);
+        }
+
+        Command::Select => {
+            if state.rest.waiting {
+                state.rest.status = "busy — wait for response".into();
+                return Ok(());
+            }
+            if state.rest.session.is_none() {
+                state.rest.status = "no active session".into();
+                return Ok(());
+            }
+            state.rest.select_pending = true;
         }
 
         Command::Help => {

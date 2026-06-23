@@ -20,6 +20,18 @@ use crate::dto::chat::ChatMessage;
 pub enum StreamEvent {
     /// A chunk of assistant text to append to the streaming buffer.
     Token(String),
+    /// Token/cost accounting for the in-flight generation. Arrives on the final
+    /// streaming chunk, just before [`StreamEvent::Done`]; stashed and committed
+    /// with the assistant message.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cost: f64,
+    },
+    /// The model requested one or more tool calls. Emitted just before
+    /// [`StreamEvent::Done`] (after any `Token`/`Usage` events) so the runtime
+    /// can stash them and run the tools once the stream finalises.
+    ToolCalls(Vec<crate::dto::chat::ToolCall>),
     /// The stream finished cleanly; commit the buffered assistant message.
     Done,
     /// The stream failed; `String` is the error to surface in the status line.

@@ -13,6 +13,7 @@
 
 pub mod chat;
 pub mod key_input;
+pub mod markdown;
 pub mod session_picker;
 pub mod settings;
 pub mod theme;

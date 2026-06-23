@@ -15,6 +15,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/compact", "Summarize and compact the conversation"),
     ("/rename", "Rename the current session"),
+    ("/select", "Dump history to the terminal to copy/paste"),
     ("/help", "List the available commands"),
     ("/quit", "Quit simple-coder"),
 ];
@@ -50,6 +51,8 @@ pub enum Command {
     Rename(String),
     /// Open the in-app settings dashboard (alias: `/config`).
     Settings,
+    /// Dump the conversation to the normal terminal for native copy/paste.
+    Select,
     /// Print available commands to the chat view.
     Help,
     /// Exit the application.
@@ -83,6 +86,7 @@ pub fn parse(line: &str) -> Command {
         "compact" => Command::Compact,
         "new" => Command::New,
         "settings" | "config" => Command::Settings,
+        "select" => Command::Select,
         "help" => Command::Help,
         "quit" | "q" | "exit" => Command::Quit,
         "rename" => {

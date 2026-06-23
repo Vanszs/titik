@@ -8,7 +8,8 @@ use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::input::Action;
-use crate::model::{session::Session, store};
+use crate::dto::chat::Role;
+use crate::model::{msglog, session::Session, store};
 use crate::service::openrouter::OpenRouterClient;
 
 use super::build_client;
@@ -44,6 +45,7 @@ pub(super) fn apply_action(
             }
             let history = {
                 let sess = state.rest.session.as_mut().unwrap();
+                let _ = msglog::append(&sess.path, Role::User, &text, None);
                 sess.conversation.push_user(text);
                 if let Err(e) = sess.save() {
                     state.rest.status = format!("error: {e}");
@@ -54,6 +56,9 @@ pub(super) fn apply_action(
             state.rest.reset_scroll();
             state.rest.begin_stream();
             state.rest.waiting = true;
+            // A new user turn starts fresh: no carried-over tool-call rounds.
+            state.rest.agent_steps = 0;
+            state.rest.pending_tool_calls.clear();
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
         }
@@ -68,12 +73,26 @@ pub(super) fn apply_action(
             // active_rx, so the aborted task's late events are ignored.
             if state.rest.waiting {
                 abort_current(&mut state.rest);
+                // Halt the agentic loop: drop any stashed tool calls and reset
+                // the step counter so the turn stops here instead of continuing.
+                state.rest.pending_tool_calls.clear();
+                state.rest.agent_steps = 0;
+                // Take any captured usage unconditionally so a partial turn's
+                // usage can't leak into the next response.
+                let usage = state.rest.pending_usage.take();
                 let buf = state.rest.take_stream();
                 if let Some(b) = buf {
                     if !b.is_empty() {
                         if let Some(sess) = state.rest.session.as_mut() {
-                            sess.conversation.push_assistant(format!("{b}  [interrupted]"));
+                            let content = format!("{b}  [interrupted]");
+                            let _ = msglog::append(&sess.path, Role::Assistant, &content, usage);
+                            sess.conversation.push_assistant(content);
                             let _ = sess.save();
+                            if let Some((pt, ct, cost)) = usage {
+                                state.rest.tokens_in = pt;        // current context size, not a sum
+                                state.rest.tokens_out += ct;
+                                state.rest.cost += cost;
+                            }
                         }
                     }
                 }
@@ -132,6 +151,10 @@ pub(super) fn apply_action(
             }
             state.rest.remember_creds(&api_key, &model, &provider);
             *client = state.rest.session.as_ref().map(build_client);
+            // Seed totals from the (new or picker-prefilled) session's log.
+            if let Some(p) = state.rest.session.as_ref().map(|s| s.path.clone()) {
+                state.rest.load_token_totals(&p);
+            }
             state.rest.prev_session = None; // committed; discard fallback
             state.rest.reset_scroll();
             state.mode = Mode::Chat;
@@ -210,7 +233,11 @@ pub(super) fn apply_action(
                     .rest
                     .remember_creds(&sess.settings.api_key, &sess.settings.model, &sess.settings.provider);
                 *client = Some(build_client(&sess));
+                let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
+                // Existing session: seed the running totals from its full sqlite
+                // log so the readout reflects prior usage.
+                state.rest.load_token_totals(&sess_path);
                 state.rest.reset_scroll();
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
@@ -228,10 +255,11 @@ pub(super) fn apply_action(
                     s.name.clone(),
                     s.theme.clone(),
                     s.accent.clone(),
+                    s.workdir.clone(),
                 )),
                 _ => None,
             };
-            if let Some((api_key, model, provider, name, theme, accent)) = drafts {
+            if let Some((api_key, model, provider, name, theme, accent, workdir)) = drafts {
                 // Detect whether the OpenRouter-relevant creds changed so we only
                 // rebuild the client when necessary.
                 let creds_changed = match state.rest.session.as_ref() {
@@ -247,6 +275,7 @@ pub(super) fn apply_action(
                     sess.settings.api_key = api_key;
                     sess.settings.model = model;
                     sess.settings.provider = provider;
+                    sess.settings.workdir = workdir;
                 }
                 // b) Apply global theme/accent and persist config.json. Best-effort:
                 //    a write failure surfaces to the status line but does not abort

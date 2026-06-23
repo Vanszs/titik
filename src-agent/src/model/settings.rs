@@ -75,6 +75,10 @@ pub struct Settings {
     /// then omitted from the request body entirely.
     #[serde(default)]
     pub provider: String,
+    /// Working directory for this session. Defaults to the process's cwd at
+    /// session creation time. Used to locate AGENT.md / AGENTS.md.
+    #[serde(default)]
+    pub workdir: String,
 }
 
 fn default_model() -> String {
@@ -89,6 +93,7 @@ impl Default for Settings {
             name: String::new(),
             compaction: Compaction::default(),
             provider: DEFAULT_PROVIDER.to_string(),
+            workdir: String::new(),
         }
     }
 }

@@ -17,6 +17,21 @@
 
 use std::path::Path;
 
+/// Read `AGENT.md` (preferred) or `AGENTS.md` from `workdir`, returning trimmed
+/// contents. `None` if neither exists or both are blank. These are project-level
+/// instructions injected into the system prompt.
+pub fn load_agents(workdir: &Path) -> Option<String> {
+    for name in ["AGENT.md", "AGENTS.md"] {
+        if let Ok(s) = std::fs::read_to_string(workdir.join(name)) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Read `<session_dir>/memory/MEMORY.md` and return its trimmed contents.
 ///
 /// Returns `None` if the file does not exist, cannot be read, or is blank

@@ -11,6 +11,7 @@ use ratatui::style::Color;
 use crate::model::app_config::{AppConfig, ThemeMode};
 
 /// All colour roles used by the views.
+#[derive(Clone, Copy, PartialEq)]
 pub struct Palette {
     /// Primary text colour.
     pub fg: Color,

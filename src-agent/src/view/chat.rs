@@ -25,8 +25,19 @@
 //! bottom as responses stream; scrolling up pauses following, reaching the
 //! bottom resumes it.
 //!
-//! - User messages   → `★` in `palette.accent`
-//! - AI / streaming  → `●` in `palette.fg`
+//! Assistant replies render as **Markdown** (headings, lists, bold, inline
+//! `code`, boxed and syntax-highlighted fenced code blocks, and aligned GFM
+//! tables) via the in-tree [`crate::view::markdown`] renderer, built on
+//! `pulldown-cmark` and `syntect`. It returns FINAL visual lines (already
+//! wrapped/boxed/aligned) while the bullet and hanging indent use the palette.
+//! User messages and the live streaming buffer stay plain (the buffer renders
+//! plain for perf and partial-fence safety). Everything is pre-wrapped — the
+//! markdown included — so the emitted line count equals the exact visual line
+//! count, which the follow-scroll math depends on.
+//!
+//! - User messages   → `★` in `palette.accent`, plain text
+//! - AI messages     → `●` in `palette.fg`, markdown body
+//! - Streaming buffer → `●` in `palette.fg`, plain text
 //! - System / status → `palette.dim`
 //!
 //! When the user types `/` followed by a command name with no whitespace, a
@@ -34,10 +45,10 @@
 //! commands filtered in real time. Up/Down navigate the list; Tab completes.
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
     Frame,
 };
 use crate::app::state::AppStateRest;
@@ -52,16 +63,34 @@ use crate::view::theme::Palette;
 /// buffer. The header has a dim bottom border + padding; the input has dim
 /// top + bottom borders + padding; the transcript is flat.
 pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
+    // --- Input height ---
+    // The input box grows to fit its wrapped content (capped). Compute the row
+    // count BEFORE the layout split so the layout can reserve the right height.
+    // Inner content width = frame width minus 2 borders and 4 cols of horizontal
+    // padding (2 left + 2 right). Logical lines split on '\n'; the first is
+    // visually prefixed by the prompt "[$] " (4 cols), continuations by 4 spaces
+    // so they hang under the prompt. Each prefixed line wraps to inner_w.
+    let inner_w = (frame.area().width.saturating_sub(2 + 4) as usize).max(1);
+    let mut input_rows = 0usize;
+    for line in rest.input.split('\n') {
+        // 4 cols for the prompt on the first line, 4 for the hanging indent on
+        // continuations — both happen to be the same width here.
+        let prefixed = line.chars().count() + 4;
+        input_rows += 1usize.max(prefixed.div_ceil(inner_w));
+    }
+    let input_rows = input_rows.clamp(1, 8);
+    let input_h = (input_rows as u16) + 2; // + top & bottom borders
+
     // Layout: header (text + bottom rule) | transcript | input (top+bottom
     // rules) | status. Header/input get thin dim borders so the screen reads
     // as structured, not boxed; the transcript itself stays flat.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // header line + bottom border
-            Constraint::Min(1),    // transcript
-            Constraint::Length(3), // top border + input line + bottom border
-            Constraint::Length(1), // status bar
+            Constraint::Length(2),       // header line + bottom border
+            Constraint::Min(1),          // transcript
+            Constraint::Length(input_h), // top border + input row(s) + bottom border
+            Constraint::Length(1),       // status bar
         ])
         .split(frame.area());
 
@@ -92,53 +121,190 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
     let body = chunks[1].inner(Margin { horizontal: 2, vertical: 1 });
     let wrap_w = (body.width as usize).saturating_sub(2).max(1);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut first = true;
-    if let Some(session) = rest.session.as_ref() {
-        for msg in session.conversation.messages() {
-            let (color, bullet) = match msg.role {
+    // Render (or reuse) each committed message's lines. Cache is keyed by width
+    // + palette; only NEW messages are rendered, so syntect doesn't re-run every
+    // frame. A shrink (compaction / resend) or key change forces a full rebuild.
+    {
+        let mut cache = rest.transcript_cache.borrow_mut();
+        if cache.width != wrap_w || cache.palette != Some(*palette) {
+            cache.width = wrap_w;
+            cache.palette = Some(*palette);
+            cache.blocks.clear();
+        }
+        let committed: Vec<&crate::dto::chat::ChatMessage> = rest
+            .session
+            .as_ref()
+            .map(|s| {
+                s.conversation
+                    .messages()
+                    .iter()
+                    .filter(|m| m.role != Role::System)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if cache.blocks.len() > committed.len() {
+            cache.blocks.clear(); // shrank → stale prefix can't be trusted
+        }
+        let start = cache.blocks.len();
+        for msg in committed.iter().skip(start) {
+            let block = match msg.role {
+                Role::User => render_block(
+                    vec![vec![Span::styled(
+                        msg.content.to_string(),
+                        Style::default().fg(palette.accent),
+                    )]],
+                    "★ ",
+                    palette.accent,
+                    wrap_w,
+                    true,
+                ),
+                Role::Assistant => {
+                    // Markdown body, then one dim line per requested tool call so
+                    // the user can see what the agent invoked. Appended as logical
+                    // lines so they get the hanging 2-col indent under the bullet.
+                    let mut logical = crate::view::markdown::render(&msg.content, palette, wrap_w);
+                    if let Some(calls) = msg.tool_calls.as_ref() {
+                        for call in calls {
+                            let args = truncate_chars(&call.function.arguments, 60);
+                            logical.push(vec![Span::styled(
+                                format!("  ⚙ {}({})", call.function.name, args),
+                                Style::default().fg(palette.dim),
+                            )]);
+                        }
+                    }
+                    render_block(logical, "● ", palette.fg, wrap_w, false)
+                }
+                Role::Tool => {
+                    // Compact dim block: just the first line of the tool output,
+                    // truncated. Tool results are not markdown-rendered.
+                    let first = msg.content.lines().next().unwrap_or("");
+                    let first = truncate_chars(first, 80);
+                    render_block(
+                        vec![vec![Span::styled(first, Style::default().fg(palette.dim))]],
+                        "  ↳ ",
+                        palette.dim,
+                        wrap_w,
+                        false,
+                    )
+                }
                 Role::System => continue,
-                Role::User => (palette.accent, "★ "),
-                Role::Assistant => (palette.fg, "● "),
             };
-            push_message(&mut lines, &msg.content, color, bullet, wrap_w, &mut first);
+            cache.blocks.push(block);
+        }
+
+        // Assemble the frame: cached blocks (with blank separators) + the live
+        // streaming line (rendered fresh — it changes every token).
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut first = true;
+        for block in &cache.blocks {
+            if !first {
+                lines.push(Line::from(""));
+            }
+            first = false;
+            lines.extend(block.iter().cloned());
+        }
+        if let Some(buf) = rest.streaming.as_ref() {
+            if !buf.is_empty() {
+                // Stream renders plain (not markdown) for perf + partial-fence safety.
+                if !first {
+                    lines.push(Line::from(""));
+                }
+                lines.extend(render_block(
+                    vec![vec![Span::styled(
+                        buf.to_string(),
+                        Style::default().fg(palette.fg),
+                    )]],
+                    "● ",
+                    palette.fg,
+                    wrap_w,
+                    true,
+                ));
+            }
+        }
+
+        // Scroll model: follow pins to the bottom (auto-scrolls as content grows);
+        // otherwise show the stored offset, clamped. Publish max_scroll so the key/
+        // mouse handlers can clamp + detect bottom.
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let max_scroll = total.saturating_sub(body.height);
+        rest.last_max_scroll.set(max_scroll);
+        let top = if rest.follow { max_scroll } else { rest.scroll.min(max_scroll) };
+        let messages = Paragraph::new(lines).scroll((top, 0));
+        frame.render_widget(messages, body);
+    } // cache borrow ends
+
+    // --- Input box --- `[$] {input}`, dim top + bottom borders. Multiline:
+    // logical lines split on '\n'; the first carries the accent prompt, every
+    // continuation a 4-col indent so it hangs under the prompt. A non-blinking
+    // block cursor is painted at the very end of the last line. The box height
+    // (`input_h`, computed above) grows with the wrapped content up to the cap.
+    let mut input_lines: Vec<Line> = Vec::new();
+    for (i, logical) in rest.input.split('\n').enumerate() {
+        if i == 0 {
+            input_lines.push(Line::from(vec![
+                Span::styled("[$] ", Style::default().fg(palette.accent)),
+                Span::raw(logical),
+            ]));
+        } else {
+            input_lines.push(Line::from(vec![Span::raw("    "), Span::raw(logical)]));
         }
     }
-    if let Some(buf) = rest.streaming.as_ref() {
-        if !buf.is_empty() {
-            push_message(&mut lines, buf, palette.fg, "● ", wrap_w, &mut first);
-        }
+    // Append a non-blinking block cursor to the last line so the caret is visible.
+    if let Some(last) = input_lines.last_mut() {
+        last.spans
+            .push(Span::styled("█", Style::default().fg(palette.accent)));
     }
-
-    // Scroll model: follow pins to the bottom (auto-scrolls as content grows);
-    // otherwise show the stored offset, clamped. Publish max_scroll so the key/
-    // mouse handlers can clamp + detect bottom.
-    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let max_scroll = total.saturating_sub(body.height);
-    rest.last_max_scroll.set(max_scroll);
-    let top = if rest.follow { max_scroll } else { rest.scroll.min(max_scroll) };
-    let messages = Paragraph::new(lines).scroll((top, 0));
-    frame.render_widget(messages, body);
-
-    // --- Input line --- `› {input}`, dim top + bottom borders.
-    let input_line = Line::from(vec![
-        Span::styled("› ", Style::default().fg(palette.accent)),
-        Span::raw(rest.input.as_str()),
-    ]);
     let input_block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim))
         .padding(Padding::horizontal(2));
     let input_inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
-    frame.render_widget(Paragraph::new(input_line), input_inner);
-
-    // --- Status bar --- padded to align with the rest.
-    let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
     frame.render_widget(
-        Paragraph::new(rest.status.as_str()).style(Style::default().fg(palette.dim)),
-        status_area,
+        Paragraph::new(input_lines).wrap(Wrap { trim: false }),
+        input_inner,
     );
+
+    // --- Status bar --- padded to align with the rest. Status text on the
+    // left (dim); the cumulative token/cost readout right-aligned (accent).
+    let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
+    let readout = if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
+        Some(format!(
+            "↑{} ↓{}  ${:.4}",
+            fmt_count(rest.tokens_in),
+            fmt_count(rest.tokens_out),
+            rest.cost
+        ))
+    } else {
+        None
+    };
+    match &readout {
+        Some(r) => {
+            // `↑ ↓ $` and digits are each one display column, so a char count is
+            // the exact width; +1 keeps a gap from the status text.
+            let w = u16::try_from(r.chars().count() + 1).unwrap_or(u16::MAX);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(w)])
+                .split(status_area);
+            frame.render_widget(
+                Paragraph::new(rest.status.as_str()).style(Style::default().fg(palette.dim)),
+                cols[0],
+            );
+            frame.render_widget(
+                Paragraph::new(r.as_str())
+                    .style(Style::default().fg(palette.accent))
+                    .alignment(Alignment::Right),
+                cols[1],
+            );
+        }
+        None => {
+            frame.render_widget(
+                Paragraph::new(rest.status.as_str()).style(Style::default().fg(palette.dim)),
+                status_area,
+            );
+        }
+    }
 
     // --- Slash command palette --- floats above the input while typing a `/`
     // command name. Cleared background so it overlays the transcript.
@@ -228,69 +394,94 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(rows), inner);
     }
+
+    // --- Error toast --- transient red box pinned to the top of the transcript.
+    if let Some((msg, _)) = rest.toast.as_ref() {
+        let err_color = Color::Rgb(255, 90, 90);
+        let tw = chunks[1].width;
+        let inner_w = (tw as usize).saturating_sub(4).max(1);
+        let rows: Vec<Line> = crate::view::markdown::wrap_spans(
+            &[Span::styled(msg.clone(), Style::default().fg(palette.fg))],
+            inner_w,
+        )
+        .into_iter()
+        .map(Line::from)
+        .collect();
+        let h = ((rows.len() as u16) + 2).min(chunks[1].height.max(3));
+        let rect = Rect { x: chunks[1].x, y: chunks[1].y, width: tw, height: h };
+        let block = Block::bordered()
+            .border_style(Style::default().fg(err_color))
+            .title(Span::styled(" error ", Style::default().fg(err_color)))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(rect);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(Paragraph::new(rows), inner);
+    }
 }
 
-/// Append one message block to `lines`: a coloured bullet on the first line,
-/// the text hanging-indented (2 cols) under it, preceded by a blank separator
-/// line unless it's the first block. `first` is flipped to false after the call.
-fn push_message(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    color: Color,
+/// Truncate `s` to at most `max` characters (not bytes), appending `…` when it
+/// was cut. Used to keep tool-call / tool-result preview lines on one row.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Compact token count: raw below 10k, else "10,1k" / "1,1m" (one decimal,
+/// comma as the decimal mark, k=thousand m=million).
+fn fmt_count(n: u64) -> String {
+    if n < 10_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0).replace('.', ",")
+    } else {
+        format!("{:.1}m", n as f64 / 1_000_000.0).replace('.', ",")
+    }
+}
+
+/// One message's visual lines: bullet on the first line, 2-col indent on the
+/// rest. `wrap` = wrap each logical line with `markdown::wrap_spans` (plain text
+/// / user / streaming); pre-wrapped markdown passes its lines through unwrapped.
+///
+/// Returns the block in isolation — NO blank separator and NO `first` handling;
+/// the caller stitches blocks together with blank lines. `bullet_color` styles
+/// only the bullet; the wrapped/pre-wrapped spans keep their own styles. The
+/// emitted line count equals the exact on-screen line count the follow-scroll
+/// math relies on.
+fn render_block(
+    logical: Vec<Vec<Span<'static>>>,
     bullet: &str,
+    bullet_color: Color,
     wrap_w: usize,
-    first: &mut bool,
-) {
-    if !*first {
-        lines.push(Line::from(""));
-    }
-    *first = false;
-    for (i, seg) in wrap_words(content, wrap_w).into_iter().enumerate() {
-        let prefix = if i == 0 { bullet } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{seg}"),
-            Style::default().fg(color),
-        )));
-    }
-}
-
-/// Word-wrap `text` to `width` columns (counted in `char`s — a good-enough
-/// approximation for a terminal). Width is clamped to >= 1. Embedded newlines
-/// force a break; words longer than `width` are hard-split.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
-    for segment in text.split('\n') {
-        let mut line = String::new();
-        let mut line_len = 0usize;
-        for word in segment.split_whitespace() {
-            let wlen = word.chars().count();
-            if wlen > width {
-                if line_len > 0 {
-                    out.push(std::mem::take(&mut line));
-                }
-                let mut chars: Vec<char> = word.chars().collect();
-                while chars.len() > width {
-                    let chunk: String = chars[..width].iter().collect();
-                    out.push(chunk);
-                    chars.drain(..width);
-                }
-                line = chars.into_iter().collect();
-                line_len = line.chars().count();
-            } else if line_len == 0 {
-                line = word.to_string();
-                line_len = wlen;
-            } else if line_len + 1 + wlen <= width {
-                line.push(' ');
-                line.push_str(word);
-                line_len += 1 + wlen;
+    wrap: bool,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first_visual = true;
+    for logical_line in logical {
+        let visuals: Vec<Vec<Span<'static>>> = if wrap {
+            crate::view::markdown::wrap_spans(&logical_line, wrap_w)
+        } else {
+            vec![logical_line]
+        };
+        for visual in visuals {
+            // First visual line of the whole block gets the bullet; the rest get
+            // a 2-col indent so wrapped/continuation/boxed content hangs under it.
+            let prefix = if first_visual {
+                Span::styled(bullet.to_string(), Style::default().fg(bullet_color))
             } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
-                line_len = wlen;
-            }
+                Span::raw("  ")
+            };
+            first_visual = false;
+            let mut spans = Vec::with_capacity(visual.len() + 1);
+            spans.push(prefix);
+            spans.extend(visual);
+            out.push(Line::from(spans));
         }
-        out.push(line);
     }
     out
 }

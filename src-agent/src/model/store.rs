@@ -132,6 +132,9 @@ pub fn create_session() -> Result<Session> {
 
     let settings = Settings {
         name: id.clone(),
+        workdir: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
         ..Default::default()
     };
     let conversation = Conversation::from_messages(vec![]);

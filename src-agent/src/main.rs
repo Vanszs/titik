@@ -20,6 +20,7 @@ mod dto;
 mod model;
 mod resources;
 mod service;
+mod tool;
 mod view;
 
 fn main() -> anyhow::Result<()> {

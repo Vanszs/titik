@@ -14,8 +14,10 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{APP_TITLE, HTTP_REFERER};
-use crate::dto::chat::ChatMessage;
-use crate::dto::openrouter::{ChatRequest, ChatResponse, StreamChunk};
+use crate::dto::chat::{ChatMessage, ToolCall};
+use crate::dto::openrouter::{
+    ChatRequest, ChatResponse, StreamChunk, ToolDef, ToolFunctionDef, UsageRequest,
+};
 use crate::service::StreamEvent;
 
 pub struct OpenRouterClient {
@@ -30,6 +32,30 @@ pub struct OpenRouterClient {
 /// request was interrupted/superseded, so the event is simply dropped).
 fn emit(tx: &UnboundedSender<StreamEvent>, event: StreamEvent) {
     let _ = tx.send(event);
+}
+
+/// Turn an OpenRouter error response body into a short human-readable message.
+/// OpenRouter returns `{"error":{"message":..,"code":..,"metadata":{"raw":..}}}`;
+/// the upstream provider's own text lives in `metadata.raw`, so prefer that, then
+/// `message`, then a trimmed slice of the raw body. `status` renders as e.g.
+/// "429 Too Many Requests".
+fn clean_error(status: reqwest::StatusCode, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let err = &v["error"];
+        let raw = err["metadata"]["raw"].as_str().unwrap_or("");
+        let msg = err["message"].as_str().unwrap_or("");
+        let detail = if !raw.is_empty() { raw } else { msg };
+        if !detail.is_empty() {
+            let detail: String = detail.chars().take(200).collect();
+            return format!("{status}: {detail}");
+        }
+    }
+    let trimmed: String = body.chars().take(160).collect();
+    if trimmed.trim().is_empty() {
+        format!("{status}")
+    } else {
+        format!("{status}: {trimmed}")
+    }
 }
 
 impl OpenRouterClient {
@@ -76,11 +102,27 @@ impl OpenRouterClient {
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
         let url = format!("{}/chat/completions", self.base_url);
+        // Expose the built-in tool set to the model. Each tool maps to an
+        // OpenAI/OpenRouter `function` definition (name + description + raw
+        // JSON-Schema parameters).
+        let tools: Vec<ToolDef> = crate::tool::all_tools()
+            .iter()
+            .map(|t| ToolDef {
+                kind: "function".into(),
+                function: ToolFunctionDef {
+                    name: t.name().into(),
+                    description: t.description().into(),
+                    parameters: t.parameters(),
+                },
+            })
+            .collect();
         let body = ChatRequest {
             model: self.model.clone(),
             messages,
             stream: true,
             provider: self.provider_routing(),
+            usage: UsageRequest { include: true },
+            tools: Some(tools),
         };
 
         let resp = self
@@ -105,13 +147,21 @@ impl OpenRouterClient {
             let text = resp.text().await.unwrap_or_default();
             emit(
                 &tx,
-                StreamEvent::Error(format!("OpenRouter error {status}: {text}")),
+                StreamEvent::Error(clean_error(status, &text)),
             );
             return Ok(());
         }
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
+        // Tool calls stream across many frames, one (or more) per `index`. Each
+        // frame contributes the id / name once and appends argument fragments;
+        // we merge them here and emit the assembled set at finalisation.
+        let mut tool_acc: Vec<ToolCall> = Vec::new();
+        // Last `finish_reason` seen on the active choice. OpenAI/OpenRouter set
+        // it to `"tool_calls"` on the frame that closes a tool-calling turn; we
+        // record it so finalisation can confirm the model wants tools run.
+        let mut finished_tool_calls = false;
         while let Some(chunk) = stream.next().await {
             let bytes = match chunk {
                 Ok(b) => b,
@@ -136,22 +186,76 @@ impl OpenRouterClient {
                     None => continue, // comments/keepalive
                 };
                 if data == "[DONE]" {
+                    // Finalise: any accumulated tool calls go out just before
+                    // Done so the runtime can run them. The `finished_tool_calls`
+                    // flag (finish_reason == "tool_calls") is the protocol-level
+                    // confirmation; non-empty `tool_acc` is the data we actually
+                    // need, so either being set means "run the tools".
+                    if !tool_acc.is_empty() || finished_tool_calls {
+                        emit(&tx, StreamEvent::ToolCalls(tool_acc.clone()));
+                    }
                     emit(&tx, StreamEvent::Done);
                     return Ok(());
                 }
                 if let Ok(c) = serde_json::from_str::<StreamChunk>(data) {
+                    // A chunk carries content / tool-call deltas OR usage (the
+                    // terminal chunk has an empty `choices` array + a `usage`
+                    // object). Handle each independently so a usage-bearing
+                    // chunk isn't skipped.
                     if let Some(choice) = c.choices.first() {
+                        if choice.finish_reason.as_deref() == Some("tool_calls") {
+                            finished_tool_calls = true;
+                        }
                         if let Some(t) = &choice.delta.content {
                             if !t.is_empty() {
                                 emit(&tx, StreamEvent::Token(t.clone()));
                             }
                         }
+                        if let Some(tcs) = &choice.delta.tool_calls {
+                            for d in tcs {
+                                // Grow the accumulator so `index` is in range,
+                                // then merge this fragment into its slot.
+                                while tool_acc.len() <= d.index {
+                                    tool_acc.push(ToolCall {
+                                        kind: "function".into(),
+                                        ..Default::default()
+                                    });
+                                }
+                                let acc = &mut tool_acc[d.index];
+                                if let Some(id) = &d.id {
+                                    acc.id = id.clone();
+                                }
+                                if let Some(f) = &d.function {
+                                    if let Some(n) = &f.name {
+                                        acc.function.name = n.clone();
+                                    }
+                                    if let Some(a) = &f.arguments {
+                                        acc.function.arguments.push_str(a);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(u) = c.usage {
+                        emit(
+                            &tx,
+                            StreamEvent::Usage {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                                cost: u.cost,
+                            },
+                        );
                     }
                 }
                 // unparseable JSON (partial keepalive) is ignored
             }
         }
-        emit(&tx, StreamEvent::Done); // stream ended without explicit [DONE]
+        // Stream ended without an explicit [DONE]: same finalisation order —
+        // tool calls (if any), then Done.
+        if !tool_acc.is_empty() || finished_tool_calls {
+            emit(&tx, StreamEvent::ToolCalls(tool_acc.clone()));
+        }
+        emit(&tx, StreamEvent::Done);
         Ok(())
     }
 
@@ -163,6 +267,9 @@ impl OpenRouterClient {
             messages,
             stream: false,
             provider: self.provider_routing(),
+            usage: UsageRequest { include: true },
+            // /compact summarisation uses no tools.
+            tools: None,
         };
 
         let response = self
@@ -178,7 +285,7 @@ impl OpenRouterClient {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenRouter error {status}: {text}"));
+            return Err(anyhow!("{}", clean_error(status, &text)));
         }
 
         let chat_response: ChatResponse = response.json().await?;
