@@ -122,29 +122,76 @@ impl KeyInputForm {
     }
 }
 
+/// A single editable/toggleable field within a settings category.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SettingField {
+    ApiKey,
+    Model,
+    Provider,
+    Theme,
+    Accent,
+    Name,
+    Workdir,
+}
+
+impl SettingField {
+    /// Human-readable label shown in the detail pane.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingField::ApiKey   => "API key",
+            SettingField::Model    => "Model",
+            SettingField::Provider => "Provider",
+            SettingField::Theme    => "Theme",
+            SettingField::Accent   => "Accent",
+            SettingField::Name     => "Session name",
+            SettingField::Workdir  => "Workdir",
+        }
+    }
+}
+
+/// A named group of related settings fields shown in the sidebar.
+pub struct SettingCategory {
+    pub name: &'static str,
+    pub fields: &'static [SettingField],
+}
+
+/// All settings categories in sidebar display order.
+///
+/// Adding a new category or field here is sufficient — the view and input
+/// handler iterate over this slice generically.
+pub const SETTING_CATEGORIES: &[SettingCategory] = &[
+    SettingCategory {
+        name: "Connection",
+        fields: &[SettingField::ApiKey, SettingField::Model, SettingField::Provider],
+    },
+    SettingCategory {
+        name: "Appearance",
+        fields: &[SettingField::Theme, SettingField::Accent],
+    },
+    SettingCategory {
+        name: "Session",
+        fields: &[SettingField::Name, SettingField::Workdir],
+    },
+];
+
 /// Working state for the in-app `/settings` dashboard.
 ///
 /// Holds editable *drafts* of every settable value; nothing is persisted until
-/// the user saves (Esc), at which point the runtime reads these fields back out
-/// and applies them. `selected` indexes the six sections in display order:
+/// the user saves (Esc from the sidebar), at which point the runtime reads these
+/// fields back out and applies them.
 ///
-/// | index | section      | kind            |
-/// |-------|--------------|-----------------|
-/// | 0     | API key      | text            |
-/// | 1     | Model        | text            |
-/// | 2     | Provider     | text            |
-/// | 3     | Theme        | toggle + cycle  |
-/// | 4     | Session name | text            |
-/// | 5     | Workdir      | text            |
-///
-/// Text rows (0/1/2/4/5) are edited in place once `editing` is set; the Theme row
-/// (3) never enters `editing` — Enter toggles dark/light and ←/→ cycle the
-/// accent instead.
+/// Navigation is two-level: `cat` selects a category in the sidebar; `field`
+/// selects a row within the category's detail list. `in_detail` tracks which
+/// pane has keyboard focus. `editing` means the user is typing into a text field.
 #[derive(Debug, Clone)]
 pub struct SettingsState {
-    /// Active section (0=API key, 1=Model, 2=Provider, 3=Theme, 4=Session name, 5=Workdir).
-    pub selected: usize,
-    /// `true` while typing into a text row; `false` while navigating sections.
+    /// Selected category index into [`SETTING_CATEGORIES`].
+    pub cat: usize,
+    /// Selected field index within `SETTING_CATEGORIES[cat].fields`.
+    pub field: usize,
+    /// `false` = focus on the sidebar; `true` = focus on the detail field list.
+    pub in_detail: bool,
+    /// `true` while typing into a text field; `false` while navigating.
     pub editing: bool,
     /// Draft API key (session-scoped).
     pub api_key: String,
@@ -166,11 +213,13 @@ impl SettingsState {
     /// Build a dashboard pre-populated from the active session and global config.
     ///
     /// Text drafts come from `session.settings` (and `session.name`); the
-    /// theme/accent drafts come from `config`. Starts on the first section with
-    /// editing off.
+    /// theme/accent drafts come from `config`. Starts on the sidebar of the
+    /// first category with editing off.
     pub fn from(session: &Session, config: &AppConfig) -> Self {
         Self {
-            selected: 0,
+            cat: 0,
+            field: 0,
+            in_detail: false,
             editing: false,
             api_key: session.settings.api_key.clone(),
             model: session.settings.model.clone(),
@@ -182,70 +231,126 @@ impl SettingsState {
         }
     }
 
-    /// Move the section cursor up one row (clamps at 0).
+    /// Return the [`SettingField`] currently highlighted in the detail pane.
+    pub fn current_field(&self) -> SettingField {
+        SETTING_CATEGORIES[self.cat].fields[self.field]
+    }
+
+    /// Return a mutable reference to the text draft for `f`, or `None` for
+    /// non-text fields (Theme, Accent).
+    pub fn text_draft_mut(&mut self, f: SettingField) -> Option<&mut String> {
+        match f {
+            SettingField::ApiKey   => Some(&mut self.api_key),
+            SettingField::Model    => Some(&mut self.model),
+            SettingField::Provider => Some(&mut self.provider),
+            SettingField::Name     => Some(&mut self.name),
+            SettingField::Workdir  => Some(&mut self.workdir),
+            SettingField::Theme | SettingField::Accent => None,
+        }
+    }
+
+    /// Move the cursor up.
     ///
-    /// Only meaningful while navigating; the caller guards against calling this
-    /// while `editing`.
+    /// In the sidebar: step `cat` up (clamp at 0) and reset `field` to 0.
+    /// In the detail pane: step `field` up within the current category (clamp at 0).
     pub fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-
-    /// Move the section cursor down one row (clamps at the last section, 5).
-    pub fn down(&mut self) {
-        if self.selected < 5 {
-            self.selected += 1;
-        }
-    }
-
-    /// Act on Enter for the current section.
-    ///
-    /// On the Theme row (3) this toggles dark/light without entering edit mode;
-    /// on every text row it starts editing so subsequent keystrokes append to
-    /// the draft.
-    pub fn enter(&mut self) {
-        if self.selected == 3 {
-            self.theme = match self.theme {
-                ThemeMode::Dark => ThemeMode::Light,
-                ThemeMode::Light => ThemeMode::Dark,
-            };
+        if self.in_detail {
+            self.field = self.field.saturating_sub(1);
         } else {
-            self.editing = true;
+            let prev = self.cat;
+            self.cat = self.cat.saturating_sub(1);
+            if self.cat != prev {
+                self.field = 0;
+            }
         }
     }
 
-    /// Append `c` to the draft of the currently-selected text row.
+    /// Move the cursor down.
     ///
-    /// No-op for the Theme row (3), which has no free-text value.
+    /// In the sidebar: step `cat` down (clamp at last category) and reset `field` to 0.
+    /// In the detail pane: step `field` down within the current category (clamp at last).
+    pub fn down(&mut self) {
+        if self.in_detail {
+            let max = SETTING_CATEGORIES[self.cat].fields.len().saturating_sub(1);
+            if self.field < max {
+                self.field += 1;
+            }
+        } else {
+            let max = SETTING_CATEGORIES.len().saturating_sub(1);
+            if self.cat < max {
+                self.cat += 1;
+                self.field = 0;
+            }
+        }
+    }
+
+    /// Move focus to the detail pane (only if the current category has fields).
+    ///
+    /// Resets `field` to 0.
+    pub fn focus_detail(&mut self) {
+        if !SETTING_CATEGORIES[self.cat].fields.is_empty() {
+            self.in_detail = true;
+            self.field = 0;
+        }
+    }
+
+    /// Return focus to the sidebar; also exits editing mode.
+    pub fn focus_sidebar(&mut self) {
+        self.in_detail = false;
+        self.editing = false;
+    }
+
+    /// Act on Enter while in the detail pane.
+    ///
+    /// - Theme → toggle dark/light (no edit mode).
+    /// - Accent → no-op (arrows cycle it instead).
+    /// - Text fields → enter editing mode.
+    ///
+    /// No-op when not in the detail pane.
+    pub fn enter(&mut self) {
+        if !self.in_detail {
+            return;
+        }
+        match self.current_field() {
+            SettingField::Theme => {
+                self.theme = match self.theme {
+                    ThemeMode::Dark  => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                };
+            }
+            SettingField::Accent => {
+                // Accent is cycled with arrow keys; Enter is intentionally a no-op.
+            }
+            _ => {
+                self.editing = true;
+            }
+        }
+    }
+
+    /// Append `c` to the draft of the current text field.
+    ///
+    /// No-op for non-text fields (Theme, Accent).
     pub fn push_char(&mut self, c: char) {
-        match self.selected {
-            0 => self.api_key.push(c),
-            1 => self.model.push(c),
-            2 => self.provider.push(c),
-            4 => self.name.push(c),
-            5 => self.workdir.push(c),
-            _ => {}
+        let f = self.current_field();
+        if let Some(s) = self.text_draft_mut(f) {
+            s.push(c);
         }
     }
 
-    /// Delete the last character from the currently-selected text row's draft.
+    /// Delete the last character from the current text field's draft.
     ///
-    /// No-op for the Theme row (3).
+    /// No-op for non-text fields (Theme, Accent).
     pub fn backspace(&mut self) {
-        match self.selected {
-            0 => { self.api_key.pop(); }
-            1 => { self.model.pop(); }
-            2 => { self.provider.pop(); }
-            4 => { self.name.pop(); }
-            5 => { self.workdir.pop(); }
-            _ => {}
-        };
+        let f = self.current_field();
+        if let Some(s) = self.text_draft_mut(f) {
+            s.pop();
+        }
     }
 
     /// Cycle the accent draft to the next/previous entry in [`ACCENTS`], wrapping.
     ///
     /// `forward = true` steps to the next accent, `false` to the previous. If the
     /// current draft isn't a known accent name, this resets to the first entry.
-    /// Only invoked on the Theme row (3).
     pub fn cycle_accent(&mut self, forward: bool) {
         let len = ACCENTS.len();
         if len == 0 {

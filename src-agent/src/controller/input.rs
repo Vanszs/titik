@@ -431,23 +431,32 @@ fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -
 
 /// Handle a key press inside the `/settings` dashboard.
 ///
-/// Two-level Esc design:
-/// - While `editing` a text row, Enter/Esc *commit* the draft and drop back to
-///   section navigation (they do NOT close the dashboard).
-/// - While navigating, Esc returns [`Action::SaveSettings`], which closes the
-///   dashboard and persists every draft.
+/// Three-level focus design:
 ///
-/// On the Theme row (3), Enter toggles dark/light and ←/→ cycle the accent; on
-/// every text row Enter starts editing. `_rest` is accepted for handler-signature
-/// consistency but unused.
+/// 1. **editing** – user is typing into a text field.
+///    Enter / Esc commit the draft and drop back to detail navigation.
+///    Backspace / Char delegate to the state mutation helpers.
+///
+/// 2. **in_detail** (not editing) – cursor is on the field list of the active
+///    category.  Esc / Left return focus to the sidebar.  Enter activates the
+///    current field.  Left/Right on the Accent field cycle the accent; Left
+///    otherwise returns to the sidebar.
+///
+/// 3. **sidebar** – cursor is on the category list.
+///    Esc saves all drafts and closes the dashboard (`Action::SaveSettings`).
+///    Enter / Right move focus to the detail pane.
+///
+/// `_rest` is accepted for handler-signature consistency but unused.
 fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    use crate::app::mode::SettingField;
+
     if is_ctrl(&key, 'c') {
         return Action::Quit;
     }
 
     if s.editing {
         match key.code {
-            // Commit the draft and return to navigation; do not close.
+            // Commit the draft and return to detail navigation; do not close.
             KeyCode::Enter | KeyCode::Esc => {
                 s.editing = false;
                 Action::None
@@ -462,7 +471,45 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
             }
             _ => Action::None,
         }
+    } else if s.in_detail {
+        match key.code {
+            // Return to the sidebar (also exits editing, already false here).
+            KeyCode::Esc => {
+                s.focus_sidebar();
+                Action::None
+            }
+            KeyCode::Up => {
+                s.up();
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                s.down();
+                Action::None
+            }
+            // Theme toggle / start editing text field.
+            KeyCode::Enter => {
+                s.enter();
+                Action::None
+            }
+            KeyCode::Left => {
+                // Accent field: cycle backward. Any other field: go back to sidebar.
+                if s.current_field() == SettingField::Accent {
+                    s.cycle_accent(false);
+                } else {
+                    s.focus_sidebar();
+                }
+                Action::None
+            }
+            KeyCode::Right => {
+                if s.current_field() == SettingField::Accent {
+                    s.cycle_accent(true);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
     } else {
+        // Sidebar focus.
         match key.code {
             // Save every draft and close the dashboard.
             KeyCode::Esc => Action::SaveSettings,
@@ -474,21 +521,9 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
                 s.down();
                 Action::None
             }
-            // Theme row: toggle dark/light. Text rows: start editing.
-            KeyCode::Enter => {
-                s.enter();
-                Action::None
-            }
-            KeyCode::Left => {
-                if s.selected == 3 {
-                    s.cycle_accent(false);
-                }
-                Action::None
-            }
-            KeyCode::Right => {
-                if s.selected == 3 {
-                    s.cycle_accent(true);
-                }
+            // Move focus to the detail pane.
+            KeyCode::Enter | KeyCode::Right => {
+                s.focus_detail();
                 Action::None
             }
             _ => Action::None,

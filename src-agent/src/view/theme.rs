@@ -32,7 +32,10 @@ pub struct Palette {
 pub const ACCENTS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white"];
 
 /// Resolve an accent name + theme into a concrete [`Color`].
-fn resolve_accent(name: &str, dark: bool) -> Color {
+///
+/// Exposed crate-wide so the settings view can colour the accent name in its
+/// own resolved tint without duplicating the mapping.
+pub(crate) fn resolve_accent(name: &str, dark: bool) -> Color {
     match (name, dark) {
         ("green",   true)  => Color::Rgb(57, 255, 20),
         ("green",   false) => Color::Rgb(0, 128, 0),
