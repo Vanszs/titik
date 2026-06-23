@@ -1,3 +1,21 @@
+//! Runtime: the synchronous event loop that ties the whole app together.
+//!
+//! Owns the terminal, the tokio runtime handle, and the `AppState`. Its job is
+//! the central cycle: drain the active request's [`StreamEvent`]s -> read
+//! terminal input -> turn keystrokes into `Action`s -> apply them by mutating
+//! state -> redraw. This is the only place that spawns async tasks and the only
+//! place that calls `view::draw`.
+//!
+//! Rendering is dirty-flagged (draw only after something changes) and input
+//! polling is adaptive (8ms while a request streams so tokens flush at >=60fps,
+//! 100ms when idle) so a quiet UI burns no CPU.
+//!
+//! Async bridge: one channel per request. [`start_stream_task`] opens a fresh
+//! channel, stashes the receiver in `state.rest.active_rx`, and spawns a task
+//! holding the sender. Cancelling (interrupt / `/new` / quit) just drops the
+//! receiver, so a superseded task's late events vanish with no generation
+//! bookkeeping.
+
 use std::io::stdout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +27,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc;
 
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::state::{AppState, AppStateRest};
@@ -17,7 +35,7 @@ use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 use crate::controller::{self, command::Command, input::Action};
 use crate::dto::chat::{ChatMessage, Role};
 use crate::model::{session::Session, settings::Settings, store};
-use crate::service::{openrouter::OpenRouterClient, StreamEvent, TaggedEvent};
+use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 use crate::view;
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
@@ -82,8 +100,6 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let handle = rt.handle().clone();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TaggedEvent>();
-
     // Decide initial state.
     let mut state = if opts.resume {
         let metas = store::list_sessions()?;
@@ -117,88 +133,96 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
 
     let mut client: Option<Arc<OpenRouterClient>> = None;
 
-    let result = run_loop(&mut terminal, &mut state, &mut rx, &tx, &handle, &mut client);
+    let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
 
     // Terminal teardown is handled by `_guard`'s Drop at function scope.
 
-    // drop(rt) LAST: runtime shutdown cancels spawned tasks; tasks hold tx
-    // clones which become Err on send after rx (owned by run) is dropped. The
-    // `let _ =` on every task send makes this safe — no panic, no deadlock.
+    // drop(rt) LAST: runtime shutdown cancels spawned tasks. Each task owns the
+    // sender of its own per-request channel; once dropped here (or earlier when
+    // its receiver in state was dropped), every send is a no-op. The `let _ =`
+    // on each send makes this safe — no panic, no deadlock.
     drop(rt);
 
     result
 }
 
+/// The central event loop. Each tick: redraw if dirty, drain the active
+/// request's events, then drain all buffered terminal input. Rendering is
+/// dirty-flagged and polling is adaptive (8ms streaming / 100ms idle) so an
+/// idle UI is effectively free while streaming stays at >=60fps.
 fn run_loop(
     terminal: &mut Term,
     state: &mut AppState,
-    rx: &mut UnboundedReceiver<TaggedEvent>,
-    tx: &UnboundedSender<TaggedEvent>,
     handle: &tokio::runtime::Handle,
     client: &mut Option<Arc<OpenRouterClient>>,
 ) -> Result<()> {
+    let mut dirty = true; // paint once on entry
     loop {
-        terminal.draw(|f| view::draw(f, state))?;
+        if dirty {
+            terminal.draw(|f| view::draw(f, state))?;
+            dirty = false;
+        }
 
-        // 1. drain async events; discard stale generations.
-        while let Ok(tev) = rx.try_recv() {
-            if tev.generation != state.rest.generation {
-                continue;
-            }
-            match tev.event {
-                StreamEvent::Token(t) => {
-                    state.rest.append_token(&t);
-                    state.rest.status = "streaming".into();
-                }
-                StreamEvent::Done => {
-                    let buf = state.rest.take_stream();
-                    if let Some(b) = buf {
-                        if !b.is_empty() {
-                            if let Some(sess) = state.rest.session.as_mut() {
-                                sess.conversation.push_assistant(b);
-                                if let Err(e) = sess.save() {
-                                    state.rest.status = format!("error: {e}");
-                                }
-                            }
-                        }
+        // 1. Drain the active stream's events. take() the receiver so the match
+        //    arms can mutate other fields of state.rest without a borrow
+        //    conflict; put it back if the stream is still open.
+        if let Some(mut rx) = state.rest.active_rx.take() {
+            let mut still_streaming = true;
+            while let Ok(event) = rx.try_recv() {
+                dirty = true;
+                match event {
+                    StreamEvent::Token(t) => {
+                        state.rest.append_token(&t);
+                        state.rest.status = "streaming".into();
                     }
-                    state.rest.waiting = false;
-                    state.rest.current_task = None;
-                    if !state.rest.status.starts_with("error") {
+                    StreamEvent::Done => {
+                        finish_stream(&mut state.rest, None);
+                        still_streaming = false;
+                        break;
+                    }
+                    StreamEvent::Error(e) => {
+                        finish_stream(&mut state.rest, Some(e));
+                        still_streaming = false;
+                        break;
+                    }
+                    StreamEvent::Compacted { summary, kept_tail } => {
+                        if let Some(sess) = state.rest.session.as_mut() {
+                            sess.conversation.apply_compaction(summary, kept_tail);
+                            let _ = sess.save();
+                        }
+                        state.rest.waiting = false;
+                        state.rest.current_task = None;
                         state.rest.status = "ready".into();
+                        still_streaming = false;
+                        break;
                     }
                 }
-                StreamEvent::Error(e) => {
-                    let buf = state.rest.take_stream();
-                    if let Some(b) = buf {
-                        if !b.is_empty() {
-                            if let Some(sess) = state.rest.session.as_mut() {
-                                sess.conversation.push_assistant(b);
-                                let _ = sess.save();
-                            }
-                        }
-                    }
-                    state.rest.waiting = false;
-                    state.rest.current_task = None;
-                    state.rest.status = format!("error: {e}");
-                }
-                StreamEvent::Compacted { summary, kept_tail } => {
-                    if let Some(sess) = state.rest.session.as_mut() {
-                        sess.conversation.apply_compaction(summary, kept_tail);
-                        let _ = sess.save();
-                    }
-                    state.rest.waiting = false;
-                    state.rest.current_task = None;
-                    state.rest.status = "ready".into();
-                }
+            }
+            if still_streaming {
+                state.rest.active_rx = Some(rx);
             }
         }
 
-        // 2. input.
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                let action = controller::input::handle_key(state, key);
-                apply_action(action, state, client, handle, tx)?;
+        // 2. Input. 8ms poll while streaming so tokens flush at >=60fps; 100ms
+        //    idle (poll still wakes instantly on a keypress, so typing latency
+        //    is 0). Drain EVERY buffered event each tick so paste / fast typing
+        //    don't lag.
+        let timeout = if state.rest.waiting {
+            Duration::from_millis(8)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(timeout)? {
+            while event::poll(Duration::ZERO)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        let action = controller::input::handle_key(state, key);
+                        apply_action(action, state, client, handle)?;
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
             }
         }
 
@@ -209,40 +233,65 @@ fn run_loop(
     Ok(())
 }
 
-/// Abort the in-flight task, invalidate any events it may still send, clear
-/// the waiting flag.
+/// Finalize a finished stream: commit any buffered assistant text, clear the
+/// waiting flag + task handle, set the status line. `error` is Some on stream
+/// failure; a save error is surfaced only if the stream itself succeeded.
+fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
+    let mut save_err = None;
+    if let Some(buf) = rest.take_stream() {
+        if !buf.is_empty() {
+            if let Some(sess) = rest.session.as_mut() {
+                sess.conversation.push_assistant(buf);
+                if let Err(e) = sess.save() {
+                    save_err = Some(e.to_string());
+                }
+            }
+        }
+    }
+    rest.waiting = false;
+    rest.current_task = None;
+    rest.status = match error.or(save_err) {
+        Some(e) => format!("error: {e}"),
+        None => "ready".into(),
+    };
+}
+
+/// Abort the in-flight task and stop listening to it: aborts the task handle,
+/// drops the active receiver (so any late events from the task vanish), and
+/// clears the waiting flag.
 fn abort_current(rest: &mut AppStateRest) {
     if let Some(h) = rest.current_task.take() {
         h.abort();
     }
-    rest.bump_generation();
+    rest.active_rx = None;
     rest.waiting = false;
 }
 
-/// Spawn a streaming task for `history`. Bumps the generation FIRST so any
-/// in-flight task's later events are discarded.
+/// Spawn a streaming task for `history`. Opens a fresh channel, stashes the
+/// receiver in state, and hands the sender to the task — so this request's
+/// events are isolated from any previous one (no generation tagging needed).
 fn start_stream_task(
     history: Vec<ChatMessage>,
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
-    tx: &UnboundedSender<TaggedEvent>,
 ) {
-    let gen = state.rest.bump_generation();
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.rest.active_rx = Some(rx);
     let c = Arc::clone(client.as_ref().unwrap());
-    let txc = tx.clone();
     let jh = handle.spawn(async move {
-        let _ = c.stream_complete(history, gen, txc).await;
+        let _ = c.stream_complete(history, tx).await;
     });
     state.rest.current_task = Some(jh.abort_handle());
 }
 
+/// Apply one `Action` (the decoded result of a keystroke) by mutating state and,
+/// where needed, spawning/aborting the request task.
 fn apply_action(
     action: Action,
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
-    tx: &UnboundedSender<TaggedEvent>,
 ) -> Result<()> {
     match action {
         Action::None => {}
@@ -275,14 +324,17 @@ fn apply_action(
             state.rest.begin_stream();
             state.rest.waiting = true;
             state.rest.status = "thinking...".into();
-            start_stream_task(history, state, client, handle, tx);
+            start_stream_task(history, state, client, handle);
         }
 
         Action::Slash(cmd) => {
-            apply_slash(cmd, state, client, handle, tx)?;
+            apply_slash(cmd, state, client, handle)?;
         }
 
         Action::Interrupt => {
+            // Custom finalization (not finish_stream): the partial buffer is
+            // committed with an "  [interrupted]" marker. abort_current drops
+            // active_rx, so the aborted task's late events are ignored.
             if state.rest.waiting {
                 abort_current(&mut state.rest);
                 let buf = state.rest.take_stream();
@@ -320,7 +372,7 @@ fn apply_action(
             state.rest.begin_stream();
             state.rest.waiting = true;
             state.rest.status = "thinking...".into();
-            start_stream_task(history, state, client, handle, tx);
+            start_stream_task(history, state, client, handle);
         }
 
         Action::SaveCreds { api_key, model } => {
@@ -434,12 +486,13 @@ fn apply_action(
     Ok(())
 }
 
+/// Apply a parsed slash command. Like [`apply_action`], it mutates state and
+/// may spawn/abort the request task.
 fn apply_slash(
     cmd: Command,
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
-    tx: &UnboundedSender<TaggedEvent>,
 ) -> Result<()> {
     match cmd {
         Command::Compact => {
@@ -467,27 +520,20 @@ fn apply_slash(
             req.extend(to_sum);
             state.rest.waiting = true;
             state.rest.status = "compacting...".into();
-            let gen = state.rest.bump_generation();
+            // Fresh channel for this request; the receiver lives in state so an
+            // interrupt/new just drops it and the task's result is ignored.
+            let (tx, rx) = mpsc::unbounded_channel();
+            state.rest.active_rx = Some(rx);
             let c = Arc::clone(client.as_ref().unwrap());
-            let txc = tx.clone();
             let jh = handle.spawn(async move {
-                match c.complete(req).await {
-                    Ok(s) => {
-                        let _ = txc.send(TaggedEvent {
-                            generation: gen,
-                            event: StreamEvent::Compacted {
-                                summary: s,
-                                kept_tail,
-                            },
-                        });
-                    }
-                    Err(e) => {
-                        let _ = txc.send(TaggedEvent {
-                            generation: gen,
-                            event: StreamEvent::Error(e.to_string()),
-                        });
-                    }
-                }
+                let event = match c.complete(req).await {
+                    Ok(s) => StreamEvent::Compacted {
+                        summary: s,
+                        kept_tail,
+                    },
+                    Err(e) => StreamEvent::Error(e.to_string()),
+                };
+                let _ = tx.send(event);
             });
             state.rest.current_task = Some(jh.abort_handle());
         }

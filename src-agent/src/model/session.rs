@@ -1,3 +1,23 @@
+//! A single chat session: identity, filesystem path, settings, and conversation.
+//!
+//! A `Session` owns everything that belongs to one named conversation on disk:
+//!
+//! ```text
+//! ~/.simple-coder/sessions/<id>/
+//!     settings.json   ← Settings (model, api_key, compaction…)
+//!     messages.json   ← Vec<ChatMessage> (the full history)
+//!     memory/
+//!         MEMORY.md   ← optional long-term context (see model::memory)
+//! ```
+//!
+//! **Load path:** `store::load` (or `Session::load` directly) reads both JSON
+//! files, then immediately calls `rebuild_system()` so the live system prompt
+//! (embedded binary + MEMORY.md) always overwrites any stale system message
+//! that was stored in `messages.json`.
+//!
+//! **Save path:** `Session::save` writes `settings.json` and `messages.json`
+//! atomically enough for a TUI — no WAL, no rename-over, just `write`.
+
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crate::dto::chat::ChatMessage;
@@ -6,6 +26,12 @@ use crate::model::memory::load_memory;
 use crate::model::settings::Settings;
 use crate::resources;
 
+/// One named chat session.
+///
+/// `id` is the directory name under `~/.simple-coder/sessions/` (a UUID for
+/// new sessions, or a slug after `store::rename_session`). `name` is the
+/// human-readable label shown in the session list — it defaults to `id` when
+/// `settings.name` is empty.
 pub struct Session {
     pub id: String,
     pub name: String,
@@ -15,6 +41,10 @@ pub struct Session {
 }
 
 impl Session {
+    /// Construct a `Session` from its parts.
+    ///
+    /// `name` is derived from `settings.name`, falling back to `id` when the
+    /// name is blank. This is the only place that enforces the fallback.
     pub fn new(
         id: String,
         path: PathBuf,
@@ -43,6 +73,16 @@ impl Session {
         self.path.join("messages.json")
     }
 
+    /// Load a session from `dir` on disk.
+    ///
+    /// Steps:
+    /// 1. Derive `id` from the directory name.
+    /// 2. Read `settings.json` (or use defaults if absent).
+    /// 3. Read `messages.json` verbatim. A missing or unparseable file yields
+    ///    an empty vec; no placeholder system message is inserted here.
+    /// 4. Call `rebuild_system()` to seed/overwrite `messages[0]` with the
+    ///    embedded system prompt + live MEMORY.md. This ensures the stored
+    ///    system message (which may be stale) is always replaced on resume.
     pub fn load(dir: &Path) -> Result<Self> {
         let id = dir
             .file_name()
@@ -83,12 +123,16 @@ impl Session {
             conversation,
         };
 
-        // Seed/overwrite the system message via set_system so the embedded
-        // prompt + live MEMORY.md always win over a stale stored system message.
+        // Overwrite the stored system message with the live one so that
+        // changes to the embedded prompt or MEMORY.md take effect on resume.
         session.rebuild_system();
         Ok(session)
     }
 
+    /// Persist `settings.json` and `messages.json` to `self.path`.
+    ///
+    /// Creates `self.path` if it does not exist (needed for a brand-new
+    /// session before its first save).
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.path)?;
         self.settings.save(&self.settings_path())?;
@@ -97,6 +141,13 @@ impl Session {
         Ok(())
     }
 
+    /// Rebuild the system prompt and push it into the conversation.
+    ///
+    /// Called on session load and after the user edits `MEMORY.md` at runtime.
+    /// Reads the session's `memory/MEMORY.md` (via `load_memory`), passes the
+    /// result to `resources::build_system_prompt` which stitches together the
+    /// embedded base prompt and the optional memory section, then calls
+    /// `Conversation::set_system` to insert or replace `messages[0]`.
     pub fn rebuild_system(&mut self) {
         let mem = load_memory(&self.path);
         let sys = resources::build_system_prompt(mem.as_deref());

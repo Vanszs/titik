@@ -1,3 +1,14 @@
+//! OpenRouter HTTP client: the only thing that talks to the network.
+//!
+//! Two entry points, both spawned as async tasks by the runtime:
+//! - [`OpenRouterClient::stream_complete`] — chat streaming over SSE, emitting
+//!   [`StreamEvent`]s down a per-request channel.
+//! - [`OpenRouterClient::complete`] — one-shot completion (used by `/compact`).
+//!
+//! The client knows nothing about the UI; it just pushes `StreamEvent`s. A
+//! dropped receiver makes every send a no-op, so an aborted/superseded request
+//! cannot corrupt the next one.
+
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -5,7 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{APP_TITLE, HTTP_REFERER};
 use crate::dto::chat::ChatMessage;
 use crate::dto::openrouter::{ChatRequest, ChatResponse, StreamChunk};
-use crate::service::{Generation, StreamEvent, TaggedEvent};
+use crate::service::StreamEvent;
 
 pub struct OpenRouterClient {
     http: reqwest::Client,
@@ -14,8 +25,10 @@ pub struct OpenRouterClient {
     model: String,
 }
 
-fn emit(tx: &UnboundedSender<TaggedEvent>, generation: Generation, event: StreamEvent) {
-    let _ = tx.send(TaggedEvent { generation, event });
+/// Send one event on the request channel, ignoring a closed receiver (the
+/// request was interrupted/superseded, so the event is simply dropped).
+fn emit(tx: &UnboundedSender<StreamEvent>, event: StreamEvent) {
+    let _ = tx.send(event);
 }
 
 impl OpenRouterClient {
@@ -28,13 +41,21 @@ impl OpenRouterClient {
         }
     }
 
-    /// Streaming completion. Emits TaggedEvent { generation, Token/Done/Error }.
-    /// Never panics; every error path emits Error then returns Ok(()).
+    /// Streaming chat completion over Server-Sent Events.
+    ///
+    /// POSTs with `stream: true`, then reads the byte stream line-by-line:
+    /// bytes are buffered until a `\n`, each complete line is stripped of its
+    /// `data:` prefix, and the JSON payload is parsed into a `StreamChunk`.
+    /// Each non-empty delta is emitted as [`StreamEvent::Token`]; a `[DONE]`
+    /// sentinel (or stream EOF) emits [`StreamEvent::Done`]. Non-`data:` lines
+    /// (SSE comments / keepalives) and unparseable partial JSON are skipped.
+    ///
+    /// Never panics: every failure emits [`StreamEvent::Error`] and returns
+    /// `Ok(())`. The caller (a spawned task) discards the return value.
     pub async fn stream_complete(
         &self,
         messages: Vec<ChatMessage>,
-        generation: Generation,
-        tx: UnboundedSender<TaggedEvent>,
+        tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
@@ -55,7 +76,7 @@ impl OpenRouterClient {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                emit(&tx, generation, StreamEvent::Error(format!("request failed: {e}")));
+                emit(&tx, StreamEvent::Error(format!("request failed: {e}")));
                 return Ok(());
             }
         };
@@ -65,7 +86,6 @@ impl OpenRouterClient {
             let text = resp.text().await.unwrap_or_default();
             emit(
                 &tx,
-                generation,
                 StreamEvent::Error(format!("OpenRouter error {status}: {text}")),
             );
             return Ok(());
@@ -77,7 +97,7 @@ impl OpenRouterClient {
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    emit(&tx, generation, StreamEvent::Error(format!("stream error: {e}")));
+                    emit(&tx, StreamEvent::Error(format!("stream error: {e}")));
                     return Ok(());
                 }
             };
@@ -97,14 +117,14 @@ impl OpenRouterClient {
                     None => continue, // comments/keepalive
                 };
                 if data == "[DONE]" {
-                    emit(&tx, generation, StreamEvent::Done);
+                    emit(&tx, StreamEvent::Done);
                     return Ok(());
                 }
                 if let Ok(c) = serde_json::from_str::<StreamChunk>(data) {
                     if let Some(choice) = c.choices.first() {
                         if let Some(t) = &choice.delta.content {
                             if !t.is_empty() {
-                                emit(&tx, generation, StreamEvent::Token(t.clone()));
+                                emit(&tx, StreamEvent::Token(t.clone()));
                             }
                         }
                     }
@@ -112,7 +132,7 @@ impl OpenRouterClient {
                 // unparseable JSON (partial keepalive) is ignored
             }
         }
-        emit(&tx, generation, StreamEvent::Done); // stream ended without explicit [DONE]
+        emit(&tx, StreamEvent::Done); // stream ended without explicit [DONE]
         Ok(())
     }
 

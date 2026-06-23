@@ -1,7 +1,20 @@
+//! Application state: the single source of truth the UI renders from.
+//!
+//! [`AppState`] = the current [`Mode`] (which screen + its form/picker data)
+//! plus [`AppStateRest`], the mode-independent rest of the world: the active
+//! session, input buffer, status line, scroll, and the streaming machinery.
+//!
+//! Data flow: a keystroke becomes an `Action` (controller), the runtime applies
+//! that `Action` by mutating this state, and `view::draw` reads it. Async
+//! request output arrives via [`AppStateRest::active_rx`] — the receiver for the
+//! one in-flight request. The runtime drains it each tick and folds the events
+//! in here; dropping it cancels delivery from a superseded task.
+
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::AbortHandle;
 use crate::app::mode::Mode;
 use crate::model::session::Session;
-use crate::service::Generation;
+use crate::service::StreamEvent;
 
 pub struct AppState {
     pub mode: Mode,
@@ -21,9 +34,10 @@ pub struct AppStateRest {
     pub last_key: Option<String>,
     pub last_model: Option<String>,
     pub current_task: Option<AbortHandle>,
-    /// Monotonic generation of the in-flight task; events with a different
-    /// generation are discarded.
-    pub generation: Generation,
+    /// Receiver for the in-flight request's events, or `None` when idle. Each
+    /// request owns a fresh channel; dropping this receiver silently discards
+    /// any further events from a task that was aborted or superseded.
+    pub active_rx: Option<UnboundedReceiver<StreamEvent>>,
 }
 
 impl AppState {
@@ -55,7 +69,7 @@ impl AppStateRest {
             last_key: None,
             last_model: None,
             current_task: None,
-            generation: 0,
+            active_rx: None,
         }
     }
 
@@ -92,13 +106,6 @@ impl AppStateRest {
     }
     pub fn take_stream(&mut self) -> Option<String> {
         self.streaming.take()
-    }
-
-    /// Increment and return the new generation. Called when starting/aborting
-    /// any task so stale events are filtered out.
-    pub fn bump_generation(&mut self) -> Generation {
-        self.generation = self.generation.wrapping_add(1);
-        self.generation
     }
 
     pub fn remember_creds(&mut self, key: &str, model: &str) {

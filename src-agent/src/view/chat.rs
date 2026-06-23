@@ -1,3 +1,11 @@
+//! Chat screen renderer: the read-only view of [`AppStateRest`].
+//!
+//! Last stage of the keystroke -> Action -> state -> render flow. Pure
+//! function of state: it borrows the session transcript, the live streaming
+//! buffer, the input, and the status line into three stacked panes (messages /
+//! input / status). It never mutates state and never allocates the transcript —
+//! every span borrows from state so a redraw stays cheap at 60fps+.
+
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
@@ -9,6 +17,8 @@ use crate::app::state::AppStateRest;
 use crate::config::{APP_TITLE, DEFAULT_MODEL};
 use crate::dto::chat::Role;
 
+/// Render the chat screen from `rest`. Borrows throughout — no per-frame
+/// clones of the transcript or streaming buffer.
 pub fn draw(frame: &mut Frame, rest: &AppStateRest) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -19,14 +29,20 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest) {
         ])
         .split(frame.area());
 
-    // Title bits from the active session settings.
-    let (name, model) = match rest.session.as_ref() {
-        Some(s) => (s.name.clone(), s.settings.model.clone()),
-        None => (APP_TITLE.to_string(), DEFAULT_MODEL.to_string()),
+    // Title bits from the active session settings. Borrowed, not cloned.
+    let (name, model): (&str, &str) = match rest.session.as_ref() {
+        Some(s) => (s.name.as_str(), s.settings.model.as_str()),
+        None => (APP_TITLE, DEFAULT_MODEL),
     };
 
-    // Build transcript lines, skipping the System message.
-    let mut lines: Vec<Line> = Vec::new();
+    // Build transcript lines, skipping the System message. Spans borrow message
+    // content directly, so no per-frame allocation of the transcript.
+    let cap = rest
+        .session
+        .as_ref()
+        .map_or(0, |s| s.conversation.messages().len())
+        + 1; // +1 for the live streaming line
+    let mut lines: Vec<Line> = Vec::with_capacity(cap);
     if let Some(session) = rest.session.as_ref() {
         for msg in session.conversation.messages() {
             let (prefix_text, color) = match msg.role {
@@ -35,7 +51,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest) {
                 Role::Assistant => ("[ai] ", Color::Green),
             };
             let prefix = Span::styled(prefix_text, Style::default().fg(color));
-            let content = Span::raw(msg.content.clone());
+            let content = Span::raw(msg.content.as_str());
             lines.push(Line::from(vec![prefix, content]));
         }
     }
@@ -44,7 +60,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest) {
     if let Some(buf) = rest.streaming.as_ref() {
         if !buf.is_empty() {
             let prefix = Span::styled("[ai] ", Style::default().fg(Color::Green));
-            let content = Span::raw(buf.clone());
+            let content = Span::raw(buf.as_str());
             lines.push(Line::from(vec![prefix, content]));
         }
     }
