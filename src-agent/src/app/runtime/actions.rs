@@ -14,7 +14,7 @@ use crate::service::openrouter::OpenRouterClient;
 
 use super::build_client;
 use super::commands::apply_slash;
-use super::stream::{abort_current, start_stream_task};
+use super::stream::{abort_current, process_tools, run_tool, start_stream_task};
 
 /// Apply one `Action` (the decoded result of a keystroke) by mutating state and,
 /// where needed, spawning/aborting the request task.
@@ -56,9 +56,13 @@ pub(super) fn apply_action(
             state.rest.reset_scroll();
             state.rest.begin_stream();
             state.rest.waiting = true;
-            // A new user turn starts fresh: no carried-over tool-call rounds.
+            // A new user turn starts fresh: no carried-over tool-call rounds or
+            // a half-finished approval machine.
             state.rest.agent_steps = 0;
             state.rest.pending_tool_calls.clear();
+            state.rest.awaiting_approval = false;
+            state.rest.tool_idx = 0;
+            state.rest.tool_results.clear();
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
         }
@@ -73,10 +77,14 @@ pub(super) fn apply_action(
             // active_rx, so the aborted task's late events are ignored.
             if state.rest.waiting {
                 abort_current(&mut state.rest);
-                // Halt the agentic loop: drop any stashed tool calls and reset
-                // the step counter so the turn stops here instead of continuing.
+                // Halt the agentic loop: drop any stashed tool calls, reset the
+                // step counter, and clear the approval machine so a halt mid-
+                // approval doesn't leave the turn wedged.
                 state.rest.pending_tool_calls.clear();
                 state.rest.agent_steps = 0;
+                state.rest.awaiting_approval = false;
+                state.rest.tool_idx = 0;
+                state.rest.tool_results.clear();
                 // Take any captured usage unconditionally so a partial turn's
                 // usage can't leak into the next response.
                 let usage = state.rest.pending_usage.take();
@@ -124,6 +132,34 @@ pub(super) fn apply_action(
             state.rest.waiting = true;
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
+        }
+
+        Action::ApproveTool => {
+            // Run the paused risky call, record its result, advance past it, then
+            // resume the machine (which may pause again on the next risky call or
+            // finish the round). Clone the call out first so `run_tool`'s mutable
+            // borrow of `state` doesn't overlap the `pending_tool_calls` read.
+            state.rest.awaiting_approval = false;
+            if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
+                let result = run_tool(state, &call);
+                state.rest.tool_results.push((call.id.clone(), result));
+                state.rest.tool_idx += 1;
+            }
+            process_tools(state, client, handle);
+        }
+
+        Action::DenyTool => {
+            // Feed a fixed "denied by user" result for the paused call, advance
+            // past it, then resume the machine.
+            state.rest.awaiting_approval = false;
+            if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
+                state
+                    .rest
+                    .tool_results
+                    .push((call.id.clone(), "denied by user".to_string()));
+                state.rest.tool_idx += 1;
+            }
+            process_tools(state, client, handle);
         }
 
         Action::SaveCreds { api_key, model, provider } => {

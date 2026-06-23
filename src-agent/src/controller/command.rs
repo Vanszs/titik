@@ -12,6 +12,7 @@
 /// (name, one-line description). Source of truth for the palette UI.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
+    ("/mode", "Toggle Normal/Auto tool approval"),
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/compact", "Summarize and compact the conversation"),
     ("/rename", "Rename the current session"),
@@ -47,6 +48,8 @@ pub enum Command {
     Compact,
     /// Start a fresh session (discards current chat).
     New,
+    /// Toggle the tool-approval policy between Normal and Auto.
+    Mode,
     /// Rename the current session.  Holds the new name string.
     Rename(String),
     /// Open the in-app settings dashboard (alias: `/config`).
@@ -85,6 +88,7 @@ pub fn parse(line: &str) -> Command {
     match head_lc.as_str() {
         "compact" => Command::Compact,
         "new" => Command::New,
+        "mode" => Command::Mode,
         "settings" | "config" => Command::Settings,
         "select" => Command::Select,
         "help" => Command::Help,

@@ -46,7 +46,7 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
     Frame,
@@ -105,6 +105,8 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         Span::styled(" [", Style::default().fg(palette.dim)),
         Span::styled(model, Style::default().fg(palette.dim)),
         Span::styled("]", Style::default().fg(palette.dim)),
+        Span::styled(" · ", Style::default().fg(palette.dim)),
+        Span::styled(rest.agent_mode.label(), Style::default().fg(palette.accent)),
     ]);
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
@@ -347,6 +349,50 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
+    // --- File reference palette --- `@`-triggered depth-1 file browser, same
+    // box style as the command palette, anchored above the input. Only shown
+    // when the command palette is NOT active and the current token is `@partial`.
+    let file_palette_active = cmd_matches.is_empty();
+    if file_palette_active {
+        if let Some(partial) = crate::controller::input::file_ref_partial(&rest.input) {
+            let files: Vec<String> = rest.dir_cache.read().map(|c| c.list_at(partial)).unwrap_or_default();
+            if !files.is_empty() {
+                let sel = rest.palette_sel.min(files.len() - 1);
+                const MAX_VIS: usize = 10;
+                // window start keeps `sel` visible (anchors to bottom when scrolling down)
+                let start = if sel < MAX_VIS { 0 } else { sel + 1 - MAX_VIS };
+                let end = (start + MAX_VIS).min(files.len());
+                let rows: Vec<Line> = files[start..end].iter().enumerate().map(|(vi, f)| {
+                    let i = start + vi;
+                    if i == sel {
+                        let hl = Style::default().fg(palette.sel_fg).bg(palette.sel_bg);
+                        Line::from(Span::styled(format!(" {f} "), hl))
+                    } else {
+                        Line::from(Span::styled(format!(" {f} "), Style::default().fg(palette.fg)))
+                    }
+                }).collect();
+                // title shows position when there are more entries than fit
+                let title = if files.len() > MAX_VIS {
+                    format!(" files {}/{} ", sel + 1, files.len())
+                } else {
+                    " files ".to_string()
+                };
+                let avail = chunks[2].y.saturating_sub(chunks[1].y);
+                let h = ((rows.len() as u16) + 2).min(avail.max(3));
+                let y = chunks[2].y.saturating_sub(h);
+                let popup = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+                let block = Block::bordered()
+                    .border_style(Style::default().fg(palette.dim))
+                    .title(Span::styled(title, Style::default().fg(palette.dim)))
+                    .padding(Padding::horizontal(1));
+                let inner = block.inner(popup);
+                frame.render_widget(Clear, popup);
+                frame.render_widget(block, popup);
+                frame.render_widget(Paragraph::new(rows), inner);
+            }
+        }
+    }
+
     // --- Help overlay --- opened with `/help`. Same flat box style as the
     // slash-command palette, anchored just above the input. Modal: any key
     // closes it (handled in the input controller).
@@ -412,6 +458,92 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         let block = Block::bordered()
             .border_style(Style::default().fg(err_color))
             .title(Span::styled(" error ", Style::default().fg(err_color)))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(rect);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(Paragraph::new(rows), inner);
+    }
+
+    // --- Tool-approval prompt --- shown while a risky tool call is paused for
+    // the user's y/n (Normal mode). A small warning-coloured box anchored just
+    // above the input, listing the pending call. Modal: keys are routed to the
+    // approve/deny handlers in the input controller, not into the transcript.
+    if rest.awaiting_approval {
+        let warn = Color::Rgb(255, 180, 60);
+        let mut rows: Vec<Line> = Vec::new();
+        if let Some(call) = rest.pending_tool_calls.get(rest.tool_idx) {
+            let name = call.function.name.as_str();
+            // header: which tool
+            rows.push(Line::from(Span::styled(
+                format!(" ⚙ {name}"),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
+            )));
+            let v: serde_json::Value =
+                serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            let inner_w = (chunks[2].width as usize)
+                .saturating_sub(2 /*borders*/ + 2 /*padding*/ + 3 /*indent*/)
+                .max(8);
+            match name {
+                "write" => {
+                    let path = v["path"].as_str().unwrap_or("?");
+                    let content = v["content"].as_str().unwrap_or("");
+                    let n_lines = content.lines().count().max(1);
+                    rows.push(Line::from(vec![
+                        Span::styled(" target:  ", Style::default().fg(palette.dim)),
+                        Span::styled(path.to_string(), Style::default().fg(palette.fg)),
+                    ]));
+                    rows.push(Line::from(vec![
+                        Span::styled(" payload: ", Style::default().fg(palette.dim)),
+                        Span::styled(
+                            format!("{n_lines} lines, {} bytes", content.len()),
+                            Style::default().fg(palette.fg),
+                        ),
+                    ]));
+                    // preview up to 8 content lines, each truncated to the box width
+                    for line in content.lines().take(8) {
+                        rows.push(Line::from(Span::styled(
+                            format!("   {}", truncate_chars(line, inner_w)),
+                            Style::default().fg(palette.dim),
+                        )));
+                    }
+                    if n_lines > 8 {
+                        rows.push(Line::from(Span::styled(
+                            format!("   … (+{} more lines)", n_lines - 8),
+                            Style::default().fg(palette.dim),
+                        )));
+                    }
+                }
+                "delete" => {
+                    let path = v["path"].as_str().unwrap_or("?");
+                    rows.push(Line::from(vec![
+                        Span::styled(" target:  ", Style::default().fg(palette.dim)),
+                        Span::styled(path.to_string(), Style::default().fg(palette.fg)),
+                    ]));
+                }
+                _ => {
+                    rows.push(Line::from(Span::styled(
+                        format!(" {}", truncate_chars(&call.function.arguments, 120)),
+                        Style::default().fg(palette.dim),
+                    )));
+                }
+            }
+        }
+        rows.push(Line::from(vec![
+            Span::styled(" [y] run   ", Style::default().fg(warn)),
+            Span::styled("[n] deny", Style::default().fg(palette.dim)),
+        ]));
+
+        // Anchor just above the input, full input width, growing upward —
+        // identical placement to the slash-command / help boxes.
+        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let h = ((rows.len() as u16) + 2).min(avail.max(3));
+        let y = chunks[2].y.saturating_sub(h);
+        let rect = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+
+        let block = Block::bordered()
+            .border_style(Style::default().fg(warn))
+            .title(Span::styled(" approve ", Style::default().fg(warn)))
             .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);

@@ -69,9 +69,13 @@ pub(super) fn apply_slash(
 
         Command::New => {
             abort_current(&mut state.rest);
-            // Halt any in-flight agentic loop before swapping sessions.
+            // Halt any in-flight agentic loop before swapping sessions, including
+            // a half-finished approval machine.
             state.rest.pending_tool_calls.clear();
             state.rest.agent_steps = 0;
+            state.rest.awaiting_approval = false;
+            state.rest.tool_idx = 0;
+            state.rest.tool_results.clear();
             let _ = state.rest.take_stream(); // discard partial; belongs to old session
             let mut sess = match store::create_session() {
                 Ok(s) => s,
@@ -113,6 +117,11 @@ pub(super) fn apply_slash(
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
             }
+        }
+
+        Command::Mode => {
+            state.rest.agent_mode = state.rest.agent_mode.toggled();
+            state.rest.status = format!("mode: {}", state.rest.agent_mode.label());
         }
 
         Command::Rename(name) => {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::app::state::{AppState, AppStateRest};
+use crate::app::state::{AgentMode, AppState, AppStateRest};
 use crate::dto::chat::{ChatMessage, Role, ToolCall};
 use crate::service::openrouter::OpenRouterClient;
 
@@ -71,7 +71,7 @@ pub(super) fn advance_turn(
 ) {
     // 1. Take the stashed tool calls + the streamed text + the in-flight usage
     //    out of state up front so nothing leaks into the next model call.
-    let pending = std::mem::take(&mut state.rest.pending_tool_calls);
+    let pending = state.rest.pending_tool_calls.clone();
     let buf = state.rest.take_stream();
     let usage = state.rest.pending_usage.take();
 
@@ -137,29 +137,82 @@ pub(super) fn advance_turn(
     }
     state.rest.agent_steps += 1;
 
-    // 5. Run each requested tool, collecting (id, result) FIRST so the
-    //    immutable read of the session inside `run_tool` never overlaps the
-    //    mutable push below.
-    let mut results: Vec<(String, String)> = Vec::with_capacity(pending.len());
-    for call in &pending {
-        let result = run_tool(state, call);
-        results.push((call.id.clone(), result));
+    // 5. Hand off to the tool-approval state machine. The pending calls were
+    //    already stashed into `state.rest.pending_tool_calls` by the event loop
+    //    (`StreamEvent::ToolCalls`); `process_tools` walks them from index 0,
+    //    running safe calls inline and — in Normal mode — pausing on the first
+    //    risky one for a `y/n`. `pending` (the local copy) is no longer needed.
+    drop(pending);
+    state.rest.tool_idx = 0;
+    state.rest.tool_results.clear();
+    process_tools(state, client, handle);
+}
+
+/// True for tools that mutate the workspace and therefore require approval in
+/// Normal mode. Deterministic, name-based — no classifier / network call.
+fn tool_is_risky(name: &str) -> bool {
+    matches!(name, "write" | "delete")
+}
+
+/// Drive the tool-approval state machine for the current round.
+///
+/// Walks `pending_tool_calls` from `tool_idx`, running each call and collecting
+/// its `(id, result)` into `tool_results`. In `Normal` mode it STOPS at the
+/// first risky (write/delete) call, sets `awaiting_approval`, and returns — the
+/// turn is resumed later by [`Action::ApproveTool`] / [`Action::DenyTool`]
+/// (which run/deny that one call, advance `tool_idx`, and call back in here).
+/// Once every call in the round has resolved it calls [`finish_tool_round`].
+///
+/// Each call/string is cloned out of `state.rest` before `run_tool` (which
+/// borrows `state` mutably) so there's no overlapping borrow of the vec.
+pub(super) fn process_tools(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
+    let mode = state.rest.agent_mode;
+    while state.rest.tool_idx < state.rest.pending_tool_calls.len() {
+        let call = state.rest.pending_tool_calls[state.rest.tool_idx].clone();
+        if mode == AgentMode::Normal && tool_is_risky(&call.function.name) {
+            // Pause the turn for the user's decision; resumed by Approve/Deny.
+            state.rest.awaiting_approval = true;
+            state.rest.status = format!("approve {}? [y/n]", call.function.name);
+            return;
+        }
+        let result = run_tool(state, &call);
+        state.rest.tool_results.push((call.id.clone(), result));
+        state.rest.tool_idx += 1;
     }
-    // Now push the tool results into the conversation + log them.
+    finish_tool_round(state, client, handle);
+}
+
+/// Finish a completed tool round: flush every collected result into the
+/// conversation + log, clear the machine, and re-stream so the model sees the
+/// tool outputs and continues the turn (`waiting` stays true throughout).
+///
+/// Bails cleanly if there is no session or client to continue against
+/// (defensive — a turn in flight normally implies both are present).
+fn finish_tool_round(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
+    // Push the collected tool results into the conversation + log them.
     if let Some(sess) = state.rest.session.as_mut() {
-        for (id, result) in &results {
+        for (id, result) in &state.rest.tool_results {
             let _ = crate::model::msglog::append(&sess.path, Role::Tool, result, None);
             sess.conversation.push_tool(id.clone(), result.clone());
         }
         let _ = sess.save();
     }
+    // Round done: clear the per-round machine before the next model call.
+    state.rest.pending_tool_calls.clear();
+    state.rest.tool_idx = 0;
+    state.rest.tool_results.clear();
 
-    // 6. Continue the turn: hand the updated history back to the model. The
-    //    streaming buffer is re-armed so the next assistant text accumulates
-    //    cleanly. `waiting` stays true (the turn isn't finished yet).
-    //
-    //    Bail cleanly if there is no session or no client to continue against
-    //    (defensive — a turn in flight normally implies both are present).
+    // Continue the turn: hand the updated history back to the model. The
+    // streaming buffer is re-armed so the next assistant text accumulates
+    // cleanly. `waiting` stays true (the turn isn't finished yet).
     let history = match (state.rest.session.as_ref(), client.as_ref()) {
         (Some(sess), Some(_)) => sess.conversation.history(),
         _ => {
@@ -179,7 +232,10 @@ pub(super) fn advance_turn(
 /// string (an `error: …` line on failure / unknown tool). Reads the session for
 /// the workspace path and clones the shared dir cache up front, then dispatches
 /// to the matching [`crate::tool::Tool`].
-fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
+///
+/// `pub(super)` so the approve/deny action handlers can run a single tool when
+/// resuming the approval machine.
+pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
     let workspace = state
         .rest
         .session

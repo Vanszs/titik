@@ -34,6 +34,12 @@ pub enum Action {
     Interrupt,
     /// Re-send the last user message (Ctrl+R while idle).
     Resend,
+    /// Approve the paused risky tool call (`y` in the approval modal): run it
+    /// and resume the tool-approval state machine.
+    ApproveTool,
+    /// Deny the paused risky tool call (`n`/Esc in the approval modal): feed
+    /// `"denied by user"` back as its result and resume the machine.
+    DenyTool,
     // --- KeyInput actions ---
     /// Credentials form confirmed; carry the api key, model, and provider out.
     SaveCreds { api_key: String, model: String, provider: String },
@@ -51,6 +57,33 @@ pub enum Action {
     /// return to Chat. The apply path reads the drafts back out of
     /// `state.mode`, mirroring [`Action::PickerSelect`].
     SaveSettings,
+}
+
+/// If the input's current (last, whitespace-delimited) token is a file
+/// reference (`@...`), return the partial path after the `@`. The file palette
+/// is shown while this is `Some`.
+pub fn file_ref_partial(input: &str) -> Option<&str> {
+    let start = input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+    let token = &input[start..];
+    token.strip_prefix('@')
+}
+
+/// Replace the current `@token` in `rest.input` with the selected entry.
+/// Completing a FILE appends a trailing space (closes the palette).
+/// Completing a FOLDER (trailing `/`) does NOT append a space so the palette
+/// stays open and the user can browse into the subfolder.
+fn complete_file_ref(rest: &mut AppStateRest, matches: &[String]) {
+    let sel = rest.palette_sel.min(matches.len().saturating_sub(1));
+    let entry = &matches[sel];
+    let start = rest.input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+    rest.input.truncate(start);
+    rest.input.push('@');
+    rest.input.push_str(entry);
+    if !entry.ends_with('/') {
+        rest.input.push(' '); // a FILE completion closes the palette
+    }
+    // a FOLDER (trailing '/') gets NO space → palette stays open at the new depth
+    rest.palette_sel = 0;
 }
 
 /// Translate a raw key event into an [`Action`] based on the current [`Mode`].
@@ -138,6 +171,17 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         return Action::None;
     }
 
+    // Tool-approval modal: while a risky call is paused, only y/n/Esc matter.
+    // `y` approves (run it), `n`/Esc deny (feed "denied by user"); every other
+    // key is swallowed so the prompt stays up and input can't leak underneath.
+    if rest.awaiting_approval {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Action::ApproveTool,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::DenyTool,
+            _ => Action::None,
+        };
+    }
+
     // Ctrl+C: interrupt if waiting, else quit.
     if is_ctrl(&key, 'c') {
         return if rest.waiting {
@@ -180,18 +224,27 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             }
             let cmd_matches = command::palette_matches(&rest.input);
             if !cmd_matches.is_empty() {
-                // Palette open: run the highlighted command, not the raw text.
+                // Command palette open: run the highlighted command, not the raw text.
                 let sel = rest.palette_sel.min(cmd_matches.len() - 1);
                 let name = cmd_matches[sel].0;
                 rest.take_input();
                 Action::Slash(command::parse(name))
-            } else if rest.input.trim().starts_with('/') {
-                let line = rest.take_input();
-                Action::Slash(command::parse(&line))
-            } else if !rest.input.trim().is_empty() && !rest.waiting {
-                Action::Submit(rest.take_input())
             } else {
-                Action::None
+                // File palette: complete instead of submitting when a file match is selected.
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    complete_file_ref(rest, &fmatches);
+                    Action::None
+                } else if rest.input.trim().starts_with('/') {
+                    let line = rest.take_input();
+                    Action::Slash(command::parse(&line))
+                } else if !rest.input.trim().is_empty() && !rest.waiting {
+                    Action::Submit(rest.take_input())
+                } else {
+                    Action::None
+                }
             }
         }
         KeyCode::Backspace => {
@@ -199,13 +252,19 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Up => {
-            // Navigate the command palette if it's open; otherwise recall the
-            // previous sent user message (bash-style history).
+            // Command palette takes precedence; then file palette; then history recall.
             if !command::palette_matches(&rest.input).is_empty() {
                 rest.palette_sel = rest.palette_sel.saturating_sub(1);
             } else {
-                let users = user_messages(rest);
-                rest.history_prev(&users);
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    rest.palette_sel = rest.palette_sel.saturating_sub(1);
+                } else {
+                    let users = user_messages(rest);
+                    rest.history_prev(&users);
+                }
             }
             Action::None
         }
@@ -214,8 +273,15 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             if n > 0 {
                 rest.palette_sel = (rest.palette_sel + 1).min(n - 1);
             } else {
-                let users = user_messages(rest);
-                rest.history_next(&users);
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    rest.palette_sel = (rest.palette_sel + 1).min(fmatches.len() - 1);
+                } else {
+                    let users = user_messages(rest);
+                    rest.history_next(&users);
+                }
             }
             Action::None
         }
@@ -225,6 +291,13 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 let sel = rest.palette_sel.min(cmd_matches.len() - 1);
                 rest.input = format!("{} ", cmd_matches[sel].0);
                 rest.palette_sel = 0;
+            } else {
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    complete_file_ref(rest, &fmatches);
+                }
             }
             Action::None
         }
@@ -243,6 +316,13 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         // End / Ctrl+End: jump to the bottom and resume following.
         KeyCode::End => {
             rest.reset_scroll();
+            Action::None
+        }
+        // Shift+Tab toggles the tool-approval mode (Auto <-> Normal). Crossterm
+        // reports Shift+Tab as BackTab, so it never collides with plain Tab.
+        KeyCode::BackTab => {
+            rest.agent_mode = rest.agent_mode.toggled();
+            rest.status = format!("mode: {}", rest.agent_mode.label());
             Action::None
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {

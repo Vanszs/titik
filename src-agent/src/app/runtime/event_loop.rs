@@ -111,10 +111,13 @@ pub(super) fn run_loop(
                     }
                     StreamEvent::Error(e) => {
                         // Surface the error and halt the whole turn (drop any
-                        // half-stashed tool calls / step count).
+                        // half-stashed tool calls / step count / approval machine).
                         finish_stream(&mut state.rest, Some(e));
                         state.rest.agent_steps = 0;
                         state.rest.pending_tool_calls.clear();
+                        state.rest.awaiting_approval = false;
+                        state.rest.tool_idx = 0;
+                        state.rest.tool_results.clear();
                         still_streaming = false;
                         break;
                     }

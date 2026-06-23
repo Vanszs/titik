@@ -45,6 +45,38 @@ pub fn reindex(root: PathBuf, cache: Arc<RwLock<DirCache>>) {
     });
 }
 
+impl DirCache {
+    /// Immediate children (files + subfolders) for the path being typed after
+    /// `@`. `partial` is split into a directory prefix (up to and including the
+    /// last `/`) and a filename fragment (after it). Returns files directly in
+    /// the prefix dir plus subfolder names (with a trailing `/`), filtered by the
+    /// fragment (case-insensitive prefix match on the child name), sorted.
+    pub fn list_at(&self, partial: &str) -> Vec<String> {
+        let (prefix, frag) = match partial.rfind('/') {
+            Some(i) => (&partial[..=i], &partial[i + 1..]), // prefix keeps trailing '/'
+            None => ("", partial),
+        };
+        let frag = frag.to_lowercase();
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in &self.files {
+            let rest = match f.strip_prefix(prefix) {
+                Some(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+            let entry = match rest.find('/') {
+                None => f.clone(),                             // file directly in prefix
+                Some(j) => format!("{prefix}{}/", &rest[..j]), // subfolder (trailing '/')
+            };
+            // filter by the typed fragment against the child name (after prefix)
+            let name = entry.strip_prefix(prefix).unwrap_or(&entry);
+            if frag.is_empty() || name.to_lowercase().starts_with(&frag) {
+                set.insert(entry);
+            }
+        }
+        set.into_iter().collect()
+    }
+}
+
 /// Tool: re-index the workspace file tree in the background.
 pub struct DirCacheUpdate;
 impl Tool for DirCacheUpdate {

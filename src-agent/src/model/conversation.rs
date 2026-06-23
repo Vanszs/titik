@@ -76,9 +76,74 @@ impl Conversation {
         &self.messages
     }
 
-    /// Clone the full message list (used when saving to disk).
+    /// Clone the message list, sanitized for API consumption.
+    ///
+    /// OpenRouter (and the OpenAI-compatible API spec) require that every
+    /// assistant message containing `tool_calls` is immediately followed by a
+    /// `Tool` message for **each** call id in that group. If the agentic loop
+    /// is interrupted mid-turn the stored history can violate this invariant,
+    /// causing a 400 error on the next request.
+    ///
+    /// This method strips dangling tool-call groups before returning, so the
+    /// caller can always forward the result to the API safely. The raw
+    /// `messages()` slice is left untouched (used by the TUI for display).
     pub fn history(&self) -> Vec<ChatMessage> {
-        self.messages.clone()
+        use std::collections::HashSet;
+        let msgs = &self.messages;
+
+        // Pass 1: collect ids of tool_calls that are fully answered.
+        // An assistant tool-call group is fully answered only when EVERY one
+        // of its ids has a corresponding Tool message in the contiguous run
+        // of Tool messages immediately following it.
+        let mut valid_ids: HashSet<String> = HashSet::new();
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role == Role::Assistant {
+                if let Some(tcs) = &m.tool_calls {
+                    let mut responded: HashSet<&str> = HashSet::new();
+                    for later in &msgs[i + 1..] {
+                        if later.role == Role::Tool {
+                            if let Some(id) = &later.tool_call_id {
+                                responded.insert(id.as_str());
+                            }
+                        } else {
+                            break; // tool responses are contiguous right after the assistant
+                        }
+                    }
+                    if tcs.iter().all(|c| responded.contains(c.id.as_str())) {
+                        for c in tcs {
+                            valid_ids.insert(c.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: emit a valid sequence.
+        let mut out: Vec<ChatMessage> = Vec::with_capacity(msgs.len());
+        for m in msgs {
+            match m.role {
+                Role::Assistant if m.tool_calls.is_some() => {
+                    let tcs = m.tool_calls.as_ref().unwrap();
+                    if tcs.iter().all(|c| valid_ids.contains(&c.id)) {
+                        out.push(m.clone()); // complete tool-call group → keep as-is
+                    } else if !m.content.trim().is_empty() {
+                        // dangling tool-call → drop tool_calls, keep any text content
+                        let mut m2 = m.clone();
+                        m2.tool_calls = None;
+                        out.push(m2);
+                    }
+                    // else: empty dangling assistant → drop entirely
+                }
+                Role::Tool => {
+                    // keep tool results only when their call was fully answered
+                    if m.tool_call_id.as_deref().is_some_and(|id| valid_ids.contains(id)) {
+                        out.push(m.clone());
+                    }
+                }
+                _ => out.push(m.clone()),
+            }
+        }
+        out
     }
 
     /// Insert or replace the system message at index 0.

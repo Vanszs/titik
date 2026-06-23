@@ -1,14 +1,15 @@
 //! Static resource embedding — system-prompt files baked into the binary.
 //!
 //! At compile time, [`include_dir!`] embeds the entire `src-misc/` directory
-//! next to the crate root.  At runtime, [`system_prompt`] and
-//! [`system_personality`] read from that in-memory directory.
+//! next to the crate root.  At runtime, [`system_prompt`], [`system_personality`],
+//! and [`system_tools`] read from that in-memory directory.
 //!
 //! Expected files in `src-misc/`:
 //! - `system-prompt.txt`      — the primary system instruction block
 //! - `system-personality.txt` — tone/style addendum appended after the prompt
+//! - `system-tools.txt`       — tool-usage guidance appended at the very bottom
 //!
-//! Both files are optional: if absent or empty, hard-coded fallback strings
+//! All files are optional: if absent or empty, hard-coded fallback strings
 //! are used so the binary is always usable out of the box.
 //!
 //! [`build_system_prompt`] assembles the final string sent as the `system`
@@ -23,6 +24,8 @@
 //!
 //! # Memory
 //! <memory>       ← only present when the session has saved memory
+//!
+//! <tools>        ← only present when system-tools.txt is non-empty
 //! ```
 
 use include_dir::{include_dir, Dir};
@@ -56,6 +59,18 @@ pub fn system_personality() -> &'static str {
         .unwrap_or(FALLBACK_PERSONALITY)
 }
 
+/// Return the tool-usage guidance from `src-misc/system-tools.txt`.
+///
+/// Appended at the bottom of the system prompt so the model knows how to use
+/// the filesystem tools. Empty string if the file is missing/blank.
+pub fn system_tools() -> &'static str {
+    MISC.get_file("system-tools.txt")
+        .and_then(|f| f.contents_utf8())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+}
+
 /// Assemble the full system prompt string for the OpenRouter `system` field.
 ///
 /// Structure: `prompt + "\n\n" + personality [+ "\n\n# Project Instructions\n" + agents]
@@ -82,6 +97,11 @@ pub fn build_system_prompt(memory: Option<&str>, agents: Option<&str>) -> String
             s.push_str("\n\n# Memory\n");
             s.push_str(mem);
         }
+    }
+    let tools = system_tools();
+    if !tools.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(tools);
     }
     s
 }

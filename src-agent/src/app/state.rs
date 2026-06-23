@@ -25,6 +25,38 @@ pub struct AppState {
     pub rest: AppStateRest,
 }
 
+/// Tool-approval policy for the agentic loop.
+///
+/// - `Auto`: every requested tool runs immediately (no prompt) — the original
+///   behaviour.
+/// - `Normal`: *risky* tools (write/delete) pause the turn for a `y/n` user
+///   approval; *safe* tools (read/dir_list/dir_cache_update) still run inline.
+///
+/// Toggled with Shift+Tab or `/mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    #[default]
+    Auto,
+    Normal,
+}
+
+impl AgentMode {
+    /// Short display label for the header / status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentMode::Auto => "auto",
+            AgentMode::Normal => "normal",
+        }
+    }
+    /// The opposite mode (for the toggle key / command).
+    pub fn toggled(self) -> Self {
+        match self {
+            AgentMode::Auto => AgentMode::Normal,
+            AgentMode::Normal => AgentMode::Auto,
+        }
+    }
+}
+
 /// Per-frame cache of the transcript's rendered visual lines.
 ///
 /// Markdown rendering (pulldown-cmark + syntect highlighting) and span-wrapping
@@ -114,6 +146,18 @@ pub struct AppStateRest {
     /// new user turn starts / the turn ends; bounded so a runaway model can't
     /// loop forever.
     pub agent_steps: usize,
+    /// Tool-approval policy. `Auto` runs every tool immediately; `Normal` pauses
+    /// for `y/n` on risky (write/delete) tools. Toggled with Shift+Tab / `/mode`.
+    pub agent_mode: AgentMode,
+    // --- tool-approval state machine (within a single agentic turn) ---
+    /// Index of the next call in `pending_tool_calls` to process this round.
+    pub tool_idx: usize,
+    /// `(tool_call_id, result)` pairs collected so far this round, flushed into
+    /// the conversation once every call in the round resolves.
+    pub tool_results: Vec<(String, String)>,
+    /// True while a risky call is paused waiting for the user's `y/n`. The event
+    /// loop routes keys to the approval modal while this is set.
+    pub awaiting_approval: bool,
 }
 
 impl AppState {
@@ -167,6 +211,10 @@ impl AppStateRest {
             )),
             pending_tool_calls: Vec::new(),
             agent_steps: 0,
+            agent_mode: AgentMode::default(),
+            tool_idx: 0,
+            tool_results: Vec::new(),
+            awaiting_approval: false,
         }
     }
 
