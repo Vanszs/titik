@@ -7,6 +7,7 @@
 //! - `store`        — filesystem session registry (list / create / rename).
 //! - `memory`       — reads the optional `MEMORY.md` from a session directory.
 
+pub mod app_config;
 pub mod conversation;
 pub mod memory;
 pub mod session;

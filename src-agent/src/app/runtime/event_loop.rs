@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, MouseEventKind};
 
+use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::controller;
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
@@ -88,6 +89,22 @@ pub(super) fn run_loop(
                         let action = controller::input::handle_key(state, key);
                         apply_action(action, state, client, handle)?;
                         dirty = true;
+                    }
+                    Event::Mouse(m) => {
+                        // Wheel scrolls the chat transcript only.
+                        if matches!(state.mode, Mode::Chat) {
+                            match m.kind {
+                                MouseEventKind::ScrollUp => {
+                                    state.rest.scroll_up();
+                                    dirty = true;
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    state.rest.scroll_down();
+                                    dirty = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     Event::Resize(_, _) => dirty = true,
                     _ => {}

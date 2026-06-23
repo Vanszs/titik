@@ -51,6 +51,7 @@ pub(super) fn apply_action(
                 }
                 sess.conversation.history()
             };
+            state.rest.reset_scroll();
             state.rest.begin_stream();
             state.rest.waiting = true;
             state.rest.status = "thinking...".into();
@@ -99,6 +100,7 @@ pub(super) fn apply_action(
                 let _ = sess.save();
                 sess.conversation.history()
             };
+            state.rest.reset_scroll();
             state.rest.begin_stream();
             state.rest.waiting = true;
             state.rest.status = "thinking...".into();
@@ -213,6 +215,75 @@ pub(super) fn apply_action(
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
             }
+        }
+
+        Action::SaveSettings => {
+            // 1. Pull drafts out of the mode first so the borrow of `state.mode`
+            //    is released before we mutate `state.rest` / `state.mode` below.
+            let drafts = match &state.mode {
+                Mode::Settings(s) => Some((
+                    s.api_key.clone(),
+                    s.model.clone(),
+                    s.provider.clone(),
+                    s.name.clone(),
+                    s.theme.clone(),
+                    s.accent.clone(),
+                )),
+                _ => None,
+            };
+            if let Some((api_key, model, provider, name, theme, accent)) = drafts {
+                // Detect whether the OpenRouter-relevant creds changed so we only
+                // rebuild the client when necessary.
+                let creds_changed = match state.rest.session.as_ref() {
+                    Some(s) => {
+                        s.settings.api_key != api_key
+                            || s.settings.model != model
+                            || s.settings.provider != provider
+                    }
+                    None => false,
+                };
+                // a) Apply the text drafts to the session settings.
+                if let Some(sess) = state.rest.session.as_mut() {
+                    sess.settings.api_key = api_key;
+                    sess.settings.model = model;
+                    sess.settings.provider = provider;
+                }
+                // b) Apply global theme/accent and persist config.json. Best-effort:
+                //    a write failure surfaces to the status line but does not abort
+                //    the rest of the save.
+                state.rest.config.theme = theme;
+                state.rest.config.accent = accent;
+                if let Err(e) = state.rest.config.save() {
+                    state.rest.status = format!("config save failed: {e}");
+                }
+                // c) Persist the session's settings.json.
+                if let Some(sess) = state.rest.session.as_mut() {
+                    if let Err(e) = sess.save() {
+                        state.rest.status = format!("error: {e}");
+                    }
+                }
+                // d) Rename LAST, and only when the name actually changed and is
+                //    non-empty. Doing it last means a rename failure can't lose the
+                //    other drafts (they're already saved above).
+                let needs_rename = state
+                    .rest
+                    .session
+                    .as_ref()
+                    .map(|s| !name.trim().is_empty() && name.trim() != s.name)
+                    .unwrap_or(false);
+                if needs_rename {
+                    if let Some(sess) = state.rest.session.as_mut() {
+                        if let Err(e) = store::rename_session(sess, name.trim()) {
+                            state.rest.status = format!("rename failed: {e}");
+                        }
+                    }
+                }
+                // e) Rebuild the OpenRouter client if the creds changed.
+                if creds_changed {
+                    *client = state.rest.session.as_ref().map(build_client);
+                }
+            }
+            state.mode = Mode::Chat;
         }
     }
     Ok(())

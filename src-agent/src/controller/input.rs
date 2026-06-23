@@ -13,7 +13,7 @@
 //! belonging to the active mode and `AppStateRest`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crate::app::mode::{KeyInputForm, Mode, PickerState};
+use crate::app::mode::{KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::{AppState, AppStateRest};
 use crate::controller::command::{self, Command};
 
@@ -46,6 +46,11 @@ pub enum Action {
     // --- Picker actions ---
     /// Enter on the session picker — open the highlighted session.
     PickerSelect,
+    // --- Settings actions ---
+    /// Esc on the settings dashboard (while navigating) — apply every draft and
+    /// return to Chat. The apply path reads the drafts back out of
+    /// `state.mode`, mirroring [`Action::PickerSelect`].
+    SaveSettings,
 }
 
 /// Translate a raw key event into an [`Action`] based on the current [`Mode`].
@@ -65,6 +70,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Chat => handle_chat(&mut state.rest, key),
         Mode::KeyInput(form) => handle_key_input(form, &mut state.rest, key),
         Mode::SessionPicker(p) => handle_picker(p, &mut state.rest, key),
+        Mode::Settings(s) => handle_settings(s, &mut state.rest, key),
     }
 }
 
@@ -79,6 +85,12 @@ fn is_ctrl(key: &KeyEvent, c: char) -> bool {
 /// Ctrl+C and Esc both interrupt an in-flight request when `waiting` is true;
 /// when idle they quit the app.  Ctrl+R re-sends the last message (idle only).
 fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    // The help overlay is modal: any key closes it and is otherwise swallowed.
+    if rest.help_open {
+        rest.help_open = false;
+        return Action::None;
+    }
+
     // Ctrl+C: interrupt if waiting, else quit.
     if is_ctrl(&key, 'c') {
         return if rest.waiting {
@@ -105,7 +117,14 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Enter => {
-            if rest.input.trim().starts_with('/') {
+            let cmd_matches = command::palette_matches(&rest.input);
+            if !cmd_matches.is_empty() {
+                // Palette open: run the highlighted command, not the raw text.
+                let sel = rest.palette_sel.min(cmd_matches.len() - 1);
+                let name = cmd_matches[sel].0;
+                rest.take_input();
+                Action::Slash(command::parse(name))
+            } else if rest.input.trim().starts_with('/') {
                 let line = rest.take_input();
                 Action::Slash(command::parse(&line))
             } else if !rest.input.trim().is_empty() && !rest.waiting {
@@ -119,11 +138,30 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Up => {
-            rest.scroll_up();
+            // Navigate the command palette if it's open; otherwise scroll.
+            if !command::palette_matches(&rest.input).is_empty() {
+                rest.palette_sel = rest.palette_sel.saturating_sub(1);
+            } else {
+                rest.scroll_up();
+            }
             Action::None
         }
         KeyCode::Down => {
-            rest.scroll_down();
+            let n = command::palette_matches(&rest.input).len();
+            if n > 0 {
+                rest.palette_sel = (rest.palette_sel + 1).min(n - 1);
+            } else {
+                rest.scroll_down();
+            }
+            Action::None
+        }
+        KeyCode::Tab => {
+            let cmd_matches = command::palette_matches(&rest.input);
+            if !cmd_matches.is_empty() {
+                let sel = rest.palette_sel.min(cmd_matches.len() - 1);
+                rest.input = format!("{} ", cmd_matches[sel].0);
+                rest.palette_sel = 0;
+            }
             Action::None
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -227,5 +265,72 @@ fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+/// Handle a key press inside the `/settings` dashboard.
+///
+/// Two-level Esc design:
+/// - While `editing` a text row, Enter/Esc *commit* the draft and drop back to
+///   section navigation (they do NOT close the dashboard).
+/// - While navigating, Esc returns [`Action::SaveSettings`], which closes the
+///   dashboard and persists every draft.
+///
+/// On the Theme row (3), Enter toggles dark/light and ←/→ cycle the accent; on
+/// every text row Enter starts editing. `_rest` is accepted for handler-signature
+/// consistency but unused.
+fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    if is_ctrl(&key, 'c') {
+        return Action::Quit;
+    }
+
+    if s.editing {
+        match key.code {
+            // Commit the draft and return to navigation; do not close.
+            KeyCode::Enter | KeyCode::Esc => {
+                s.editing = false;
+                Action::None
+            }
+            KeyCode::Backspace => {
+                s.backspace();
+                Action::None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                s.push_char(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    } else {
+        match key.code {
+            // Save every draft and close the dashboard.
+            KeyCode::Esc => Action::SaveSettings,
+            KeyCode::Up => {
+                s.up();
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                s.down();
+                Action::None
+            }
+            // Theme row: toggle dark/light. Text rows: start editing.
+            KeyCode::Enter => {
+                s.enter();
+                Action::None
+            }
+            KeyCode::Left => {
+                if s.selected == 3 {
+                    s.cycle_accent(false);
+                }
+                Action::None
+            }
+            KeyCode::Right => {
+                if s.selected == 3 {
+                    s.cycle_accent(true);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 }

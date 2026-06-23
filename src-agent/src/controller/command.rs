@@ -6,7 +6,38 @@
 //! service logic (compaction, new session, rename, etc.).
 //!
 //! Supported commands: `/compact`, `/new`, `/rename [session] <name>`,
-//! `/help`, `/quit` (aliases: `/q`, `/exit`).
+//! `/settings` (alias `/config`), `/help`, `/quit` (aliases: `/q`, `/exit`).
+
+/// User-facing slash commands shown in the `/` palette, in display order.
+/// (name, one-line description). Source of truth for the palette UI.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "Start a new session"),
+    ("/settings", "Edit key, model, provider, theme, name"),
+    ("/compact", "Summarize and compact the conversation"),
+    ("/rename", "Rename the current session"),
+    ("/help", "List the available commands"),
+    ("/quit", "Quit simple-coder"),
+];
+
+/// True while the user is still typing a command NAME: input starts with `/`
+/// and contains no whitespace yet (once they type a space they're onto args).
+pub fn palette_active(input: &str) -> bool {
+    input.starts_with('/') && !input.contains(char::is_whitespace)
+}
+
+/// Commands whose name starts with the typed prefix (case-insensitive).
+/// Empty when the palette isn't active.
+pub fn palette_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !palette_active(input) {
+        return Vec::new();
+    }
+    let prefix = input.to_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .copied()
+        .collect()
+}
 
 /// A parsed in-chat slash command.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +48,8 @@ pub enum Command {
     New,
     /// Rename the current session.  Holds the new name string.
     Rename(String),
+    /// Open the in-app settings dashboard (alias: `/config`).
+    Settings,
     /// Print available commands to the chat view.
     Help,
     /// Exit the application.
@@ -49,6 +82,7 @@ pub fn parse(line: &str) -> Command {
     match head_lc.as_str() {
         "compact" => Command::Compact,
         "new" => Command::New,
+        "settings" | "config" => Command::Settings,
         "help" => Command::Help,
         "quit" | "q" | "exit" => Command::Quit,
         "rename" => {

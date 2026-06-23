@@ -7,12 +7,15 @@
 //! - [`chat`]           – the main conversation view (messages + input bar)
 //! - [`key_input`]      – the first-run / reconfigure credentials form
 //! - [`session_picker`] – the `--resume` session list with search bar
+//! - [`settings`]       – the in-app `/settings` dashboard
 //!
 //! No logic lives here; all rendering decisions belong to the sub-modules.
 
 pub mod chat;
 pub mod key_input;
 pub mod session_picker;
+pub mod settings;
+pub mod theme;
 
 use ratatui::Frame;
 use crate::app::mode::Mode;
@@ -22,10 +25,15 @@ use crate::app::state::AppState;
 ///
 /// Called by the runtime on every UI refresh tick.  Delegates to the
 /// mode-specific draw function; only one mode is active at a time.
+///
+/// The palette is computed once here and passed to every sub-draw so all
+/// colour decisions flow through a single source of truth.
 pub fn draw(frame: &mut Frame, state: &AppState) {
+    let palette = theme::palette(&state.rest.config);
     match &state.mode {
-        Mode::Chat => chat::draw(frame, &state.rest),
-        Mode::KeyInput(form) => key_input::draw(frame, form),
-        Mode::SessionPicker(p) => session_picker::draw(frame, p),
+        Mode::Chat => chat::draw(frame, &state.rest, &palette),
+        Mode::KeyInput(form) => key_input::draw(frame, form, &palette),
+        Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
+        Mode::Settings(s) => settings::draw(frame, s, &palette),
     }
 }

@@ -31,7 +31,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::state::AppState;
 use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
-use crate::model::{session::Session, settings::Settings, store};
+use crate::model::{app_config::AppConfig, session::Session, settings::Settings, store};
 use crate::service::openrouter::OpenRouterClient;
 
 use terminal::TerminalGuard;
@@ -87,30 +87,72 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
         state
     } else {
         let (lk, lm, lp) = prefill_creds();
-        // Lazy creation: do NOT create a session dir yet. It is created in the
-        // SaveCreds handler once the user actually confirms credentials, so an
-        // aborted first run (Esc/Quit) or a terminal-setup failure leaves no
-        // orphaned empty session directory on disk.
-        let mut state = AppState::new(Mode::KeyInput(KeyInputForm::prefilled(
-            lk.clone().unwrap_or_default(),
-            lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            lp.clone().unwrap_or_default(),
-            true,  // first_run
-            false, // from_picker
-        )));
+        let key_known = lk.as_deref().is_some_and(|k| !k.is_empty());
+        let mut state = if key_known {
+            // Returning user: spawn a fresh session pre-loaded with the last
+            // creds and drop straight into chat. The credential prompt only
+            // appears on the very first run. Per-session changes via /settings.
+            let mut st = AppState::new(Mode::Chat);
+            match store::create_session() {
+                Ok(mut sess) => {
+                    sess.settings.api_key = lk.clone().unwrap_or_default();
+                    sess.settings.model =
+                        lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+                    sess.settings.provider = lp.clone().unwrap_or_default();
+                    let _ = sess.save();
+                    st.rest.session = Some(sess);
+                }
+                Err(e) => {
+                    // Couldn't create the session dir — fall back to the prompt.
+                    st.rest.status = format!("error: {e}");
+                    st.mode = Mode::KeyInput(KeyInputForm::prefilled(
+                        lk.clone().unwrap_or_default(),
+                        lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                        lp.clone().unwrap_or_default(),
+                        true,
+                        false,
+                    ));
+                }
+            }
+            st
+        } else {
+            // First ever run on this machine: prompt for credentials (lazy — no
+            // session dir is created until the user confirms).
+            AppState::new(Mode::KeyInput(KeyInputForm::prefilled(
+                lk.clone().unwrap_or_default(),
+                lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                lp.clone().unwrap_or_default(),
+                true,  // first_run
+                false, // from_picker
+            )))
+        };
         state.rest.last_key = lk;
         state.rest.last_model = lm;
         state.rest.last_provider = lp;
         state
     };
 
+    // Load global config now that ensure_dirs has run (so the dir exists if we
+    // later write config.json). Falls back to AppConfig::default() on any error.
+    state.rest.config = AppConfig::load();
+
     // Terminal setup. Guard created BEFORE the Terminal so its Drop covers a
     // failing Terminal::new, any later `?`-error, and panic-unwind.
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+    // Clear the alternate screen so no shell scrollback bleeds through the
+    // cells the UI never paints (e.g. the empty part of the transcript).
+    terminal.clear()?;
 
-    let mut client: Option<Arc<OpenRouterClient>> = None;
+    // If startup opened a session straight into chat (returning user), build its
+    // client now; otherwise it's built when the user confirms credentials.
+    let mut client: Option<Arc<OpenRouterClient>> = state
+        .rest
+        .session
+        .as_ref()
+        .filter(|s| !s.settings.api_key.is_empty())
+        .map(build_client);
 
     let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::app::mode::{KeyInputForm, Mode};
+use crate::app::mode::{KeyInputForm, Mode, SettingsState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
@@ -70,28 +70,42 @@ pub(super) fn apply_slash(
         Command::New => {
             abort_current(&mut state.rest);
             let _ = state.rest.take_stream(); // discard partial; belongs to old session
-            let sess = match store::create_session() {
+            let mut sess = match store::create_session() {
                 Ok(s) => s,
                 Err(e) => {
                     state.rest.status = format!("error: {e}");
                     return Ok(());
                 }
             };
+            // Inherit the last-used creds so a new session drops straight into
+            // chat — no credential prompt. (Change them per-session via /settings.)
+            sess.settings.api_key = state.rest.last_key.clone().unwrap_or_default();
+            sess.settings.model = state
+                .rest
+                .last_model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            sess.settings.provider = state.rest.last_provider.clone().unwrap_or_default();
+            let _ = sess.save();
             state.rest.prev_session = state.rest.session.take();
-            state.rest.session = Some(sess);
-            *client = None; // forces SaveCreds rebuild
             state.rest.reset_scroll();
-            state.mode = Mode::KeyInput(KeyInputForm::prefilled(
-                state.rest.last_key.clone().unwrap_or_default(),
-                state
-                    .rest
-                    .last_model
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-                state.rest.last_provider.clone().unwrap_or_default(),
-                false, // Esc -> CancelKeyInput restores prev_session
-                false, // not from picker
-            ));
+            if sess.settings.api_key.is_empty() {
+                // No creds known yet — fall back to the credential prompt.
+                state.rest.session = Some(sess);
+                *client = None;
+                state.mode = Mode::KeyInput(KeyInputForm::prefilled(
+                    String::new(),
+                    DEFAULT_MODEL.to_string(),
+                    String::new(),
+                    false, // Esc -> CancelKeyInput restores prev_session
+                    false, // not from picker
+                ));
+            } else {
+                *client = Some(super::build_client(&sess));
+                state.rest.session = Some(sess);
+                state.mode = Mode::Chat;
+                state.rest.status = "ready".into();
+            }
         }
 
         Command::Rename(name) => {
@@ -107,9 +121,23 @@ pub(super) fn apply_slash(
             }
         }
 
+        Command::Settings => {
+            // Needs an active session (drafts seed from it); also blocked while a
+            // request is in flight, mirroring the /compact guard.
+            if state.rest.waiting {
+                state.rest.status = "busy — wait for response".into();
+                return Ok(());
+            }
+            let Some(session) = state.rest.session.as_ref() else {
+                state.rest.status = "no active session".into();
+                return Ok(());
+            };
+            let st = SettingsState::from(session, &state.rest.config);
+            state.mode = Mode::Settings(st);
+        }
+
         Command::Help => {
-            state.rest.status =
-                "/compact /new /rename <name> /help /quit · Ctrl+R resend · Esc interrupt".into();
+            state.rest.help_open = true;
         }
 
         Command::Quit => {
