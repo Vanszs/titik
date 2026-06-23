@@ -313,6 +313,8 @@ pub(super) fn start_stream_task(
 ) {
     // Self-awareness: tell the model the project's top-level layout every request
     // (so it's present after compaction too). Pulled from the live dir cache.
+    // The project-doc summary (Phase 2), when present, rides the same System
+    // message right after the listing so it likewise survives compaction.
     if let Some(first) = history.first_mut() {
         if first.role == Role::System {
             if let Ok(cache) = state.rest.dir_cache.read() {
@@ -320,6 +322,12 @@ pub(super) fn start_stream_task(
                 if !listing.is_empty() {
                     first.content.push_str("\n\n# Project files (top level)\n");
                     first.content.push_str(&listing.join("\n"));
+                }
+            }
+            if let Some(summary) = state.rest.awareness_summary.as_deref() {
+                if !summary.is_empty() {
+                    first.content.push_str("\n\n# Project summary\n");
+                    first.content.push_str(summary);
                 }
             }
         }

@@ -325,10 +325,27 @@ pub(super) fn apply_action(
                     s.theme.clone(),
                     s.accent.clone(),
                     s.workdir.clone(),
+                    s.awareness_enabled,
+                    s.awareness_inherit,
+                    s.awareness_model.clone(),
+                    s.awareness_provider.clone(),
                 )),
                 _ => None,
             };
-            if let Some((api_key, model, provider, name, theme, accent, workdir)) = drafts {
+            if let Some((
+                api_key,
+                model,
+                provider,
+                name,
+                theme,
+                accent,
+                workdir,
+                awareness_enabled,
+                awareness_inherit,
+                awareness_model,
+                awareness_provider,
+            )) = drafts
+            {
                 // Detect whether the OpenRouter-relevant creds changed so we only
                 // rebuild the client when necessary.
                 let creds_changed = match state.rest.session.as_ref() {
@@ -339,12 +356,19 @@ pub(super) fn apply_action(
                     }
                     None => false,
                 };
-                // a) Apply the text drafts to the session settings.
+                // a) Apply the text drafts to the session settings. The
+                //    awareness settings ride along here too; they don't affect
+                //    the chat client (the awareness call uses `complete_with`
+                //    per invocation), so no client rebuild is keyed off them.
                 if let Some(sess) = state.rest.session.as_mut() {
                     sess.settings.api_key = api_key;
                     sess.settings.model = model;
                     sess.settings.provider = provider;
                     sess.settings.workdir = workdir;
+                    sess.settings.awareness_enabled = awareness_enabled;
+                    sess.settings.awareness_inherit = awareness_inherit;
+                    sess.settings.awareness_model = awareness_model;
+                    sess.settings.awareness_provider = awareness_provider;
                 }
                 // b) Apply global theme/accent and persist config.json. Best-effort:
                 //    a write failure surfaces to the status line but does not abort

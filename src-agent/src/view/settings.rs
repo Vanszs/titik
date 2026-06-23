@@ -165,6 +165,26 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
                     let tint: Color = resolve_accent(&st.accent, dark);
                     vec![Span::styled(st.accent.as_str(), Style::default().fg(tint))]
                 }
+                SettingField::AwarenessEnabled => {
+                    // Boolean toggle: on/off.
+                    let v = if st.awareness_enabled { "on" } else { "off" };
+                    vec![Span::styled(v, Style::default().fg(palette.accent))]
+                }
+                SettingField::AwarenessSource => {
+                    // Boolean toggle: inherit the session model, or a custom one.
+                    let v = if st.awareness_inherit {
+                        "inherit parent"
+                    } else {
+                        "custom"
+                    };
+                    vec![Span::styled(v, Style::default().fg(palette.accent))]
+                }
+                SettingField::AwarenessModel | SettingField::AwarenessProvider
+                    if st.awareness_inherit =>
+                {
+                    // Irrelevant while inheriting → dimmed "(inherited)".
+                    vec![Span::styled("(inherited)", Style::default().fg(palette.dim))]
+                }
                 _ => {
                     // Text field: show draft with optional cursor block.
                     let raw: &str = match f {
@@ -180,7 +200,12 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
                         }
                         SettingField::Name    => st.name.as_str(),
                         SettingField::Workdir => st.workdir.as_str(),
-                        // Theme and Accent are handled above; this arm is unreachable.
+                        // Reached only when source == "custom" (the inherit case
+                        // is handled in the arm above).
+                        SettingField::AwarenessModel    => st.awareness_model.as_str(),
+                        SettingField::AwarenessProvider => st.awareness_provider.as_str(),
+                        // Theme, Accent, and the awareness toggles are handled
+                        // above; this arm is unreachable for them.
                         _ => "",
                     };
                     let editing_here = st.editing && is_selected;

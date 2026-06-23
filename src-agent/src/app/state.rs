@@ -163,6 +163,13 @@ pub struct AppStateRest {
     /// requested call is answered with `PLAN_NUDGE` instead of being executed,
     /// forcing the model to state its plan before actually running tools.
     pub needs_plan: bool,
+    /// Project-awareness summary (Phase 2): a few-sentence digest of the
+    /// project's depth-1 docs, produced by a secondary model at startup and
+    /// after `/compact`. Appended to the first System message on every request
+    /// (see `runtime::stream::start_stream_task`) so it survives compaction.
+    /// `None` when awareness is disabled, no docs exist, or the call failed —
+    /// it is recomputed per session, never persisted.
+    pub awareness_summary: Option<String>,
 }
 
 impl AppState {
@@ -221,6 +228,7 @@ impl AppStateRest {
             tool_results: Vec::new(),
             awaiting_approval: false,
             needs_plan: false,
+            awareness_summary: None,
         }
     }
 

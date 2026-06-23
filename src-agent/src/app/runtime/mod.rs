@@ -164,6 +164,24 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
         .filter(|s| !s.settings.api_key.is_empty())
         .map(build_client);
 
+    // Project self-awareness (Phase 2): if a session + client are already live
+    // at startup, summarise the project's docs via a cheap secondary model and
+    // stash it for injection into the system prompt. Best-effort and gated by
+    // `awareness_enabled` inside `summarize`; a quick small-model `block_on`
+    // here is acceptable (it never hard-blocks once the call returns/errors).
+    // Picker / first-run paths have no session yet; they get a summary lazily
+    // on the next trigger (post-`/compact`) instead.
+    if let (Some(c), Some(sess)) = (client.as_ref(), state.rest.session.as_ref()) {
+        if sess.settings.awareness_enabled {
+            let summary = handle.block_on(crate::app::awareness::summarize(
+                c,
+                &sess.settings,
+                &sess.workdir(),
+            ));
+            state.rest.awareness_summary = summary;
+        }
+    }
+
     let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
 
     // Terminal teardown is handled by `_guard`'s Drop at function scope.

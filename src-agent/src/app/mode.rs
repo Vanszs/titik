@@ -132,19 +132,32 @@ pub enum SettingField {
     Accent,
     Name,
     Workdir,
+    /// Toggle: whether the project-awareness summary is generated/injected.
+    AwarenessEnabled,
+    /// Toggle: awareness model source — inherit the session model or use the
+    /// dedicated awareness model/provider.
+    AwarenessSource,
+    /// Text: dedicated awareness model (ignored when the source is "inherit").
+    AwarenessModel,
+    /// Text: dedicated awareness provider (ignored when the source is "inherit").
+    AwarenessProvider,
 }
 
 impl SettingField {
     /// Human-readable label shown in the detail pane.
     pub fn label(self) -> &'static str {
         match self {
-            SettingField::ApiKey   => "API key",
-            SettingField::Model    => "Model",
-            SettingField::Provider => "Provider",
-            SettingField::Theme    => "Theme",
-            SettingField::Accent   => "Accent",
-            SettingField::Name     => "Session name",
-            SettingField::Workdir  => "Workdir",
+            SettingField::ApiKey            => "API key",
+            SettingField::Model             => "Model",
+            SettingField::Provider          => "Provider",
+            SettingField::Theme             => "Theme",
+            SettingField::Accent            => "Accent",
+            SettingField::Name              => "Session name",
+            SettingField::Workdir           => "Workdir",
+            SettingField::AwarenessEnabled  => "Awareness",
+            SettingField::AwarenessSource   => "Model source",
+            SettingField::AwarenessModel    => "Aware model",
+            SettingField::AwarenessProvider => "Aware provider",
         }
     }
 }
@@ -171,6 +184,15 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     SettingCategory {
         name: "Session",
         fields: &[SettingField::Name, SettingField::Workdir],
+    },
+    SettingCategory {
+        name: "Awareness",
+        fields: &[
+            SettingField::AwarenessEnabled,
+            SettingField::AwarenessSource,
+            SettingField::AwarenessModel,
+            SettingField::AwarenessProvider,
+        ],
     },
 ];
 
@@ -207,6 +229,15 @@ pub struct SettingsState {
     pub accent: String,
     /// Draft working directory for this session.
     pub workdir: String,
+    /// Draft: project-awareness summary enabled.
+    pub awareness_enabled: bool,
+    /// Draft: awareness model source — `true` = inherit the session model,
+    /// `false` = use the dedicated awareness model/provider below.
+    pub awareness_inherit: bool,
+    /// Draft: dedicated awareness model (used when `awareness_inherit` is false).
+    pub awareness_model: String,
+    /// Draft: dedicated awareness provider (used when `awareness_inherit` is false).
+    pub awareness_provider: String,
 }
 
 impl SettingsState {
@@ -228,6 +259,10 @@ impl SettingsState {
             theme: config.theme.clone(),
             accent: config.accent.clone(),
             workdir: session.settings.workdir.clone(),
+            awareness_enabled: session.settings.awareness_enabled,
+            awareness_inherit: session.settings.awareness_inherit,
+            awareness_model: session.settings.awareness_model.clone(),
+            awareness_provider: session.settings.awareness_provider.clone(),
         }
     }
 
@@ -237,7 +272,12 @@ impl SettingsState {
     }
 
     /// Return a mutable reference to the text draft for `f`, or `None` for
-    /// non-text fields (Theme, Accent).
+    /// non-text fields (Theme, Accent, the awareness toggles).
+    ///
+    /// The awareness model/provider are text fields ONLY when the source is
+    /// "custom" (`awareness_inherit == false`); while inheriting they return
+    /// `None` so they can't be edited (push/backspace and Enter all no-op),
+    /// matching their dimmed "(inherited)" display.
     pub fn text_draft_mut(&mut self, f: SettingField) -> Option<&mut String> {
         match f {
             SettingField::ApiKey   => Some(&mut self.api_key),
@@ -245,7 +285,18 @@ impl SettingsState {
             SettingField::Provider => Some(&mut self.provider),
             SettingField::Name     => Some(&mut self.name),
             SettingField::Workdir  => Some(&mut self.workdir),
-            SettingField::Theme | SettingField::Accent => None,
+            SettingField::AwarenessModel if !self.awareness_inherit => {
+                Some(&mut self.awareness_model)
+            }
+            SettingField::AwarenessProvider if !self.awareness_inherit => {
+                Some(&mut self.awareness_provider)
+            }
+            SettingField::Theme
+            | SettingField::Accent
+            | SettingField::AwarenessEnabled
+            | SettingField::AwarenessSource
+            | SettingField::AwarenessModel
+            | SettingField::AwarenessProvider => None,
         }
     }
 
@@ -304,7 +355,11 @@ impl SettingsState {
     ///
     /// - Theme → toggle dark/light (no edit mode).
     /// - Accent → no-op (arrows cycle it instead).
-    /// - Text fields → enter editing mode.
+    /// - AwarenessEnabled → toggle on/off.
+    /// - AwarenessSource → toggle inherit/custom.
+    /// - AwarenessModel / AwarenessProvider → edit only when source is "custom";
+    ///   a no-op while inheriting (the values are irrelevant then).
+    /// - Other text fields → enter editing mode.
     ///
     /// No-op when not in the detail pane.
     pub fn enter(&mut self) {
@@ -320,6 +375,19 @@ impl SettingsState {
             }
             SettingField::Accent => {
                 // Accent is cycled with arrow keys; Enter is intentionally a no-op.
+            }
+            SettingField::AwarenessEnabled => {
+                self.awareness_enabled = !self.awareness_enabled;
+            }
+            SettingField::AwarenessSource => {
+                self.awareness_inherit = !self.awareness_inherit;
+            }
+            SettingField::AwarenessModel | SettingField::AwarenessProvider => {
+                // Editable only as a "custom" source; while inheriting the
+                // dedicated model/provider are irrelevant, so Enter is a no-op.
+                if !self.awareness_inherit {
+                    self.editing = true;
+                }
             }
             _ => {
                 self.editing = true;

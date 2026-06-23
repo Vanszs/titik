@@ -22,6 +22,16 @@ pub const DEFAULT_PROVIDER: &str = "";
 /// turns so the model retains recent context while the token count shrinks.
 pub const DEFAULT_PRESERVE_N: usize = 6;
 
+/// Default secondary model used to summarise the project's docs for the
+/// self-awareness block. A small, cheap model: the summary is short and
+/// regenerated each session, so capability beyond "read docs, write 4-6
+/// sentences" is wasted spend.
+pub const DEFAULT_AWARENESS_MODEL: &str = "openai/gpt-oss-20b";
+
+/// Default provider slug for the awareness summary call (strict-pinned). Groq
+/// serves the default awareness model fast and cheap.
+pub const DEFAULT_AWARENESS_PROVIDER: &str = "groq";
+
 /// Value sent as the `HTTP-Referer` header with every OpenRouter request.
 ///
 /// OpenRouter uses this to attribute usage to the originating project.

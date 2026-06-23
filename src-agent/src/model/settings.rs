@@ -23,7 +23,10 @@
 use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::config::{DEFAULT_MODEL, DEFAULT_PRESERVE_N, DEFAULT_PROVIDER};
+use crate::config::{
+    DEFAULT_AWARENESS_MODEL, DEFAULT_AWARENESS_PROVIDER, DEFAULT_MODEL, DEFAULT_PRESERVE_N,
+    DEFAULT_PROVIDER,
+};
 
 /// Controls conversation compaction behaviour (the `/compact` command).
 ///
@@ -79,10 +82,43 @@ pub struct Settings {
     /// session creation time. Used to locate AGENT.md / AGENTS.md.
     #[serde(default)]
     pub workdir: String,
+    /// Whether the project-awareness summary is generated and injected into the
+    /// system prompt. When false, no secondary-model call is made.
+    #[serde(default = "default_awareness_enabled")]
+    pub awareness_enabled: bool,
+    /// Awareness model source. `false` (default) uses the dedicated
+    /// `awareness_model` / `awareness_provider` below; `true` reuses this
+    /// session's own `model` / `provider` for the summary call.
+    #[serde(default = "default_awareness_inherit")]
+    pub awareness_inherit: bool,
+    /// Dedicated model for the awareness summary when `awareness_inherit` is
+    /// false. A small/cheap model is plenty for a few-sentence summary.
+    #[serde(default = "default_awareness_model")]
+    pub awareness_model: String,
+    /// Dedicated provider slug (strict-pinned) for the awareness summary when
+    /// `awareness_inherit` is false. Empty means OpenRouter default routing.
+    #[serde(default = "default_awareness_provider")]
+    pub awareness_provider: String,
 }
 
 fn default_model() -> String {
     DEFAULT_MODEL.to_string()
+}
+
+fn default_awareness_enabled() -> bool {
+    true
+}
+
+fn default_awareness_inherit() -> bool {
+    false
+}
+
+fn default_awareness_model() -> String {
+    DEFAULT_AWARENESS_MODEL.to_string()
+}
+
+fn default_awareness_provider() -> String {
+    DEFAULT_AWARENESS_PROVIDER.to_string()
 }
 
 impl Default for Settings {
@@ -94,6 +130,10 @@ impl Default for Settings {
             compaction: Compaction::default(),
             provider: DEFAULT_PROVIDER.to_string(),
             workdir: String::new(),
+            awareness_enabled: default_awareness_enabled(),
+            awareness_inherit: default_awareness_inherit(),
+            awareness_model: DEFAULT_AWARENESS_MODEL.to_string(),
+            awareness_provider: DEFAULT_AWARENESS_PROVIDER.to_string(),
         }
     }
 }

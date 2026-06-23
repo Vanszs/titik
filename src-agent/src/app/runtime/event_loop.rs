@@ -127,6 +127,26 @@ pub(super) fn run_loop(
                             sess.rebuild_system();
                             let _ = sess.save();
                         }
+                        // Refresh the project-awareness summary post-compaction:
+                        // the project is often better understood after a compact,
+                        // and this also satisfies the "applies on compaction"
+                        // requirement. Best-effort; gated by `awareness_enabled`
+                        // inside `summarize`. Clone the inputs out first so the
+                        // `block_on` doesn't hold a borrow of `state.rest`.
+                        let aware_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
+                            (Some(c), Some(sess)) if sess.settings.awareness_enabled => Some((
+                                Arc::clone(c),
+                                sess.settings.clone(),
+                                sess.workdir(),
+                            )),
+                            _ => None,
+                        };
+                        if let Some((c, settings, workdir)) = aware_inputs {
+                            let summary = handle.block_on(crate::app::awareness::summarize(
+                                &c, &settings, &workdir,
+                            ));
+                            state.rest.awareness_summary = summary;
+                        }
                         state.rest.waiting = false;
                         state.rest.current_task = None;
                         state.rest.status = "ready".into();

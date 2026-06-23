@@ -34,6 +34,23 @@ fn emit(tx: &UnboundedSender<StreamEvent>, event: StreamEvent) {
     let _ = tx.send(event);
 }
 
+/// Build a provider-routing directive from a provider slug.
+///
+/// Returns `None` for an empty slug (OpenRouter default routing) and
+/// `Some(ProviderRouting)` with `allow_fallbacks: false` otherwise, strictly
+/// pinning the request to that single provider. Free helper so every request
+/// path (streaming, `complete`, `complete_with`) shares one routing rule.
+fn provider_routing_for(provider: &str) -> Option<crate::dto::openrouter::ProviderRouting> {
+    if provider.is_empty() {
+        None
+    } else {
+        Some(crate::dto::openrouter::ProviderRouting {
+            only: vec![provider.to_string()],
+            allow_fallbacks: false,
+        })
+    }
+}
+
 /// Turn an OpenRouter error response body into a short human-readable message.
 /// OpenRouter returns `{"error":{"message":..,"code":..,"metadata":{"raw":..}}}`;
 /// the upstream provider's own text lives in `metadata.raw`, so prefer that, then
@@ -69,20 +86,10 @@ impl OpenRouterClient {
         }
     }
 
-    /// Build a provider-routing directive from the stored provider slug.
-    ///
-    /// Returns `None` when the slug is empty (OpenRouter default routing).
-    /// Returns `Some(ProviderRouting)` with `allow_fallbacks: false` when a
-    /// slug is set, strictly pinning the request to that provider.
+    /// Build a provider-routing directive from this client's stored provider
+    /// slug. Thin wrapper over [`provider_routing_for`] for the session model.
     fn provider_routing(&self) -> Option<crate::dto::openrouter::ProviderRouting> {
-        if self.provider.is_empty() {
-            None
-        } else {
-            Some(crate::dto::openrouter::ProviderRouting {
-                only: vec![self.provider.clone()],
-                allow_fallbacks: false,
-            })
-        }
+        provider_routing_for(&self.provider)
     }
 
     /// Streaming chat completion over Server-Sent Events.
@@ -281,6 +288,57 @@ impl OpenRouterClient {
             provider: self.provider_routing(),
             usage: UsageRequest { include: true },
             // /compact summarisation uses no tools.
+            tools: None,
+        };
+
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("{}", clean_error(status, &text)));
+        }
+
+        let chat_response: ChatResponse = response.json().await?;
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| anyhow!("no choices returned"))
+    }
+
+    /// One-off non-streaming completion against a DIFFERENT model/provider,
+    /// reusing this client's http + api_key + base_url. provider "" = default
+    /// routing.
+    ///
+    /// Generic helper for secondary-model calls (project-awareness summaries
+    /// today; a future request classifier reuses the same path). Builds the
+    /// same body `complete` does — no tools, `stream: false`, usage on — but
+    /// with the caller's `model` and provider pin. Returns the assistant
+    /// content; clean errors, no panics.
+    pub async fn complete_with(
+        &self,
+        model: &str,
+        provider: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            provider: provider_routing_for(provider),
+            usage: UsageRequest { include: true },
+            // Secondary-model calls use no tools.
             tools: None,
         };
 
