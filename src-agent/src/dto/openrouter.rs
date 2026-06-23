@@ -22,6 +22,17 @@ use crate::dto::chat::ChatMessage;
 // Request (outbound)
 // ---------------------------------------------------------------------------
 
+/// OpenRouter provider-routing directive for strict provider pinning.
+///
+/// When set, the request is routed exclusively through the listed provider with
+/// no fallback. Omitting this struct entirely (via `skip_serializing_if`) lets
+/// OpenRouter use its default routing logic.
+#[derive(Debug, Serialize)]
+pub struct ProviderRouting {
+    pub only: Vec<String>,
+    pub allow_fallbacks: bool,
+}
+
 /// POST body for `POST /api/v1/chat/completions`.
 ///
 /// `stream: true` triggers SSE delivery; `stream: false` waits for the full
@@ -31,6 +42,11 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
+    /// Optional provider-routing directive. When `Some`, the request is strictly
+    /// pinned to the specified provider. When `None`, the field is omitted and
+    /// OpenRouter uses its default routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderRouting>,
 }
 
 // ---------------------------------------------------------------------------

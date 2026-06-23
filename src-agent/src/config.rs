@@ -10,6 +10,12 @@ pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Model identifier sent to OpenRouter when the user hasn't specified one.
 pub const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
 
+/// Default OpenRouter provider slug (empty = use OpenRouter's default routing).
+///
+/// An empty string means no provider pin is applied; the `provider` field is
+/// omitted from the request body so OpenRouter selects the route automatically.
+pub const DEFAULT_PROVIDER: &str = "";
+
 /// How many most-recent messages to keep when compacting the conversation.
 ///
 /// `/compact` preserves the system prompt plus the last `DEFAULT_PRESERVE_N`

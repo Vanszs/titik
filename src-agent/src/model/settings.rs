@@ -23,7 +23,7 @@
 use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::config::{DEFAULT_MODEL, DEFAULT_PRESERVE_N};
+use crate::config::{DEFAULT_MODEL, DEFAULT_PRESERVE_N, DEFAULT_PROVIDER};
 
 /// Controls conversation compaction behaviour (the `/compact` command).
 ///
@@ -70,6 +70,11 @@ pub struct Settings {
     pub name: String,
     #[serde(default)]
     pub compaction: Compaction,
+    /// OpenRouter provider slug to strict-pin (e.g. `"anthropic"`, `"together"`).
+    /// Empty string means use OpenRouter default routing; the `provider` field is
+    /// then omitted from the request body entirely.
+    #[serde(default)]
+    pub provider: String,
 }
 
 fn default_model() -> String {
@@ -83,6 +88,7 @@ impl Default for Settings {
             model: DEFAULT_MODEL.to_string(),
             name: String::new(),
             compaction: Compaction::default(),
+            provider: DEFAULT_PROVIDER.to_string(),
         }
     }
 }

@@ -33,6 +33,8 @@ pub struct AppStateRest {
     pub scroll: u16,
     pub last_key: Option<String>,
     pub last_model: Option<String>,
+    /// Most-recently used OpenRouter provider slug (empty string = default routing).
+    pub last_provider: Option<String>,
     pub current_task: Option<AbortHandle>,
     /// Receiver for the in-flight request's events, or `None` when idle. Each
     /// request owns a fresh channel; dropping this receiver silently discards
@@ -68,6 +70,7 @@ impl AppStateRest {
             scroll: 0,
             last_key: None,
             last_model: None,
+            last_provider: None,
             current_task: None,
             active_rx: None,
         }
@@ -108,8 +111,9 @@ impl AppStateRest {
         self.streaming.take()
     }
 
-    pub fn remember_creds(&mut self, key: &str, model: &str) {
+    pub fn remember_creds(&mut self, key: &str, model: &str, provider: &str) {
         self.last_key = Some(key.to_string());
         self.last_model = Some(model.to_string());
+        self.last_provider = Some(provider.to_string());
     }
 }

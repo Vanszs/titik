@@ -35,8 +35,8 @@ pub enum Action {
     /// Re-send the last user message (Ctrl+R while idle).
     Resend,
     // --- KeyInput actions ---
-    /// Credentials form confirmed; carry the api key and model string out.
-    SaveCreds { api_key: String, model: String },
+    /// Credentials form confirmed; carry the api key, model, and provider out.
+    SaveCreds { api_key: String, model: String, provider: String },
     /// Esc on a credentials form that was NOT opened from the picker — return
     /// to the normal Chat view.
     CancelKeyInput,
@@ -176,6 +176,7 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
                     Action::SaveCreds {
                         api_key: form.api_key.trim().to_string(),
                         model: form.model.trim().to_string(),
+                        provider: form.provider.trim().to_string(),
                     }
                 }
             } else {

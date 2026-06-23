@@ -23,6 +23,7 @@ pub struct OpenRouterClient {
     api_key: String,
     base_url: String,
     model: String,
+    provider: String,
 }
 
 /// Send one event on the request channel, ignoring a closed receiver (the
@@ -32,12 +33,29 @@ fn emit(tx: &UnboundedSender<StreamEvent>, event: StreamEvent) {
 }
 
 impl OpenRouterClient {
-    pub fn new(api_key: String, base_url: String, model: String) -> Self {
+    pub fn new(api_key: String, base_url: String, model: String, provider: String) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key,
             base_url,
             model,
+            provider,
+        }
+    }
+
+    /// Build a provider-routing directive from the stored provider slug.
+    ///
+    /// Returns `None` when the slug is empty (OpenRouter default routing).
+    /// Returns `Some(ProviderRouting)` with `allow_fallbacks: false` when a
+    /// slug is set, strictly pinning the request to that provider.
+    fn provider_routing(&self) -> Option<crate::dto::openrouter::ProviderRouting> {
+        if self.provider.is_empty() {
+            None
+        } else {
+            Some(crate::dto::openrouter::ProviderRouting {
+                only: vec![self.provider.clone()],
+                allow_fallbacks: false,
+            })
         }
     }
 
@@ -62,6 +80,7 @@ impl OpenRouterClient {
             model: self.model.clone(),
             messages,
             stream: true,
+            provider: self.provider_routing(),
         };
 
         let resp = self
@@ -143,6 +162,7 @@ impl OpenRouterClient {
             model: self.model.clone(),
             messages,
             stream: false,
+            provider: self.provider_routing(),
         };
 
         let response = self
