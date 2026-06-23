@@ -151,17 +151,48 @@ pub(super) fn apply_action(
         }
 
         Action::DenyTool => {
-            // Feed a fixed "denied by user" result for the paused call, advance
-            // past it, then resume the machine.
             state.rest.awaiting_approval = false;
-            if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
-                state
-                    .rest
-                    .tool_results
-                    .push((call.id.clone(), "denied by user".to_string()));
-                state.rest.tool_idx += 1;
+            // Denial halts the turn. Answer the denied call AND every remaining
+            // pending call with "denied by user" (so the conversation stays
+            // API-valid: every tool_call gets a result), commit any results
+            // already collected this round, then STOP — do not re-stream.
+            let results = state.rest.tool_results.clone();
+            let denied_ids: Vec<String> = state
+                .rest
+                .pending_tool_calls
+                .iter()
+                .skip(state.rest.tool_idx)
+                .map(|c| c.id.clone())
+                .collect();
+            if let Some(sess) = state.rest.session.as_mut() {
+                for (id, result) in &results {
+                    let _ = msglog::append(
+                        &sess.path,
+                        Role::Tool,
+                        result,
+                        None,
+                    );
+                    sess.conversation.push_tool(id.clone(), result.clone());
+                }
+                for id in &denied_ids {
+                    let _ = msglog::append(
+                        &sess.path,
+                        Role::Tool,
+                        "denied by user",
+                        None,
+                    );
+                    sess.conversation.push_tool(id.clone(), "denied by user".to_string());
+                }
+                let _ = sess.save();
             }
-            process_tools(state, client, handle);
+            // Reset the agentic-loop state and end the turn.
+            state.rest.pending_tool_calls.clear();
+            state.rest.tool_idx = 0;
+            state.rest.tool_results.clear();
+            state.rest.agent_steps = 0;
+            state.rest.waiting = false;
+            state.rest.current_task = None;
+            state.rest.status = "denied — stopped".into();
         }
 
         Action::SaveCreds { api_key, model, provider } => {
