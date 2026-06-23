@@ -1,19 +1,23 @@
-//! View – in-app settings dashboard (Settings mode).
+//! View – in-app settings form (Settings mode).
 //!
-//! A flat (borderless) two-pane dashboard opened with `/settings` (alias
-//! `/config`). The left sidebar lists the five editable sections; the right
-//! pane shows the draft value of the selected section. A header line labels the
-//! screen and a footer shows context-sensitive key hints.
+//! A single bordered form opened with `/settings` (alias `/config`). Every
+//! editable field is shown inline — selected row is prefixed with `› ` and
+//! drawn in accent colour; others are dim. A footer shows context-sensitive
+//! key hints.
 //!
 //! Layout:
 //! ```text
-//! settings                                   ← header (dim)
-//! › API key      | sk-or-...                  ← sidebar | detail
-//!   Model        |                            (selected row in accent;
-//!   Provider     |                             others dim)
-//!   Theme        |
-//!   Session name |
-//! ↑/↓ move · Enter edit/toggle · …            ← footer (dim)
+//! ┌ settings ───────────────────────────────────────┐
+//! │                                                  │
+//! │  › API key       sk-or-v1-abc…                   │
+//! │    Model         openai/gpt-oss-120b             │
+//! │    Provider      groq                            │
+//! │    Theme         dark   ·   accent green         │
+//! │    Session name  my project                      │
+//! │    Workdir       /home/user/project              │
+//! │                                                  │
+//! └──────────────────────────────────────────────────┘
+//!  ↑/↓ move · Enter edit/toggle · ←/→ accent · Esc save & close
 //! ```
 //!
 //! This screen is purely presentational; all draft mutation lives in
@@ -24,7 +28,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Padding, Paragraph},
     Frame,
 };
 use crate::app::mode::SettingsState;
@@ -32,38 +36,113 @@ use crate::model::app_config::ThemeMode;
 use crate::view::theme::Palette;
 
 /// Section labels in display order; index matches `SettingsState::selected`.
-const SECTIONS: &[&str] = &["API key", "Model", "Provider", "Theme", "Session name", "Workdir"];
+const LABELS: &[&str] = &["API key", "Model", "Provider", "Theme", "Session name", "Workdir"];
 
-/// Render the settings dashboard for `st` using the given colour `palette`.
+/// Truncate `s` to at most `max` chars, appending `…` if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        // Reserve one char for the ellipsis
+        let cut = max.saturating_sub(1);
+        chars[..cut].iter().collect::<String>() + "…"
+    }
+}
+
+/// Render the settings form for `st` using the given colour `palette`.
 ///
-/// The selected sidebar row and the active detail label are drawn in
-/// `palette.accent`; everything else uses `palette.fg` / `palette.dim`. All
-/// colours flow through `palette` — no hardcoded `Color::` values.
+/// All colours flow through `palette` — no hardcoded `Color::` values.
 pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
-    // Outer vertical split: header (1) | body (flex) | footer (1).
+    // Outer vertical split: form box (flex) | footer (1).
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(0),    // body (sidebar + detail)
+            Constraint::Min(0),    // form box
             Constraint::Length(1), // footer / key hints
         ])
         .split(frame.area());
 
-    // Header.
-    frame.render_widget(
-        Paragraph::new("settings").style(Style::default().fg(palette.dim)),
-        outer[0],
-    );
+    // Bordered form box titled " settings ".
+    let block = Block::bordered()
+        .title(" settings ")
+        .border_style(Style::default().fg(palette.dim))
+        .title_style(Style::default().fg(palette.dim))
+        .padding(Padding::new(2, 2, 1, 1));
 
-    // Body: fixed-width sidebar on the left, detail pane fills the rest.
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
-        .split(outer[1]);
+    let inner = block.inner(outer[0]);
 
-    draw_sidebar(frame, st, palette, body[0]);
-    draw_detail(frame, st, palette, body[1]);
+    // Compute available width for values: inner width minus marker(2) + label(14) = 16.
+    let inner_w = inner.width as usize;
+    let value_w = inner_w.saturating_sub(16);
+
+    // Build one Line per field.
+    let mut lines: Vec<Line> = Vec::with_capacity(LABELS.len() * 2);
+
+    for (i, label) in LABELS.iter().enumerate() {
+        let selected = i == st.selected;
+
+        // Marker: "› " for selected, "  " otherwise — both in accent colour.
+        let marker = Span::styled(
+            if selected { "› " } else { "  " },
+            Style::default().fg(palette.accent),
+        );
+
+        // Label: left-padded to width 14.
+        let label_text = format!("{:<14}", label);
+        let label_span = Span::styled(
+            label_text,
+            Style::default().fg(if selected { palette.accent } else { palette.dim }),
+        );
+
+        // Value spans differ per field.
+        let value_spans: Vec<Span> = if i == 3 {
+            // Theme row: "dark/light   ·   accent <name>"
+            let mode = match st.theme {
+                ThemeMode::Dark => "dark",
+                ThemeMode::Light => "light",
+            };
+            vec![
+                Span::styled(mode, Style::default().fg(palette.accent)),
+                Span::styled("   ·   accent ", Style::default().fg(palette.dim)),
+                Span::styled(st.accent.as_str(), Style::default().fg(palette.accent)),
+            ]
+        } else {
+            // Text rows: show draft value, truncated to fit, cursor if editing this row.
+            let raw = match i {
+                0 => st.api_key.as_str(),
+                1 => st.model.as_str(),
+                2 => st.provider.as_str(),
+                4 => st.name.as_str(),
+                5 => st.workdir.as_str(),
+                _ => st.name.as_str(),
+            };
+            let editing_here = st.editing && selected;
+            // Reserve 1 char for cursor when editing so it doesn't push past the box.
+            let truncate_w = if editing_here {
+                value_w.saturating_sub(1)
+            } else {
+                value_w
+            };
+            let mut shown = truncate(raw, truncate_w);
+            if editing_here {
+                shown.push('█');
+            }
+            vec![Span::styled(shown, Style::default().fg(palette.fg))]
+        };
+
+        // Compose the full line: marker + label + value(s).
+        let mut spans = vec![marker, label_span];
+        spans.extend(value_spans);
+        lines.push(Line::from(spans));
+    }
+
+    // Render the form block and the rows inside it.
+    frame.render_widget(block, outer[0]);
+    frame.render_widget(Paragraph::new(lines), inner);
 
     // Footer: hints differ between navigating and editing.
     let footer = if st.editing {
@@ -73,79 +152,6 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(palette.dim)),
-        outer[2],
+        outer[1],
     );
-}
-
-/// Render the section list. The selected row is prefixed `› ` and drawn in
-/// `palette.accent`; the rest are dim.
-fn draw_sidebar(frame: &mut Frame, st: &SettingsState, palette: &Palette, area: ratatui::layout::Rect) {
-    let lines: Vec<Line> = SECTIONS
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            if i == st.selected {
-                Line::from(Span::styled(
-                    format!("› {label}"),
-                    Style::default().fg(palette.accent),
-                ))
-            } else {
-                Line::from(Span::styled(
-                    format!("  {label}"),
-                    Style::default().fg(palette.dim),
-                ))
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Render the detail pane for the selected section.
-fn draw_detail(frame: &mut Frame, st: &SettingsState, palette: &Palette, area: ratatui::layout::Rect) {
-    let lines: Vec<Line> = match st.selected {
-        // Theme row: two lines (theme mode + accent), neither is free-text.
-        3 => {
-            let mode = match st.theme {
-                ThemeMode::Dark => "dark",
-                ThemeMode::Light => "light",
-            };
-            vec![
-                Line::from(vec![
-                    Span::styled("theme: ", Style::default().fg(palette.fg)),
-                    Span::styled(mode, Style::default().fg(palette.accent)),
-                ]),
-                Line::from(vec![
-                    Span::styled("accent: ", Style::default().fg(palette.fg)),
-                    Span::styled(st.accent.as_str(), Style::default().fg(palette.accent)),
-                ]),
-                Line::from(Span::styled(
-                    "Enter toggles theme · ←/→ cycle accent",
-                    Style::default().fg(palette.dim),
-                )),
-            ]
-        }
-        // Text rows: show the draft, appending a cursor while editing this row.
-        sel => {
-            let (label, value) = match sel {
-                0 => ("API key", st.api_key.as_str()),
-                1 => ("Model", st.model.as_str()),
-                2 => ("Provider", st.provider.as_str()),
-                4 => ("Session name", st.name.as_str()),
-                5 => ("Workdir", st.workdir.as_str()),
-                _ => ("Session name", st.name.as_str()),
-            };
-            let editing_this = st.editing; // selected == sel by construction here
-            let label_color = if editing_this { palette.accent } else { palette.fg };
-            let shown = if editing_this {
-                format!("{value}█")
-            } else {
-                value.to_string()
-            };
-            vec![
-                Line::from(Span::styled(label, Style::default().fg(label_color))),
-                Line::from(Span::styled(shown, Style::default().fg(palette.fg))),
-            ]
-        }
-    };
-    frame.render_widget(Paragraph::new(lines), area);
 }
