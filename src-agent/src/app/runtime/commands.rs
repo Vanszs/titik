@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::app::mode::{KeyInputForm, Mode, SettingsState};
+use crate::app::mode::{KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
@@ -150,6 +150,25 @@ pub(super) fn apply_slash(
             };
             let st = SettingsState::from(session, &state.rest.config);
             state.mode = Mode::Settings(st);
+        }
+
+        Command::Resume => {
+            // Open the session picker so the user can switch to a different
+            // session.  Unlike CancelKeyInputToPicker we do NOT clear the
+            // current session/client — if the user Escapes the picker they
+            // return to the active chat unchanged.
+            if state.rest.waiting {
+                state.rest.status = "busy — wait for response".into();
+                return Ok(());
+            }
+            match store::list_sessions() {
+                Ok(sessions) => {
+                    state.mode = Mode::SessionPicker(PickerState::new(sessions));
+                }
+                Err(e) => {
+                    state.rest.status = format!("error listing sessions: {e}");
+                }
+            }
         }
 
         Command::Select => {

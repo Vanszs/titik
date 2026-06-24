@@ -6,12 +6,14 @@
 //! service logic (compaction, new session, rename, etc.).
 //!
 //! Supported commands: `/compact`, `/new`, `/rename [session] <name>`,
-//! `/settings` (alias `/config`), `/help`, `/quit` (aliases: `/q`, `/exit`).
+//! `/settings` (alias `/config`), `/resume` (alias `/sessions`),
+//! `/help`, `/quit` (aliases: `/q`, `/exit`).
 
 /// User-facing slash commands shown in the `/` palette, in display order.
 /// (name, one-line description). Source of truth for the palette UI.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
+    ("/resume", "Open the session picker to switch sessions"),
     ("/mode", "Toggle Normal/Auto tool approval"),
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/compact", "Summarize and compact the conversation"),
@@ -54,6 +56,8 @@ pub enum Command {
     Rename(String),
     /// Open the in-app settings dashboard (alias: `/config`).
     Settings,
+    /// Open the session picker to switch to a different session (alias: `/sessions`).
+    Resume,
     /// Dump the conversation to the normal terminal for native copy/paste.
     Select,
     /// Print available commands to the chat view.
@@ -90,6 +94,7 @@ pub fn parse(line: &str) -> Command {
         "new" => Command::New,
         "mode" => Command::Mode,
         "settings" | "config" => Command::Settings,
+        "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,
         "quit" | "q" | "exit" => Command::Quit,
