@@ -105,8 +105,13 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
 
     for (i, &j) in picker.filtered_idx.iter().enumerate() {
         let meta = &picker.all[j];
+        // Monochrome lock marker (NO emoji — house rule). A locked session is one
+        // open in a live instance (including ours); it reads as "[locked]" and
+        // can't be entered. Kept fixed-width so the right column stays aligned
+        // across locked and unlocked rows.
+        let lock = if meta.locked { "[locked]" } else { "        " };
         let right = format!(
-            "{:>3} msgs   {:>8}",
+            "{:>3} msgs   {:>8}  {lock}",
             meta.message_count,
             fmt_modified(meta.modified)
         );
@@ -118,7 +123,11 @@ pub fn draw(frame: &mut Frame, picker: &PickerState, palette: &Palette) {
         let name = truncate(&meta.name, name_w);
         let row = format!("{name:<name_w$}  {right}");
 
-        let style = if i == picker.selected {
+        // Locked rows are dimmed so they visibly read as non-selectable; the
+        // selection highlight still applies to selectable (unlocked) rows.
+        let style = if meta.locked {
+            Style::default().fg(palette.dim)
+        } else if i == picker.selected {
             Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
         } else {
             Style::default().fg(palette.fg)

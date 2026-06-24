@@ -20,7 +20,7 @@
 //! - `rename_session` — slugify the new name, find a free directory, `fs::rename`.
 //! - `slugify` — normalise a human name into a safe directory name.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
@@ -42,6 +42,11 @@ pub struct SessionMeta {
     pub modified: SystemTime,
     /// Number of non-System messages, counted best-effort (0 on read failure).
     pub message_count: usize,
+    /// `true` when the session is currently open in a LIVE process (a fresh
+    /// `session.lock` holding a still-running PID). Computed via [`is_locked`],
+    /// so a stale lock from a crashed instance reads as unlocked. The picker
+    /// shows a lock marker and refuses to enter a locked session.
+    pub locked: bool,
 }
 
 /// Returns `~/.simple-coder/` (the application data root).
@@ -105,12 +110,18 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
+        // Lock state for the picker. `is_locked` treats a stale lock (dead PID)
+        // as unlocked and opportunistically clears it, so this is also the place
+        // crashed-instance leftovers get swept on the next listing.
+        let locked = is_locked(&path);
+
         metas.push(SessionMeta {
             id,
             name,
             path,
             modified,
             message_count,
+            locked,
         });
     }
 
@@ -223,5 +234,72 @@ pub(crate) fn slugify(name: &str) -> Result<String> {
         Err(anyhow!("name contains no usable characters"))
     } else {
         Ok(slug)
+    }
+}
+
+// --- Per-session locking ----------------------------------------------------
+//
+// A running instance marks its active session with a `session.lock` file inside
+// the session directory; the file holds the owner's PID. The picker reads these
+// to show a lock marker and to refuse re-entering a session that is already open
+// (including this instance's own session, which it holds the lock for).
+//
+// Crash safety is by PID liveness, not by the file's mere presence: if the PID
+// recorded in `session.lock` is no longer a live process, the lock is STALE and
+// treated as unlocked (and the stale file is swept). This platform is Linux, so
+// liveness is a `/proc/<pid>` existence check. All IO here is best-effort — a
+// failed read/write/remove must never crash or block the TUI.
+
+/// Path to a session's lock file: `<session_dir>/session.lock`.
+fn lock_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("session.lock")
+}
+
+/// Whether `pid` refers to a live process on this (Linux) host.
+///
+/// Our own PID is alive by definition. Any other PID is alive iff `/proc/<pid>`
+/// exists — the simple, Linux-correct check the spec calls for.
+fn pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Write our PID into the session's lock file, overwriting any existing one.
+///
+/// Best-effort: IO errors are ignored (e.g. a read-only or vanished dir just
+/// means the session won't appear locked — never a crash).
+pub fn write_lock(session_dir: &Path) {
+    let _ = std::fs::write(lock_path(session_dir), std::process::id().to_string());
+}
+
+/// Remove the session's lock file. Best-effort; a missing file or IO error is
+/// ignored.
+pub fn remove_lock(session_dir: &Path) {
+    let _ = std::fs::remove_file(lock_path(session_dir));
+}
+
+/// Whether the session is locked by a LIVE process (this one included).
+///
+/// Reads the PID from `session.lock`:
+/// - file missing / unreadable → NOT locked.
+/// - PID parses and is alive   → locked.
+/// - PID is dead or unparseable → STALE: treat as NOT locked and opportunistically
+///   remove the stale file so it stops haunting future checks.
+pub fn is_locked(session_dir: &Path) -> bool {
+    let path = lock_path(session_dir);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false, // no lock file (or unreadable) → not locked
+    };
+    match contents.trim().parse::<u32>() {
+        Ok(pid) if pid_alive(pid) => true,
+        // Dead PID or garbage in the file: stale lock. Sweep it (best-effort)
+        // and report unlocked so a crashed instance never blocks a session.
+        _ => {
+            let _ = std::fs::remove_file(&path);
+            false
+        }
     }
 }

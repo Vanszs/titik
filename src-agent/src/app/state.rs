@@ -218,6 +218,12 @@ pub struct AppStateRest {
     /// only when a compaction finished faster than the minimum so the apply is
     /// deferred (non-blocking) rather than slept on. Applied by the event loop.
     pub compact_pending: Option<(String, Vec<crate::dto::chat::ChatMessage>)>,
+    /// Path of the session whose on-disk `session.lock` THIS instance currently
+    /// holds (its active session's directory). `reconcile_session_lock` keeps it
+    /// in lock-step with the active session: it releases this lock when switching
+    /// away and acquires the new one. The clean-exit teardown in `runtime::run`
+    /// removes it; a crash leaves a stale lock that PID-liveness later sweeps.
+    pub held_lock: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -284,6 +290,7 @@ impl AppStateRest {
             compact_anim_start: None,
             compact_apply_at: None,
             compact_pending: None,
+            held_lock: None,
         }
     }
 

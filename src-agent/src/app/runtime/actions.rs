@@ -282,6 +282,10 @@ pub(super) fn apply_action(
                     Some(build_client(sess))
                 };
             }
+            // Restoring prev_session here bypasses warm_session, so reconcile the
+            // lock directly: release the lock for the session we were configuring
+            // and re-acquire the restored one's.
+            super::reconcile_session_lock(state);
             state.rest.reset_scroll();
             state.mode = Mode::Chat;
             if client.is_none() {
@@ -314,6 +318,14 @@ pub(super) fn apply_action(
                 state.rest.status = "no session selected".into();
                 return Ok(());
             };
+            // Re-check the lock live (don't trust the cached row flag) so a race
+            // — the session getting opened elsewhere after the list was built —
+            // can't slip through. If it's locked by a live process, refuse to
+            // enter and stay in the picker; the row already shows the marker.
+            if store::is_locked(&path) {
+                state.rest.status = "session is open — can't enter".into();
+                return Ok(());
+            }
             let sess = match Session::load(&path) {
                 Ok(s) => s,
                 Err(e) => {

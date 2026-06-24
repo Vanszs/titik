@@ -39,6 +39,28 @@ use event_loop::run_loop;
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Make the on-disk lock match the active session.
+///
+/// Releases the previously-held lock if the active session changed, then writes
+/// a fresh `session.lock` for the current one. A no-op when the active session
+/// is unchanged (so calling it on every activation is cheap and idempotent).
+/// All lock IO is best-effort, so this never fails or blocks.
+pub(super) fn reconcile_session_lock(state: &mut AppState) {
+    let cur = state.rest.session.as_ref().map(|s| s.path.clone());
+    if state.rest.held_lock == cur {
+        return; // active session unchanged → on-disk lock already correct
+    }
+    // Drop the stale lock first so switching away from a session unlocks it.
+    if let Some(old) = state.rest.held_lock.take() {
+        crate::model::store::remove_lock(&old);
+    }
+    // Acquire the new session's lock (if there is an active session now).
+    if let Some(new) = cur {
+        crate::model::store::write_lock(&new);
+        state.rest.held_lock = Some(new);
+    }
+}
+
 /// Warm a newly-activated session to match a cold terminal launch: kick off a
 /// background reindex of its workspace and (best-effort) compute the project
 /// awareness summary. Safe to call whenever a session becomes the active one
@@ -48,6 +70,11 @@ pub(super) fn warm_session(
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
+    // Claim the lock for the now-active session (and release any prior one).
+    // Cheap no-op when the active session is unchanged. Placed first so every
+    // activation path that routes through warm_session — startup, /new,
+    // picker-select, creds-confirm — acquires the lock.
+    reconcile_session_lock(state);
     // Snapshot what we need, dropping the session borrow before block_on +
     // the mutable write to state.rest.awareness_summary.
     let (workdir, settings) = match state.rest.session.as_ref() {
@@ -197,6 +224,14 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
 
     // Terminal teardown is handled by `_guard`'s Drop at function scope.
+
+    // Clean-exit unlock: release the lock we hold for the active session so the
+    // session is immediately re-enterable. Runs on both the Ok and Err paths
+    // (this is after run_loop returns either way). A crash that skips this is
+    // covered by PID-liveness staleness in `store::is_locked`.
+    if let Some(p) = state.rest.held_lock.take() {
+        crate::model::store::remove_lock(&p);
+    }
 
     // drop(rt) LAST: runtime shutdown cancels spawned tasks. Each task owns the
     // sender of its own per-request channel; once dropped here (or earlier when
