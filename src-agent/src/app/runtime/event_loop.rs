@@ -180,10 +180,15 @@ pub(super) fn run_loop(
                         state.rest.append_reasoning(&t);
                         state.rest.status = "thinking".into();
                     }
-                    StreamEvent::Usage { prompt_tokens, completion_tokens, cost } => {
+                    StreamEvent::Usage { prompt_tokens, completion_tokens, cached_tokens, cost } => {
                         // Stash for the assistant-commit step; do NOT break —
                         // usage arrives just before Done.
                         state.rest.pending_usage = Some((prompt_tokens, completion_tokens, cost));
+                        // Cached-prompt-token count for THIS prompt (current
+                        // context, like tokens_in — not cumulative). Set straight
+                        // away so the readout can show the cache hit even on a
+                        // tool round-trip that commits no assistant text.
+                        state.rest.tokens_cached = cached_tokens;
                     }
                     StreamEvent::ToolCalls(calls) => {
                         // Stash the requested tool calls; do NOT break — Done

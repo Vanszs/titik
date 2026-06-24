@@ -27,10 +27,13 @@ pub enum StreamEvent {
     Reasoning(String),
     /// Token/cost accounting for the in-flight generation. Arrives on the final
     /// streaming chunk, just before [`StreamEvent::Done`]; stashed and committed
-    /// with the assistant message.
+    /// with the assistant message. `cached_tokens` is the share of `prompt_tokens`
+    /// served from the prompt cache (a cache hit at the discounted rate); 0 on a
+    /// cold prefix or a provider that doesn't report cache stats.
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
+        cached_tokens: u64,
         cost: f64,
     },
     /// The model requested one or more tool calls. Emitted just before

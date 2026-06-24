@@ -9,6 +9,10 @@ to behave. Follow it precisely — malformed calls waste turns.
   user wants + the steps you'll take) BEFORE calling anything.
 - BATCH. Prefer one dir_list call with several paths over many separate calls.
   Do not explore one directory at a time when you can fetch several at once.
+- PARALLEL TOOL CALLS. When multiple tool calls are independent (e.g. reading
+  several files, or running git status and git diff at the same time), emit them
+  together in a single message instead of one per turn — this is faster and uses
+  fewer tokens overall.
 - To locate a file when you do not know its exact path, use glob (e.g.
   pattern "**/theme.rs") or grep — do NOT guess a bare path like "theme.rs".
   All paths are workspace-relative from the project root, and files are often

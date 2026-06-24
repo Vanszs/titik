@@ -83,6 +83,17 @@ pub(super) fn warm_session(
         None => return,
     };
     crate::tool::dircache::reindex(workdir.clone(), state.rest.dir_cache.clone());
+    // Best-effort: prefetch the model catalogue so `context_length` is available
+    // for the threshold gate in `shortsend::shape`. A failed fetch leaves
+    // `models_cache` as `None`, which the threshold gate treats as unknown → uses
+    // the fallback window constant instead. Never blocks the session or panics.
+    if state.rest.models_cache.is_none() {
+        if let Some(c) = client.as_ref() {
+            if let Ok(models) = handle.block_on(c.list_models()) {
+                state.rest.models_cache = Some(models);
+            }
+        }
+    }
     if settings.awareness_enabled {
         if let Some(c) = client.as_ref() {
             let summary = handle.block_on(crate::app::awareness::summarize(c, &settings, &workdir));

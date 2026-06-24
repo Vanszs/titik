@@ -16,8 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{APP_TITLE, HTTP_REFERER};
 use crate::dto::chat::{ChatMessage, ToolCall};
 use crate::dto::openrouter::{
-    ChatRequest, ChatResponse, ModelInfo, ModelsResponse, ReasoningConfig, StreamChunk, ToolDef,
-    ToolFunctionDef, UsageRequest,
+    to_wire, ChatRequest, ChatResponse, ModelInfo, ModelsResponse, ReasoningConfig, StreamChunk,
+    ToolDef, ToolFunctionDef, UsageRequest,
 };
 use crate::service::StreamEvent;
 
@@ -32,6 +32,12 @@ pub struct OpenRouterClient {
     /// effort level like `"low"`/`"high"`); mapped to the request `reasoning`
     /// object by [`reasoning_config`]. Only [`Self::stream_complete`] applies it.
     effort: String,
+    /// Whimsical plan lead-in word, chosen ONCE per client (= per session) in
+    /// the constructor. [`Self::stream_complete`] injects this SAME word into the
+    /// system message every request instead of rolling a fresh one each time —
+    /// keeping the system prefix byte-stable across the session so OpenRouter
+    /// prompt caching can hit. (A per-request random word busted the cache.)
+    plan_word: String,
 }
 
 /// Send one event on the request channel, ignoring a closed receiver (the
@@ -130,6 +136,17 @@ pub fn effort_caps(models: &[ModelInfo], model_id: &str) -> EffortCaps {
     }
 }
 
+/// Return the context-window size (tokens) for `model_id` from a `GET /models`
+/// listing. Returns `None` when the model is absent from the listing or its
+/// `context_length` field was not reported. The caller falls back to a hardcoded
+/// default when `None` is returned — never panics.
+pub fn context_length_for(models: &[ModelInfo], model_id: &str) -> Option<u64> {
+    models
+        .iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| m.context_length)
+}
+
 /// Turn an OpenRouter error response body into a short human-readable message.
 /// OpenRouter returns `{"error":{"message":..,"code":..,"metadata":{"raw":..}}}`;
 /// the upstream provider's own text lives in `metadata.raw`, so prefer that, then
@@ -169,6 +186,9 @@ impl OpenRouterClient {
             model,
             provider,
             effort,
+            // Pick the plan lead-in ONCE here so every request in this session
+            // injects the same word → the cached system prefix stays byte-stable.
+            plan_word: crate::resources::wanderer_word(),
         }
     }
 
@@ -176,6 +196,14 @@ impl OpenRouterClient {
     /// slug. Thin wrapper over [`provider_routing_for`] for the session model.
     fn provider_routing(&self) -> Option<crate::dto::openrouter::ProviderRouting> {
         provider_routing_for(&self.provider)
+    }
+
+    /// The whimsical plan lead-in word chosen once per client (= per session) in
+    /// the constructor. Exposed so the runtime can inject the SAME steer into the
+    /// system message every request (inside the cached head), keeping the cached
+    /// prefix byte-stable so prompt caching can hit.
+    pub fn plan_word(&self) -> &str {
+        &self.plan_word
     }
 
     /// Streaming chat completion over Server-Sent Events.
@@ -191,21 +219,14 @@ impl OpenRouterClient {
     /// `Ok(())`. The caller (a spawned task) discards the return value.
     pub async fn stream_complete(
         &self,
-        mut messages: Vec<ChatMessage>,
+        messages: Vec<ChatMessage>,
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
-        // Steer the model to lead its FIRST plan with a random whimsical corpus
-        // word (instead of "Plan:"). Injected per request into the System
-        // message so the model plans up front and the runtime needs no separate
-        // "plan first" nudge round in the common case.
-        if let Some(first) = messages.first_mut() {
-            if first.role == crate::dto::chat::Role::System {
-                let word = crate::resources::wanderer_word();
-                first.content.push_str(&format!(
-                    "\n\nWhen you write your plan for this task, lead with the single word \"{word}:\" (a whimsical lead-in) instead of \"Plan:\"."
-                ));
-            }
-        }
+        // The plan-word steer is now injected into the System message upstream in
+        // `start_stream_task`, BEFORE the volatile project-files/awareness tail and
+        // ahead of the `CACHE_SPLIT_MARK` boundary, so it stays inside the cached
+        // (byte-stable) head. `to_wire` splits the System content on that mark and
+        // puts the cache breakpoint on the head only.
         let url = format!("{}/chat/completions", self.base_url);
         // Expose the built-in tool set to the model. Each tool maps to an
         // OpenAI/OpenRouter `function` definition (name + description + raw
@@ -223,7 +244,9 @@ impl OpenRouterClient {
             .collect();
         let body = ChatRequest {
             model: self.model.clone(),
-            messages,
+            // Wrap into wire messages: the system message gets the single prompt-
+            // caching breakpoint; everything else serialises as a plain string.
+            messages: to_wire(messages),
             stream: true,
             provider: self.provider_routing(),
             usage: UsageRequest { include: true },
@@ -233,6 +256,8 @@ impl OpenRouterClient {
             reasoning: reasoning_config(&self.effort),
             // Free-form text reply; structured output is classifier-only.
             response_format: None,
+            // Generous runaway cap for the interactive path.
+            max_tokens: Some(32_000),
         };
 
         let resp = self
@@ -355,11 +380,19 @@ impl OpenRouterClient {
                         }
                     }
                     if let Some(u) = c.usage {
+                        // Cache hit count lives in the optional details object;
+                        // absent/null → 0 (cold prefix or no cache reporting).
+                        let cached_tokens = u
+                            .prompt_tokens_details
+                            .as_ref()
+                            .map(|d| d.cached_tokens)
+                            .unwrap_or(0);
                         emit(
                             &tx,
                             StreamEvent::Usage {
                                 prompt_tokens: u.prompt_tokens,
                                 completion_tokens: u.completion_tokens,
+                                cached_tokens,
                                 cost: u.cost,
                             },
                         );
@@ -382,7 +415,7 @@ impl OpenRouterClient {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
             model: self.model.clone(),
-            messages,
+            messages: to_wire(messages),
             stream: false,
             provider: self.provider_routing(),
             usage: UsageRequest { include: true },
@@ -392,6 +425,8 @@ impl OpenRouterClient {
             reasoning: None,
             // Free-form summary text; structured output is classifier-only.
             response_format: None,
+            // No cap on compaction: the summary length is bounded by the prompt.
+            max_tokens: None,
         };
 
         let response = self
@@ -437,7 +472,7 @@ impl OpenRouterClient {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
             model: model.to_string(),
-            messages,
+            messages: to_wire(messages),
             stream: false,
             provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },
@@ -447,6 +482,8 @@ impl OpenRouterClient {
             reasoning: None,
             // Free-form reply; structured output is classifier-only.
             response_format: None,
+            // No cap: awareness summaries can be long.
+            max_tokens: None,
         };
 
         let response = self
@@ -524,7 +561,7 @@ impl OpenRouterClient {
         });
         let body = ChatRequest {
             model: model.to_string(),
-            messages,
+            messages: to_wire(messages),
             stream: false,
             provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },
@@ -540,6 +577,8 @@ impl OpenRouterClient {
             }),
             // Force the verdict object as strict JSON.
             response_format: Some(response_format),
+            // Classifier returns a tiny JSON object; cap prevents runaway.
+            max_tokens: Some(2_000),
         };
 
         let response = self
@@ -608,7 +647,7 @@ impl OpenRouterClient {
         ];
         let body = ChatRequest {
             model: model.to_string(),
-            messages,
+            messages: to_wire(messages),
             stream: false,
             // `provider_routing_for` treats "" as default routing; a `None`
             // provider behaves the same (no pin).
@@ -628,6 +667,8 @@ impl OpenRouterClient {
             }),
             // Free-form summary prose; structured output is classifier-only.
             response_format: None,
+            // No cap: fold summaries can be proportionally sized.
+            max_tokens: None,
         };
 
         let response = self
@@ -720,7 +761,7 @@ impl OpenRouterClient {
         ];
         let body = ChatRequest {
             model: model.to_string(),
-            messages,
+            messages: to_wire(messages),
             stream: false,
             provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },
@@ -736,6 +777,8 @@ impl OpenRouterClient {
             }),
             // Force the id list as strict JSON.
             response_format: Some(response_format),
+            // Picker returns a tiny JSON object; cap prevents runaway.
+            max_tokens: Some(2_000),
         };
 
         // Best-effort: any failure returns an empty selection rather than erroring.

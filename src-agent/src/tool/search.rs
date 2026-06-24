@@ -113,7 +113,7 @@ impl Tool for Grep {
         }
         let mut out = matches.join("\n");
         if truncated {
-            out.push_str("\n... (truncated at 200 matches)");
+            out.push_str("\n... (truncated at 200 matches; narrow your pattern or path to see more)");
         }
         Ok(out)
     }
@@ -195,7 +195,7 @@ impl Tool for Glob {
         }
         let mut out = results.join("\n");
         if truncated {
-            out.push_str("\n... (truncated at 200 results)");
+            out.push_str("\n... (truncated at 200 results; narrow the glob to see more)");
         }
         Ok(out)
     }

@@ -361,9 +361,18 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
     // left (dim); the cumulative token/cost readout right-aligned (accent).
     let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
     let readout = if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
+        // Show the cached-prompt-token count right after the input arrow when the
+        // last response hit the prompt cache (`cached:N`), so the saving is
+        // visible; omitted entirely on a cold prefix to keep the readout quiet.
+        let cached = if rest.tokens_cached > 0 {
+            format!(" cached:{}", fmt_count(rest.tokens_cached))
+        } else {
+            String::new()
+        };
         Some(format!(
-            "↑{} ↓{}  ${:.4}",
+            "↑{}{} ↓{}  ${:.4}",
             fmt_count(rest.tokens_in),
+            cached,
             fmt_count(rest.tokens_out),
             rest.cost
         ))

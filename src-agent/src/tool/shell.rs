@@ -96,7 +96,7 @@ impl Tool for Bash {
 
         let mut out = String::new();
         if truncated {
-            out.push_str("... (output truncated, showing tail)\n");
+            out.push_str("... (output truncated to last 8000 chars; redirect to a file and read it if you need the full output)\n");
         }
         out.push_str(&tail);
         if !out.ends_with('\n') {

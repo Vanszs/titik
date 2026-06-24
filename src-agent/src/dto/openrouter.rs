@@ -22,6 +22,150 @@ use crate::dto::chat::ChatMessage;
 // Request (outbound)
 // ---------------------------------------------------------------------------
 
+// --- Prompt-caching wire layer --------------------------------------------
+//
+// OpenRouter prompt caching wants ONE `cache_control: {"type":"ephemeral"}`
+// breakpoint on the LAST content block of the stable prefix (here: the system
+// message). `cache_control` can only ride a content block, so a cached message
+// must serialise its `content` as an ARRAY of parts rather than a plain string.
+//
+// `ChatMessage.content` stays a `String` (it's used everywhere); this is a
+// serialise-only mirror used solely when building the request body. Non-system
+// messages serialise `content` as a plain string — byte-identical to the old
+// wire format — so nothing about existing behaviour changes for them.
+
+/// `cache_control` marker placed on a content part to open a cache breakpoint.
+/// Serialises to `{"type":"ephemeral"}`. `pub(crate)` only to satisfy the
+/// reachability of the wire types it's nested under; never named outside this
+/// module.
+#[derive(Serialize)]
+pub(crate) struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// One content part of a multi-part message `content` array. Carries the text
+/// plus an optional `cache_control` breakpoint (set only on the last part of
+/// the stable prefix). `pub(crate)` only to satisfy the reachability of the wire
+/// types it's nested under; never named outside this module.
+#[derive(Serialize)]
+pub(crate) struct ContentPart {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// Message `content` on the wire: either a plain string (no caching, identical
+/// to the old format) or an array of parts (when a `cache_control` breakpoint
+/// must be attached). `#[serde(untagged)]` makes the string serialise as a bare
+/// JSON string and the parts as a JSON array, matching the API's accepted shapes.
+///
+/// `pub(crate)` only to match the reachability of `WireMessage::content` (which
+/// is `pub` on a `pub(crate)` struct); it's never constructed outside this module
+/// — `to_wire` is the only producer.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum WireContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// Serialise-only mirror of [`ChatMessage`] for the request body. Field names /
+/// serde attrs match `ChatMessage` exactly (`tool_calls` / `tool_call_id` with
+/// `skip_serializing_if`) so the wire format is identical, except `content` can
+/// now carry a `cache_control` breakpoint via [`WireContent::Parts`]. The
+/// display-only `reasoning` field is intentionally absent (it's `#[serde(skip)]`
+/// on `ChatMessage`, i.e. never sent).
+#[derive(Serialize)]
+pub struct WireMessage {
+    pub role: crate::dto::chat::Role,
+    pub content: WireContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::dto::chat::ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Convert a conversation history into wire messages, placing the single prompt-
+/// caching breakpoint on the system message (the stable prefix).
+///
+/// The System message gets `WireContent::Parts`; every other message serialises as
+/// `WireContent::Text` — a plain `"content":"…"` string, byte-identical to the
+/// pre-caching wire format. If there is no System message, no breakpoint is set
+/// (all messages stay plain strings).
+///
+/// The System content may carry a [`CACHE_SPLIT_MARK`](crate::dto::chat::CACHE_SPLIT_MARK)
+/// boundary that separates the STABLE cached head (base prompt + plan-word steer)
+/// from the VOLATILE tail (project file listing + awareness summary, which change
+/// across sessions/turns). When present, the content is split once at the mark
+/// (which is stripped, never sent):
+/// - the head becomes a `ContentPart` WITH the `cache_control: ephemeral`
+///   breakpoint — only this byte-stable prefix is cached, so file changes in the
+///   tail never bust the cache,
+/// - the tail becomes a SECOND `ContentPart` WITHOUT `cache_control`, emitted only
+///   when non-empty (an empty tail collapses to the single cached part).
+///
+/// When the System content has NO mark (e.g. secondary/utility calls that build a
+/// fresh system message), the whole content is emitted as one cached part — the
+/// original pre-split behaviour.
+pub fn to_wire(messages: Vec<ChatMessage>) -> Vec<WireMessage> {
+    messages
+        .into_iter()
+        .map(|m| {
+            let content = if m.role == crate::dto::chat::Role::System {
+                WireContent::Parts(system_parts(m.content))
+            } else {
+                WireContent::Text(m.content)
+            };
+            WireMessage {
+                role: m.role,
+                content,
+                tool_calls: m.tool_calls,
+                tool_call_id: m.tool_call_id,
+            }
+        })
+        .collect()
+}
+
+/// Build the System message's wire content parts, splitting the stable cached head
+/// from the volatile tail on [`CACHE_SPLIT_MARK`](crate::dto::chat::CACHE_SPLIT_MARK).
+///
+/// - mark present → `[head WITH cache_control, tail WITHOUT cache_control]`, the
+///   tail part included only if non-empty; the mark itself is stripped.
+/// - mark absent (or an empty tail) → a single cached part holding the whole
+///   content — the original behaviour.
+fn system_parts(content: String) -> Vec<ContentPart> {
+    match content.split_once(crate::dto::chat::CACHE_SPLIT_MARK) {
+        Some((head, tail)) if !tail.is_empty() => vec![
+            ContentPart {
+                kind: "text",
+                text: head.to_string(),
+                cache_control: Some(CacheControl { kind: "ephemeral" }),
+            },
+            ContentPart {
+                kind: "text",
+                text: tail.to_string(),
+                cache_control: None,
+            },
+        ],
+        // No mark, or an empty tail: one cached part holding the head (mark
+        // stripped). `split_once` returns the head before the mark; with no mark
+        // the whole string is the head.
+        Some((head, _)) => vec![ContentPart {
+            kind: "text",
+            text: head.to_string(),
+            cache_control: Some(CacheControl { kind: "ephemeral" }),
+        }],
+        None => vec![ContentPart {
+            kind: "text",
+            text: content,
+            cache_control: Some(CacheControl { kind: "ephemeral" }),
+        }],
+    }
+}
+
 /// OpenRouter provider-routing directive for strict provider pinning.
 ///
 /// When set, the request is routed exclusively through the listed provider with
@@ -92,10 +236,13 @@ pub struct ToolDef {
 ///
 /// `stream: true` triggers SSE delivery; `stream: false` waits for the full
 /// response (used only by the compaction summary request).
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct ChatRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    /// Wire-format messages. Built from a `Vec<ChatMessage>` via [`to_wire`],
+    /// which attaches the single prompt-caching `cache_control` breakpoint to
+    /// the system message; non-system messages serialise as plain strings.
+    pub messages: Vec<WireMessage>,
     pub stream: bool,
     /// Optional provider-routing directive. When `Some`, the request is strictly
     /// pinned to the specified provider. When `None`, the field is omitted and
@@ -123,6 +270,13 @@ pub struct ChatRequest {
     /// the interactive/compaction calls emit free-form text as before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
+    /// Hard cap on generated tokens. A generous limit (e.g. 32 000) on the
+    /// interactive path guards against runaway generation; small caps (e.g. 2 000)
+    /// on classifier/picker calls that return tiny JSON. `None` lets the provider
+    /// use its own default. Omitted from the wire body when `None` via
+    /// `skip_serializing_if`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +301,8 @@ pub struct ModelReasoning {
 /// One model entry from `GET /models`. Only the fields the effort-capability
 /// derivation needs are modelled; the rest of OpenRouter's rich model record is
 /// ignored. `reasoning` is absent for models with no thinking support.
+/// `context_length` is the model's maximum context window in tokens, taken from
+/// the top-level field OpenRouter exposes on each model object.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelInfo {
     pub id: String,
@@ -154,6 +310,8 @@ pub struct ModelInfo {
     pub supported_parameters: Vec<String>,
     #[serde(default)]
     pub reasoning: Option<ModelReasoning>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
 }
 
 /// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.
@@ -179,6 +337,22 @@ pub struct Usage {
     /// OpenRouter total cost (USD) for this generation.
     #[serde(default)]
     pub cost: f64,
+    /// Breakdown of the prompt tokens, including how many were served from the
+    /// prompt cache. Present when the request set `usage: {"include": true}` and
+    /// the provider reports cache stats; `None`/null otherwise (defaulted, so a
+    /// missing object never fails to deserialise).
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// The `prompt_tokens_details` sub-object of [`Usage`]. `cached_tokens` is the
+/// count of prompt tokens served from the prompt cache (a cache hit) at the
+/// discounted rate — what prompt caching saves. Defaults to 0 so a partial /
+/// absent object still deserialises.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------

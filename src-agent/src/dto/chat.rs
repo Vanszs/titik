@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 /// transcript. An invisible char so it never affects what the model reads.
 pub const PLAN_NUDGE_MARK: &str = "\u{2063}";
 
+/// Marks the boundary in a System message between the STABLE cached head and
+/// the volatile (per-session-changing) tail (project file listing, awareness
+/// summary). `to_wire` puts the cache breakpoint on the head only.
+pub const CACHE_SPLIT_MARK: &str = "\u{2062}\u{2061}";
+
 /// Which participant authored a message.
 ///
 /// Serialised as lowercase strings (`"system"`, `"user"`, `"assistant"`) to

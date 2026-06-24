@@ -50,9 +50,13 @@ impl Tool for DirList {
         }
         if dirs.is_empty() { dirs.push(".".to_string()); }
 
+        const MAX_ENTRIES: usize = 500;
+
         let cache = ctx.dir_cache.read().map_err(|_| anyhow::anyhow!("dir cache unavailable"))?;
         let mut out = String::new();
-        for dir in &dirs {
+        let mut total_entries = 0usize;
+        let mut truncated = false;
+        'outer: for dir in &dirs {
             // sandbox the path even though we read from the cache, to reject escapes
             let _ = resolve(&ctx.workspace, dir)?;
             let children = cache.children(dir);
@@ -62,12 +66,20 @@ impl Tool for DirList {
                 out.push_str("  (empty or not indexed)\n");
             } else {
                 for c in &children {
+                    if total_entries >= MAX_ENTRIES {
+                        truncated = true;
+                        break 'outer;
+                    }
                     out.push_str("  ");
                     out.push_str(c);
                     out.push('\n');
+                    total_entries += 1;
                 }
             }
             out.push('\n');
+        }
+        if truncated {
+            out.push_str("... (truncated at 500 entries; use a more specific path)");
         }
         Ok(out.trim_end().to_string())
     }
@@ -78,13 +90,21 @@ pub struct Read;
 impl Tool for Read {
     fn name(&self) -> &'static str { "read" }
     fn description(&self) -> &'static str {
-        "Read a workspace-relative file. Returns line-numbered content."
+        "Read a workspace-relative file. Returns line-numbered content. Use offset/limit to paginate large files."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path" }
+                "path": { "type": "string", "description": "Workspace-relative file path" },
+                "offset": {
+                    "type": "integer",
+                    "description": "0-based line to start from (default 0)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max lines to read (default 2000, capped at 2000)."
+                }
             },
             "required": ["path"]
         })
@@ -104,27 +124,51 @@ impl Tool for Read {
         const MAX_LINES: usize = 2000;
         const MAX_BYTES: usize = 50 * 1024;
 
+        // Parse optional offset/limit; clamp limit to the hard cap.
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let limit = args.get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| (v as usize).min(MAX_LINES))
+            .unwrap_or(MAX_LINES);
+
+        // Collect all lines so we know the total for the notice.
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total_lines = all_lines.len();
+
         let mut out = String::new();
         let mut bytes = 0usize;
-        let mut truncated = false;
-        // The loop only ever emits or breaks, so `i` equals the number of lines
-        // already emitted at the top of each iteration.
-        for (i, line) in content.lines().enumerate() {
-            if i >= MAX_LINES {
-                truncated = true;
+        // `last_emitted_idx` tracks the 0-based index of the last line emitted.
+        let mut last_emitted_idx: Option<usize> = None;
+        let mut byte_truncated = false;
+
+        for (idx, line) in all_lines.iter().enumerate().skip(offset) {
+            if idx >= offset + limit {
                 break;
             }
             // 1-indexed line numbers, right-aligned in a 6-wide field.
-            let rendered = format!("{:>6}\t{}\n", i + 1, line);
-            if bytes + rendered.len() > MAX_BYTES && i > 0 {
-                truncated = true;
+            let rendered = format!("{:>6}\t{}\n", idx + 1, line);
+            if bytes + rendered.len() > MAX_BYTES && last_emitted_idx.is_some() {
+                byte_truncated = true;
                 break;
             }
             bytes += rendered.len();
             out.push_str(&rendered);
+            last_emitted_idx = Some(idx);
         }
-        if truncated {
-            out.push_str("… (output truncated)\n");
+
+        // Determine whether we reached the end of the file.
+        // `showed_through` is the 1-based line number of the last line shown.
+        let showed_through = last_emitted_idx.map(|i| i + 1).unwrap_or(offset);
+        // `next_offset` is what the caller should pass as offset to continue.
+        let next_offset = showed_through;
+        let reached_end = !byte_truncated && (offset + limit >= total_lines);
+
+        if !reached_end || offset > 0 {
+            // Only add the notice when content was cut or we started mid-file.
+            let start_line = offset + 1; // 1-based
+            out.push_str(&format!(
+                "\n[truncated: showing lines {start_line}-{showed_through} of {total_lines}. Use read with offset={next_offset} to continue.]"
+            ));
         }
         Ok(out)
     }

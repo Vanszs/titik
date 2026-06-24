@@ -481,12 +481,39 @@ pub(super) fn start_stream_task(
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
-    // Self-awareness: tell the model the project's top-level layout every request
-    // (so it's present after compaction too). Pulled from the live dir cache.
-    // The project-doc summary (Phase 2), when present, rides the same System
-    // message right after the listing so it likewise survives compaction.
+    // Assemble the System message so the prompt-caching breakpoint covers only the
+    // STABLE head (which is byte-identical across the session, so the cache hits):
+    //
+    //   [ stable base system prompt (already in history[0]) ]
+    // + [ plan-word steer (same word every request, chosen once per client) ]
+    // + CACHE_SPLIT_MARK                                     <- cache breakpoint here
+    // + [ "\n\n# Project files (top level)" listing ]       (volatile: changes with files)
+    // + [ "\n\n# Project summary" awareness block ]          (volatile: project-dependent)
+    //
+    // The plan-word steer + the mark go in FIRST, before the volatile tail, so the
+    // head ends at the mark and the listing/awareness land after it. `to_wire`
+    // splits on the mark and attaches `cache_control` to the head only; the tail
+    // rides as a second, uncached content part. Injecting here (BEFORE `to_wire`)
+    // keeps the steer inside the cached block. The tail may be empty (no listing /
+    // no summary) — `to_wire` handles that by emitting a single cached part.
     if let Some(first) = history.first_mut() {
         if first.role == Role::System {
+            // Plan-word steer: lead the FIRST plan with the session's whimsical
+            // word instead of "Plan:". `plan_word` is chosen once per client, so
+            // the SAME word every request keeps the cached head byte-stable.
+            if let Some(c) = client.as_ref() {
+                let word = c.plan_word();
+                first.content.push_str(&format!(
+                    "\n\nWhen you write your plan for this task, lead with the single word \"{word}:\" (a whimsical lead-in) instead of \"Plan:\"."
+                ));
+            }
+            // Boundary between the stable cached head (everything above) and the
+            // volatile tail (everything below). Inserted unconditionally so the
+            // split point always exists, even when the tail ends up empty.
+            first.content.push_str(crate::dto::chat::CACHE_SPLIT_MARK);
+            // Volatile tail begins here — project layout + awareness summary. Sent
+            // every request (so they survive compaction too) but kept AFTER the
+            // cache breakpoint so file changes never bust the cached prefix.
             if let Ok(cache) = state.rest.dir_cache.read() {
                 let listing = cache.children(".");
                 if !listing.is_empty() {
@@ -513,10 +540,21 @@ pub(super) fn start_stream_task(
     // `sess.conversation.history()` by the caller). It reads `messages.sqlite` and
     // returns a NEW Vec; it does not touch `sess.conversation`, `messages.json`,
     // or the rendered transcript — display is entirely unaffected.
-    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String)> =
+    //
+    // `context_limit`: the model's context-window size in tokens, looked up from
+    // the cached catalogue. `None` when the catalogue isn't available yet — shape
+    // falls back to its FALLBACK_CONTEXT constant in that case.
+    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String, Option<u64>)> =
         state.rest.session.as_ref().map(|sess| {
             let user_intent = sess.conversation.last_user_content().unwrap_or_default();
-            (sess.path.clone(), sess.settings.clone(), user_intent)
+            let context_limit = state
+                .rest
+                .models_cache
+                .as_deref()
+                .and_then(|models| {
+                    crate::service::openrouter::context_length_for(models, &sess.settings.model)
+                });
+            (sess.path.clone(), sess.settings.clone(), user_intent, context_limit)
         });
     let (tx, rx) = mpsc::unbounded_channel();
     state.rest.active_rx = Some(rx);
@@ -528,8 +566,8 @@ pub(super) fn start_stream_task(
         // fails open — any error returns the original history — so this can never
         // break the send.
         let history = match reshape {
-            Some((session_dir, settings, user_intent)) => {
-                super::shortsend::shape(history, &session_dir, &c, &settings, &user_intent).await
+            Some((session_dir, settings, user_intent, context_limit)) => {
+                super::shortsend::shape(history, &session_dir, &c, &settings, &user_intent, context_limit).await
             }
             None => history,
         };

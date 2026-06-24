@@ -253,12 +253,18 @@ fn build_router_payload(user_intent: &str, candidates: &[msglog::BlobRef]) -> St
 /// `history[0]` (the system message, already carrying any project-files/awareness
 /// injection from the caller) is preserved VERBATIM as index 0 of the output, so
 /// downstream system-message handling still lands on the real system message.
+///
+/// `context_limit` is the model's context-window size in tokens (from the OpenRouter
+/// catalogue). When `None`, a conservative fallback is used. Compression only fires
+/// when the estimated history size exceeds `COMPRESS_AT_PCT`% of the window — below
+/// that threshold the full history is sent verbatim (cheap via prompt caching).
 pub async fn shape(
     history: Vec<ChatMessage>,
     session_dir: &Path,
     client: &OpenRouterClient,
     settings: &Settings,
     user_intent: &str,
+    context_limit: Option<u64>,
 ) -> Vec<ChatMessage> {
     // 1. Kill switch: short-send disabled → send the full history unchanged.
     if !settings.short_send_enabled {
@@ -290,6 +296,38 @@ pub async fn shape(
                 return history;
             }
         }
+    }
+
+    // 2c. Threshold gate: only compress when we're actually near the model's context
+    //     window. Below the threshold the full history is cheap via prompt caching
+    //     AND weak models keep full context fidelity — compression only kicks in as
+    //     an overflow valve. Estimate token count at ~4 chars/token (fast, no
+    //     tokenizer needed). An unknown window falls back to FALLBACK_CONTEXT; when
+    //     in doubt, prefer sending the full history (fail-open).
+    const COMPRESS_AT_PCT: u64 = 75;
+    const FALLBACK_CONTEXT: u64 = 32_768; // conservative default when window is unknown
+    // ~4 chars/token. Include tool-call argument blobs (often large) and a fixed
+    // overhead for the system prompt + tool-definition schemas, which aren't in
+    // `history` but DO count against the model's context window.
+    const TOOL_DEF_OVERHEAD: u64 = 2_500;
+    let est_tokens: u64 = TOOL_DEF_OVERHEAD
+        + history
+            .iter()
+            .map(|m| {
+                let base = m.content.chars().count() as u64 / 4;
+                let args: u64 = m
+                    .tool_calls
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|tc| tc.function.arguments.chars().count() as u64 / 4)
+                    .sum();
+                base + args
+            })
+            .sum::<u64>();
+    let window = context_limit.unwrap_or(FALLBACK_CONTEXT);
+    if est_tokens < window * COMPRESS_AT_PCT / 100 {
+        return history; // plenty of room — send the full history, no compression
     }
 
     // 3. Best-effort fold so the summary reflects everything older than the tail.

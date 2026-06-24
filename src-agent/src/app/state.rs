@@ -146,6 +146,11 @@ pub struct AppStateRest {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost: f64,
+    /// Prompt tokens served from the prompt cache on the LATEST response (a cache
+    /// hit at the discounted rate). Like `tokens_in`, this tracks the current
+    /// prompt, not a cumulative sum; set from `StreamEvent::Usage` each response,
+    /// 0 on a cold prefix or a provider that doesn't report cache stats.
+    pub tokens_cached: u64,
     /// Usage for the in-flight response, captured from the StreamEvent::Usage
     /// chunk and consumed when the assistant message is committed.
     pub pending_usage: Option<(u64, u64, f64)>,
@@ -272,6 +277,7 @@ impl AppStateRest {
             tokens_in: 0,
             tokens_out: 0,
             cost: 0.0,
+            tokens_cached: 0,
             pending_usage: None,
             transcript_cache: RefCell::new(TranscriptCache::default()),
             dir_cache: std::sync::Arc::new(std::sync::RwLock::new(
