@@ -404,6 +404,20 @@ fn finish_tool_round(
         }
         let _ = sess.save();
     }
+
+    // Live reload: if the `remember` tool ran this round, re-inject the updated
+    // MEMORY.md into messages[0] so the model sees the new fact immediately.
+    let remember_ran = state
+        .rest
+        .pending_tool_calls
+        .iter()
+        .any(|c| c.function.name == "remember");
+    if remember_ran {
+        if let Some(sess) = state.rest.session.as_mut() {
+            sess.rebuild_system();
+        }
+    }
+
     // Round done: clear the per-round machine before the next model call.
     state.rest.pending_tool_calls.clear();
     state.rest.tool_idx = 0;
@@ -446,10 +460,14 @@ pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
         .as_ref()
         .map(|s| s.workdirs())
         .unwrap_or_else(|| vec![workspace.clone()]);
+    let memory_dir = session_ref
+        .as_ref()
+        .map(|s| s.path.join("memory"));
     let ctx = crate::tool::ToolCtx {
         workspace,
         workspaces,
         dir_cache: state.rest.dir_cache.clone(),
+        memory_dir,
     };
     // OpenAI/OpenRouter send `arguments` as a JSON-encoded string; an empty or
     // malformed payload degrades to `{}` so the tool sees no arguments. Sanitize
