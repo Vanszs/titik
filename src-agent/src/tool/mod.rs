@@ -29,6 +29,9 @@ pub struct ToolCtx {
     /// Absolute workspace root (the session's workdir). All tool paths are
     /// resolved against this and may not escape it.
     pub workspace: PathBuf,
+    /// All configured workspace roots (may be >1 when the user lists multiple
+    /// workdirs in settings). Used by `DirCacheUpdate` and the `@` palette.
+    pub workspaces: Vec<PathBuf>,
     pub dir_cache: Arc<RwLock<DirCache>>,
 }
 

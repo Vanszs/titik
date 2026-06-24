@@ -159,6 +159,24 @@ impl Session {
             })
     }
 
+    /// All configured workdirs (trimmed, non-empty), falling back to the
+    /// process cwd when the list is empty. Used by `DirCacheUpdate` and the
+    /// `@` autocomplete to index every workspace root.
+    pub fn workdirs(&self) -> Vec<std::path::PathBuf> {
+        let dirs: Vec<std::path::PathBuf> = self.settings
+            .workdir
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect();
+        if dirs.is_empty() {
+            vec![std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))]
+        } else {
+            dirs
+        }
+    }
+
     /// Rebuild the system prompt and push it into the conversation.
     ///
     /// Called on session load and after the user edits `MEMORY.md` at runtime.

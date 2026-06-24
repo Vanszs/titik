@@ -78,11 +78,11 @@ pub(super) fn warm_session(
     reconcile_session_lock(state);
     // Snapshot what we need, dropping the session borrow before block_on +
     // the mutable write to state.rest.awareness_summary.
-    let (workdir, settings) = match state.rest.session.as_ref() {
-        Some(s) => (s.workdir(), s.settings.clone()),
+    let (workdir, settings, workdirs) = match state.rest.session.as_ref() {
+        Some(s) => (s.workdir(), s.settings.clone(), s.workdirs()),
         None => return,
     };
-    crate::tool::dircache::reindex(workdir.clone(), state.rest.dir_cache.clone());
+    crate::tool::dircache::reindex(workdirs, state.rest.dir_cache.clone());
     // Best-effort: prefetch the model catalogue so `context_length` is available
     // for the threshold gate in `shortsend::shape`. A failed fetch leaves
     // `models_cache` as `None`, which the threshold gate treats as unknown → uses

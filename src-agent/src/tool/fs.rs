@@ -302,7 +302,7 @@ impl Tool for Write {
         }
         std::fs::write(&path, content.as_bytes())
             .with_context(|| format!("writing file '{rel}'"))?;
-        super::dircache::reindex(ctx.workspace.clone(), ctx.dir_cache.clone());
+        super::dircache::reindex(ctx.workspaces.clone(), ctx.dir_cache.clone());
         Ok(format!("Wrote {} bytes to {}.", content.len(), rel))
     }
 }
@@ -366,7 +366,7 @@ impl Tool for Edit {
 
         std::fs::write(&path, replaced.as_bytes())
             .with_context(|| format!("writing file '{rel}'"))?;
-        super::dircache::reindex(ctx.workspace.clone(), ctx.dir_cache.clone());
+        super::dircache::reindex(ctx.workspaces.clone(), ctx.dir_cache.clone());
 
         let n = if replace_all { count } else { 1 };
         Ok(format!("edited {rel} ({n} replacement(s))"))
@@ -399,7 +399,7 @@ impl Tool for Delete {
             bail!("{}", not_found_help(ctx, &path, rel));
         }
         std::fs::remove_file(&path).with_context(|| format!("deleting file '{rel}'"))?;
-        super::dircache::reindex(ctx.workspace.clone(), ctx.dir_cache.clone());
+        super::dircache::reindex(ctx.workspaces.clone(), ctx.dir_cache.clone());
         Ok(format!("Deleted {rel}."))
     }
 }

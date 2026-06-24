@@ -488,12 +488,12 @@ pub(super) fn apply_action(
                         state.rest.status = format!("error: {e}");
                     }
                 }
-                // c2) Reindex the dir cache against the (possibly changed) workdir.
+                // c2) Reindex the dir cache against the (possibly changed) workdirs.
                 //     Spawns a background thread; non-blocking.
-                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
+                let roots = state.rest.session.as_ref().map(|s| s.workdirs());
                 let dir_cache = state.rest.dir_cache.clone();
-                if let Some(wd) = workdir {
-                    crate::tool::dircache::reindex(wd, dir_cache);
+                if let Some(r) = roots {
+                    crate::tool::dircache::reindex(r, dir_cache);
                 }
                 // d) Rename LAST, and only when the name actually changed and is
                 //    non-empty. Doing it last means a rename failure can't lose the

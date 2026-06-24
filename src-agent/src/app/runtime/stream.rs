@@ -412,14 +412,18 @@ fn finish_tool_round(
 /// `pub(super)` so the approve/deny action handlers can run a single tool when
 /// resuming the approval machine.
 pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
-    let workspace = state
-        .rest
-        .session
+    let session_ref = state.rest.session.as_ref();
+    let workspace = session_ref
         .as_ref()
         .map(|s| s.workdir())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let workspaces = session_ref
+        .as_ref()
+        .map(|s| s.workdirs())
+        .unwrap_or_else(|| vec![workspace.clone()]);
     let ctx = crate::tool::ToolCtx {
         workspace,
+        workspaces,
         dir_cache: state.rest.dir_cache.clone(),
     };
     // OpenAI/OpenRouter send `arguments` as a JSON-encoded string; an empty or
