@@ -13,6 +13,23 @@ use crate::service::openrouter::OpenRouterClient;
 const MAX_AGENT_STEPS: usize = 40;
 
 
+/// Pick the assistant message content + display-reasoning for a FINAL turn.
+/// Normally content is the answer and `reasoning` rides along (rendered gray).
+/// But when the model left content empty and streamed its answer into the
+/// reasoning channel (e.g. deepseek-v4-flash with reasoning on), promote the
+/// reasoning to BE the content so it shows in the foreground and persists.
+/// Returns (content, reasoning_to_attach). Empty content with no reasoning -> ("", None).
+fn final_answer(content: String, reasoning: Option<String>) -> (String, Option<String>) {
+    if content.trim().is_empty() {
+        match reasoning {
+            Some(r) if !r.trim().is_empty() => (r, None), // reasoning becomes the answer
+            _ => (String::new(), None),
+        }
+    } else {
+        (content, reasoning) // normal: content is answer, reasoning rendered gray
+    }
+}
+
 /// Finalize a finished stream: commit any buffered assistant text, clear the
 /// waiting flag + task handle, set the status line. `error` is Some on stream
 /// failure; a save error is surfaced only if the stream itself succeeded.
@@ -20,30 +37,30 @@ pub(super) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
     // Take the in-flight usage unconditionally so it can never leak into the
     // next turn, even when the buffer is empty or there's no session to commit.
     let usage = rest.pending_usage.take();
-    // Display-only reasoning streamed this turn, folded onto the committed
-    // message (never logged to disk / sent to the API).
+    // Reasoning taken unconditionally so it can't leak; may be promoted to
+    // content below when the model streamed its entire answer through that channel.
     let reasoning = rest.take_reasoning();
+    let buf = rest.take_stream().unwrap_or_default();
+    let (content, msg_reasoning) = final_answer(buf, reasoning);
     let mut save_err = None;
-    if let Some(buf) = rest.take_stream() {
-        if !buf.is_empty() {
-            if let Some(sess) = rest.session.as_mut() {
-                let _ = crate::model::msglog::append(
-                    &sess.path,
-                    crate::dto::chat::Role::Assistant,
-                    &buf,
-                    usage,
-                );
-                sess.conversation.push_assistant(buf, reasoning);
-                if let Err(e) = sess.save() {
-                    save_err = Some(e.to_string());
-                }
-                // tokens_in = current context size (latest prompt), not cumulative.
-                // tokens_out and cost are cumulative (each turn adds new spend).
-                if let Some((pt, ct, cost)) = usage {
-                    rest.tokens_in = pt;        // current context size, not a sum
-                    rest.tokens_out += ct;
-                    rest.cost += cost;
-                }
+    if !content.is_empty() {
+        if let Some(sess) = rest.session.as_mut() {
+            let _ = crate::model::msglog::append(
+                &sess.path,
+                crate::dto::chat::Role::Assistant,
+                &content,
+                usage,
+            );
+            sess.conversation.push_assistant(content, msg_reasoning);
+            if let Err(e) = sess.save() {
+                save_err = Some(e.to_string());
+            }
+            // tokens_in = current context size (latest prompt), not cumulative.
+            // tokens_out and cost are cumulative (each turn adds new spend).
+            if let Some((pt, ct, cost)) = usage {
+                rest.tokens_in = pt;        // current context size, not a sum
+                rest.tokens_out += ct;
+                rest.cost += cost;
             }
         }
     }
@@ -98,10 +115,12 @@ pub(super) fn advance_turn(
                 if let Err(e) = sess.save() {
                     save_err = Some(e.to_string());
                 }
-            } else if let Some(b) = buf.as_ref() {
-                if !b.is_empty() {
-                    let _ = crate::model::msglog::append(&sess.path, Role::Assistant, b, usage);
-                    sess.conversation.push_assistant(b.clone(), reasoning);
+            } else {
+                let (content, msg_reasoning) =
+                    final_answer(buf.clone().unwrap_or_default(), reasoning);
+                if !content.is_empty() {
+                    let _ = crate::model::msglog::append(&sess.path, Role::Assistant, &content, usage);
+                    sess.conversation.push_assistant(content, msg_reasoning);
                     if let Err(e) = sess.save() {
                         save_err = Some(e.to_string());
                     }
