@@ -171,20 +171,31 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     // the user can see what the agent invoked. Appended as logical
                     // lines so they get the hanging 2-col indent under the bullet.
                     //
-                    // If the message begins with a wanderer lead-in (`Word: ...`),
-                    // that first line is styled like a tool-call line (dim + italic)
-                    // instead of being markdown-parsed, so it reads as thinking.
-                    let (leadin_line, body) = split_leadin(&msg.content);
-                    let leadin_style = Style::default()
+                    // If the message contains wanderer lead-in lines (`Word: ...`),
+                    // the entire block up to and including the LAST such line is
+                    // rendered dim+italic (the "thinking" block); the remainder is
+                    // rendered as markdown.
+                    let (thinking_block, response_body) = split_thinking(&msg.content);
+                    let thinking_style = Style::default()
                         .fg(palette.dim)
                         .add_modifier(Modifier::ITALIC);
                     let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
-                    if let Some(leadin) = leadin_line {
-                        // Wrap the lead-in at wrap_w; each fragment gets the italic+dim style.
-                        let leadin_spans = vec![Span::styled(leadin.to_string(), leadin_style)];
-                        logical.extend(crate::view::markdown::wrap_spans(&leadin_spans, wrap_w));
+                    if let Some(thinking) = thinking_block {
+                        // Render each line of the thinking block dim+italic, wrapping
+                        // at wrap_w. Blank lines are preserved as empty visual rows so
+                        // paragraph breaks inside the thinking section survive.
+                        for line in thinking.lines() {
+                            if line.trim().is_empty() {
+                                logical.push(vec![]);
+                            } else {
+                                let spans = vec![Span::styled(line.to_string(), thinking_style)];
+                                logical.extend(crate::view::markdown::wrap_spans(&spans, wrap_w));
+                            }
+                        }
                     }
-                    logical.extend(crate::view::markdown::render(body, palette, wrap_w));
+                    if !response_body.is_empty() {
+                        logical.extend(crate::view::markdown::render(response_body, palette, wrap_w));
+                    }
                     if let Some(calls) = msg.tool_calls.as_ref() {
                         for call in calls {
                             let args = truncate_chars(&call.function.arguments, 60);
@@ -746,28 +757,50 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
-/// Detect and split off a wanderer lead-in line from an assistant message.
+/// Split an assistant message into (thinking, response).
 ///
-/// Returns `(Some(first_line), rest)` if the first line matches `^Word:` where
-/// `Word` (case-insensitive) is in the wanderer corpus; otherwise `(None, full)`.
-/// The returned `first_line` is the trimmed first line; `rest` is everything after
-/// the first newline (which may be empty).
-fn split_leadin(content: &str) -> (Option<&str>, &str) {
-    // Pull the first line and check it against the wanderer corpus.
-    let (first, rest) = match content.find('\n') {
-        Some(pos) => (&content[..pos], &content[pos + 1..]),
-        None => (content, ""),
-    };
-    let trimmed = first.trim();
-    // The lead-in token is everything before the first ':'.
-    if let Some(colon_pos) = trimmed.find(':') {
-        let token = trimmed[..colon_pos].trim().to_lowercase();
-        let corpus = crate::resources::wanderer_words();
-        if corpus.iter().any(|w| w == &token) {
-            return (Some(trimmed), rest);
+/// `thinking` = the prefix up to and INCLUDING the last line that starts with a
+/// wanderer-word lead-in (`Word:` where `Word` is in the wanderer corpus,
+/// case-insensitive). `response` = the remainder (leading blank lines trimmed).
+/// Returns `(None, full)` when no wanderer-led line exists (normal message).
+///
+/// Only lines whose FIRST colon-delimited token is a wanderer word count; a
+/// wanderer word appearing mid-sentence (no leading `Word:` pattern) is ignored.
+fn split_thinking(content: &str) -> (Option<&str>, &str) {
+    let corpus = crate::resources::wanderer_words();
+    // Walk lines recording byte offsets. For each line, check whether the token
+    // before the first ':' (trimmed, lowercased) is in the wanderer corpus.
+    // Track the byte offset just past the last matching line's trailing '\n' (or
+    // end of string when the matching line is the final line).
+    let mut last_end: Option<usize> = None;
+    let mut offset: usize = 0;
+    for line in content.split('\n') {
+        // `line` does not include the '\n'; `line_end` is the byte offset of the
+        // character after the '\n' (or end of string for the final segment).
+        let line_end = offset + line.len();
+        // Check whether this line has a wanderer lead-in.
+        let trimmed = line.trim();
+        if let Some(colon_pos) = trimmed.find(':') {
+            let token = trimmed[..colon_pos].trim().to_lowercase();
+            if corpus.iter().any(|w| w == &token) {
+                // Include the '\n' if present; clamp to content length.
+                last_end = Some((line_end + 1).min(content.len()));
+            }
         }
+        // Advance past the '\n' separator (the split consumes it but we account
+        // for it in the offset so our byte positions stay aligned with `content`).
+        offset = line_end + 1;
     }
-    (None, content)
+    match last_end {
+        Some(e) => {
+            let thinking = &content[..e];
+            // Trim only leading newlines from the response so internal structure
+            // of the response body is preserved.
+            let response = content[e..].trim_start_matches('\n');
+            (Some(thinking), response)
+        }
+        None => (None, content),
+    }
 }
 
 /// One message's visual lines: bullet on the first line, 2-col indent on the
