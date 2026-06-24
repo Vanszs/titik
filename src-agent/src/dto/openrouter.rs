@@ -109,6 +109,13 @@ pub struct ChatRequest {
     /// `skip_serializing_if`, so the model falls back to its own default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    /// Structured-output directive, serialised as the top-level `response_format`
+    /// object. `Some` only on the classifier path, where it pins a strict
+    /// `json_schema` so the verdict comes back as machine-parseable JSON; `None`
+    /// everywhere else (and omitted from the body via `skip_serializing_if`), so
+    /// the interactive/compaction calls emit free-form text as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------

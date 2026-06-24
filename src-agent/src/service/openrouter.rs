@@ -229,6 +229,8 @@ impl OpenRouterClient {
             // Interactive chat is the only path that thinks; map the session's
             // effort token to a `reasoning` directive (None = model default).
             reasoning: reasoning_config(&self.effort),
+            // Free-form text reply; structured output is classifier-only.
+            response_format: None,
         };
 
         let resp = self
@@ -378,6 +380,8 @@ impl OpenRouterClient {
             tools: None,
             // Compaction is a mechanical summary; no thinking needed.
             reasoning: None,
+            // Free-form summary text; structured output is classifier-only.
+            response_format: None,
         };
 
         let response = self
@@ -431,6 +435,8 @@ impl OpenRouterClient {
             tools: None,
             // Secondary-model calls (awareness / classifier) don't think.
             reasoning: None,
+            // Free-form reply; structured output is classifier-only.
+            response_format: None,
         };
 
         let response = self
@@ -463,13 +469,23 @@ impl OpenRouterClient {
     /// the awareness summary path is unaffected.
     ///
     /// Same body as `complete_with` (no tools, `stream: false`, usage on, provider
-    /// pin from `provider`) but with `reasoning: {effort: "low"}` set: the
-    /// safeguard model (`gpt-oss-safeguard-20b`) is a reasoning model, so a low
-    /// effort keeps the verdict fast. Reasoning models often leave `content`
-    /// empty and put their answer in `message.reasoning`, so the reply is
-    /// `content` when non-empty (trimmed), else the `reasoning` text; an error if
-    /// BOTH are empty. Clean errors, no panics — callers (`harness::classify`)
-    /// degrade any `Err` to "classifier unavailable".
+    /// pin from `provider`) but tuned for a deterministic, fast, machine-parseable
+    /// verdict:
+    /// - `reasoning: {enabled: false}` turns thinking OFF. The safeguard model
+    ///   (`gpt-oss-safeguard-20b`) can reason, but a free-form thinking pass made
+    ///   the reply slow and unstructured; off is deterministic, fast, and fills
+    ///   `content` directly. `effort` and `enabled` are mutually exclusive — only
+    ///   `enabled` is set.
+    /// - `response_format` pins a STRICT `json_schema` (`{allow, reason}`,
+    ///   `additionalProperties:false`) so the model must return exactly the
+    ///   verdict object as JSON. The safeguard model advertises both
+    ///   `response_format` and `structured_outputs`, so this is honoured.
+    ///
+    /// Returns the raw reply for the caller to parse: `message.content` (the JSON
+    /// string) when non-empty, else `message.reasoning` (defensive — should be
+    /// empty with thinking off), else an error. The HTTP-error path returns
+    /// `Err(clean_error(..))` carrying the upstream text — that reason now matters
+    /// because the caller surfaces it. Clean errors, no panics.
     pub async fn classify_with(
         &self,
         model: &str,
@@ -477,6 +493,25 @@ impl OpenRouterClient {
         messages: Vec<ChatMessage>,
     ) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
+        // Strict JSON-schema for the verdict object. `strict: true` +
+        // `additionalProperties: false` force the model to emit exactly
+        // `{"allow": <bool>, "reason": <string>}` and nothing else.
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "verdict",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["allow", "reason"],
+                    "properties": {
+                        "allow": { "type": "boolean" },
+                        "reason": { "type": "string" }
+                    }
+                }
+            }
+        });
         let body = ChatRequest {
             model: model.to_string(),
             messages,
@@ -485,13 +520,15 @@ impl OpenRouterClient {
             usage: UsageRequest { include: true },
             // Classifier calls use no tools.
             tools: None,
-            // The safeguard model is a reasoning model; pin a low effort so the
-            // verdict lands quickly. `effort` and `enabled` are mutually
-            // exclusive — only `effort` is set.
+            // Thinking OFF: deterministic + fast, and the verdict lands in
+            // `content`. `effort` and `enabled` are mutually exclusive — only
+            // `enabled` is set.
             reasoning: Some(ReasoningConfig {
-                effort: Some("low".to_string()),
-                enabled: None,
+                effort: None,
+                enabled: Some(false),
             }),
+            // Force the verdict object as strict JSON.
+            response_format: Some(response_format),
         };
 
         let response = self

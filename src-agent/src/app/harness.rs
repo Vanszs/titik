@@ -20,13 +20,15 @@
 //!   the caller degrades to a human prompt in both modes.
 //!
 //! Both classifier calls run against the configured `classifier_model` /
-//! `classifier_provider`. PC uses the plain secondary-model path; TAC uses the
-//! dedicated [`OpenRouterClient::classify_with`] (low reasoning effort, with a
-//! content-or-reasoning fallback) so the safeguard reasoning model stays fast and
-//! its verdict is still read when it lands in `message.reasoning`. They build a
-//! two-message conversation (System = the embedded policy text, User = the prompt
-//! / the request + tool call) and parse a single `VERDICT:` line out of the
-//! reply, all bounded by an 8s timeout so the sync loop can't freeze.
+//! `classifier_provider` via the dedicated [`OpenRouterClient::classify_with`],
+//! which turns thinking OFF and pins a strict JSON schema so the safeguard model
+//! returns a machine-parseable `{allow, reason}` object fast and deterministically.
+//! They build a two-message conversation (System = the embedded policy text, User
+//! = the prompt / the request + tool call) and parse the reply with
+//! [`parse_verdict`] (JSON-first, with a lenient text-scan fallback), all bounded
+//! by [`CLASSIFY_TIMEOUT`] so the sync loop can't freeze. Every failure becomes an
+//! unavailable verdict carrying the REAL cause (HTTP error / timeout / unparseable
+//! slice) so the UI shows what actually went wrong instead of a generic string.
 
 use std::path::Path;
 
@@ -66,16 +68,6 @@ impl Verdict {
             allow: false,
             reason: reason.into(),
             available: true,
-        }
-    }
-    /// The classifier could not be reached / its reply was unusable. `allow`
-    /// here is meaningless to the caller — `available = false` is the signal to
-    /// degrade to a human prompt.
-    fn unavailable() -> Self {
-        Self {
-            allow: false,
-            reason: "classifier unavailable".to_string(),
-            available: false,
         }
     }
 }
@@ -119,62 +111,157 @@ pub fn workspace_allowed(settings: &Settings, workdir: &Path, launch_dir: &Path)
         .any(|allowed| allowed == wd)
 }
 
-/// Parse a classifier reply into a [`Verdict`].
+/// The verdict object the classifier is asked to emit as strict JSON. `allow`
+/// drives the decision; `reason` is the short note. A second shape (`verdict`
+/// as `"allow"`/`"block"`) is tolerated for robustness — see [`parse_verdict`].
+#[derive(serde::Deserialize)]
+struct VerdictJson {
+    allow: Option<bool>,
+    #[serde(default)]
+    verdict: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Truncate a string to at most `max` characters (char-boundary safe), appending
+/// an ellipsis when it was cut. Keeps the diagnostic reasons that ride into the
+/// UI from blowing up the approval box / toast.
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// Build a [`Verdict`] from a parsed `{allow|verdict, reason}` object. `allow`
+/// wins when present; otherwise `verdict` is read as `"allow"` (any other value,
+/// including `"block"`, is a block). An allow drops its reason (a clean allow
+/// carries none); a block keeps the reason, defaulting to "flagged" when blank.
+fn verdict_from_json(v: VerdictJson) -> Verdict {
+    let allow = match v.allow {
+        Some(a) => a,
+        None => v
+            .verdict
+            .as_deref()
+            .map(|s| s.trim().eq_ignore_ascii_case("allow"))
+            .unwrap_or(false),
+    };
+    if allow {
+        return Verdict::allow();
+    }
+    let reason = v
+        .reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "flagged".to_string());
+    Verdict::block(reason)
+}
+
+/// Parse a classifier reply into a [`Verdict`], robustly.
 ///
-/// Scans for the first line containing `VERDICT:`. `ALLOW` → a parsed allow
-/// (`available = true`); `BLOCK` → a parsed block (`available = true`) with the
-/// text after `BLOCK` as the reason. If no `VERDICT:` line is found the reply is
-/// malformed and the `fallback` is returned verbatim — callers pass a fallback
-/// carrying `available = false` (PC keeps `allow = true` since it's advisory,
-/// TAC keeps `allow = false`), so an unparseable reply is treated as "classifier
-/// unavailable", never as a trusted verdict.
-fn parse_verdict(reply: &str, fallback: Verdict) -> Verdict {
-    for line in reply.lines() {
+/// Order of attempts:
+/// 1. **JSON-first.** Parse the whole reply as `{allow|verdict, reason}`. If that
+///    fails (the model wrapped the object in prose/code fences), locate the first
+///    `{` and last `}` and parse that substring. `allow` is authoritative; a
+///    `{"verdict":"allow"|"block"}` shape is also accepted.
+/// 2. **Lenient text scan (fallback).** Look (case-insensitive) for `VERDICT:`
+///    followed by ALLOW/BLOCK; failing that, scan whole-word for
+///    ALLOW/ALLOWED/SAFE (→ allow) or BLOCK/BLOCKED/DENY/UNSAFE (→ block), taking
+///    a short slice of the reply as the reason.
+///
+/// Returns `None` only when NOTHING parseable is found — the caller turns that
+/// into an unavailable verdict carrying the raw reply, never a trusted decision.
+fn parse_verdict(reply: &str) -> Option<Verdict> {
+    let trimmed = reply.trim();
+
+    // 1. JSON-first: the strict-schema happy path.
+    if let Ok(v) = serde_json::from_str::<VerdictJson>(trimmed) {
+        return Some(verdict_from_json(v));
+    }
+    // 1b. Prose/fence-wrapped JSON: carve out the first {...} and retry.
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(v) = serde_json::from_str::<VerdictJson>(&trimmed[start..=end]) {
+                return Some(verdict_from_json(v));
+            }
+        }
+    }
+
+    // 2. Lenient text scan. First honour an explicit `VERDICT:` line.
+    for line in trimmed.lines() {
         let Some((_, rest)) = line.split_once("VERDICT:") else {
             continue;
         };
         let rest = rest.trim();
         let upper = rest.to_ascii_uppercase();
         if upper.starts_with("ALLOW") {
-            return Verdict::allow();
+            return Some(Verdict::allow());
         }
         if let Some(after) = upper.strip_prefix("BLOCK") {
-            // Re-slice the ORIGINAL (non-uppercased) text for the reason so its
-            // casing is preserved; `after` only told us where it starts.
+            // Re-slice the ORIGINAL (non-uppercased) text so the reason's casing
+            // is preserved; `after` only told us where it starts.
             let reason = rest[rest.len() - after.len()..].trim();
             let reason = if reason.is_empty() {
                 "flagged".to_string()
             } else {
                 reason.to_string()
             };
-            return Verdict::block(reason);
+            return Some(Verdict::block(reason));
         }
-        // A VERDICT: line that's neither ALLOW nor BLOCK is malformed — stop
-        // scanning and use the fallback rather than guessing.
-        break;
     }
-    fallback
+    // 2b. No VERDICT: line — scan for a standalone decision keyword. ALLOW is
+    //     checked first; any block keyword present forces a block with a short
+    //     slice of the reply as the reason.
+    let upper = trimmed.to_ascii_uppercase();
+    let has_word = |word: &str| {
+        upper.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| tok == word)
+    };
+    if has_word("ALLOW") || has_word("ALLOWED") || has_word("SAFE") {
+        return Some(Verdict::allow());
+    }
+    if has_word("BLOCK") || has_word("BLOCKED") || has_word("DENY") || has_word("UNSAFE") {
+        return Some(Verdict::block(truncate(trimmed, 100)));
+    }
+
+    // 3. Nothing parseable.
+    None
 }
 
-/// How long to wait for a classifier verdict before giving up. The safeguard
-/// model is a reasoning model, so a slow generation could otherwise stall the
-/// sync loop that drives this via `block_on`. On timeout the call degrades to
-/// the `fallback` (TAC → human prompt), so the UI can never freeze waiting on it.
-const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long to wait for a classifier verdict before giving up. With thinking
+/// turned OFF the call is fast, so this is mostly headroom for a slow network;
+/// the bound still matters because the sync loop drives this via `block_on` and
+/// must never freeze. On timeout the verdict is `unavailable("classifier
+/// timeout")`, so the caller degrades (TAC → human prompt) rather than hanging.
+const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
-/// Run the classifier model over `messages` and parse its verdict.
+/// Run the classifier model over `messages` and return a [`Verdict`].
 ///
-/// On any error (no key, network failure, empty reply) OR a timeout the
-/// `fallback` verdict is returned — the call never propagates an error or
-/// panics. The whole request is bounded by [`CLASSIFY_TIMEOUT`] so a slow
-/// reasoning model can't hang the loop. `block_on`-friendly: it is a plain async
-/// fn the caller can drive from the sync loop.
+/// Never propagates an error or panics — every failure becomes an unavailable
+/// verdict carrying the REAL cause so the UI can show it:
+/// - reply parsed → that verdict (`available = true`).
+/// - reply unparseable → `unavailable("unparseable verdict: <slice>")`.
+/// - HTTP / network error → `unavailable("classifier error: <detail>")`.
+/// - timeout → `unavailable("classifier timeout")`.
+///
+/// `unavailable_allow` selects the fail-open posture for the *unavailable* cases:
+/// PC passes `true` (advisory — the turn still proceeds) and TAC passes `false`
+/// (the caller decides per mode). The reason is preserved either way so the toast
+/// / approval box is accurate. Bounded by [`CLASSIFY_TIMEOUT`]; `block_on`-safe.
 async fn classify(
     client: &OpenRouterClient,
     settings: &Settings,
     messages: Vec<ChatMessage>,
-    fallback: Verdict,
+    unavailable_allow: bool,
 ) -> Verdict {
+    // Build an unavailable verdict carrying `reason`, with the caller's fail-open
+    // `allow` posture (only meaningful while `available = false`).
+    let unavailable = |reason: String| Verdict {
+        allow: unavailable_allow,
+        reason,
+        available: false,
+    };
     match tokio::time::timeout(
         CLASSIFY_TIMEOUT,
         client.classify_with(
@@ -185,18 +272,21 @@ async fn classify(
     )
     .await
     {
-        Ok(Ok(reply)) => parse_verdict(&reply, fallback),
-        // Inner error (network / empty reply) or outer timeout → unavailable.
-        _ => fallback,
+        Ok(Ok(reply)) => match parse_verdict(&reply) {
+            Some(v) => v,
+            None => unavailable(format!("unparseable verdict: {}", truncate(&reply, 100))),
+        },
+        Ok(Err(e)) => unavailable(format!("classifier error: {}", truncate(&e.to_string(), 100))),
+        Err(_) => unavailable("classifier timeout".to_string()),
     }
 }
 
 /// Prompt classifier (PC). Classify a user prompt; ADVISORY only.
 ///
 /// FAIL-OPEN: a malformed reply or a failed call returns `allow = true` (with
-/// the note "classifier unavailable" and `available = false`) so the turn is
-/// never blocked by classifier trouble. The caller surfaces a block verdict as a
-/// toast and otherwise proceeds; it ignores `available` because PC is advisory.
+/// `available = false` and the REAL cause as `reason`) so the turn is never
+/// blocked by classifier trouble. The caller surfaces a block verdict as a toast
+/// and otherwise proceeds; it ignores `available` because PC is advisory.
 pub async fn classify_prompt(
     client: &OpenRouterClient,
     settings: &Settings,
@@ -206,19 +296,9 @@ pub async fn classify_prompt(
         ChatMessage::new(Role::System, crate::resources::classifier_prompt()),
         ChatMessage::new(Role::User, user_prompt),
     ];
-    classify(
-        client,
-        settings,
-        messages,
-        // Advisory fail-open: allow the turn, but mark it unavailable so the
-        // note is accurate.
-        Verdict {
-            allow: true,
-            reason: "classifier unavailable".to_string(),
-            available: false,
-        },
-    )
-    .await
+    // Advisory fail-open: on an unavailable classifier, allow the turn but keep
+    // the real reason for the toast.
+    classify(client, settings, messages, true).await
 }
 
 /// Tool-call classifier (TAC). Classify a single tool call for auto-run safety,
@@ -245,5 +325,7 @@ pub async fn classify_toolcall(
         ChatMessage::new(Role::System, crate::resources::classifier_toolcall()),
         ChatMessage::new(Role::User, call),
     ];
-    classify(client, settings, messages, Verdict::unavailable()).await
+    // TAC fail-closed on unavailable: `allow = false` so the caller degrades to a
+    // human decision per mode; the real reason rides along for the prompt/toast.
+    classify(client, settings, messages, false).await
 }

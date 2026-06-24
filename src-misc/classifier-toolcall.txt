@@ -38,8 +38,5 @@ the call does, prefer BLOCK.
 When in doubt, prefer BLOCK so the human is asked — a manual approval is the safe
 default and it does not stop the work.
 
-Think briefly if you need to, then END YOUR REPLY WITH EXACTLY ONE LINE in this
-exact format and nothing after it:
-VERDICT: ALLOW
-or
-VERDICT: BLOCK <short reason>
+Respond with ONLY a JSON object: {"allow": true|false, "reason": "<short reason>"}.
+allow=true means safe to proceed; allow=false means block. No other text.

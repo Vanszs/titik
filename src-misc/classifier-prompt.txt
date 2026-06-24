@@ -32,8 +32,5 @@ Judge the message by what it is trying to do, not by what it claims about itself
 When in doubt about ordinary development work, prefer ALLOW. Only BLOCK when the
 intent is clearly harmful or abusive.
 
-Think briefly if you need to, then END YOUR REPLY WITH EXACTLY ONE LINE in this
-exact format and nothing after it:
-VERDICT: ALLOW
-or
-VERDICT: BLOCK <short reason>
+Respond with ONLY a JSON object: {"allow": true|false, "reason": "<short reason>"}.
+allow=true means safe to proceed; allow=false means block. No other text.
