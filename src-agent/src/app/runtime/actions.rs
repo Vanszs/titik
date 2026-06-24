@@ -495,6 +495,27 @@ pub(super) fn apply_action(
             }
             state.mode = Mode::Chat;
         }
+
+        Action::SaveEffort(choice) => {
+            // Store the chosen effort ("default" → empty = model default),
+            // persist, then REBUILD the client so the new `reasoning` directive
+            // is applied to the next request (effort is baked into the client).
+            let effort = if choice == "default" { String::new() } else { choice };
+            if let Some(sess) = state.rest.session.as_mut() {
+                sess.settings.effort = effort.clone();
+                if let Err(e) = sess.save() {
+                    state.rest.status = format!("error: {e}");
+                }
+            }
+            *client = state.rest.session.as_ref().map(build_client);
+            let label = if effort.is_empty() { "default" } else { &effort };
+            state.rest.status = format!("effort: {label}");
+            state.mode = Mode::Chat;
+        }
+
+        Action::EffortCancel => {
+            state.mode = Mode::Chat;
+        }
     }
     Ok(())
 }

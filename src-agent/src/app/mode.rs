@@ -1,6 +1,6 @@
 //! App – UI mode enum and associated state types.
 //!
-//! The app is always in exactly one of four modes, represented by [`Mode`]:
+//! The app is always in exactly one of five modes, represented by [`Mode`]:
 //!
 //! | Variant          | Meaning                                       |
 //! |-----------------|-----------------------------------------------|
@@ -8,11 +8,13 @@
 //! | `SessionPicker`  | `--resume` session list with live search      |
 //! | `Chat`           | Normal conversation view                      |
 //! | `Settings`       | In-app `/settings` dashboard                  |
+//! | `Effort`         | `/effort` reasoning-effort picker overlay     |
 //!
 //! Mode-specific state is stored inline in the variant so the type system
 //! ensures the runtime can only access data that is relevant to the active
-//! mode.  [`KeyInputForm`], [`PickerState`], and [`SettingsState`] live here;
-//! `Chat` carries no extra state beyond `AppStateRest`.
+//! mode.  [`KeyInputForm`], [`PickerState`], [`SettingsState`], and
+//! [`EffortPickerState`] live here; `Chat` carries no extra state beyond
+//! `AppStateRest`.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +42,11 @@ pub enum Mode {
     /// every draft plus the path-list/picker working state), so storing it inline
     /// would bloat `Mode` everywhere. The box keeps the enum small.
     Settings(Box<SettingsState>),
+    /// Reasoning/thinking-effort picker (`/effort`): a small overlay listing the
+    /// effort options the current model supports. The inner [`EffortPickerState`]
+    /// holds the option list, the cursor, and a one-line capability note. Boxed
+    /// to keep `Mode` small and consistent with `Settings`.
+    Effort(Box<EffortPickerState>),
 }
 
 /// Transient state for the credentials input form.
@@ -837,6 +844,42 @@ impl SettingsState {
             (cur + len - 1) % len
         };
         self.accent = ACCENTS[next].to_string();
+    }
+}
+
+/// State for the `/effort` reasoning-effort picker overlay.
+///
+/// `options` is the capability-derived list shown to the user (e.g.
+/// `["default","off","low","high"]` for an effort model, or `["off","on"]` for
+/// an on/off-only one). `selected` indexes `options`; `note` is a short
+/// capability line shown dimmed in the footer (e.g. why a model has no control,
+/// or that capabilities couldn't be fetched). Built in the `/effort` command
+/// handler; keystrokes are handled by [`controller::input::handle_effort`].
+pub struct EffortPickerState {
+    /// The effort options offered for the current model, in display order.
+    pub options: Vec<String>,
+    /// Cursor within `options`.
+    pub selected: usize,
+    /// One-line capability note rendered dim in the footer.
+    pub note: String,
+}
+
+impl EffortPickerState {
+    /// Move the cursor up one row (clamps at 0).
+    pub fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Move the cursor down one row (clamps at the last option).
+    pub fn down(&mut self) {
+        if self.selected + 1 < self.options.len() {
+            self.selected += 1;
+        }
+    }
+
+    /// The currently highlighted option, if any.
+    pub fn selected_option(&self) -> Option<&String> {
+        self.options.get(self.selected)
     }
 }
 

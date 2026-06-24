@@ -46,6 +46,7 @@ pub(super) fn build_client(s: &Session) -> Arc<OpenRouterClient> {
         DEFAULT_BASE_URL.to_string(),
         s.settings.model.clone(),
         s.settings.provider.clone(),
+        s.settings.effort.clone(),
     ))
 }
 

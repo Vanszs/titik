@@ -16,7 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{APP_TITLE, HTTP_REFERER};
 use crate::dto::chat::{ChatMessage, ToolCall};
 use crate::dto::openrouter::{
-    ChatRequest, ChatResponse, StreamChunk, ToolDef, ToolFunctionDef, UsageRequest,
+    ChatRequest, ChatResponse, ModelInfo, ModelsResponse, ReasoningConfig, StreamChunk, ToolDef,
+    ToolFunctionDef, UsageRequest,
 };
 use crate::service::StreamEvent;
 
@@ -26,6 +27,11 @@ pub struct OpenRouterClient {
     base_url: String,
     model: String,
     provider: String,
+    /// Reasoning/thinking effort for the interactive chat path. Free-form token
+    /// (`""`/`"default"` = model default, `"off"`/`"none"` = thinking off, or an
+    /// effort level like `"low"`/`"high"`); mapped to the request `reasoning`
+    /// object by [`reasoning_config`]. Only [`Self::stream_complete`] applies it.
+    effort: String,
 }
 
 /// Send one event on the request channel, ignoring a closed receiver (the
@@ -48,6 +54,77 @@ fn provider_routing_for(provider: &str) -> Option<crate::dto::openrouter::Provid
             only: vec![provider.to_string()],
             allow_fallbacks: false,
         })
+    }
+}
+
+/// Map a stored effort token to the request `reasoning` object.
+///
+/// - `""` / `"default"` → `None`: omit `reasoning` entirely so the model uses
+///   its own default thinking behaviour.
+/// - `"off"` / `"none"` → `Some(enabled: false)`: turn thinking off.
+/// - any effort token (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/…) →
+///   `Some(effort: <token>)`. `effort` and `enabled` are mutually exclusive, so
+///   only `effort` is set here.
+///
+/// Free helper (not a method) so it has no hidden state — what you pass is what
+/// you get. Applied only on the interactive chat path.
+fn reasoning_config(effort: &str) -> Option<ReasoningConfig> {
+    match effort.trim() {
+        "" | "default" => None,
+        "off" | "none" => Some(ReasoningConfig {
+            effort: None,
+            enabled: Some(false),
+        }),
+        level => Some(ReasoningConfig {
+            effort: Some(level.to_string()),
+            enabled: None,
+        }),
+    }
+}
+
+/// Derived reasoning capability for a single model, used to build the `/effort`
+/// menu conditionally.
+///
+/// - `supported`: the model exposes any reasoning control at all.
+/// - `mandatory`: reasoning can't be turned off (no "off" option offered).
+/// - `efforts`: discrete effort tokens the model accepts, in the order the API
+///   reported them; empty means on/off-only (or unreported).
+pub struct EffortCaps {
+    pub supported: bool,
+    pub mandatory: bool,
+    pub efforts: Vec<String>,
+}
+
+/// Derive [`EffortCaps`] for `model_id` from a `GET /models` listing.
+///
+/// Matches the model by exact `id`. Reasoning is considered supported when the
+/// model carries a `reasoning` object OR advertises `reasoning` /
+/// `include_reasoning` in its `supported_parameters`. The effort list and the
+/// mandatory flag come from the `reasoning` object when present. A model absent
+/// from the listing yields `supported = false` so the caller can fall back.
+pub fn effort_caps(models: &[ModelInfo], model_id: &str) -> EffortCaps {
+    let Some(info) = models.iter().find(|m| m.id == model_id) else {
+        return EffortCaps {
+            supported: false,
+            mandatory: false,
+            efforts: Vec::new(),
+        };
+    };
+    let has_param = info
+        .supported_parameters
+        .iter()
+        .any(|p| p == "reasoning" || p == "include_reasoning");
+    let supported = info.reasoning.is_some() || has_param;
+    let efforts = info
+        .reasoning
+        .as_ref()
+        .map(|r| r.supported_efforts.clone())
+        .unwrap_or_default();
+    let mandatory = info.reasoning.as_ref().map(|r| r.mandatory).unwrap_or(false);
+    EffortCaps {
+        supported,
+        mandatory,
+        efforts,
     }
 }
 
@@ -76,13 +153,20 @@ fn clean_error(status: reqwest::StatusCode, body: &str) -> String {
 }
 
 impl OpenRouterClient {
-    pub fn new(api_key: String, base_url: String, model: String, provider: String) -> Self {
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        model: String,
+        provider: String,
+        effort: String,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key,
             base_url,
             model,
             provider,
+            effort,
         }
     }
 
@@ -142,6 +226,9 @@ impl OpenRouterClient {
             provider: self.provider_routing(),
             usage: UsageRequest { include: true },
             tools: Some(tools),
+            // Interactive chat is the only path that thinks; map the session's
+            // effort token to a `reasoning` directive (None = model default).
+            reasoning: reasoning_config(&self.effort),
         };
 
         let resp = self
@@ -289,6 +376,8 @@ impl OpenRouterClient {
             usage: UsageRequest { include: true },
             // /compact summarisation uses no tools.
             tools: None,
+            // Compaction is a mechanical summary; no thinking needed.
+            reasoning: None,
         };
 
         let response = self
@@ -340,6 +429,8 @@ impl OpenRouterClient {
             usage: UsageRequest { include: true },
             // Secondary-model calls use no tools.
             tools: None,
+            // Secondary-model calls (awareness / classifier) don't think.
+            reasoning: None,
         };
 
         let response = self
@@ -365,5 +456,34 @@ impl OpenRouterClient {
             .next()
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow!("no choices returned"))
+    }
+
+    /// Fetch the OpenRouter model catalogue (`GET /models`).
+    ///
+    /// Drives the `/effort` capability menu: the returned [`ModelInfo`] list is
+    /// passed to [`effort_caps`] to decide which options the current model
+    /// supports. The endpoint needs no auth, but we send the bearer header
+    /// anyway for consistency with the other calls. Returns the `data` array;
+    /// clean errors, no panics. Callers treat any `Err` as "capabilities
+    /// unknown" and fall back to a generic menu.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let url = format!("{}/models", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("{}", clean_error(status, &text)));
+        }
+
+        let models: ModelsResponse = response.json().await?;
+        Ok(models.data)
     }
 }

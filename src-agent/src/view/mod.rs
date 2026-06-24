@@ -8,10 +8,12 @@
 //! - [`key_input`]      – the first-run / reconfigure credentials form
 //! - [`session_picker`] – the `--resume` session list with search bar
 //! - [`settings`]       – the in-app `/settings` dashboard
+//! - [`effort`]         – the `/effort` reasoning-effort picker overlay
 //!
 //! No logic lives here; all rendering decisions belong to the sub-modules.
 
 pub mod chat;
+pub mod effort;
 pub mod key_input;
 pub mod markdown;
 pub mod session_picker;
@@ -36,5 +38,6 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Mode::KeyInput(form) => key_input::draw(frame, form, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
         Mode::Settings(s) => settings::draw(frame, s, &palette),
+        Mode::Effort(e) => effort::draw(frame, e, &palette),
     }
 }

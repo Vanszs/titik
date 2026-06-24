@@ -5,9 +5,9 @@
 //! [`Command`] value.  The runtime then routes that value to the appropriate
 //! service logic (compaction, new session, rename, etc.).
 //!
-//! Supported commands: `/compact`, `/new`, `/rename [session] <name>`,
-//! `/settings` (alias `/config`), `/resume` (alias `/sessions`),
-//! `/help`, `/quit` (aliases: `/q`, `/exit`).
+//! Supported commands: `/compact`, `/new`, `/mode`, `/effort`,
+//! `/rename [session] <name>`, `/settings` (alias `/config`),
+//! `/resume` (alias `/sessions`), `/help`, `/quit` (aliases: `/q`, `/exit`).
 
 /// User-facing slash commands shown in the `/` palette, in display order.
 /// (name, one-line description). Source of truth for the palette UI.
@@ -15,6 +15,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/resume", "Open the session picker to switch sessions"),
     ("/mode", "Toggle Normal/Auto tool approval"),
+    ("/effort", "Set model reasoning/thinking effort"),
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/compact", "Summarize and compact the conversation"),
     ("/rename", "Rename the current session"),
@@ -52,6 +53,8 @@ pub enum Command {
     New,
     /// Toggle the tool-approval policy between Normal and Auto.
     Mode,
+    /// Open the reasoning/thinking-effort picker for the current model.
+    Effort,
     /// Rename the current session.  Holds the new name string.
     Rename(String),
     /// Open the in-app settings dashboard (alias: `/config`).
@@ -93,6 +96,7 @@ pub fn parse(line: &str) -> Command {
         "compact" => Command::Compact,
         "new" => Command::New,
         "mode" => Command::Mode,
+        "effort" => Command::Effort,
         "settings" | "config" => Command::Settings,
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,

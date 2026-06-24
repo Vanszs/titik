@@ -186,6 +186,11 @@ pub struct AppStateRest {
     /// `None` for an approval that wasn't classifier-driven. Cleared when the
     /// approval resolves.
     pub approval_reason: Option<String>,
+    /// Cached OpenRouter model catalogue (`GET /models`), fetched lazily the
+    /// first time `/effort` opens and reused on subsequent opens so the menu
+    /// doesn't refetch. `None` until the first successful fetch; a failed fetch
+    /// leaves it `None` (the picker falls back to a generic option set).
+    pub models_cache: Option<Vec<crate::dto::openrouter::ModelInfo>>,
 }
 
 impl AppState {
@@ -248,6 +253,7 @@ impl AppStateRest {
             launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             harness_rx: None,
             approval_reason: None,
+            models_cache: None,
         }
     }
 

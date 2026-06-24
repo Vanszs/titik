@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::app::mode::{KeyInputForm, Mode, PickerState, SettingsState};
+use crate::app::mode::{EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
@@ -14,6 +14,56 @@ use crate::model::store;
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 
 use super::stream::abort_current;
+
+/// Generic effort menu used when the model catalogue can't be fetched (network
+/// failure). Covers the common tokens so the user can still set something; the
+/// accompanying note tells them capabilities are unknown.
+const GENERIC_EFFORTS: &[&str] = &["default", "off", "low", "medium", "high", "max"];
+
+/// Append `opt` to `out` unless it's already present (case-sensitive). Keeps the
+/// option list deduped while preserving the order options are added in.
+fn push_unique(out: &mut Vec<String>, opt: &str) {
+    if !out.iter().any(|o| o == opt) {
+        out.push(opt.to_string());
+    }
+}
+
+/// Build the `/effort` option list from a model's derived [`EffortCaps`].
+///
+/// Returns `None` when the model has no reasoning control at all (the caller
+/// toasts and does NOT open the menu). Otherwise:
+/// - discrete efforts reported → `["default","off"] + efforts` (deduped, model
+///   order preserved); `"off"` dropped when reasoning is mandatory.
+/// - supported but no discrete efforts (on/off only) → `["default","off","max"]`
+///   (`"max"` == thinking on); `"off"` dropped when mandatory.
+///
+/// `"default"` is always first so the model-default choice is one keypress away.
+fn build_effort_options(caps: &crate::service::openrouter::EffortCaps) -> Option<Vec<String>> {
+    if !caps.supported {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    push_unique(&mut out, "default");
+    if !caps.mandatory {
+        push_unique(&mut out, "off");
+    }
+    if caps.efforts.is_empty() {
+        // On/off-only model: "max" stands in for "thinking on".
+        push_unique(&mut out, "max");
+    } else {
+        for e in &caps.efforts {
+            push_unique(&mut out, e);
+        }
+    }
+    Some(out)
+}
+
+/// Index of the option matching the session's stored `effort` (empty → the
+/// `"default"` entry). Falls back to 0 when the stored value isn't offered.
+fn preselect_effort(options: &[String], effort: &str) -> usize {
+    let want = if effort.is_empty() { "default" } else { effort };
+    options.iter().position(|o| o == want).unwrap_or(0)
+}
 
 /// Apply a parsed slash command. Like [`apply_action`], it mutates state and
 /// may spawn/abort the request task.
@@ -122,6 +172,73 @@ pub(super) fn apply_slash(
         Command::Mode => {
             state.rest.agent_mode = state.rest.agent_mode.toggled();
             state.rest.status = format!("mode: {}", state.rest.agent_mode.label());
+        }
+
+        Command::Effort => {
+            // Needs an active session + client (the menu is per-model and a fetch
+            // uses the client). Blocked while a request is in flight, mirroring
+            // the /settings + /compact guards.
+            if state.rest.waiting {
+                state.rest.status = "busy — wait for response".into();
+                return Ok(());
+            }
+            let (Some(c), Some(model)) = (
+                client.as_ref(),
+                state.rest.session.as_ref().map(|s| s.settings.model.clone()),
+            ) else {
+                state.rest.status = "no active session".into();
+                return Ok(());
+            };
+
+            // Fetch the model catalogue once and cache it. A network failure
+            // leaves the cache `None`, which the option-build step below treats
+            // as "capabilities unknown" and falls back to a generic menu.
+            if state.rest.models_cache.is_none() {
+                if let Ok(models) = handle.block_on(c.list_models()) {
+                    state.rest.models_cache = Some(models);
+                }
+            }
+
+            // Build the option list + capability note from the (cached) catalogue.
+            let (options, note) = if let Some(models) = state.rest.models_cache.as_ref() {
+                let caps = crate::service::openrouter::effort_caps(models, &model);
+                match build_effort_options(&caps) {
+                    Some(opts) => {
+                        let note = if caps.efforts.is_empty() {
+                            "thinking on/off only".to_string()
+                        } else if caps.mandatory {
+                            "reasoning is always on for this model".to_string()
+                        } else {
+                            "pick a thinking effort".to_string()
+                        };
+                        (opts, note)
+                    }
+                    None => {
+                        // No reasoning control: don't open the menu, just say so.
+                        state.rest.status = "model has no thinking control".into();
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Fetch failed (cache still None): generic fallback menu.
+                (
+                    GENERIC_EFFORTS.iter().map(|s| s.to_string()).collect(),
+                    "couldn't fetch model capabilities".to_string(),
+                )
+            };
+
+            let stored = state
+                .rest
+                .session
+                .as_ref()
+                .map(|s| s.settings.effort.clone())
+                .unwrap_or_default();
+            let selected = preselect_effort(&options, &stored);
+            state.mode = Mode::Effort(Box::new(EffortPickerState {
+                options,
+                selected,
+                note,
+            }));
         }
 
         Command::Rename(name) => {

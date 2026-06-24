@@ -135,6 +135,13 @@ pub struct Settings {
     /// then omitted from the request body entirely.
     #[serde(default)]
     pub provider: String,
+    /// Reasoning/thinking effort for the interactive chat, set via `/effort`.
+    /// Free-form token: `""` (default) = model default, `"off"`/`"none"` =
+    /// thinking off, or an effort level (`"low"`/`"high"`/`"max"`/…). Mapped to
+    /// the request `reasoning` object by the OpenRouter client. Defaults to `""`
+    /// so old `settings.json` files load unchanged.
+    #[serde(default)]
+    pub effort: String,
     /// Working directories for this session, as a managed path list. The FIRST
     /// non-empty entry is the effective workdir (see `Session::workdir`); the
     /// rest also count toward the harness workspace allow-set. Seeded with the
@@ -223,6 +230,7 @@ impl Default for Settings {
             name: String::new(),
             compaction: Compaction::default(),
             provider: DEFAULT_PROVIDER.to_string(),
+            effort: String::new(),
             workdir: Vec::new(),
             awareness_enabled: default_awareness_enabled(),
             awareness_inherit: default_awareness_inherit(),

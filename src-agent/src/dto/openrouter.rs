@@ -44,6 +44,25 @@ pub struct UsageRequest {
     pub include: bool,
 }
 
+/// Reasoning/thinking control for the request, serialised as the top-level
+/// `"reasoning"` object.
+///
+/// Only the two fields this app uses are modelled; both are skipped when
+/// `None` so the on-wire object carries exactly what was set:
+/// - `{"reasoning":{"effort":"high"}}` selects a thinking effort level.
+/// - `{"reasoning":{"enabled":false}}` turns thinking off entirely.
+///
+/// Omitting the whole struct (via `skip_serializing_if` on the `ChatRequest`
+/// field) lets the model use its own default reasoning behaviour. `effort` and
+/// `enabled` are never set together — see `reasoning_config` in the service.
+#[derive(Debug, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
 /// JSON-Schema description of one tool's `function`, as required by the
 /// OpenAI/OpenRouter `tools` request field. `parameters` is the tool's raw
 /// JSON-Schema object (taken verbatim from `Tool::parameters`).
@@ -84,6 +103,49 @@ pub struct ChatRequest {
     /// `skip_serializing_if` on the `/compact` summary call, which uses no tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
+    /// Reasoning/thinking directive. `Some` only on the interactive chat path
+    /// (set from the session's `effort`); `None` everywhere else (compaction +
+    /// secondary-model calls don't think) and omitted from the body via
+    /// `skip_serializing_if`, so the model falls back to its own default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Models list (inbound, GET /models — drives the /effort capability menu)
+// ---------------------------------------------------------------------------
+
+/// The `reasoning` sub-object of a model entry in `GET /models`.
+///
+/// Both fields default so a model that omits one (or omits `reasoning`
+/// entirely) still deserialises. `supported_efforts` is the list of effort
+/// tokens the model accepts (e.g. `["high","low"]`); empty means the model
+/// either takes no discrete efforts (on/off only) or none were reported.
+/// `mandatory` is true when reasoning can't be turned off.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ModelReasoning {
+    #[serde(default)]
+    pub mandatory: bool,
+    #[serde(default)]
+    pub supported_efforts: Vec<String>,
+}
+
+/// One model entry from `GET /models`. Only the fields the effort-capability
+/// derivation needs are modelled; the rest of OpenRouter's rich model record is
+/// ignored. `reasoning` is absent for models with no thinking support.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub supported_parameters: Vec<String>,
+    #[serde(default)]
+    pub reasoning: Option<ModelReasoning>,
+}
+
+/// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.
+#[derive(Debug, Deserialize)]
+pub struct ModelsResponse {
+    pub data: Vec<ModelInfo>,
 }
 
 // ---------------------------------------------------------------------------

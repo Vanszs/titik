@@ -13,7 +13,7 @@
 //! belonging to the active mode and `AppStateRest`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crate::app::mode::{KeyInputForm, Mode, PickerState, SettingsState};
+use crate::app::mode::{EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::{AppState, AppStateRest};
 use crate::controller::command::{self, Command};
 
@@ -57,6 +57,13 @@ pub enum Action {
     /// return to Chat. The apply path reads the drafts back out of
     /// `state.mode`, mirroring [`Action::PickerSelect`].
     SaveSettings,
+    // --- Effort picker actions ---
+    /// Enter on the `/effort` picker — store the chosen effort, rebuild the
+    /// client so it takes effect, and return to Chat. Inner string is the chosen
+    /// option (`"default"` stores `""`).
+    SaveEffort(String),
+    /// Esc on the `/effort` picker — discard the selection and return to Chat.
+    EffortCancel,
 }
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -104,6 +111,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::KeyInput(form) => handle_key_input(form, &mut state.rest, key),
         Mode::SessionPicker(p) => handle_picker(p, &mut state.rest, key),
         Mode::Settings(s) => handle_settings(s, &mut state.rest, key),
+        Mode::Effort(e) => handle_effort(e, &mut state.rest, key),
     }
 }
 
@@ -142,7 +150,8 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 }
             }
         }
-        Mode::SessionPicker(_) => {}
+        // No text entry in the session/effort pickers — paste is a no-op.
+        Mode::SessionPicker(_) | Mode::Effort(_) => {}
     }
 }
 
@@ -622,5 +631,34 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
             }
             _ => Action::None,
         }
+    }
+}
+
+/// Handle a key press inside the `/effort` reasoning-effort picker.
+///
+/// Up/Down move the selection; Enter confirms the highlighted option (the
+/// runtime stores it, rebuilds the client, and returns to Chat); Esc cancels
+/// back to Chat; Ctrl+C quits. `_rest` is accepted for handler-signature
+/// consistency but unused.
+fn handle_effort(e: &mut EffortPickerState, _rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    if is_ctrl(&key, 'c') {
+        return Action::Quit;
+    }
+
+    match key.code {
+        KeyCode::Esc => Action::EffortCancel,
+        KeyCode::Up => {
+            e.up();
+            Action::None
+        }
+        KeyCode::Down => {
+            e.down();
+            Action::None
+        }
+        KeyCode::Enter => match e.selected_option() {
+            Some(opt) => Action::SaveEffort(opt.clone()),
+            None => Action::EffortCancel,
+        },
+        _ => Action::None,
     }
 }
