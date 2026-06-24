@@ -363,16 +363,17 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
-    // --- File reference palette --- `@`-triggered depth-1 file browser, same
-    // box style as the command palette, anchored above the input. Only shown
-    // when the command palette is NOT active and the current token is `@partial`.
+    // --- File reference palette --- `@`-triggered global substring file search,
+    // same box style as the command palette, anchored above the input. Only
+    // shown when the command palette is NOT active and the current token is
+    // `@partial`. Uses `search` so deep files appear on every keystroke.
     let file_palette_active = cmd_matches.is_empty();
     if file_palette_active {
         if let Some(partial) = crate::controller::input::file_ref_partial(&rest.input) {
-            let files: Vec<String> = rest.dir_cache.read().map(|c| c.list_at(partial)).unwrap_or_default();
+            const MAX_VIS: usize = 10;
+            let files: Vec<String> = rest.dir_cache.read().map(|c| c.search(partial, MAX_VIS)).unwrap_or_default();
             if !files.is_empty() {
                 let sel = rest.palette_sel.min(files.len() - 1);
-                const MAX_VIS: usize = 10;
                 // window start keeps `sel` visible (anchors to bottom when scrolling down)
                 let start = if sel < MAX_VIS { 0 } else { sel + 1 - MAX_VIS };
                 let end = (start + MAX_VIS).min(files.len());

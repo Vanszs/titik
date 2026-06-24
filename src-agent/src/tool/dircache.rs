@@ -46,6 +46,83 @@ pub fn reindex(root: PathBuf, cache: Arc<RwLock<DirCache>>) {
 }
 
 impl DirCache {
+    /// Global case-insensitive substring search over every file AND every
+    /// ancestor directory in the cache.
+    ///
+    /// Candidate set: every file path in `self.files` plus every unique ancestor
+    /// directory (rendered with a trailing "/"). Example: the file
+    /// "src-agent/x/a/b/c/ages.rs" contributes itself plus the dirs
+    /// "src-agent/", "src-agent/x/", "src-agent/x/a/", "src-agent/x/a/b/",
+    /// "src-agent/x/a/b/c/".
+    ///
+    /// If `query` is empty the depth-1 entries (immediate root children, files
+    /// and first-level directories) are returned capped at `limit`, matching the
+    /// original `@` browse behaviour.
+    ///
+    /// Otherwise: keep every candidate whose full path contains `query`
+    /// case-insensitively, then rank:
+    ///   (a) entries whose basename (last segment, stripping any trailing "/")
+    ///       STARTS WITH the query — ranked first;
+    ///   (b) all others that merely contain it.
+    /// Within each group, sort by ascending path length then lexicographically.
+    /// Truncate to `limit`.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
+        if query.is_empty() {
+            // Depth-1 browse: same as children("") capped at limit.
+            return self.children("").into_iter().take(limit).collect();
+        }
+
+        // Build the full candidate set: all files + all unique ancestor dirs.
+        let q = query.to_lowercase();
+        let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: Vec<String> = Vec::new();
+
+        for f in &self.files {
+            // Ancestor directories for this file.
+            let mut path = f.as_str();
+            while let Some(i) = path.rfind('/') {
+                path = &path[..i];
+                let dir_entry = format!("{path}/");
+                dirs.insert(dir_entry);
+            }
+            candidates.push(f.clone());
+        }
+        for d in dirs {
+            candidates.push(d);
+        }
+
+        // Filter by substring match, then rank.
+        let mut starts: Vec<String> = Vec::new();
+        let mut contains: Vec<String> = Vec::new();
+        for c in candidates {
+            let cl = c.to_lowercase();
+            if !cl.contains(&q) {
+                continue;
+            }
+            // Basename: strip trailing "/" then take everything after the last "/".
+            let base = {
+                let stripped = c.trim_end_matches('/');
+                match stripped.rfind('/') {
+                    Some(i) => &stripped[i + 1..],
+                    None => stripped,
+                }
+            };
+            if base.to_lowercase().starts_with(&q) {
+                starts.push(c);
+            } else {
+                contains.push(c);
+            }
+        }
+
+        // Sort each group: shorter path first, then lexicographic.
+        starts.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+        contains.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+
+        starts.extend(contains);
+        starts.truncate(limit);
+        starts
+    }
+
     /// Immediate children (files + subfolders) of a workspace-relative directory,
     /// derived from the cached file list. `dir` may be "", ".", "src", "src/".
     /// Files are basenames; subfolders end with "/". Sorted, deduped.
@@ -60,36 +137,6 @@ impl DirCache {
                     None => { set.insert(rest.to_string()); }              // file
                     Some(j) => { set.insert(format!("{}/", &rest[..j])); } // subfolder
                 }
-            }
-        }
-        set.into_iter().collect()
-    }
-
-    /// Immediate children (files + subfolders) for the path being typed after
-    /// `@`. `partial` is split into a directory prefix (up to and including the
-    /// last `/`) and a filename fragment (after it). Returns files directly in
-    /// the prefix dir plus subfolder names (with a trailing `/`), filtered by the
-    /// fragment (case-insensitive prefix match on the child name), sorted.
-    pub fn list_at(&self, partial: &str) -> Vec<String> {
-        let (prefix, frag) = match partial.rfind('/') {
-            Some(i) => (&partial[..=i], &partial[i + 1..]), // prefix keeps trailing '/'
-            None => ("", partial),
-        };
-        let frag = frag.to_lowercase();
-        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for f in &self.files {
-            let rest = match f.strip_prefix(prefix) {
-                Some(r) if !r.is_empty() => r,
-                _ => continue,
-            };
-            let entry = match rest.find('/') {
-                None => f.clone(),                             // file directly in prefix
-                Some(j) => format!("{prefix}{}/", &rest[..j]), // subfolder (trailing '/')
-            };
-            // filter by the typed fragment against the child name (after prefix)
-            let name = entry.strip_prefix(prefix).unwrap_or(&entry);
-            if frag.is_empty() || name.to_lowercase().starts_with(&frag) {
-                set.insert(entry);
             }
         }
         set.into_iter().collect()

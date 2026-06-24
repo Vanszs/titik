@@ -205,6 +205,10 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         return Action::None;
     }
 
+    // Max visible entries in the `@` file-reference palette (shared across all
+    // key handlers in this function and kept in sync with the view constant).
+    const FILE_PAL_MAX: usize = 10;
+
     match key.code {
         KeyCode::Esc => {
             if rest.waiting {
@@ -232,7 +236,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             } else {
                 // File palette: complete instead of submitting when a file match is selected.
                 let fmatches: Vec<String> = file_ref_partial(&rest.input)
-                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     complete_file_ref(rest, &fmatches);
@@ -257,7 +261,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 rest.palette_sel = rest.palette_sel.saturating_sub(1);
             } else {
                 let fmatches: Vec<String> = file_ref_partial(&rest.input)
-                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     rest.palette_sel = rest.palette_sel.saturating_sub(1);
@@ -274,7 +278,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 rest.palette_sel = (rest.palette_sel + 1).min(n - 1);
             } else {
                 let fmatches: Vec<String> = file_ref_partial(&rest.input)
-                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     rest.palette_sel = (rest.palette_sel + 1).min(fmatches.len() - 1);
@@ -293,7 +297,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 rest.palette_sel = 0;
             } else {
                 let fmatches: Vec<String> = file_ref_partial(&rest.input)
-                    .map(|p| rest.dir_cache.read().map(|c| c.list_at(p)).unwrap_or_default())
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     complete_file_ref(rest, &fmatches);
