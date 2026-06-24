@@ -93,13 +93,38 @@ pub(super) fn advance_turn(
 ) {
     // 1. Take the stashed tool calls + the streamed text + the in-flight usage
     //    out of state up front so nothing leaks into the next model call.
-    let pending = state.rest.pending_tool_calls.clone();
-    let buf = state.rest.take_stream();
+    let mut pending = state.rest.pending_tool_calls.clone();
+    let mut buf = state.rest.take_stream();
     let usage = state.rest.pending_usage.take();
     // Display-only reasoning streamed this round. Taken unconditionally (so it
     // can never leak into the next round) and folded onto the committed message
     // below; never logged to disk or sent to the API.
     let reasoning = state.rest.take_reasoning();
+
+    // 1b. Text-format tool-call fallback. Some models (Hermes/Qwen/ChatML on
+    //     budget / gpt-oss / GLM routes) emit a tool call as `<tool_call>…JSON…
+    //     </tool_call>` TEXT inside content instead of via the native
+    //     `tool_calls` field. When the native path produced NO pending calls but
+    //     the model did stream text, try to harvest such calls and feed them
+    //     through the IDENTICAL path as native ones: the cleaned content (markup
+    //     stripped) becomes the committed/persisted/displayed message, the
+    //     synthesized calls become `pending`, AND they are written back into
+    //     `state.rest.pending_tool_calls` so any other reader of rest state sees
+    //     them too. Zero behaviour change when native calls already exist or when
+    //     no parseable block is present (cleaned == original, pending stays empty).
+    if pending.is_empty() {
+        if let Some(text) = buf.as_deref() {
+            if !text.is_empty() {
+                let (cleaned, synthesized) =
+                    crate::dto::chat::extract_text_tool_calls(text);
+                if !synthesized.is_empty() {
+                    buf = Some(cleaned);
+                    pending = synthesized.clone();
+                    state.rest.pending_tool_calls = synthesized;
+                }
+            }
+        }
+    }
 
     // 2. Commit the assistant message (and log + count it). The assistant text
     //    may be empty on a tool-call turn — we still record the row so usage

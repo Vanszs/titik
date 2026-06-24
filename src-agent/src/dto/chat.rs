@@ -70,6 +70,131 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// Parse out tool calls a model emitted as TEXT in its content rather than via
+/// the native OpenAI-style `tool_calls` field. Budget / gpt-oss / GLM routes
+/// (and Hermes/Qwen/ChatML-trained models generally) tend to write a call as a
+/// `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` span in plain
+/// text; without this fallback such calls render as literal text and never run.
+///
+/// Scans `content` for `<tool_call>` … `</tool_call>` spans. Each `</tool_call>`
+/// close tag is paired with the NEAREST `<tool_call>` open that precedes it
+/// (within the not-yet-consumed region), so a stray/unclosed open tag before a
+/// valid block never swallows the valid block's call. Trims inner text and
+/// parses it as JSON. A span counts as a tool call only when the JSON is an
+/// object with a non-empty string `name` and an `arguments` (or `parameters`)
+/// field. The arguments are normalised to a JSON-encoded string (mirroring how
+/// the wire format carries `FunctionCall.arguments`): a JSON string is used
+/// verbatim, a JSON object is stringified, and any other value (number, bool,
+/// null, array) or a missing key degrades to `"{}"`.
+///
+/// Returns `(cleaned_content, calls)`. Successfully-parsed spans are removed
+/// from the content (leading/trailing whitespace trimmed, 3+ newline runs
+/// collapsed to 2); malformed or non-tool-call spans are SKIPPED and left in
+/// the content so the user still sees the model's raw attempt. When nothing
+/// parses, the content is returned unchanged with an empty vec.
+pub fn extract_text_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+
+    let mut calls: Vec<ToolCall> = Vec::new();
+    // Spans (byte ranges over `content`, including the tags) that parsed
+    // successfully and must be stripped from the cleaned output.
+    let mut remove: Vec<(usize, usize)> = Vec::new();
+
+    let mut search_from = 0usize;
+    while let Some(rel_close) = content[search_from..].find(CLOSE) {
+        let close_start = search_from + rel_close;
+        let close_end = close_start + CLOSE.len();
+
+        // Within the not-yet-consumed region up to this close tag, find the
+        // NEAREST (rightmost) preceding open tag.
+        let region = &content[search_from..close_start];
+        match region.rfind(OPEN) {
+            Some(rel_open) => {
+                let open_start = search_from + rel_open;
+                let inner_start = open_start + OPEN.len();
+                let inner = content[inner_start..close_start].trim();
+                if let Some((name, arguments)) = parse_tool_call_json(inner) {
+                    calls.push(ToolCall {
+                        id: format!("text_call_{}", calls.len()),
+                        kind: "function".to_string(),
+                        function: FunctionCall { name, arguments },
+                    });
+                    remove.push((open_start, close_end));
+                }
+                // Whether it parsed or not, advance past this close tag.
+                search_from = close_end;
+            }
+            None => {
+                // No open tag precedes this close — orphan close; skip it.
+                search_from = close_end;
+            }
+        }
+    }
+
+    if calls.is_empty() {
+        return (content.to_string(), Vec::new());
+    }
+
+    // Rebuild the content with the parsed spans removed (ranges are in order
+    // and non-overlapping since we scan left to right).
+    let mut cleaned = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for (start, end) in remove {
+        cleaned.push_str(&content[cursor..start]);
+        cursor = end;
+    }
+    cleaned.push_str(&content[cursor..]);
+
+    let cleaned = collapse_blank_runs(cleaned.trim());
+    (cleaned, calls)
+}
+
+/// Parse one `<tool_call>` inner JSON blob into `(name, arguments_string)`.
+/// Returns `None` unless it is an object with a non-empty string `name` and an
+/// `arguments` or `parameters` field (or `name` alone, which yields `"{}"`).
+fn parse_tool_call_json(inner: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(inner).ok()?;
+    let obj = value.as_object()?;
+    let name = obj.get("name")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    let args_value = obj.get("arguments").or_else(|| obj.get("parameters"));
+    let arguments = match args_value {
+        // A JSON string is used verbatim (already stringified JSON / raw text).
+        Some(serde_json::Value::String(s)) => s.clone(),
+        // A JSON object is stringified into our String-encoded form.
+        Some(v @ serde_json::Value::Object(_)) => serde_json::to_string(v).ok()?,
+        // Scalars (number, bool, null) and arrays are not valid argument bags;
+        // degrade to an empty object rather than emitting e.g. "5" or "null".
+        Some(_) => "{}".to_string(),
+        // name present but no arguments/parameters → empty object.
+        None => "{}".to_string(),
+    };
+    Some((name.to_string(), arguments))
+}
+
+/// Collapse any run of 3+ consecutive newlines into exactly 2, leaving other
+/// whitespace untouched. Used to tidy the gap left behind when a `<tool_call>`
+/// span is removed from between blocks of prose.
+fn collapse_blank_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut newline_run = 0usize;
+    for ch in s.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// A single turn in a conversation: who spoke and what they said.
 ///
 /// Serialised to / from JSON so it can be stored in `messages.json` and sent
@@ -139,5 +264,150 @@ impl ChatMessage {
     pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
         self.reasoning = reasoning.filter(|r| !r.is_empty());
         self
+    }
+}
+
+#[cfg(test)]
+mod text_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn single_block_object_arguments() {
+        let content =
+            r#"<tool_call>{"name": "read", "arguments": {"path": "ARCHITECTURE.md"}}</tool_call>"#;
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "text_call_0");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"ARCHITECTURE.md"}"#);
+    }
+
+    #[test]
+    fn parameters_alias() {
+        let content =
+            r#"<tool_call>{"name": "list", "parameters": {"dir": "src"}}</tool_call>"#;
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "list");
+        assert_eq!(calls[0].function.arguments, r#"{"dir":"src"}"#);
+    }
+
+    #[test]
+    fn arguments_already_json_string() {
+        // `arguments` is itself a JSON string holding stringified JSON — used verbatim.
+        let content =
+            r#"<tool_call>{"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}</tool_call>"#;
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"cmd": "ls"}"#);
+    }
+
+    #[test]
+    fn two_blocks_in_one_message() {
+        let content = concat!(
+            r#"<tool_call>{"name": "read", "arguments": {"path": "a"}}</tool_call>"#,
+            "\n",
+            r#"<tool_call>{"name": "read", "arguments": {"path": "b"}}</tool_call>"#,
+        );
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "text_call_0");
+        assert_eq!(calls[1].id, "text_call_1");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a"}"#);
+        assert_eq!(calls[1].function.arguments, r#"{"path":"b"}"#);
+    }
+
+    #[test]
+    fn malformed_json_skipped_and_left_in_content() {
+        let content = r#"<tool_call>{"name": "read", "arguments": }</tool_call>"#;
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert!(calls.is_empty());
+        // Skipped block stays in the content verbatim.
+        assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn surrounding_prose_preserved() {
+        let content = concat!(
+            "Let me read that file.\n\n",
+            r#"<tool_call>{"name": "read", "arguments": {"path": "x"}}</tool_call>"#,
+            "\n\nDone.",
+        );
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(cleaned, "Let me read that file.\n\nDone.");
+    }
+
+    #[test]
+    fn no_tool_call_present() {
+        let content = "Just a normal answer with no tool calls at all.";
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn nested_braces_in_arguments() {
+        let content = concat!(
+            r#"<tool_call>{"name": "edit", "arguments": {"path": "f", "#,
+            r#""replace": {"from": {"a": 1}, "to": {"b": 2}}}}</tool_call>"#,
+        );
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit");
+        // Re-parse the stringified arguments to confirm the nesting survived.
+        let v: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(v["replace"]["from"]["a"], 1);
+        assert_eq!(v["replace"]["to"]["b"], 2);
+    }
+
+    #[test]
+    fn whitespace_inside_tags_tolerated() {
+        let content = "<tool_call>\n  {\n  \"name\": \"read\",\n  \"arguments\": {\"path\": \"y\"}\n  }\n</tool_call>";
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(cleaned, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, r#"{"path":"y"}"#);
+    }
+
+    #[test]
+    fn stray_open_before_valid_block_still_parses() {
+        // A stray <tool_call> with no matching close precedes a complete valid
+        // block. The close of the valid block must re-anchor to the valid
+        // block's own open; the stray open is left in content as text.
+        let content = concat!(
+            "stray <tool_call> then a real ",
+            r#"<tool_call>{"name":"read","arguments":{"path":"x"}}</tool_call>"#,
+        );
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(calls.len(), 1, "exactly one call must be parsed");
+        assert_eq!(calls[0].function.name, "read");
+        // The valid block's span is removed from content; the stray open tag
+        // text may remain but the parsed block must not be present.
+        assert!(
+            !cleaned.contains(r#"{"name":"read""#),
+            "parsed block should be stripped from content"
+        );
+    }
+
+    #[test]
+    fn scalar_arguments_coerced_to_empty_object() {
+        // `arguments` is a bare number — not a valid argument bag.
+        // Must be coerced to "{}" rather than emitting "5".
+        let content = r#"<tool_call>{"name":"ping","arguments":5}</tool_call>"#;
+        let (cleaned, calls) = extract_text_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ping");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(cleaned, "");
     }
 }
