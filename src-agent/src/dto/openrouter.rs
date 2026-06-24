@@ -298,11 +298,26 @@ pub struct ModelReasoning {
     pub supported_efforts: Vec<String>,
 }
 
+/// The `top_provider` sub-object of a model entry in `GET /models`.
+///
+/// OpenRouter exposes both a nominal `context_length` (the model's theoretical
+/// maximum) and `top_provider.context_length` (the limit actually enforced by
+/// the serving provider). The provider-served value is what matters for
+/// summarisation thresholds; the nominal value is the fallback when this
+/// object is absent.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TopProvider {
+    #[serde(default)]
+    pub context_length: Option<u64>,
+}
+
 /// One model entry from `GET /models`. Only the fields the effort-capability
 /// derivation needs are modelled; the rest of OpenRouter's rich model record is
 /// ignored. `reasoning` is absent for models with no thinking support.
 /// `context_length` is the model's maximum context window in tokens, taken from
 /// the top-level field OpenRouter exposes on each model object.
+/// `top_provider` carries the provider-served context limit, which takes
+/// precedence over the nominal `context_length` when computing thresholds.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelInfo {
     pub id: String,
@@ -312,6 +327,8 @@ pub struct ModelInfo {
     pub reasoning: Option<ModelReasoning>,
     #[serde(default)]
     pub context_length: Option<u64>,
+    #[serde(default)]
+    pub top_provider: Option<TopProvider>,
 }
 
 /// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.
