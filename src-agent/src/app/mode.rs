@@ -297,7 +297,13 @@ impl SettingsState {
             classifier_enabled: session.settings.classifier_enabled,
             classifier_model: session.settings.classifier_model.clone(),
             classifier_provider: session.settings.classifier_provider.clone(),
-            allowed_folders: session.settings.allowed_folders.join(", "),
+            allowed_folders: if session.settings.allowed_folders.is_empty() {
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            } else {
+                session.settings.allowed_folders.join(", ")
+            },
         }
     }
 

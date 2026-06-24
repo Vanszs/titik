@@ -48,6 +48,14 @@ fn wanderer_corpus() -> &'static Vec<String> {
     })
 }
 
+/// The full wanderer corpus as a static slice (lowercased), for lead-in detection.
+///
+/// Returns the same corpus as [`wanderer_word`] uses so callers can check whether
+/// a token matches without re-embedding or re-parsing the JSON.
+pub fn wanderer_words() -> &'static [String] {
+    wanderer_corpus()
+}
+
 /// A random capitalized lead-in word for the plan step (e.g. "Wondering").
 pub fn wanderer_word() -> String {
     let corpus = wanderer_corpus();

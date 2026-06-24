@@ -164,7 +164,21 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     // Markdown body, then one dim line per requested tool call so
                     // the user can see what the agent invoked. Appended as logical
                     // lines so they get the hanging 2-col indent under the bullet.
-                    let mut logical = crate::view::markdown::render(&msg.content, palette, wrap_w);
+                    //
+                    // If the message begins with a wanderer lead-in (`Word: ...`),
+                    // that first line is styled like a tool-call line (dim + italic)
+                    // instead of being markdown-parsed, so it reads as thinking.
+                    let (leadin_line, body) = split_leadin(&msg.content);
+                    let leadin_style = Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::ITALIC);
+                    let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
+                    if let Some(leadin) = leadin_line {
+                        // Wrap the lead-in at wrap_w; each fragment gets the italic+dim style.
+                        let leadin_spans = vec![Span::styled(leadin.to_string(), leadin_style)];
+                        logical.extend(crate::view::markdown::wrap_spans(&leadin_spans, wrap_w));
+                    }
+                    logical.extend(crate::view::markdown::render(body, palette, wrap_w));
                     if let Some(calls) = msg.tool_calls.as_ref() {
                         for call in calls {
                             let args = truncate_chars(&call.function.arguments, 60);
@@ -643,6 +657,30 @@ fn fmt_count(n: u64) -> String {
     } else {
         format!("{:.1}m", n as f64 / 1_000_000.0).replace('.', ",")
     }
+}
+
+/// Detect and split off a wanderer lead-in line from an assistant message.
+///
+/// Returns `(Some(first_line), rest)` if the first line matches `^Word:` where
+/// `Word` (case-insensitive) is in the wanderer corpus; otherwise `(None, full)`.
+/// The returned `first_line` is the trimmed first line; `rest` is everything after
+/// the first newline (which may be empty).
+fn split_leadin(content: &str) -> (Option<&str>, &str) {
+    // Pull the first line and check it against the wanderer corpus.
+    let (first, rest) = match content.find('\n') {
+        Some(pos) => (&content[..pos], &content[pos + 1..]),
+        None => (content, ""),
+    };
+    let trimmed = first.trim();
+    // The lead-in token is everything before the first ':'.
+    if let Some(colon_pos) = trimmed.find(':') {
+        let token = trimmed[..colon_pos].trim().to_lowercase();
+        let corpus = crate::resources::wanderer_words();
+        if corpus.iter().any(|w| w == &token) {
+            return (Some(trimmed), rest);
+        }
+    }
+    (None, content)
 }
 
 /// One message's visual lines: bullet on the first line, 2-col indent on the
