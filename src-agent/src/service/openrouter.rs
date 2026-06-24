@@ -319,6 +319,14 @@ impl OpenRouterClient {
                                 emit(&tx, StreamEvent::Token(t.clone()));
                             }
                         }
+                        // Reasoning rides a separate delta channel (present only
+                        // when reasoning is enabled); accumulate it as a display-
+                        // only block, mirroring the content handling above.
+                        if let Some(r) = &choice.delta.reasoning {
+                            if !r.is_empty() {
+                                emit(&tx, StreamEvent::Reasoning(r.clone()));
+                            }
+                        }
                         if let Some(tcs) = &choice.delta.tool_calls {
                             for d in tcs {
                                 // Grow the accumulator so `index` is in range,

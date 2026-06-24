@@ -20,6 +20,11 @@ use crate::dto::chat::ChatMessage;
 pub enum StreamEvent {
     /// A chunk of assistant text to append to the streaming buffer.
     Token(String),
+    /// A chunk of the model's reasoning/thinking text (the `delta.reasoning`
+    /// channel, separate from `content`). Appended to a parallel reasoning buffer
+    /// and committed onto the assistant message as a display-only block — never
+    /// sent back to the API or persisted to disk.
+    Reasoning(String),
     /// Token/cost accounting for the in-flight generation. Arrives on the final
     /// streaming chunk, just before [`StreamEvent::Done`]; stashed and committed
     /// with the assistant message.

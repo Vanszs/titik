@@ -82,6 +82,14 @@ pub struct ChatMessage {
     /// entry this message answers. Omitted on every other message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Display-only reasoning/thinking text accumulated from the model's
+    /// `delta.reasoning` channel during streaming. `#[serde(skip)]` means it is
+    /// NEVER serialised — not into a `ChatRequest` body nor `messages.json` — and
+    /// always defaults to `None` on deserialise. This keeps reasoning purely a
+    /// render-time concern: it shows above the answer but never re-enters the
+    /// conversation the model sees, and never touches disk.
+    #[serde(skip)]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -92,6 +100,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -103,6 +112,7 @@ impl ChatMessage {
             content,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -113,6 +123,16 @@ impl ChatMessage {
             content,
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
+            reasoning: None,
         }
+    }
+
+    /// Attach a display-only reasoning block (builder style). An empty/`None`
+    /// reasoning leaves the field `None` so no empty thinking block renders.
+    /// Used at assistant-commit time to fold the streamed reasoning buffer onto
+    /// the message before it enters the conversation.
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning.filter(|r| !r.is_empty());
+        self
     }
 }

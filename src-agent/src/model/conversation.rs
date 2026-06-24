@@ -53,15 +53,31 @@ impl Conversation {
     }
 
     /// Append an assistant turn (used for both streamed and non-streamed replies).
-    pub fn push_assistant(&mut self, content: impl Into<String>) {
-        self.messages.push(ChatMessage::new(Role::Assistant, content));
+    ///
+    /// `reasoning` is the display-only thinking block streamed for this turn
+    /// (`None` when the model didn't think). It is attached BEFORE the message
+    /// enters the list so the transcript cache captures it on first render, and
+    /// it is never serialised (the field is `#[serde(skip)]`) — it only ever
+    /// shows above the answer, never re-entering the conversation or disk.
+    pub fn push_assistant(&mut self, content: impl Into<String>, reasoning: Option<String>) {
+        self.messages
+            .push(ChatMessage::new(Role::Assistant, content).with_reasoning(reasoning));
     }
 
     /// Append an assistant turn that requested tool calls. `content` is the
-    /// assistant text accompanying the calls (often empty).
-    pub fn push_assistant_with_tools(&mut self, content: String, tool_calls: Vec<ToolCall>) {
-        self.messages
-            .push(ChatMessage::assistant_with_tools(content, tool_calls));
+    /// assistant text accompanying the calls (often empty). `reasoning` is the
+    /// display-only thinking block (the model may think before emitting tool
+    /// calls); attached before the push and never serialised — see
+    /// [`Self::push_assistant`].
+    pub fn push_assistant_with_tools(
+        &mut self,
+        content: String,
+        tool_calls: Vec<ToolCall>,
+        reasoning: Option<String>,
+    ) {
+        self.messages.push(
+            ChatMessage::assistant_with_tools(content, tool_calls).with_reasoning(reasoning),
+        );
     }
 
     /// Append a `tool`-role result message answering `tool_call_id`.

@@ -120,13 +120,17 @@ pub(super) fn apply_action(
                 // Take any captured usage unconditionally so a partial turn's
                 // usage can't leak into the next response.
                 let usage = state.rest.pending_usage.take();
+                // Likewise drain the reasoning buffer unconditionally so a
+                // half-streamed thinking block can't bleed into the next turn;
+                // it's folded onto the interrupted message (display-only).
+                let reasoning = state.rest.take_reasoning();
                 let buf = state.rest.take_stream();
                 if let Some(b) = buf {
                     if !b.is_empty() {
                         if let Some(sess) = state.rest.session.as_mut() {
                             let content = format!("{b}  [interrupted]");
                             let _ = msglog::append(&sess.path, Role::Assistant, &content, usage);
-                            sess.conversation.push_assistant(content);
+                            sess.conversation.push_assistant(content, reasoning);
                             let _ = sess.save();
                             if let Some((pt, ct, cost)) = usage {
                                 state.rest.tokens_in = pt;        // current context size, not a sum

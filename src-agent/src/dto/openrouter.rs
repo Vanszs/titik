@@ -261,6 +261,13 @@ pub struct StreamChoice {
 pub struct Delta {
     #[serde(default)]
     pub content: Option<String>,
+    /// Incremental reasoning/thinking fragment for the current assistant turn,
+    /// streamed in a SEPARATE channel from `content` when reasoning is enabled
+    /// (via `/effort`). Accumulated into the assistant message's display-only
+    /// reasoning block; never echoed back to the API. `None` on frames the model
+    /// doesn't think on (and absent entirely for non-reasoning models).
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Incremental tool-call fragments. The model streams a tool call across
     /// several frames: the first carries the `id` + function `name`, subsequent
     /// frames append `arguments` text. Each entry's `index` selects the slot to

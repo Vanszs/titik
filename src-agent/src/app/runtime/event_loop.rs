@@ -174,6 +174,12 @@ pub(super) fn run_loop(
                         state.rest.append_token(&t);
                         state.rest.status = "streaming".into();
                     }
+                    StreamEvent::Reasoning(t) => {
+                        // Accumulate the model's thinking into the parallel buffer;
+                        // `dirty` is already set so it animates in like content.
+                        state.rest.append_reasoning(&t);
+                        state.rest.status = "thinking".into();
+                    }
                     StreamEvent::Usage { prompt_tokens, completion_tokens, cost } => {
                         // Stash for the assistant-commit step; do NOT break —
                         // usage arrives just before Done.

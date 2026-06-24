@@ -20,6 +20,9 @@ pub(super) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
     // Take the in-flight usage unconditionally so it can never leak into the
     // next turn, even when the buffer is empty or there's no session to commit.
     let usage = rest.pending_usage.take();
+    // Display-only reasoning streamed this turn, folded onto the committed
+    // message (never logged to disk / sent to the API).
+    let reasoning = rest.take_reasoning();
     let mut save_err = None;
     if let Some(buf) = rest.take_stream() {
         if !buf.is_empty() {
@@ -30,7 +33,7 @@ pub(super) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
                     &buf,
                     usage,
                 );
-                sess.conversation.push_assistant(buf);
+                sess.conversation.push_assistant(buf, reasoning);
                 if let Err(e) = sess.save() {
                     save_err = Some(e.to_string());
                 }
@@ -75,6 +78,10 @@ pub(super) fn advance_turn(
     let pending = state.rest.pending_tool_calls.clone();
     let buf = state.rest.take_stream();
     let usage = state.rest.pending_usage.take();
+    // Display-only reasoning streamed this round. Taken unconditionally (so it
+    // can never leak into the next round) and folded onto the committed message
+    // below; never logged to disk or sent to the API.
+    let reasoning = state.rest.take_reasoning();
 
     // 2. Commit the assistant message (and log + count it). The assistant text
     //    may be empty on a tool-call turn — we still record the row so usage
@@ -87,14 +94,14 @@ pub(super) fn advance_turn(
                 let content = buf.clone().unwrap_or_default();
                 let _ = crate::model::msglog::append(&sess.path, Role::Assistant, &content, usage);
                 sess.conversation
-                    .push_assistant_with_tools(content, pending.clone());
+                    .push_assistant_with_tools(content, pending.clone(), reasoning);
                 if let Err(e) = sess.save() {
                     save_err = Some(e.to_string());
                 }
             } else if let Some(b) = buf.as_ref() {
                 if !b.is_empty() {
                     let _ = crate::model::msglog::append(&sess.path, Role::Assistant, b, usage);
-                    sess.conversation.push_assistant(b.clone());
+                    sess.conversation.push_assistant(b.clone(), reasoning);
                     if let Err(e) = sess.save() {
                         save_err = Some(e.to_string());
                     }

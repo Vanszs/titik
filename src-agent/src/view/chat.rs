@@ -180,6 +180,26 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                         .fg(palette.dim)
                         .add_modifier(Modifier::ITALIC);
                     let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
+                    // Native reasoning channel (the model's streamed `reasoning`,
+                    // captured separately from `content`). Rendered first, dim +
+                    // italic, with the same wrapping + blank-line preservation as
+                    // the heuristic thinking block below. Display-only — it never
+                    // re-enters the conversation or disk (`#[serde(skip)]`).
+                    if let Some(reasoning) = msg.reasoning.as_deref() {
+                        if !reasoning.is_empty() {
+                            for line in reasoning.lines() {
+                                if line.trim().is_empty() {
+                                    logical.push(vec![]);
+                                } else {
+                                    let spans =
+                                        vec![Span::styled(line.to_string(), thinking_style)];
+                                    logical.extend(
+                                        crate::view::markdown::wrap_spans(&spans, wrap_w),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some(thinking) = thinking_block {
                         // Render each line of the thinking block dim+italic, wrapping
                         // at wrap_w. Blank lines are preserved as empty visual rows so
@@ -250,23 +270,40 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
             first = false;
             lines.extend(block.iter().cloned());
         }
-        if let Some(buf) = rest.streaming.as_ref() {
-            if !buf.is_empty() {
-                // Stream renders plain (not markdown) for perf + partial-fence safety.
-                if !first {
-                    lines.push(Line::from(""));
-                }
-                lines.extend(render_block(
-                    vec![vec![Span::styled(
-                        buf.to_string(),
-                        Style::default().fg(palette.fg),
-                    )]],
-                    "● ",
-                    palette.fg,
-                    wrap_w,
-                    true,
-                ));
+        // Live partial turn: the in-progress reasoning (dim+italic, on top) and
+        // content (fg). Reasoning typically streams first (the model thinks, then
+        // answers), so the block shows whenever EITHER buffer has text — they
+        // share one `●` bullet. Stream renders plain (not markdown) for perf +
+        // partial-fence safety.
+        let partial_content = rest.streaming.as_deref().unwrap_or("");
+        let partial_reasoning = rest.stream_reasoning.as_str();
+        if !partial_content.is_empty() || !partial_reasoning.is_empty() {
+            if !first {
+                lines.push(Line::from(""));
             }
+            let thinking_style = Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::ITALIC);
+            let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
+            // Partial reasoning first, dim+italic, per-line with blank-line
+            // preservation (mirrors the committed-message reasoning render).
+            if !partial_reasoning.is_empty() {
+                for line in partial_reasoning.lines() {
+                    if line.trim().is_empty() {
+                        logical.push(vec![]);
+                    } else {
+                        logical.push(vec![Span::styled(line.to_string(), thinking_style)]);
+                    }
+                }
+            }
+            // Then the partial answer in the theme fg (one logical line; wraps).
+            if !partial_content.is_empty() {
+                logical.push(vec![Span::styled(
+                    partial_content.to_string(),
+                    Style::default().fg(palette.fg),
+                )]);
+            }
+            lines.extend(render_block(logical, "● ", palette.fg, wrap_w, true));
         }
 
         // Scroll model: follow pins to the bottom (auto-scrolls as content grows);
