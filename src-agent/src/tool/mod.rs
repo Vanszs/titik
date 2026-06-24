@@ -18,6 +18,7 @@ use serde_json::Value;
 
 pub mod dircache;
 pub mod fs;
+pub mod pong;
 pub mod search;
 pub mod shell;
 
@@ -53,6 +54,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(shell::Bash),
         Box::new(fs::DirList),
         Box::new(dircache::DirCacheUpdate),
+        Box::new(pong::Pong),
     ]
 }
 
