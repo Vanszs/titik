@@ -75,9 +75,12 @@ pub fn palette(cfg: &AppConfig) -> Palette {
         (Color::Rgb(20, 20, 20), Color::Gray)
     };
 
-    // On dark backgrounds the accent is bright/neon so black text is readable.
-    // On light backgrounds the accent is muted so white text is readable.
-    let sel_fg = if dark { Color::Black } else { Color::White };
+    // Color::Black/Color::White are ANSI palette colors; when text is rendered BOLD,
+    // terminals brighten ANSI black to "bright black" (gray), making the inverse
+    // footer/selection text look gray instead of black. True-color RGB values bypass
+    // the 16-color palette, so bold cannot brighten them — the text stays truly
+    // black (dark theme) / white (light theme) on the accent background.
+    let sel_fg = if dark { Color::Rgb(0, 0, 0) } else { Color::Rgb(255, 255, 255) };
     let sel_bg = accent;
 
     Palette { fg, dim, accent, sel_fg, sel_bg }
