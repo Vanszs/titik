@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use super::{resolve, Tool, ToolCtx};
+use super::{resolve_read, Tool, ToolCtx};
 
 /// Search file contents by regular expression.
 pub struct Grep;
@@ -25,7 +25,7 @@ impl Tool for Grep {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search (workspace-relative, default '.')."
+                    "description": "Directory or file to search (workspace-relative, default '.'). With multiple workspaces, prefix with [N] (e.g. \"[1]src\") to target workspace N; a bare path targets workspace [0]."
                 },
                 "glob": {
                     "type": "string",
@@ -47,7 +47,7 @@ impl Tool for Grep {
         };
 
         let search_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let base = resolve(&ctx.workspaces, search_path)?;
+        let base = resolve_read(&ctx.workspaces, search_path)?;
 
         // Optional glob filter.
         let glob_matcher: Option<globset::GlobMatcher> = match args.get("glob").and_then(Value::as_str) {
@@ -152,7 +152,7 @@ impl Tool for Glob {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Base directory to search (workspace-relative, default '.')."
+                    "description": "Base directory to search (workspace-relative, default '.'). With multiple workspaces, prefix with [N] (e.g. \"[1]src\") to target workspace N; a bare path targets workspace [0]."
                 }
             },
             "required": ["pattern"]
@@ -164,7 +164,7 @@ impl Tool for Glob {
             .ok_or_else(|| anyhow::anyhow!("missing required string argument 'pattern'"))?;
 
         let base_rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let _base = resolve(&ctx.workspaces, base_rel)?; // sandbox check
+        let _base = resolve_read(&ctx.workspaces, base_rel)?; // sandbox check
 
         let matcher = globset::Glob::new(pattern)
             .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?
@@ -185,7 +185,7 @@ impl Tool for Glob {
                 .collect()
         } else {
             // Cache empty: fall back to a fresh walk from the base path.
-            let base_abs = resolve(&ctx.workspaces, base_rel)?;
+            let base_abs = resolve_read(&ctx.workspaces, base_rel)?;
             let mut v: Vec<String> = Vec::new();
             let multi = ctx.workspaces.len() > 1;
             for entry in ignore::WalkBuilder::new(&base_abs).build().flatten() {

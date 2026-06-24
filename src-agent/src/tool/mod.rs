@@ -116,6 +116,31 @@ pub fn resolve(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
     Ok(candidate)
 }
 
+/// Resolve a path for READ-ONLY tools, forgiving a dropped [N] prefix.
+/// An explicit [N] prefix is honoured strictly (same as resolve). A BARE path
+/// resolves against workspace 0 first; if that file does not exist on disk, the
+/// other workspaces are tried by existence and the first physical match wins.
+/// This lets weak models that drop the [N] prefix still READ a file that only
+/// lives in another workspace, while writes (which keep using resolve) stay
+/// strictly pinned to workspace 0 unless an explicit [N] is given.
+pub fn resolve_read(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
+    if rel.starts_with('[') {
+        return resolve(workspaces, rel);
+    }
+    let primary = resolve(workspaces, rel)?;
+    if primary.exists() {
+        return Ok(primary);
+    }
+    for idx in 1..workspaces.len() {
+        if let Ok(p) = resolve(workspaces, &format!("[{idx}]{rel}")) {
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    Ok(primary)
+}
+
 /// Find which workspace contains the given absolute path.
 /// Returns the canonicalized workspace root if found.
 pub fn find_workspace(workspaces: &[PathBuf], abs: &Path) -> Option<PathBuf> {

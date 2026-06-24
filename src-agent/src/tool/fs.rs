@@ -9,7 +9,7 @@
 use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use super::{resolve, Tool, ToolCtx};
+use super::{resolve, resolve_read, Tool, ToolCtx};
 
 /// Pull a required string argument out of the decoded JSON args.
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -199,7 +199,7 @@ impl Tool for Read {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path" },
+                "path": { "type": "string", "description": "Workspace-relative file path. When multiple workspace roots are active, file listings prefix paths with [N] (e.g. \"[1]src/main.rs\") — copy that prefix exactly. A bare path with no prefix targets workspace [0]." },
                 "offset": {
                     "type": "integer",
                     "description": "0-based line to start from (default 0)."
@@ -214,7 +214,7 @@ impl Tool for Read {
     }
     fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
         let rel = arg_str(args, "path")?;
-        let path = resolve(&ctx.workspaces, rel)?;
+        let path = resolve_read(&ctx.workspaces, rel)?;
         if path.is_dir() {
             bail!("'{rel}' is a directory, not a file");
         }
@@ -288,7 +288,7 @@ impl Tool for Write {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path" },
+                "path": { "type": "string", "description": "Workspace-relative file path. When multiple workspace roots are active, file listings prefix paths with [N] (e.g. \"[1]src/main.rs\") — copy that prefix exactly. A bare path with no prefix targets workspace [0]." },
                 "content": { "type": "string", "description": "Full file content to write" }
             },
             "required": ["path", "content"]
@@ -320,7 +320,7 @@ impl Tool for Edit {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path" },
+                "path": { "type": "string", "description": "Workspace-relative file path. When multiple workspace roots are active, file listings prefix paths with [N] (e.g. \"[1]src/main.rs\") — copy that prefix exactly. A bare path with no prefix targets workspace [0]." },
                 "old": { "type": "string", "description": "Exact substring to replace" },
                 "new": { "type": "string", "description": "Replacement text" },
                 "replace_all": {
@@ -386,7 +386,7 @@ impl Tool for Delete {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Workspace-relative file path" }
+                "path": { "type": "string", "description": "Workspace-relative file path. When multiple workspace roots are active, file listings prefix paths with [N] (e.g. \"[1]src/main.rs\") — copy that prefix exactly. A bare path with no prefix targets workspace [0]." }
             },
             "required": ["path"]
         })
