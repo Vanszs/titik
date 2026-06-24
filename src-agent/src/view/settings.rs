@@ -229,6 +229,11 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
                     let v = if st.classifier_enabled { "on" } else { "off" };
                     vec![Span::styled(v, Style::default().fg(palette.accent))]
                 }
+                SettingField::ShortSendEnabled => {
+                    // Boolean toggle: on/off (kill switch for the token saver).
+                    let v = if st.short_send_enabled { "on" } else { "off" };
+                    vec![Span::styled(v, Style::default().fg(palette.accent))]
+                }
                 SettingField::AwarenessSource => {
                     // Boolean toggle: inherit the session model, or a custom one.
                     let v = if st.awareness_inherit {

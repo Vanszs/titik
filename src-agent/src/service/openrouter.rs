@@ -74,10 +74,12 @@ fn reasoning_config(effort: &str) -> Option<ReasoningConfig> {
         "off" | "none" => Some(ReasoningConfig {
             effort: None,
             enabled: Some(false),
+            exclude: None,
         }),
         level => Some(ReasoningConfig {
             effort: Some(level.to_string()),
             enabled: None,
+            exclude: None,
         }),
     }
 }
@@ -528,12 +530,13 @@ impl OpenRouterClient {
             usage: UsageRequest { include: true },
             // Classifier calls use no tools.
             tools: None,
-            // Thinking OFF: deterministic + fast, and the verdict lands in
-            // `content`. `effort` and `enabled` are mutually exclusive — only
-            // `enabled` is set.
+            // Thinking excluded: `exclude: true` keeps reasoning mandatory for
+            // endpoints that require it, but strips the `reasoning` field from the
+            // response — deterministic, fast, bleed-proof, verdict lands in `content`.
             reasoning: Some(ReasoningConfig {
                 effort: None,
-                enabled: Some(false),
+                enabled: None,
+                exclude: Some(true),
             }),
             // Force the verdict object as strict JSON.
             response_format: Some(response_format),
@@ -562,21 +565,235 @@ impl OpenRouterClient {
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow!("no choices returned"))?;
-        // Prefer `content`; fall back to the model's `reasoning` (the verdict may
-        // live in the thinking for a reasoning model). Error only if BOTH empty.
-        // `content` may be null (some models return `"content": null`) — treat
-        // null/absent the same as an empty string and fall through to reasoning.
+        // `exclude: true` means no `reasoning` field is returned; content-only.
+        // `content` may be null on some models — treat null/absent as empty.
         let content = message.content.as_deref().unwrap_or("").trim();
         if !content.is_empty() {
             return Ok(content.to_string());
         }
-        if let Some(reasoning) = message.reasoning {
-            let reasoning = reasoning.trim();
-            if !reasoning.is_empty() {
-                return Ok(reasoning.to_string());
-            }
-        }
         Err(anyhow!("empty classifier reply"))
+    }
+
+    /// Rolling-summary "fold" completion against a DIFFERENT model/provider — the
+    /// dedicated path for the short-send incremental summary (P2), kept separate
+    /// from [`Self::complete_with`] so the awareness path is unaffected.
+    ///
+    /// Takes the fold system prompt + the pre-built user payload directly (a plain
+    /// two-message request) rather than a message vec, since the caller always
+    /// sends exactly system + user. Same body shape as `complete_with` (no tools,
+    /// `stream: false`, usage on, provider pin from `provider`) with one critical
+    /// difference:
+    /// - `reasoning: {enabled: false}` turns thinking OFF. This is non-negotiable:
+    ///   the returned text is PERSISTED as the rolling summary and replayed into
+    ///   every future send, so any leaked chain-of-thought would poison the
+    ///   conversation permanently. Thinking off keeps the reply clean and fills
+    ///   `content` directly. `effort` and `enabled` are mutually exclusive — only
+    ///   `enabled` is set. (No `response_format`: the summary is free-form prose.)
+    ///
+    /// Returns the clean summary text: `message.content` when non-empty, else
+    /// `message.reasoning` (defensive — some models such as gpt-oss/deepseek leave
+    /// `content` empty and put the answer in `reasoning` even with thinking off),
+    /// else an error. Clean errors, no panics.
+    pub async fn summarize_fold(
+        &self,
+        model: &str,
+        provider: Option<&str>,
+        system_prompt: &str,
+        user_payload: &str,
+    ) -> Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let messages = vec![
+            ChatMessage::new(crate::dto::chat::Role::System, system_prompt),
+            ChatMessage::new(crate::dto::chat::Role::User, user_payload),
+        ];
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            // `provider_routing_for` treats "" as default routing; a `None`
+            // provider behaves the same (no pin).
+            provider: provider_routing_for(provider.unwrap_or("")),
+            usage: UsageRequest { include: true },
+            // Fold calls use no tools.
+            tools: None,
+            // Thinking excluded: `exclude: true` keeps reasoning mandatory for
+            // endpoints that require it, but strips the `reasoning` field from the
+            // response. The summary is PERSISTED and replayed forever — a CoT bleed
+            // would poison the conversation permanently, so the `reasoning` fallback
+            // is intentionally absent here. Content-only, bleed-proof.
+            reasoning: Some(ReasoningConfig {
+                effort: None,
+                enabled: None,
+                exclude: Some(true),
+            }),
+            // Free-form summary prose; structured output is classifier-only.
+            response_format: None,
+        };
+
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("{}", clean_error(status, &text)));
+        }
+
+        let chat_response: ChatResponse = response.json().await?;
+        let message = chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow!("no choices returned"))?;
+        // Content-only extraction: with `exclude: true` the response has no
+        // `reasoning` field, and we must NEVER fall back to it even if it appeared —
+        // raw CoT must not be persisted to the rolling summary.
+        let content = message.content.as_deref().unwrap_or("").trim();
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+        Err(anyhow!("empty summary reply"))
+    }
+
+    /// Blob-rehydrate router completion against a DIFFERENT model/provider — the
+    /// dedicated path for the short-send retrieval router (P3), kept separate from
+    /// [`Self::complete_with`] so the awareness/summary paths are unaffected.
+    ///
+    /// Takes the router system prompt + a pre-built user payload (the latest user
+    /// message plus the candidate blob list) and returns the ids of the blobs whose
+    /// full content the router judged necessary. Same body shape as `classify_with`
+    /// (no tools, `stream: false`, usage on, provider pin from `provider`):
+    /// - `reasoning: {enabled: false}` turns thinking OFF — deterministic, fast,
+    ///   and the verdict lands in `content`. `effort` and `enabled` are mutually
+    ///   exclusive — only `enabled` is set.
+    /// - `response_format` pins a STRICT `json_schema` (`{blob_ids: integer[]}`)
+    ///   so the model must return exactly the id list as JSON.
+    ///
+    /// BLEED GUARD: thinking is off and the reply is parsed as JSON only; no
+    /// chain-of-thought is ever read or persisted. The returned ids merely select
+    /// already-clean message content from sqlite to rehydrate.
+    ///
+    /// Best-effort: on ANY error (HTTP failure, empty reply, unparseable JSON) this
+    /// returns `Ok(vec![])` so the caller simply rehydrates nothing rather than
+    /// breaking the send. The selection is content-or-reasoning extracted, like the
+    /// other secondary-model paths.
+    pub async fn pick_blobs(
+        &self,
+        model: &str,
+        provider: &str,
+        system_prompt: &str,
+        user_payload: &str,
+    ) -> Result<Vec<i64>> {
+        let url = format!("{}/chat/completions", self.base_url);
+        // Strict JSON-schema for the id list. `strict: true` +
+        // `additionalProperties: false` force the model to emit exactly
+        // `{"blob_ids": [<integer>, ...]}` and nothing else.
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "blob_selection",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["blob_ids"],
+                    "properties": {
+                        "blob_ids": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        }
+                    }
+                }
+            }
+        });
+        let messages = vec![
+            ChatMessage::new(crate::dto::chat::Role::System, system_prompt),
+            ChatMessage::new(crate::dto::chat::Role::User, user_payload),
+        ];
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            provider: provider_routing_for(provider),
+            usage: UsageRequest { include: true },
+            // Router calls use no tools.
+            tools: None,
+            // Thinking excluded: `exclude: true` keeps reasoning mandatory for
+            // endpoints that require it, but strips the `reasoning` field from the
+            // response — deterministic, fast, bleed-proof, id list lands in `content`.
+            reasoning: Some(ReasoningConfig {
+                effort: None,
+                enabled: None,
+                exclude: Some(true),
+            }),
+            // Force the id list as strict JSON.
+            response_format: Some(response_format),
+        };
+
+        // Best-effort: any failure returns an empty selection rather than erroring.
+        let response = match self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let chat_response: ChatResponse = match response.json().await {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let Some(message) = chat_response.choices.into_iter().next().map(|c| c.message) else {
+            return Ok(Vec::new());
+        };
+        // Prefer `content`; fall back to `reasoning` (some models leave `content`
+        // empty/null and put the answer there even with thinking off). Either way
+        // it must be the strict JSON object — we never read a CoT.
+        let raw = {
+            let content = message.content.as_deref().unwrap_or("").trim();
+            if !content.is_empty() {
+                content.to_string()
+            } else {
+                message
+                    .reasoning
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            }
+        };
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Parse `{"blob_ids": [..]}` and return the ids. Unparseable → empty.
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let ids = parsed
+            .get("blob_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default();
+        Ok(ids)
     }
 
     /// Fetch the OpenRouter model catalogue (`GET /models`).

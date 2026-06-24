@@ -66,8 +66,6 @@ pub(super) fn apply_action(
             state.rest.awaiting_approval = false;
             state.rest.tool_idx = 0;
             state.rest.tool_results.clear();
-            // Every new user turn must plan before running tools.
-            state.rest.needs_plan = true;
             state.rest.status = "thinking...".into();
             start_stream_task(history, state, client, handle);
 
@@ -389,6 +387,7 @@ pub(super) fn apply_action(
                     s.classifier_model.clone(),
                     s.classifier_provider.clone(),
                     s.allowed_folders.clone(),
+                    s.short_send_enabled,
                 )),
                 _ => None,
             };
@@ -408,6 +407,7 @@ pub(super) fn apply_action(
                 classifier_model,
                 classifier_provider,
                 allowed_folders,
+                short_send_enabled,
             )) = drafts
             {
                 // Detect whether the OpenRouter-relevant creds changed so we only
@@ -462,6 +462,9 @@ pub(super) fn apply_action(
                     sess.settings.classifier_model = classifier_model;
                     sess.settings.classifier_provider = classifier_provider;
                     sess.settings.allowed_folders = allowed_folders_vec;
+                    // Short-send kill switch: no client rebuild needed; the
+                    // shape() call reads this flag per-send.
+                    sess.settings.short_send_enabled = short_send_enabled;
                 }
                 // b) Apply global theme/accent and persist config.json. Best-effort:
                 //    a write failure surfaces to the status line but does not abort

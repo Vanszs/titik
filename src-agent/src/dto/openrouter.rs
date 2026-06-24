@@ -47,20 +47,27 @@ pub struct UsageRequest {
 /// Reasoning/thinking control for the request, serialised as the top-level
 /// `"reasoning"` object.
 ///
-/// Only the two fields this app uses are modelled; both are skipped when
+/// Only the fields this app uses are modelled; all are skipped when
 /// `None` so the on-wire object carries exactly what was set:
 /// - `{"reasoning":{"effort":"high"}}` selects a thinking effort level.
 /// - `{"reasoning":{"enabled":false}}` turns thinking off entirely.
+/// - `{"reasoning":{"exclude":true}}` keeps reasoning mandatory (satisfying
+///   endpoints that require it) but strips the `reasoning` field from the
+///   response — used by all secondary/utility model calls so their replies
+///   are bleed-proof and the chain-of-thought is never persisted.
 ///
 /// Omitting the whole struct (via `skip_serializing_if` on the `ChatRequest`
-/// field) lets the model use its own default reasoning behaviour. `effort` and
-/// `enabled` are never set together — see `reasoning_config` in the service.
+/// field) lets the model use its own default reasoning behaviour. `effort`,
+/// `enabled`, and `exclude` are never set together — see `reasoning_config`
+/// in the service.
 #[derive(Debug, Serialize)]
 pub struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
 }
 
 /// JSON-Schema description of one tool's `function`, as required by the

@@ -99,10 +99,6 @@ pub(super) fn advance_turn(
     // can never leak into the next round) and folded onto the committed message
     // below; never logged to disk or sent to the API.
     let reasoning = state.rest.take_reasoning();
-    // Capture before `reasoning` is moved into the commit below. Used by the
-    // plan gate: a non-empty reasoning channel satisfies the plan requirement
-    // (reasoning models emit their CoT there and leave content empty on tool turns).
-    let had_reasoning = reasoning.as_deref().is_some_and(|r| !r.trim().is_empty());
 
     // 2. Commit the assistant message (and log + count it). The assistant text
     //    may be empty on a tool-call turn — we still record the row so usage
@@ -192,34 +188,6 @@ pub(super) fn advance_turn(
         state.rest.set_toast("workspace not in allowed folders".into());
         state.rest.status = "stopped: workspace not allowed".into();
         return;
-    }
-
-    // 5a. Plan gate: on the FIRST tool round of a new user turn, make sure the
-    //     model stated a plan before tools run. The System message already steers
-    //     it to lead with a whimsical word (see `stream_complete`), so it usually
-    //     plans on its own — in which case we just run the tools (no duplicate
-    //     plan). Only when it jumped straight to tools with NO text do we answer
-    //     each call with a silent nudge and re-stream; that nudge carries the
-    //     hide-marker so it's fed to the model but never shown in the transcript.
-    //     Every pending call gets a result, so there are no dangling tool_call IDs.
-    if state.rest.needs_plan {
-        state.rest.needs_plan = false;
-        let planned = buf.as_deref().is_some_and(|b| !b.trim().is_empty()) || had_reasoning;
-        if !planned {
-            state.rest.tool_idx = 0;
-            state.rest.tool_results.clear();
-            let nudge = format!(
-                "{}First state a brief plan: restate what the user wants in one line, then list your steps. Then make your tool calls (batch where possible — dir_list accepts multiple paths).",
-                crate::dto::chat::PLAN_NUDGE_MARK
-            );
-            let ids: Vec<String> = state.rest.pending_tool_calls.iter().map(|c| c.id.clone()).collect();
-            for id in ids {
-                state.rest.tool_results.push((id, nudge.clone()));
-            }
-            finish_tool_round(state, client, handle);
-            return;
-        }
-        // else: model already planned → fall through to the normal tool run below
     }
 
     // 5b. Hand off to the tool-approval state machine. The pending calls were
@@ -534,10 +502,37 @@ pub(super) fn start_stream_task(
             }
         }
     }
+    // Short-send reshape inputs, snapshotted out of `state` BEFORE the spawn so
+    // the task holds no borrow of `state`. Cloning the session dir + settings +
+    // latest user message lets `shortsend::shape` run its fold/router off the UI
+    // thread (the task already shows the "waiting" state, so the UI never freezes
+    // on these secondary-model calls). `None` when there's no session — the task
+    // then sends the injected history unchanged.
+    //
+    // DUAL RAIL: `shape` only transforms this API-bound `history` Vec (built from
+    // `sess.conversation.history()` by the caller). It reads `messages.sqlite` and
+    // returns a NEW Vec; it does not touch `sess.conversation`, `messages.json`,
+    // or the rendered transcript — display is entirely unaffected.
+    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String)> =
+        state.rest.session.as_ref().map(|sess| {
+            let user_intent = sess.conversation.last_user_content().unwrap_or_default();
+            (sess.path.clone(), sess.settings.clone(), user_intent)
+        });
     let (tx, rx) = mpsc::unbounded_channel();
     state.rest.active_rx = Some(rx);
     let c = Arc::clone(client.as_ref().unwrap());
     let jh = handle.spawn(async move {
+        // Reshape the wire payload just before POSTing. `shape` preserves the
+        // system message at index 0 (with the project-files/awareness injection
+        // applied above), so the model still receives the real system prompt. It
+        // fails open — any error returns the original history — so this can never
+        // break the send.
+        let history = match reshape {
+            Some((session_dir, settings, user_intent)) => {
+                super::shortsend::shape(history, &session_dir, &c, &settings, &user_intent).await
+            }
+            None => history,
+        };
         let _ = c.stream_complete(history, tx).await;
     });
     state.rest.current_task = Some(jh.abort_handle());

@@ -188,6 +188,18 @@ pub struct Settings {
     /// by default; ignored entirely when `classifier_enabled` is false.
     #[serde(default)]
     pub allowed_folders: Vec<String>,
+    /// Master switch for the "short-send" payload reshaper. When true (the
+    /// default), the API-bound history is compressed before each send: the older
+    /// turns are replaced by a rolling summary + a verbatim tail, with heavy
+    /// blobs rehydrated on demand. When false the full history is sent as before
+    /// (kill switch). Display + on-disk state are unaffected either way.
+    #[serde(default = "default_short_send_enabled")]
+    pub short_send_enabled: bool,
+    /// How many of the newest messages short-send keeps verbatim (the tail that
+    /// is sent in full; everything older is folded into the summary). Defaults to
+    /// `6`. Old `settings.json` files load unchanged via the serde default.
+    #[serde(default = "default_short_send_tail_n")]
+    pub short_send_tail_n: i64,
 }
 
 fn default_model() -> String {
@@ -222,6 +234,14 @@ fn default_classifier_provider() -> String {
     DEFAULT_CLASSIFIER_PROVIDER.to_string()
 }
 
+fn default_short_send_enabled() -> bool {
+    true
+}
+
+fn default_short_send_tail_n() -> i64 {
+    6
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -240,6 +260,8 @@ impl Default for Settings {
             classifier_model: DEFAULT_CLASSIFIER_MODEL.to_string(),
             classifier_provider: DEFAULT_CLASSIFIER_PROVIDER.to_string(),
             allowed_folders: Vec::new(),
+            short_send_enabled: default_short_send_enabled(),
+            short_send_tail_n: default_short_send_tail_n(),
         }
     }
 }

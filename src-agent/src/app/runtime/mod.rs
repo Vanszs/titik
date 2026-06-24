@@ -21,6 +21,7 @@ mod event_loop;
 mod stream;
 mod actions;
 mod commands;
+mod shortsend;
 
 use std::io::stdout;
 use std::sync::Arc;

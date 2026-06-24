@@ -162,6 +162,8 @@ pub enum SettingField {
     ClassifierProvider,
     /// Text: extra allowed folders (comma-separated) for the workspace check.
     AllowedFolders,
+    /// Toggle: master kill-switch for the short-send token saver.
+    ShortSendEnabled,
 }
 
 impl SettingField {
@@ -183,6 +185,7 @@ impl SettingField {
             SettingField::ClassifierModel    => "Class. model",
             SettingField::ClassifierProvider => "Class. provider",
             SettingField::AllowedFolders     => "Allowed dirs",
+            SettingField::ShortSendEnabled   => "Short-send",
         }
     }
 }
@@ -208,7 +211,7 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     },
     SettingCategory {
         name: "Session",
-        fields: &[SettingField::Name, SettingField::Workdir],
+        fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled],
     },
     SettingCategory {
         name: "Awareness",
@@ -435,6 +438,8 @@ pub struct SettingsState {
     /// `settings.allowed_folders` (or the launch cwd when empty) and written back
     /// to `Vec<String>` (trim, drop empties) on save.
     pub allowed_folders: Vec<String>,
+    /// Draft: short-send token-saver master switch.
+    pub short_send_enabled: bool,
     /// The session's effective working directory, captured at construction. Used
     /// as the base for resolving workspace-relative paths in the FS picker.
     pub cwd: PathBuf,
@@ -502,6 +507,7 @@ impl SettingsState {
             classifier_model: session.settings.classifier_model.clone(),
             classifier_provider: session.settings.classifier_provider.clone(),
             allowed_folders,
+            short_send_enabled: session.settings.short_send_enabled,
             cwd: effective_cwd,
             list_editing: false,
             list_sel: 0,
@@ -545,7 +551,8 @@ impl SettingsState {
             | SettingField::AwarenessSource
             | SettingField::AwarenessModel
             | SettingField::AwarenessProvider
-            | SettingField::ClassifierEnabled => None,
+            | SettingField::ClassifierEnabled
+            | SettingField::ShortSendEnabled => None,
         }
     }
 
@@ -669,6 +676,9 @@ impl SettingsState {
             }
             SettingField::ClassifierEnabled => {
                 self.classifier_enabled = !self.classifier_enabled;
+            }
+            SettingField::ShortSendEnabled => {
+                self.short_send_enabled = !self.short_send_enabled;
             }
             SettingField::Workdir | SettingField::AllowedFolders => {
                 // Path lists: drop into per-entry management, top row selected.
