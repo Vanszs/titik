@@ -20,13 +20,70 @@
 //! }
 //! ```
 
+use std::fmt;
 use std::path::Path;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use crate::config::{
     DEFAULT_AWARENESS_MODEL, DEFAULT_AWARENESS_PROVIDER, DEFAULT_CLASSIFIER_MODEL,
     DEFAULT_CLASSIFIER_PROVIDER, DEFAULT_MODEL, DEFAULT_PRESERVE_N, DEFAULT_PROVIDER,
 };
+
+/// Backwards-compatible deserializer for a field that is now a `Vec<String>`
+/// but historically may have been written as a plain JSON string.
+///
+/// Accepts either form so OLD `settings.json` files (where e.g. `workdir` was a
+/// single string) still load cleanly:
+/// - a JSON string `"…"`  → `vec!["…".to_string()]`
+/// - a JSON array `["…"]` → the sequence as a `Vec<String>` (verbatim)
+///
+/// Serialisation is unaffected: the field always writes back as an array. An
+/// empty string deserialises to `vec![""]`; callers trim/drop empties downstream.
+fn string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+
+        // Old format: a single bare string becomes a one-element vec.
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![v.to_string()])
+        }
+
+        // Owned-string variant (some deserializers hand ownership directly).
+        fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![v])
+        }
+
+        // New format: a sequence is collected into the vec verbatim.
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
 
 /// Controls conversation compaction behaviour (the `/compact` command).
 ///
@@ -78,10 +135,15 @@ pub struct Settings {
     /// then omitted from the request body entirely.
     #[serde(default)]
     pub provider: String,
-    /// Working directory for this session. Defaults to the process's cwd at
-    /// session creation time. Used to locate AGENT.md / AGENTS.md.
-    #[serde(default)]
-    pub workdir: String,
+    /// Working directories for this session, as a managed path list. The FIRST
+    /// non-empty entry is the effective workdir (see `Session::workdir`); the
+    /// rest also count toward the harness workspace allow-set. Seeded with the
+    /// process's cwd at session creation time. Used to locate AGENT.md / AGENTS.md.
+    ///
+    /// `string_or_vec` keeps OLD configs loadable: a plain string `"…"` is read
+    /// as `vec!["…"]`; arrays load verbatim. Always serialised as an array.
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub workdir: Vec<String>,
     /// Whether the project-awareness summary is generated and injected into the
     /// system prompt. When false, no secondary-model call is made.
     #[serde(default = "default_awareness_enabled")]
@@ -161,7 +223,7 @@ impl Default for Settings {
             name: String::new(),
             compaction: Compaction::default(),
             provider: DEFAULT_PROVIDER.to_string(),
-            workdir: String::new(),
+            workdir: Vec::new(),
             awareness_enabled: default_awareness_enabled(),
             awareness_inherit: default_awareness_inherit(),
             awareness_model: DEFAULT_AWARENESS_MODEL.to_string(),

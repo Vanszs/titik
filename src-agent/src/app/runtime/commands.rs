@@ -149,7 +149,7 @@ pub(super) fn apply_slash(
                 return Ok(());
             };
             let st = SettingsState::from(session, &state.rest.config);
-            state.mode = Mode::Settings(st);
+            state.mode = Mode::Settings(Box::new(st));
         }
 
         Command::Resume => {

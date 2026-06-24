@@ -60,21 +60,32 @@ fn norm(path: &Path) -> String {
 }
 
 /// Deterministic workspace check (WC). Returns true when `workdir` is the
-/// process launch directory OR matches one of `settings.allowed_folders`.
+/// process launch directory OR appears in the session's allow-set: every
+/// `settings.workdir` entry plus every `settings.allowed_folders` entry.
+///
+/// `workdir` (the dir actually being checked) is the session's *effective*
+/// workdir — the first `settings.workdir` entry — but the path list may name
+/// several directories the session is allowed to touch, so ALL of them count,
+/// alongside the extra `allowed_folders`. The launch directory is ALWAYS allowed
+/// regardless of the lists, so the common case (running the agent in the folder
+/// you want to work in) just works.
 ///
 /// Comparison is on canonicalised path strings so equivalent spellings (relative
-/// vs absolute, trailing slash, symlink) of the same directory match. The launch
-/// directory is ALWAYS allowed regardless of the allow-list, so the common case
-/// (running the agent in the folder you want to work in) just works.
+/// vs absolute, trailing slash, symlink) of the same directory match.
 pub fn workspace_allowed(settings: &Settings, workdir: &Path, launch_dir: &Path) -> bool {
     let wd = norm(workdir);
     if wd == norm(launch_dir) {
         return true;
     }
+    // The allow-set is the union of the workdir path list and the extra allowed
+    // folders; a blank entry can't match a real directory after canonicalisation.
     settings
-        .allowed_folders
+        .workdir
         .iter()
-        .map(|f| norm(Path::new(f.trim())))
+        .chain(settings.allowed_folders.iter())
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .map(|f| norm(Path::new(f)))
         .any(|allowed| allowed == wd)
 }
 

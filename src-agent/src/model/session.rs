@@ -141,14 +141,22 @@ impl Session {
         Ok(())
     }
 
-    /// The session's working directory: the `workdir` setting if set, else the
-    /// process's current dir.
+    /// The session's working directory: the FIRST non-empty entry of the
+    /// `workdir` path list (trimmed), else the process's current dir.
+    ///
+    /// The setting is a managed list; only the first usable entry is the
+    /// effective workdir. The remaining entries still feed the harness
+    /// workspace allow-set (see `harness::workspace_allowed`).
     pub fn workdir(&self) -> std::path::PathBuf {
-        if self.settings.workdir.trim().is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        } else {
-            std::path::PathBuf::from(self.settings.workdir.trim())
-        }
+        self.settings
+            .workdir
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            })
     }
 
     /// Rebuild the system prompt and push it into the conversation.

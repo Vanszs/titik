@@ -14,6 +14,8 @@
 //! mode.  [`KeyInputForm`], [`PickerState`], and [`SettingsState`] live here;
 //! `Chat` carries no extra state beyond `AppStateRest`.
 
+use std::path::{Path, PathBuf};
+
 use crate::model::app_config::{AppConfig, ThemeMode};
 use crate::model::session::Session;
 use crate::model::store::SessionMeta;
@@ -33,7 +35,11 @@ pub enum Mode {
     /// In-app settings dashboard (`/settings`): edit per-session credentials,
     /// the session name, and the global theme/accent. The inner
     /// [`SettingsState`] holds working drafts that are applied on save.
-    Settings(SettingsState),
+    ///
+    /// Boxed: `SettingsState` is much larger than the other variants (it carries
+    /// every draft plus the path-list/picker working state), so storing it inline
+    /// would bloat `Mode` everywhere. The box keeps the enum small.
+    Settings(Box<SettingsState>),
 }
 
 /// Transient state for the credentials input form.
@@ -217,15 +223,168 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     },
 ];
 
+/// What a confirmed [`PathPicker`] selection does to the target path list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerMode {
+    /// Append the chosen path as a new entry.
+    Add,
+    /// Replace the entry at this index in the list.
+    Replace(usize),
+}
+
+/// A real-filesystem directory picker overlay (the `@`-style descent UI).
+///
+/// `query` is the raw text the user types (a leading `@` is allowed and stripped
+/// when matching). `matches` is the live list of directories under the resolved
+/// parent whose name starts with the typed prefix, rendered in the SAME form the
+/// user is typing (absolute → absolute, relative → relative). `sel` indexes
+/// `matches`. `mode` decides whether confirming adds or replaces in the list.
+#[derive(Debug, Clone)]
+pub struct PathPicker {
+    /// Raw query text (may begin with `@`; relative or absolute).
+    pub query: String,
+    /// Directory matches for the current query, capped at the view limit.
+    pub matches: Vec<String>,
+    /// Cursor within `matches`.
+    pub sel: usize,
+    /// Add a new entry, or replace an existing one at the given index.
+    pub mode: PickerMode,
+}
+
+/// Max directory matches surfaced in the picker overlay (mirrors the chat `@`
+/// file palette and the view-side window constant).
+pub const PICKER_MAX: usize = 10;
+
+impl PathPicker {
+    /// Open a picker in the given `mode`, seeded with `query` (used to prefill a
+    /// REPLACE with the current entry). Computes the first match set against `cwd`.
+    pub fn new(mode: PickerMode, query: String, cwd: &Path) -> Self {
+        let matches = list_dirs(&query, cwd, PICKER_MAX);
+        Self {
+            query,
+            matches,
+            sel: 0,
+            mode,
+        }
+    }
+
+    /// Recompute `matches` for the current `query` and clamp `sel` into range.
+    pub fn recompute(&mut self, cwd: &Path) {
+        self.matches = list_dirs(&self.query, cwd, PICKER_MAX);
+        if self.sel >= self.matches.len() {
+            self.sel = self.matches.len().saturating_sub(1);
+        }
+    }
+
+    /// Move the selection up one row (clamps at 0).
+    pub fn up(&mut self) {
+        self.sel = self.sel.saturating_sub(1);
+    }
+
+    /// Move the selection down one row (clamps at the last match).
+    pub fn down(&mut self) {
+        if self.sel + 1 < self.matches.len() {
+            self.sel += 1;
+        }
+    }
+
+    /// The currently highlighted match, if any.
+    pub fn selected(&self) -> Option<&String> {
+        self.matches.get(self.sel)
+    }
+}
+
+/// List directories for an `@`-style `query`, rendered in the same form the user
+/// is typing them, capped at `limit`.
+///
+/// Resolution:
+/// - A leading `@` is stripped.
+/// - If the (stripped) query begins with `/` it is ABSOLUTE; otherwise it is
+///   resolved relative to `cwd`.
+/// - The query is split into `(parent, prefix)` at the last `/`. A query ending
+///   in `/` means "list everything in this directory" (prefix = "").
+/// - `parent` is read with `std::fs::read_dir`; only sub-DIRECTORIES whose file
+///   name starts with `prefix` (case-insensitive) are kept. Hidden dirs (leading
+///   `.`) are skipped UNLESS the prefix itself starts with `.`.
+/// - Each kept directory is rendered back in the user's form (absolute → an
+///   absolute path string, relative → a relative string) WITHOUT a trailing
+///   slash, sorted, then capped at `limit`.
+///
+/// Any IO error (unreadable parent, etc.) yields an empty vec — the picker just
+/// shows nothing rather than failing.
+pub fn list_dirs(query: &str, cwd: &Path, limit: usize) -> Vec<String> {
+    // Strip an optional leading '@'; the rest is the path the user is typing.
+    let raw = query.strip_prefix('@').unwrap_or(query);
+    let is_abs = raw.starts_with('/');
+
+    // Split into the directory part and the in-progress final segment (prefix).
+    // A trailing '/' means the whole thing is the parent and the prefix is empty.
+    let (dir_part, prefix) = match raw.rfind('/') {
+        Some(i) => (&raw[..=i], &raw[i + 1..]), // keep the slash on dir_part
+        None => ("", raw),                       // no slash: parent is cwd-relative root
+    };
+
+    // Resolve the parent directory on the real filesystem.
+    let parent: PathBuf = if is_abs {
+        // dir_part always starts with '/' here (raw starts with '/').
+        PathBuf::from(dir_part)
+    } else if dir_part.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        cwd.join(dir_part)
+    };
+
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let prefix_lower = prefix.to_lowercase();
+    // Honour hidden dirs only when the user is explicitly typing a dotted prefix.
+    let want_hidden = prefix.starts_with('.');
+
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        // Directories only (follows symlinks via file_type()? no — use metadata
+        // through is_dir on the path so symlinked dirs are included, matching the
+        // lenient spirit of the workspace check).
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue, // non-UTF-8 directory name: skip
+        };
+        if name.starts_with('.') && !want_hidden {
+            continue;
+        }
+        if !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        // Render back in the user's typing form: dir_part (which carries the
+        // trailing slash, or is empty) + the matched name, no trailing slash.
+        out.push(format!("{dir_part}{name}"));
+    }
+
+    out.sort();
+    out.truncate(limit);
+    out
+}
+
 /// Working state for the in-app `/settings` dashboard.
 ///
 /// Holds editable *drafts* of every settable value; nothing is persisted until
 /// the user saves (Esc from the sidebar), at which point the runtime reads these
 /// fields back out and applies them.
 ///
-/// Navigation is two-level: `cat` selects a category in the sidebar; `field`
-/// selects a row within the category's detail list. `in_detail` tracks which
-/// pane has keyboard focus. `editing` means the user is typing into a text field.
+/// Navigation is now THREE-level inside the detail pane for the path-list fields
+/// (Workdir, Allowed dirs): `cat` selects a category in the sidebar; `field`
+/// selects a row within the category's detail list; for a path-list field,
+/// `list_editing` enters per-entry management (`list_sel` highlights a row) and a
+/// `picker` overlay drives add/replace via the real filesystem. `in_detail`
+/// tracks which pane has keyboard focus. `editing` means typing into a plain
+/// text field.
 #[derive(Debug, Clone)]
 pub struct SettingsState {
     /// Selected category index into [`SETTING_CATEGORIES`].
@@ -248,8 +407,8 @@ pub struct SettingsState {
     pub theme: ThemeMode,
     /// Draft global accent name (one of [`ACCENTS`]).
     pub accent: String,
-    /// Draft working directory for this session.
-    pub workdir: String,
+    /// Draft working-directory path list for this session (min 1 entry on save).
+    pub workdir: Vec<String>,
     /// Draft: project-awareness summary enabled.
     pub awareness_enabled: bool,
     /// Draft: awareness model source — `true` = inherit the session model,
@@ -265,10 +424,21 @@ pub struct SettingsState {
     pub classifier_model: String,
     /// Draft: safety-classifier provider slug.
     pub classifier_provider: String,
-    /// Draft: extra allowed folders as comma-separated text for editing. Seeded
-    /// from `settings.allowed_folders.join(", ")` and parsed back to a
-    /// `Vec<String>` (split on ',', trim, drop empties) on save.
-    pub allowed_folders: String,
+    /// Draft: extra allowed folders as a managed path list. Seeded from
+    /// `settings.allowed_folders` (or the launch cwd when empty) and written back
+    /// to `Vec<String>` (trim, drop empties) on save.
+    pub allowed_folders: Vec<String>,
+    /// The session's effective working directory, captured at construction. Used
+    /// as the base for resolving workspace-relative paths in the FS picker.
+    pub cwd: PathBuf,
+    /// `true` when the user has entered a path-list field to manage its entries
+    /// (one nesting level below field navigation, above the picker).
+    pub list_editing: bool,
+    /// Highlighted entry row within the active path list (while `list_editing`).
+    pub list_sel: usize,
+    /// Active filesystem directory picker overlay, if any. When `Some` it has
+    /// keyboard focus (deepest nesting level) until confirmed or cancelled.
+    pub picker: Option<PathPicker>,
 }
 
 impl SettingsState {
@@ -278,6 +448,33 @@ impl SettingsState {
     /// theme/accent drafts come from `config`. Starts on the sidebar of the
     /// first category with editing off.
     pub fn from(session: &Session, config: &AppConfig) -> Self {
+        // The effective workdir doubles as the picker's relative-path base.
+        let effective_cwd = session.workdir();
+        // Workdir list: prefer the stored entries (trimmed, non-empty); if none,
+        // show the single effective dir so the field is never blank.
+        let workdir: Vec<String> = {
+            let stored: Vec<String> = session
+                .settings
+                .workdir
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if stored.is_empty() {
+                vec![effective_cwd.display().to_string()]
+            } else {
+                stored
+            }
+        };
+        // Allowed dirs list: stored entries, or the launch cwd when empty so the
+        // always-allowed launch directory is visible (preserves prior behaviour).
+        let allowed_folders: Vec<String> = if session.settings.allowed_folders.is_empty() {
+            std::env::current_dir()
+                .map(|p| vec![p.display().to_string()])
+                .unwrap_or_else(|_| vec![effective_cwd.display().to_string()])
+        } else {
+            session.settings.allowed_folders.clone()
+        };
         Self {
             cat: 0,
             field: 0,
@@ -289,7 +486,7 @@ impl SettingsState {
             name: session.name.clone(),
             theme: config.theme.clone(),
             accent: config.accent.clone(),
-            workdir: session.workdir().display().to_string(),
+            workdir,
             awareness_enabled: session.settings.awareness_enabled,
             awareness_inherit: session.settings.awareness_inherit,
             awareness_model: session.settings.awareness_model.clone(),
@@ -297,13 +494,11 @@ impl SettingsState {
             classifier_enabled: session.settings.classifier_enabled,
             classifier_model: session.settings.classifier_model.clone(),
             classifier_provider: session.settings.classifier_provider.clone(),
-            allowed_folders: if session.settings.allowed_folders.is_empty() {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            } else {
-                session.settings.allowed_folders.join(", ")
-            },
+            allowed_folders,
+            cwd: effective_cwd,
+            list_editing: false,
+            list_sel: 0,
+            picker: None,
         }
     }
 
@@ -325,7 +520,6 @@ impl SettingsState {
             SettingField::Model    => Some(&mut self.model),
             SettingField::Provider => Some(&mut self.provider),
             SettingField::Name     => Some(&mut self.name),
-            SettingField::Workdir  => Some(&mut self.workdir),
             SettingField::AwarenessModel if !self.awareness_inherit => {
                 Some(&mut self.awareness_model)
             }
@@ -334,14 +528,41 @@ impl SettingsState {
             }
             SettingField::ClassifierModel    => Some(&mut self.classifier_model),
             SettingField::ClassifierProvider => Some(&mut self.classifier_provider),
-            SettingField::AllowedFolders     => Some(&mut self.allowed_folders),
-            SettingField::Theme
+            // Workdir / AllowedFolders are PATH LISTS (managed via the picker),
+            // not plain text fields, so they have no scalar text draft.
+            SettingField::Workdir
+            | SettingField::AllowedFolders
+            | SettingField::Theme
             | SettingField::Accent
             | SettingField::AwarenessEnabled
             | SettingField::AwarenessSource
             | SettingField::AwarenessModel
             | SettingField::AwarenessProvider
             | SettingField::ClassifierEnabled => None,
+        }
+    }
+
+    /// Whether `f` is a managed PATH LIST (Workdir or Allowed dirs).
+    pub fn is_path_list(f: SettingField) -> bool {
+        matches!(f, SettingField::Workdir | SettingField::AllowedFolders)
+    }
+
+    /// Mutable handle to the path-list draft vec for `f`, or `None` if `f` is
+    /// not a path-list field.
+    pub fn path_list_mut(&mut self, f: SettingField) -> Option<&mut Vec<String>> {
+        match f {
+            SettingField::Workdir        => Some(&mut self.workdir),
+            SettingField::AllowedFolders => Some(&mut self.allowed_folders),
+            _ => None,
+        }
+    }
+
+    /// Immutable handle to the path-list draft vec for `f` (view-side reads).
+    pub fn path_list(&self, f: SettingField) -> Option<&Vec<String>> {
+        match f {
+            SettingField::Workdir        => Some(&self.workdir),
+            SettingField::AllowedFolders => Some(&self.allowed_folders),
+            _ => None,
         }
     }
 
@@ -390,10 +611,14 @@ impl SettingsState {
         }
     }
 
-    /// Return focus to the sidebar; also exits editing mode.
+    /// Return focus to the sidebar; also exits editing/list/picker modes so the
+    /// detail pane is back at plain field navigation next time it's focused.
     pub fn focus_sidebar(&mut self) {
         self.in_detail = false;
         self.editing = false;
+        self.list_editing = false;
+        self.list_sel = 0;
+        self.picker = None;
     }
 
     /// Act on Enter while in the detail pane.
@@ -404,6 +629,7 @@ impl SettingsState {
     /// - AwarenessSource → toggle inherit/custom.
     /// - AwarenessModel / AwarenessProvider → edit only when source is "custom";
     ///   a no-op while inheriting (the values are irrelevant then).
+    /// - Workdir / AllowedFolders (PATH LISTS) → enter per-entry list management.
     /// - Other text fields → enter editing mode.
     ///
     /// No-op when not in the detail pane.
@@ -437,8 +663,138 @@ impl SettingsState {
             SettingField::ClassifierEnabled => {
                 self.classifier_enabled = !self.classifier_enabled;
             }
+            SettingField::Workdir | SettingField::AllowedFolders => {
+                // Path lists: drop into per-entry management, top row selected.
+                self.list_editing = true;
+                self.list_sel = 0;
+            }
             _ => {
                 self.editing = true;
+            }
+        }
+    }
+
+    // --- Path-list management (one nesting level below field navigation) -------
+
+    /// Move the highlighted list entry up (clamps at 0).
+    pub fn list_up(&mut self) {
+        self.list_sel = self.list_sel.saturating_sub(1);
+    }
+
+    /// Move the highlighted list entry down (clamps at the last entry).
+    pub fn list_down(&mut self) {
+        let len = self
+            .path_list(self.current_field())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if self.list_sel + 1 < len {
+            self.list_sel += 1;
+        }
+    }
+
+    /// Remove the highlighted entry, honouring the min-1 rule: the last entry
+    /// can never be removed. Clamps `list_sel` afterwards.
+    pub fn list_remove(&mut self) {
+        let f = self.current_field();
+        let sel = self.list_sel;
+        if let Some(v) = self.path_list_mut(f) {
+            if v.len() > 1 && sel < v.len() {
+                v.remove(sel);
+            }
+        }
+        // Re-clamp the cursor against the (possibly shortened) list.
+        let len = self.path_list(f).map(|v| v.len()).unwrap_or(0);
+        if self.list_sel >= len {
+            self.list_sel = len.saturating_sub(1);
+        }
+    }
+
+    /// Open the FS picker in ADD mode (a fresh, empty query).
+    pub fn open_picker_add(&mut self) {
+        self.picker = Some(PathPicker::new(PickerMode::Add, String::new(), &self.cwd));
+    }
+
+    /// Open the FS picker in REPLACE mode for the highlighted entry, seeding the
+    /// query with that entry's current value for easy editing.
+    pub fn open_picker_replace(&mut self) {
+        let f = self.current_field();
+        let sel = self.list_sel;
+        let seed = self
+            .path_list(f)
+            .and_then(|v| v.get(sel))
+            .cloned()
+            .unwrap_or_default();
+        self.picker = Some(PathPicker::new(PickerMode::Replace(sel), seed, &self.cwd));
+    }
+
+    /// Confirm the active picker: apply the chosen path (the selected match, else
+    /// the raw query stripped of a leading `@`), trimmed, to the target list,
+    /// then close the picker. A blank choice is ignored (picker still closes).
+    pub fn picker_confirm(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        // Selected match wins; otherwise fall back to the raw typed query.
+        let chosen = picker
+            .selected()
+            .cloned()
+            .unwrap_or_else(|| picker.query.clone());
+        let chosen = chosen.strip_prefix('@').unwrap_or(&chosen).trim().to_string();
+        if chosen.is_empty() {
+            return; // nothing to apply; picker already closed
+        }
+        let f = self.current_field();
+        match picker.mode {
+            PickerMode::Add => {
+                if let Some(v) = self.path_list_mut(f) {
+                    v.push(chosen);
+                    // Keep the cursor on the freshly added entry.
+                    self.list_sel = v.len().saturating_sub(1);
+                }
+            }
+            PickerMode::Replace(i) => {
+                if let Some(v) = self.path_list_mut(f) {
+                    if let Some(slot) = v.get_mut(i) {
+                        *slot = chosen;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel the active picker without applying anything.
+    pub fn picker_cancel(&mut self) {
+        self.picker = None;
+    }
+
+    /// Append `c` to the picker query and recompute matches.
+    pub fn picker_push_char(&mut self, c: char) {
+        let cwd = self.cwd.clone();
+        if let Some(p) = self.picker.as_mut() {
+            p.query.push(c);
+            p.recompute(&cwd);
+        }
+    }
+
+    /// Delete the last char of the picker query and recompute matches.
+    pub fn picker_backspace(&mut self) {
+        let cwd = self.cwd.clone();
+        if let Some(p) = self.picker.as_mut() {
+            p.query.pop();
+            p.recompute(&cwd);
+        }
+    }
+
+    /// Drill into the currently highlighted match: set the query to that match
+    /// plus a trailing `/` and recompute, descending one level. No-op when no
+    /// match is highlighted.
+    pub fn picker_descend(&mut self) {
+        let cwd = self.cwd.clone();
+        if let Some(p) = self.picker.as_mut() {
+            if let Some(sel) = p.selected().cloned() {
+                p.query = format!("{sel}/");
+                p.sel = 0;
+                p.recompute(&cwd);
             }
         }
     }

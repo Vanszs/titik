@@ -412,20 +412,32 @@ pub(super) fn apply_action(
                 //    awareness settings ride along here too; they don't affect
                 //    the chat client (the awareness call uses `complete_with`
                 //    per invocation), so no client rebuild is keyed off them.
-                // Parse the comma-separated allowed-folders text into a Vec:
-                // split on ',', trim each entry, drop empties. This is the seam
-                // where the editable text becomes the stored `Vec<String>`.
+                // Normalise both path-list drafts: trim each entry, drop empties.
+                // (They're already `Vec<String>` from the managed list editor — no
+                // comma-splitting anymore.)
                 let allowed_folders_vec: Vec<String> = allowed_folders
-                    .split(',')
-                    .map(str::trim)
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .map(str::to_string)
                     .collect();
+                // Workdir must keep at least one entry; if the draft normalises to
+                // nothing, fall back to the launch cwd so `Session::workdir` still
+                // resolves and the reindex below has a real directory.
+                let mut workdir_vec: Vec<String> = workdir
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if workdir_vec.is_empty() {
+                    workdir_vec = std::env::current_dir()
+                        .map(|p| vec![p.display().to_string()])
+                        .unwrap_or_default();
+                }
                 if let Some(sess) = state.rest.session.as_mut() {
                     sess.settings.api_key = api_key;
                     sess.settings.model = model;
                     sess.settings.provider = provider;
-                    sess.settings.workdir = workdir;
+                    sess.settings.workdir = workdir_vec;
                     sess.settings.awareness_enabled = awareness_enabled;
                     sess.settings.awareness_inherit = awareness_inherit;
                     sess.settings.awareness_model = awareness_model;

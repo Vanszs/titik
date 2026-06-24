@@ -127,7 +127,14 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
             }
         }
         Mode::Settings(s) => {
-            if s.editing {
+            // Route a paste into the active picker query first, else the text field.
+            if s.picker.is_some() {
+                for c in text.chars() {
+                    if c != '\r' && c != '\n' {
+                        s.picker_push_char(c);
+                    }
+                }
+            } else if s.editing {
                 for c in text.chars() {
                     if c != '\r' && c != '\n' {
                         s.push_char(c);
@@ -435,18 +442,27 @@ fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -
 
 /// Handle a key press inside the `/settings` dashboard.
 ///
-/// Three-level focus design:
+/// Nested focus design (deepest first):
 ///
-/// 1. **editing** – user is typing into a text field.
+/// 0. **picker** (`s.picker` is `Some`) – the FS directory picker overlay.
+///    Type to filter, ↑/↓ select, Tab or `/` descend into the highlighted dir,
+///    Enter confirms (applies to the path list), Esc cancels. Highest priority.
+///
+/// 1. **list_editing** – a path-list field is open for per-entry management.
+///    ↑/↓ move the highlighted entry; `+`/`a` add (opens the picker); `-`/`d`
+///    remove (min-1 rule); Enter edits the entry (opens the picker, seeded);
+///    Esc returns to field navigation.
+///
+/// 2. **editing** – user is typing into a plain text field.
 ///    Enter / Esc commit the draft and drop back to detail navigation.
 ///    Backspace / Char delegate to the state mutation helpers.
 ///
-/// 2. **in_detail** (not editing) – cursor is on the field list of the active
-///    category.  Esc / Left return focus to the sidebar.  Enter activates the
-///    current field.  Left/Right on the Accent field cycle the accent; Left
-///    otherwise returns to the sidebar.
+/// 3. **in_detail** (none of the above) – cursor is on the field list of the
+///    active category. Esc / Left return focus to the sidebar. Enter activates
+///    the current field (toggle / edit / enter list management). Left/Right on
+///    the Accent field cycle the accent; Left otherwise returns to the sidebar.
 ///
-/// 3. **sidebar** – cursor is on the category list.
+/// 4. **sidebar** – cursor is on the category list.
 ///    Esc saves all drafts and closes the dashboard (`Action::SaveSettings`).
 ///    Enter / Right move focus to the detail pane.
 ///
@@ -458,7 +474,86 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
         return Action::Quit;
     }
 
-    if s.editing {
+    if s.picker.is_some() {
+        // --- FS directory picker (deepest level) ---
+        match key.code {
+            // Cancel the picker WITHOUT applying; stay in list management.
+            KeyCode::Esc => {
+                s.picker_cancel();
+                Action::None
+            }
+            // Confirm: apply the chosen path to the list, close the picker.
+            KeyCode::Enter => {
+                s.picker_confirm();
+                Action::None
+            }
+            KeyCode::Up => {
+                if let Some(p) = s.picker.as_mut() {
+                    p.up();
+                }
+                Action::None
+            }
+            KeyCode::Down => {
+                if let Some(p) = s.picker.as_mut() {
+                    p.down();
+                }
+                Action::None
+            }
+            // Tab descends into the highlighted match for easy directory walking.
+            KeyCode::Tab => {
+                s.picker_descend();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                s.picker_backspace();
+                Action::None
+            }
+            // '/' descends into the highlighted match (mirrors the chat palette's
+            // folder-drill); any other printable char appends to the query.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if c == '/' && s.picker.as_ref().is_some_and(|p| p.selected().is_some()) {
+                    s.picker_descend();
+                } else {
+                    s.picker_push_char(c);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    } else if s.list_editing {
+        // --- Path-list per-entry management ---
+        match key.code {
+            // Done managing this list: back to field navigation.
+            KeyCode::Esc => {
+                s.list_editing = false;
+                Action::None
+            }
+            KeyCode::Up => {
+                s.list_up();
+                Action::None
+            }
+            KeyCode::Down => {
+                s.list_down();
+                Action::None
+            }
+            // Add a new entry via the picker.
+            KeyCode::Char('+') | KeyCode::Char('a') => {
+                s.open_picker_add();
+                Action::None
+            }
+            // Remove the highlighted entry (last entry is protected).
+            KeyCode::Char('-') | KeyCode::Char('d') => {
+                s.list_remove();
+                Action::None
+            }
+            // Edit the highlighted entry via the picker (seeded with its value).
+            KeyCode::Enter => {
+                s.open_picker_replace();
+                Action::None
+            }
+            _ => Action::None,
+        }
+    } else if s.editing {
         match key.code {
             // Commit the draft and return to detail navigation; do not close.
             KeyCode::Enter | KeyCode::Esc => {
@@ -477,7 +572,7 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
         }
     } else if s.in_detail {
         match key.code {
-            // Return to the sidebar (also exits editing, already false here).
+            // Return to the sidebar (also exits editing/list/picker state).
             KeyCode::Esc => {
                 s.focus_sidebar();
                 Action::None
@@ -490,7 +585,7 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
                 s.down();
                 Action::None
             }
-            // Theme toggle / start editing text field.
+            // Theme/awareness toggle / start editing text field / enter a path list.
             KeyCode::Enter => {
                 s.enter();
                 Action::None

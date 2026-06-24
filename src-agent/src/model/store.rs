@@ -132,8 +132,9 @@ pub fn create_session() -> Result<Session> {
 
     let settings = Settings {
         name: id.clone(),
+        // Seed the workdir path list with a single entry: the launch cwd.
         workdir: std::env::current_dir()
-            .map(|p| p.display().to_string())
+            .map(|p| vec![p.display().to_string()])
             .unwrap_or_default(),
         ..Default::default()
     };
