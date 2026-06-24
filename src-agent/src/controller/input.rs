@@ -13,7 +13,7 @@
 //! belonging to the active mode and `AppStateRest`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crate::app::mode::{EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
+use crate::app::mode::{AgentsState, EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::{AppState, AppStateRest};
 use crate::controller::command::{self, Command};
 
@@ -64,6 +64,18 @@ pub enum Action {
     SaveEffort(String),
     /// Esc on the `/effort` picker — discard the selection and return to Chat.
     EffortCancel,
+    // --- Agents dashboard actions ---
+    /// Confirm CREATE: write a new agent from the drafts, reload, back to Browse.
+    CreateAgent,
+    /// Confirm EDIT: overwrite the selected agent from the drafts, reload, back
+    /// to Browse.
+    SaveAgent,
+    /// Confirm DELETE: remove the selected file-backed agent, reload, back to
+    /// Browse.
+    DeleteAgent,
+    /// Esc from the agents dashboard (Browse, LIST focused) — discard any drafts
+    /// and return to Chat.
+    CloseAgents,
 }
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -114,6 +126,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::KeyInput(form) => handle_key_input(form, &mut state.rest, key),
         Mode::SessionPicker(p) => handle_picker(p, &mut state.rest, key),
         Mode::Settings(s) => handle_settings(s, &mut state.rest, key),
+        Mode::Agents(a) => handle_agents(a, &mut state.rest, key),
         Mode::Effort(e) => handle_effort(e, &mut state.rest, key),
     }
 }
@@ -149,6 +162,25 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 for c in text.chars() {
                     if c != '\r' && c != '\n' {
                         s.push_char(c);
+                    }
+                }
+            }
+        }
+        Mode::Agents(a) => {
+            // Only meaningful while typing into a draft field; newlines collapse
+            // to spaces except in the multiline body.
+            if a.editing {
+                let body = a.field == crate::app::mode::AgentEditField::Body;
+                for c in text.chars() {
+                    if c == '\r' {
+                        continue;
+                    }
+                    if c == '\n' {
+                        if body {
+                            a.newline();
+                        }
+                    } else {
+                        a.push_char(c);
                     }
                 }
             }
@@ -663,6 +695,179 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
             }
             _ => Action::None,
         }
+    }
+}
+
+/// Handle a key press inside the `/agents` management dashboard.
+///
+/// Context-sensitive dispatch keyed on the sub-mode + editing flag (deepest
+/// focus first):
+///
+/// 0. **DeleteConfirm** – modal y/n; `y` deletes (`Action::DeleteAgent`),
+///    `n`/Esc cancels back to Browse.
+///
+/// 1. **editing** (Edit/Create, typing a field) – Char/Backspace mutate the
+///    draft; Ctrl+J / Shift+Enter add a newline in the body; Enter or Esc
+///    commit the field and drop back to field navigation (Esc in Create only
+///    leaves the field, it does NOT cancel the whole flow).
+///
+/// 2. **Edit/Create** (navigating fields, not editing) – ↑/↓ move the field
+///    cursor; Enter starts editing the field (Name/Description/… ) or, for the
+///    scope row in Create, toggles scope; `s` saves/creates; Esc cancels the
+///    whole flow back to Browse.
+///
+/// 3. **Browse** – ↑/↓ move the LIST cursor; →/Enter open the selected agent
+///    for editing (built-ins are read-only → status note, no transition);
+///    `n` starts Create; `d` deletes the selected file-backed agent; Esc closes
+///    the dashboard (`Action::CloseAgents`).
+fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    use crate::app::mode::{AgentEditField, AgentSubMode};
+    use crate::model::agent_def::AgentSource;
+
+    if is_ctrl(&key, 'c') {
+        return Action::Quit;
+    }
+
+    match s.mode {
+        // --- DeleteConfirm: modal y/n ---
+        AgentSubMode::DeleteConfirm => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Action::DeleteAgent,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                s.mode = AgentSubMode::Browse;
+                Action::None
+            }
+            _ => Action::None,
+        },
+
+        // --- Edit / Create ---
+        AgentSubMode::Edit | AgentSubMode::Create => {
+            if s.editing {
+                // Typing into the highlighted draft field.
+                // Ctrl+J always inserts a body newline (reliable multiline key).
+                if is_ctrl(&key, 'j') {
+                    s.newline();
+                    return Action::None;
+                }
+                match key.code {
+                    // Commit the field; stay in the editor.
+                    KeyCode::Esc => {
+                        s.editing = false;
+                        Action::None
+                    }
+                    KeyCode::Enter => {
+                        // Shift+Enter (when reported) inserts a body newline;
+                        // plain Enter commits the field.
+                        if s.field == AgentEditField::Body
+                            && key.modifiers.contains(KeyModifiers::SHIFT)
+                        {
+                            s.newline();
+                        } else {
+                            s.editing = false;
+                        }
+                        Action::None
+                    }
+                    KeyCode::Backspace => {
+                        s.backspace();
+                        Action::None
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        s.push_char(c);
+                        Action::None
+                    }
+                    _ => Action::None,
+                }
+            } else {
+                // Navigating the field list.
+                match key.code {
+                    KeyCode::Esc => {
+                        s.cancel();
+                        Action::None
+                    }
+                    KeyCode::Up => {
+                        s.field_up();
+                        Action::None
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        s.field_down();
+                        Action::None
+                    }
+                    KeyCode::Enter => {
+                        s.editing = true;
+                        Action::None
+                    }
+                    // Scope toggle is only meaningful in Create; bind it to ←/→
+                    // so it never collides with field text entry.
+                    KeyCode::Left | KeyCode::Right if s.mode == AgentSubMode::Create => {
+                        s.toggle_scope();
+                        Action::None
+                    }
+                    // Save (Edit) / create (Create).
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if s.mode == AgentSubMode::Create {
+                            if s.draft_name.trim().is_empty() {
+                                rest.status = "name required".into();
+                                Action::None
+                            } else if s.draft_description.trim().is_empty() {
+                                rest.status = "description required".into();
+                                Action::None
+                            } else {
+                                Action::CreateAgent
+                            }
+                        } else if s.draft_description.trim().is_empty() {
+                            rest.status = "description required".into();
+                            Action::None
+                        } else {
+                            Action::SaveAgent
+                        }
+                    }
+                    _ => Action::None,
+                }
+            }
+        }
+
+        // --- Browse: navigate the LIST ---
+        AgentSubMode::Browse => match key.code {
+            KeyCode::Esc => Action::CloseAgents,
+            KeyCode::Up => {
+                s.list_up();
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                s.list_down();
+                Action::None
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                match s.current_agent().map(|a| a.source) {
+                    Some(AgentSource::Builtin) => {
+                        rest.status = "built-in agents are read-only".into();
+                        Action::None
+                    }
+                    Some(_) => {
+                        s.enter_edit();
+                        Action::None
+                    }
+                    None => Action::None,
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                s.enter_create();
+                Action::None
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                match s.current_agent().map(|a| a.source) {
+                    Some(AgentSource::Builtin) => {
+                        rest.status = "cannot delete a built-in agent".into();
+                        Action::None
+                    }
+                    Some(_) => {
+                        s.enter_delete();
+                        Action::None
+                    }
+                    None => Action::None,
+                }
+            }
+            _ => Action::None,
+        },
     }
 }
 

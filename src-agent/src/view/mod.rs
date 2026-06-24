@@ -12,6 +12,7 @@
 //!
 //! No logic lives here; all rendering decisions belong to the sub-modules.
 
+pub mod agents;
 pub mod chat;
 pub mod effort;
 pub mod key_input;
@@ -38,6 +39,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Mode::KeyInput(form) => key_input::draw(frame, form, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
         Mode::Settings(s) => settings::draw(frame, s, &palette),
+        Mode::Agents(a) => agents::draw(frame, a, &palette),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
     }
 }

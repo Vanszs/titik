@@ -20,7 +20,9 @@ mod key_input;
 mod effort;
 mod picker;
 pub mod settings;
+pub mod agents;
 
+pub use agents::{AgentEditField, AgentScope, AgentSubMode, AgentsState};
 pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
 pub use picker::PickerState;
@@ -48,6 +50,12 @@ pub enum Mode {
     /// every draft plus the path-list/picker working state), so storing it inline
     /// would bloat `Mode` everywhere. The box keeps the enum small.
     Settings(Box<SettingsState>),
+    /// In-app agent definitions manager (`/agents`): create / modify / delete
+    /// the `.md` frontmatter agent files. The inner [`AgentsState`] holds the
+    /// loaded registry snapshot, the LIST/DETAIL cursor, the sub-mode state
+    /// machine, and the per-field working drafts. Boxed to keep `Mode` small,
+    /// consistent with `Settings`.
+    Agents(Box<AgentsState>),
     /// Reasoning/thinking-effort picker (`/effort`): a small overlay listing the
     /// effort options the current model supports. The inner [`EffortPickerState`]
     /// holds the option list, the cursor, and a one-line capability note. Boxed

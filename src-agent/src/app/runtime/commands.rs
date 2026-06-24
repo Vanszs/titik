@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::app::mode::{EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
+use crate::app::mode::{AgentsState, EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
@@ -277,6 +277,22 @@ pub(super) fn apply_slash(
             };
             let st = SettingsState::from(session, &state.rest.config);
             state.mode = Mode::Settings(Box::new(st));
+        }
+
+        Command::Agents => {
+            // Needs an active session (the registry loads from it); also blocked
+            // while a request is in flight, mirroring the /settings + /compact
+            // guards.
+            if state.rest.waiting {
+                state.rest.status = "busy — wait for response".into();
+                return Ok(());
+            }
+            let Some(session) = state.rest.session.as_ref() else {
+                state.rest.status = "no active session".into();
+                return Ok(());
+            };
+            let st = AgentsState::from(session);
+            state.mode = Mode::Agents(Box::new(st));
         }
 
         Command::Resume => {

@@ -17,6 +17,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/mode", "Toggle Normal/Auto tool approval"),
     ("/effort", "Set model reasoning/thinking effort"),
     ("/settings", "Edit key, model, provider, theme, name"),
+    ("/agents", "Create, modify, or delete agent definitions"),
     ("/compact", "Summarize and compact the conversation"),
     ("/rename", "Rename the current session"),
     ("/select", "Dump history to the terminal to copy/paste"),
@@ -59,6 +60,8 @@ pub enum Command {
     Rename(String),
     /// Open the in-app settings dashboard (alias: `/config`).
     Settings,
+    /// Open the `/agents` management dashboard (alias: `/agent`).
+    Agents,
     /// Open the session picker to switch to a different session (alias: `/sessions`).
     Resume,
     /// Dump the conversation to the normal terminal for native copy/paste.
@@ -98,6 +101,7 @@ pub fn parse(line: &str) -> Command {
         "mode" => Command::Mode,
         "effort" => Command::Effort,
         "settings" | "config" => Command::Settings,
+        "agents" | "agent" => Command::Agents,
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,
