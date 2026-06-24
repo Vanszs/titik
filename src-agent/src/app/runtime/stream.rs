@@ -452,9 +452,15 @@ pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
         dir_cache: state.rest.dir_cache.clone(),
     };
     // OpenAI/OpenRouter send `arguments` as a JSON-encoded string; an empty or
-    // malformed payload degrades to `{}` so the tool sees no arguments.
+    // malformed payload degrades to `{}` so the tool sees no arguments. Sanitize
+    // first: a non-delta provider may have produced a duplicated `{...}{...}`
+    // string (valid JSON document + trailing copy) that `from_str` would reject
+    // outright — collapsing it to one clean value here recovers the real arguments
+    // (e.g. the bash `command`) instead of silently degrading to `{}`. A single
+    // clean value is unchanged, so the normal path is unaffected.
+    let sanitized = crate::dto::chat::sanitize_tool_arguments(&call.function.arguments);
     let args: serde_json::Value =
-        serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        serde_json::from_str(&sanitized).unwrap_or_else(|_| serde_json::json!({}));
     for tool in crate::tool::all_tools() {
         if tool.name() == call.function.name {
             return match tool.run(&ctx, &args) {

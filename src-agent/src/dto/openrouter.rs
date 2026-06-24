@@ -119,10 +119,26 @@ pub fn to_wire(messages: Vec<ChatMessage>) -> Vec<WireMessage> {
             } else {
                 WireContent::Text(m.content)
             };
+            // Repair any tool-call argument string on the way OUT. A provider that
+            // violated the streaming-delta contract may have persisted a malformed
+            // `{...}{...}` arguments value into a stored assistant message; sending it
+            // verbatim makes the provider's prefill/validation reject the whole
+            // request ("unexpected content after document"), wedging the session.
+            // `m.tool_calls` here is an owned clone of the stored message (the caller
+            // passes `conversation.history()` clones), so cleaning it touches ONLY this
+            // wire copy — the stored `ChatMessage` / `messages.json` is never mutated.
+            // A single clean value is left semantically unchanged (no-op).
+            let tool_calls = m.tool_calls.map(|mut calls| {
+                for call in &mut calls {
+                    call.function.arguments =
+                        crate::dto::chat::sanitize_tool_arguments(&call.function.arguments);
+                }
+                calls
+            });
             WireMessage {
                 role: m.role,
                 content,
-                tool_calls: m.tool_calls,
+                tool_calls,
                 tool_call_id: m.tool_call_id,
             }
         })

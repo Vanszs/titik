@@ -195,6 +195,70 @@ fn collapse_blank_runs(s: &str) -> String {
     out
 }
 
+/// Repair a tool call's JSON-encoded `arguments` string against providers that
+/// violate the streaming-delta contract.
+///
+/// OpenAI/OpenRouter `tool_calls[*].function.arguments` is meant to arrive as a
+/// stream of pure DELTAS that, concatenated, form ONE JSON object. Some budget
+/// routes instead re-send the COMPLETE arguments in every chunk (or repeat the
+/// full arguments in the final frame). Blind concatenation then produces a valid
+/// JSON document followed by trailing content — e.g. `{"command":"x"}{"command":"x"}`
+/// or `{}{"command":"x"}` — which:
+///   1. makes `serde_json::from_str` fail (trailing content), so the tool sees
+///      `{}` and reports a missing required argument, and
+///   2. is PERSISTED and re-sent, where the provider's prefill/validation rejects
+///      the whole request ("unexpected content after document"), wedging the session.
+///
+/// This function parses the input as a STREAM of JSON values (stopping at the
+/// first trailing garbage) and picks ONE clean value to keep:
+/// - prefer the LAST parsed value that is a non-empty object (handles the
+///   empty-then-full `{}` → `{...}` case by keeping the full one, and the
+///   duplicate `{...}{...}` case by keeping a single copy);
+/// - else the LAST parsed value (any kind), if anything parsed at all;
+/// - else `"{}"` (empty input, or leading garbage that parses to nothing).
+///
+/// The chosen value is re-serialised compactly. For the NORMAL case — the input
+/// is already a single valid JSON object — the result is a semantic no-op (only
+/// whitespace/key-order may change, and arguments are read by key), so a working
+/// tool call is never broken. On any serialisation error it returns `"{}"`.
+pub fn sanitize_tool_arguments(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+
+    // Parse the input as a SEQUENCE of JSON values. `into_iter::<Value>()` yields
+    // one item per top-level value; the first `Err` marks trailing non-JSON
+    // garbage (or a partial/incomplete value), at which point we stop and keep
+    // whatever clean values we already collected.
+    let mut last_any: Option<serde_json::Value> = None;
+    let mut last_nonempty_obj: Option<serde_json::Value> = None;
+    let stream = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    for item in stream {
+        match item {
+            Ok(value) => {
+                if value
+                    .as_object()
+                    .is_some_and(|obj| !obj.is_empty())
+                {
+                    last_nonempty_obj = Some(value.clone());
+                }
+                last_any = Some(value);
+            }
+            // Trailing garbage / incomplete value: stop; keep what parsed so far.
+            Err(_) => break,
+        }
+    }
+
+    // Prefer the last non-empty object; else the last value of any kind; else
+    // nothing parsed → empty object.
+    let chosen = match last_nonempty_obj.or(last_any) {
+        Some(v) => v,
+        None => return "{}".to_string(),
+    };
+    serde_json::to_string(&chosen).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// A single turn in a conversation: who spoke and what they said.
 ///
 /// Serialised to / from JSON so it can be stored in `messages.json` and sent
@@ -409,5 +473,86 @@ mod text_tool_call_tests {
         assert_eq!(calls[0].function.name, "ping");
         assert_eq!(calls[0].function.arguments, "{}");
         assert_eq!(cleaned, "");
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tool_arguments_tests {
+    use super::*;
+
+    /// Parse both sides as `Value` and assert structural equality — re-serialise
+    /// may reorder keys / drop whitespace, so a byte compare would be wrong.
+    fn assert_json_eq(a: &str, b: &str) {
+        let va: serde_json::Value = serde_json::from_str(a).unwrap();
+        let vb: serde_json::Value = serde_json::from_str(b).unwrap();
+        assert_eq!(va, vb, "left={a} right={b}");
+    }
+
+    #[test]
+    fn single_clean_object_is_preserved() {
+        // The normal path MUST be a semantic no-op.
+        let input = r#"{"command":"ls -la","timeout":30}"#;
+        let out = sanitize_tool_arguments(input);
+        assert_json_eq(&out, input);
+    }
+
+    #[test]
+    fn duplicated_object_collapses_to_one() {
+        let out = sanitize_tool_arguments(r#"{"a":1}{"a":1}"#);
+        assert_json_eq(&out, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn empty_then_full_keeps_full() {
+        // Provider emits `{}` first, then the complete args.
+        let out = sanitize_tool_arguments(r#"{}{"command":"x"}"#);
+        assert_json_eq(&out, r#"{"command":"x"}"#);
+    }
+
+    #[test]
+    fn full_then_duplicate_realistic_bash_keeps_command() {
+        // The real-world bug: the full bash args, then a duplicate copy.
+        let one = r#"{"command":"grep -rn \"foo\" src/ | head -20"}"#;
+        let input = format!("{one}{one}");
+        let out = sanitize_tool_arguments(&input);
+        assert_json_eq(&out, one);
+        // The command must survive intact.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["command"].as_str().unwrap(),
+            r#"grep -rn "foo" src/ | head -20"#
+        );
+    }
+
+    #[test]
+    fn incomplete_or_garbage_yields_empty_object() {
+        // A truncated/partial value parses to nothing → "{}".
+        assert_eq!(sanitize_tool_arguments(r#"{"command":"#), "{}");
+    }
+
+    #[test]
+    fn legit_empty_object_is_preserved() {
+        // A genuinely empty argument bag stays empty (no value to upgrade to).
+        assert_eq!(sanitize_tool_arguments("{}"), "{}");
+    }
+
+    #[test]
+    fn whitespace_between_two_values_handled() {
+        // Newlines/spaces separating two full copies must not defeat parsing.
+        let out = sanitize_tool_arguments("{\"a\":1}\n  \t {\"a\":1}");
+        assert_json_eq(&out, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn empty_string_yields_empty_object() {
+        assert_eq!(sanitize_tool_arguments(""), "{}");
+        assert_eq!(sanitize_tool_arguments("   \n\t "), "{}");
+    }
+
+    #[test]
+    fn empty_then_full_then_duplicate_keeps_full() {
+        // `{}` then the full args repeated twice: keep the last non-empty object.
+        let out = sanitize_tool_arguments(r#"{}{"command":"x"}{"command":"x"}"#);
+        assert_json_eq(&out, r#"{"command":"x"}"#);
     }
 }

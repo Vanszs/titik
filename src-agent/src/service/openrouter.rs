@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{APP_TITLE, HTTP_REFERER};
-use crate::dto::chat::{ChatMessage, ToolCall};
+use crate::dto::chat::{sanitize_tool_arguments, ChatMessage, ToolCall};
 use crate::dto::openrouter::{
     to_wire, ChatRequest, ChatResponse, ModelInfo, ModelsResponse, ReasoningConfig, StreamChunk,
     ToolDef, ToolFunctionDef, UsageRequest,
@@ -44,6 +44,20 @@ pub struct OpenRouterClient {
 /// request was interrupted/superseded, so the event is simply dropped).
 fn emit(tx: &UnboundedSender<StreamEvent>, event: StreamEvent) {
     let _ = tx.send(event);
+}
+
+/// Repair every accumulated tool call's `function.arguments` in place via
+/// [`sanitize_tool_arguments`] before the assembled set leaves the client.
+///
+/// Streamed argument fragments are concatenated assuming pure deltas; providers
+/// that re-send the FULL arguments per chunk (common on budget routes) make that
+/// concatenation a malformed `{...}{...}` string. Collapsing it to one clean value
+/// here keeps the bad string from entering the runtime/persistence pipeline — the
+/// SOURCE-layer guard. A single clean value is left semantically unchanged.
+fn sanitize_tool_acc(tool_acc: &mut [ToolCall]) {
+    for call in tool_acc.iter_mut() {
+        call.function.arguments = sanitize_tool_arguments(&call.function.arguments);
+    }
 }
 
 /// Build a provider-routing directive from a provider slug.
@@ -338,6 +352,12 @@ impl OpenRouterClient {
                     // confirmation; non-empty `tool_acc` is the data we actually
                     // need, so either being set means "run the tools".
                     if !tool_acc.is_empty() || finished_tool_calls {
+                        // Repair argument strings before they leave the client:
+                        // some providers re-send the FULL arguments per chunk, so
+                        // blind delta concatenation yields `{...}{...}`. Collapse
+                        // to one clean value so the runtime + persistence never see
+                        // a malformed (and later prefill-rejected) string.
+                        sanitize_tool_acc(&mut tool_acc);
                         emit(&tx, StreamEvent::ToolCalls(tool_acc.clone()));
                     }
                     emit(&tx, StreamEvent::Done);
@@ -413,8 +433,10 @@ impl OpenRouterClient {
             }
         }
         // Stream ended without an explicit [DONE]: same finalisation order —
-        // tool calls (if any), then Done.
+        // tool calls (if any), then Done. Same argument repair as the [DONE]
+        // path so a non-delta provider that never sends [DONE] is also covered.
         if !tool_acc.is_empty() || finished_tool_calls {
+            sanitize_tool_acc(&mut tool_acc);
             emit(&tx, StreamEvent::ToolCalls(tool_acc.clone()));
         }
         emit(&tx, StreamEvent::Done);
