@@ -301,6 +301,26 @@ pub(super) fn run_loop(
             }
         }
 
+        // When a background reindex has SETTLED (not indexing), warn once about
+        // any workspace root missing on disk. Keyed on the missing set CHANGING
+        // vs what we last warned, so it fires exactly once per change and does
+        // not depend on catching the brief indexing=true window (an all-missing
+        // reindex can finish before the loop ever observes it).
+        let (indexing_now, missing_now) = match state.rest.dir_cache.read() {
+            Ok(c) => (c.indexing, c.missing_roots.clone()),
+            Err(_) => (true, state.rest.warned_missing_roots.clone()),
+        };
+        if !indexing_now && missing_now != state.rest.warned_missing_roots {
+            if !missing_now.is_empty() {
+                state.rest.set_toast_info(format!(
+                    "workspace root(s) not found on disk:\n{}\nfix the path in /settings",
+                    missing_now.join("\n")
+                ));
+                dirty = true;
+            }
+            state.rest.warned_missing_roots = missing_now;
+        }
+
         // Status-line "comet" activity clock. Shimmer is active whenever the app
         // is in a WORKING wait that isn't paused on a y/n approval. Reconcile
         // `work_since` against that on the rising/falling edge here (the single

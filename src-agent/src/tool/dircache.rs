@@ -18,6 +18,9 @@ use super::{Tool, ToolCtx};
 pub struct DirCache {
     pub files: Vec<String>,
     pub indexing: bool,
+    /// Human-readable '[i] /path' entries for configured roots that were not
+    /// directories at the last index. Empty when all roots resolved.
+    pub missing_roots: Vec<String>,
 }
 
 /// Re-index one or more workspace roots on a background thread
@@ -34,7 +37,12 @@ pub fn reindex(roots: Vec<PathBuf>, cache: Arc<RwLock<DirCache>>) {
     let multi = roots.len() > 1;
     std::thread::spawn(move || {
         let mut files: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for (i, root) in roots.iter().enumerate() {
+            if !root.is_dir() {
+                missing.push(format!("[{i}] {}", root.display()));
+                continue;
+            }
             for dent in ignore::WalkBuilder::new(root).build().flatten() {
                 if dent.file_type().is_some_and(|t| t.is_file()) {
                     if let Ok(rel) = dent.path().strip_prefix(root) {
@@ -51,6 +59,7 @@ pub fn reindex(roots: Vec<PathBuf>, cache: Arc<RwLock<DirCache>>) {
         files.sort();
         if let Ok(mut c) = cache.write() {
             c.files = files;
+            c.missing_roots = missing;
             c.indexing = false;
         }
     });

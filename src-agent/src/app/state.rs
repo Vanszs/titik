@@ -255,6 +255,9 @@ pub struct AppStateRest {
     /// `Some(now)` when shimmer becomes active and it's `None`; cleared to `None`
     /// the moment work ends or an approval prompt takes over. `None` when idle.
     pub work_since: Option<std::time::Instant>,
+    /// The missing-root set we last warned about, so the toast fires only when
+    /// the set changes (not on every reindex).
+    pub warned_missing_roots: Vec<String>,
 }
 
 impl AppState {
@@ -328,6 +331,7 @@ impl AppStateRest {
             provider_caches: false,
             summarizing: false,
             work_since: None,
+            warned_missing_roots: Vec::new(),
         }
     }
 
