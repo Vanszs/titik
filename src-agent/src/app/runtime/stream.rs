@@ -539,7 +539,15 @@ pub(super) fn start_stream_task(
             // every request (so they survive compaction too) but kept AFTER the
             // cache breakpoint so file changes never bust the cached prefix.
             if let Ok(cache) = state.rest.dir_cache.read() {
-                let listing = cache.children(".");
+                let mut listing = cache.children(".", 0);
+                // When multi-workspace, also list entries from other workspaces.
+                if cache.is_multi() {
+                    for i in 1.. {
+                        let more = cache.children(".", i);
+                        if more.is_empty() { break; }
+                        listing.extend(more);
+                    }
+                }
                 if !listing.is_empty() {
                     first.content.push_str("\n\n# Project files (top level)\n");
                     first.content.push_str(&listing.join("\n"));

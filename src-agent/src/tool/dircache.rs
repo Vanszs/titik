@@ -22,19 +22,28 @@ pub struct DirCache {
 
 /// Re-index one or more workspace roots on a background thread
 /// (gitignore-respecting via the `ignore` crate). Non-blocking: returns
-/// immediately; the cache is replaced when done. Each root's files are merged
-/// into a single flat index so `@` autocomplete sees all workspaces.
+/// immediately; the cache is replaced when done.
+///
+/// When there are 2+ roots, each file is prefixed with `[N]/` where N is the
+/// root's index — e.g. `[0]src/main.rs`, `[1]kantara-player/README.md`. A
+/// single root produces bare paths (no prefix) for backwards compatibility.
 pub fn reindex(roots: Vec<PathBuf>, cache: Arc<RwLock<DirCache>>) {
     if let Ok(mut c) = cache.write() {
         c.indexing = true;
     }
+    let multi = roots.len() > 1;
     std::thread::spawn(move || {
         let mut files: Vec<String> = Vec::new();
-        for root in &roots {
+        for (i, root) in roots.iter().enumerate() {
             for dent in ignore::WalkBuilder::new(root).build().flatten() {
                 if dent.file_type().is_some_and(|t| t.is_file()) {
                     if let Ok(rel) = dent.path().strip_prefix(root) {
-                        files.push(rel.to_string_lossy().into_owned());
+                        let path = rel.to_string_lossy().into_owned();
+                        if multi {
+                            files.push(format!("[{i}]{path}"));
+                        } else {
+                            files.push(path);
+                        }
                     }
                 }
             }
@@ -70,8 +79,31 @@ impl DirCache {
     /// Truncate to `limit`.
     pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
         if query.is_empty() {
-            // Depth-1 browse: same as children("") capped at limit.
-            return self.children("").into_iter().take(limit).collect();
+            // Depth-1 browse: list top-level entries from all workspaces.
+            let mut result: Vec<String> = Vec::new();
+            if self.is_multi() {
+                // Collect unique workspace indices from file prefixes.
+                let mut ws_indices: Vec<usize> = Vec::new();
+                for f in &self.files {
+                    if let Some(rest) = f.strip_prefix('[') {
+                        if let Some(end) = rest.find(']') {
+                            if let Ok(idx) = rest[..end].parse::<usize>() {
+                                if !ws_indices.contains(&idx) {
+                                    ws_indices.push(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                ws_indices.sort();
+                for idx in &ws_indices {
+                    result.extend(self.children("", *idx));
+                }
+            } else {
+                result.extend(self.children("", 0));
+            }
+            result.truncate(limit);
+            return result;
         }
 
         // Build the full candidate set: all files + all unique ancestor dirs.
@@ -128,20 +160,49 @@ impl DirCache {
     /// Immediate children (files + subfolders) of a workspace-relative directory,
     /// derived from the cached file list. `dir` may be "", ".", "src", "src/".
     /// Files are basenames; subfolders end with "/". Sorted, deduped.
-    pub fn children(&self, dir: &str) -> Vec<String> {
+    ///
+    /// `ws_idx` is used to filter prefixed entries (e.g. `[0]src/main.rs`)
+    /// when there are multiple workspaces. Pass 0 for single-workspace mode
+    /// (prefixes are absent).
+    pub fn children(&self, dir: &str, ws_idx: usize) -> Vec<String> {
         let d = dir.trim().trim_start_matches("./").trim_end_matches('/');
         let prefix = if d.is_empty() || d == "." { String::new() } else { format!("{d}/") };
+        // When multiple workspaces are indexed, files are prefixed with `[N]`.
+        // Strip the prefix before matching, but re-add it in the output so the
+        // model can reference the workspace in subsequent tool calls.
+        let ws_tag = format!("[{ws_idx}]");
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for f in &self.files {
-            if let Some(rest) = f.strip_prefix(&prefix) {
-                if rest.is_empty() { continue; }
-                match rest.find('/') {
-                    None => { set.insert(rest.to_string()); }              // file
-                    Some(j) => { set.insert(format!("{}/", &rest[..j])); } // subfolder
+            let bare = if self.is_multi() {
+                match f.strip_prefix(&ws_tag) {
+                    Some(rest) => rest,
+                    None => continue, // belongs to a different workspace
                 }
+            } else {
+                f.as_str()
+            };
+            if let Some(rest) = bare.strip_prefix(&prefix) {
+                if rest.is_empty() { continue; }
+                let entry = if self.is_multi() {
+                    match rest.find('/') {
+                        None => format!("[{ws_idx}]{rest}"),
+                        Some(j) => format!("[{ws_idx}]{}/", &rest[..j]),
+                    }
+                } else {
+                    match rest.find('/') {
+                        None => rest.to_string(),
+                        Some(j) => format!("{}/", &rest[..j]),
+                    }
+                };
+                set.insert(entry);
             }
         }
         set.into_iter().collect()
+    }
+
+    /// True when the cache holds files from 2+ workspaces (prefixed with `[N]`).
+    pub fn is_multi(&self) -> bool {
+        self.files.first().is_some_and(|f| f.starts_with('['))
     }
 }
 

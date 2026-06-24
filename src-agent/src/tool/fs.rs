@@ -34,11 +34,14 @@ const NOT_FOUND_MAX_ENTRIES: usize = 30;
 /// Entries are capped at [`NOT_FOUND_MAX_ENTRIES`] with a "… (N more)" note, and
 /// we always point at `glob` as the escape hatch.
 fn not_found_help(ctx: &ToolCtx, abs: &Path, rel: &str) -> String {
-    // Canonicalized workspace root — the floor we never walk above.
-    let ws = ctx
-        .workspace
-        .canonicalize()
-        .unwrap_or_else(|_| ctx.workspace.clone());
+    // Parse workspace index from the path prefix.
+    let (ws_idx, _bare) = super::parse_ws_prefix(rel);
+    // Find which workspace contains the path, and use it as the floor.
+    let ws = super::find_workspace(&ctx.workspaces, abs)
+        .or_else(|| ctx.workspaces.get(ws_idx).cloned())
+        .or_else(|| ctx.workspaces.first().cloned())
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Walk up `abs` to the nearest ancestor that exists AND is a directory,
     // stopping at the workspace root.
@@ -48,8 +51,6 @@ fn not_found_help(ctx: &ToolCtx, abs: &Path, rel: &str) -> String {
             break;
         }
         if p == ws {
-            // Reached the root without finding an existing dir above it; the root
-            // itself is the only sane place to list.
             break;
         }
         ancestor = p.parent();
@@ -77,7 +78,7 @@ fn not_found_help(ctx: &ToolCtx, abs: &Path, rel: &str) -> String {
     let mut entries: Vec<String> = ctx
         .dir_cache
         .read()
-        .map(|c| c.children(&dir_rel))
+        .map(|c| c.children(&dir_rel, ws_idx))
         .unwrap_or_default();
     if entries.is_empty() {
         if let Ok(rd) = std::fs::read_dir(dir_abs) {
@@ -132,7 +133,7 @@ impl Tool for DirList {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Workspace-relative directory paths to list. Use [\".\"] for the workspace root."
+                    "description": "Workspace-relative directory paths to list. Use [\".\"] for the workspace root. Prefix with [N] to target workspace N (e.g. \"[1]src\")."
                 },
                 "path": { "type": "string", "description": "A single directory (alternative to `paths`)." }
             }
@@ -159,9 +160,10 @@ impl Tool for DirList {
         let mut truncated = false;
         'outer: for dir in &dirs {
             // sandbox the path even though we read from the cache, to reject escapes
-            let _ = resolve(&ctx.workspace, dir)?;
-            let children = cache.children(dir);
-            let label = if dir.is_empty() || dir == "." { "." } else { dir.as_str() };
+            let _ = resolve(&ctx.workspaces, dir)?;
+            let (ws_idx, bare) = super::parse_ws_prefix(dir);
+            let children = cache.children(bare, ws_idx);
+            let label = if bare.is_empty() || bare == "." { if ws_idx == 0 { ".".to_string() } else { format!("[{ws_idx}].") } } else { dir.to_string() };
             out.push_str(&format!("{label}:\n"));
             if children.is_empty() {
                 out.push_str("  (empty or not indexed)\n");
@@ -212,7 +214,7 @@ impl Tool for Read {
     }
     fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
         let rel = arg_str(args, "path")?;
-        let path = resolve(&ctx.workspace, rel)?;
+        let path = resolve(&ctx.workspaces, rel)?;
         if path.is_dir() {
             bail!("'{rel}' is a directory, not a file");
         }
@@ -295,7 +297,7 @@ impl Tool for Write {
     fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
         let rel = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
-        let path = resolve(&ctx.workspace, rel)?;
+        let path = resolve(&ctx.workspaces, rel)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent directories for '{rel}'"))?;
@@ -335,7 +337,7 @@ impl Tool for Edit {
         let new = arg_str(args, "new")?;
         let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
 
-        let path = resolve(&ctx.workspace, rel)?;
+        let path = resolve(&ctx.workspaces, rel)?;
         if path.is_dir() {
             bail!("'{rel}' is a directory, not a file");
         }
@@ -391,7 +393,7 @@ impl Tool for Delete {
     }
     fn run(&self, ctx: &ToolCtx, args: &Value) -> Result<String> {
         let rel = arg_str(args, "path")?;
-        let path = resolve(&ctx.workspace, rel)?;
+        let path = resolve(&ctx.workspaces, rel)?;
         if path.is_dir() {
             bail!("'{rel}' is a directory, not a file");
         }

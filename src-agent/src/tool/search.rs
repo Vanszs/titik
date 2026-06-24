@@ -47,7 +47,7 @@ impl Tool for Grep {
         };
 
         let search_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let base = resolve(&ctx.workspace, search_path)?;
+        let base = resolve(&ctx.workspaces, search_path)?;
 
         // Optional glob filter.
         let glob_matcher: Option<globset::GlobMatcher> = match args.get("glob").and_then(Value::as_str) {
@@ -74,9 +74,19 @@ impl Tool for Grep {
 
             // Apply glob filter against the workspace-relative path.
             if let Some(ref m) = glob_matcher {
-                let rel = abs_path.strip_prefix(&ctx.workspace).unwrap_or(abs_path);
-                if !m.is_match(rel) {
-                    continue;
+                let rel = ctx.workspaces.iter().enumerate()
+                    .find_map(|(i, ws)| abs_path.strip_prefix(ws).ok().map(|r| (i, r)))
+                    .map(|(i, r)| {
+                        if ctx.workspaces.len() > 1 {
+                            format!("[{i}]{}", r.display())
+                        } else {
+                            r.display().to_string()
+                        }
+                    });
+                match rel {
+                    Some(ref r) if !m.is_match(r.as_str()) => continue,
+                    None => continue,
+                    _ => {}
                 }
             }
 
@@ -86,10 +96,16 @@ impl Tool for Grep {
                 Err(_) => continue, // binary or unreadable
             };
 
-            let rel_display = abs_path
-                .strip_prefix(&ctx.workspace)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| abs_path.to_string_lossy().into_owned());
+            let rel_display = ctx.workspaces.iter().enumerate()
+                .find_map(|(i, ws)| abs_path.strip_prefix(ws).ok().map(|r| (i, r)))
+                .map(|(i, r)| {
+                    if ctx.workspaces.len() > 1 {
+                        format!("[{i}]{}", r.display())
+                    } else {
+                        r.display().to_string()
+                    }
+                })
+                .unwrap_or_else(|| abs_path.display().to_string());
 
             for (lineno, line) in content.lines().enumerate() {
                 if re.is_match(line) {
@@ -148,7 +164,7 @@ impl Tool for Glob {
             .ok_or_else(|| anyhow::anyhow!("missing required string argument 'pattern'"))?;
 
         let base_rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let _base = resolve(&ctx.workspace, base_rel)?; // sandbox check
+        let _base = resolve(&ctx.workspaces, base_rel)?; // sandbox check
 
         let matcher = globset::Glob::new(pattern)
             .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?
@@ -169,15 +185,22 @@ impl Tool for Glob {
                 .collect()
         } else {
             // Cache empty: fall back to a fresh walk from the base path.
-            let base_abs = resolve(&ctx.workspace, base_rel)?;
+            let base_abs = resolve(&ctx.workspaces, base_rel)?;
             let mut v: Vec<String> = Vec::new();
+            let multi = ctx.workspaces.len() > 1;
             for entry in ignore::WalkBuilder::new(&base_abs).build().flatten() {
                 if entry.file_type().is_some_and(|t| t.is_file()) {
                     let abs = entry.path();
-                    let rel = abs
-                        .strip_prefix(&ctx.workspace)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| abs.to_string_lossy().into_owned());
+                    let rel = ctx.workspaces.iter().enumerate()
+                        .find_map(|(i, ws)| abs.strip_prefix(ws).ok().map(|r| (i, r)))
+                        .map(|(i, r)| {
+                            if multi {
+                                format!("[{i}]{}", r.display())
+                            } else {
+                                r.display().to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| abs.display().to_string());
                     if matcher.is_match(rel.as_str()) {
                         v.push(rel);
                     }

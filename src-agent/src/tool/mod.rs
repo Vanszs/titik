@@ -26,13 +26,28 @@ pub use dircache::DirCache;
 
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx {
-    /// Absolute workspace root (the session's workdir). All tool paths are
-    /// resolved against this and may not escape it.
+    /// Absolute workspace root (the session's primary workdir). All tool paths
+    /// are resolved against this and may not escape it.
     pub workspace: PathBuf,
     /// All configured workspace roots (may be >1 when the user lists multiple
-    /// workdirs in settings). Used by `DirCacheUpdate` and the `@` palette.
+    /// workdirs in settings). Indexed as [0], [1], etc. in `@`-prefixed paths.
     pub workspaces: Vec<PathBuf>,
     pub dir_cache: Arc<RwLock<DirCache>>,
+}
+
+/// Parse a `[N]` workspace-index prefix from the start of a path string.
+/// If the path starts with `[digits]`, returns `(index, rest)`.
+/// Otherwise returns `(0, original)` — a bare path resolves against workspace 0.
+pub fn parse_ws_prefix(path: &str) -> (usize, &str) {
+    if !path.starts_with('[') {
+        return (0, path);
+    }
+    if let Some(end) = path.find(']') {
+        if let Ok(idx) = path[1..end].parse::<usize>() {
+            return (idx, &path[end + 1..]);
+        }
+    }
+    (0, path)
 }
 
 /// A callable tool, shaped for OpenRouter function-calling: `parameters` is a
@@ -61,18 +76,20 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
     ]
 }
 
-/// Resolve a workspace-relative path and ENFORCE it stays inside the workspace.
-/// Works for existing and not-yet-created paths (canonicalizes the nearest
-/// existing ancestor). Returns an error if the path escapes the workspace.
-pub fn resolve(workspace: &Path, rel: &str) -> Result<PathBuf> {
-    let ws = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
-    let joined = ws.join(rel);
+/// Resolve a path (optionally with `[N]` workspace-index prefix) and enforce
+/// containment. A bare path like `src/main.rs` resolves against workspace 0.
+/// A prefixed path like `[2]src/main.rs` resolves against workspace 2.
+pub fn resolve(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
+    let (ws_idx, bare) = parse_ws_prefix(rel);
+    let base = workspaces.get(ws_idx)
+        .ok_or_else(|| anyhow::anyhow!("workspace index [{ws_idx}] out of range (have {})", workspaces.len()))?;
+    let ws = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let joined = ws.join(bare);
     // Canonicalize as far as exists, then re-append the non-existent tail, so
     // `..` tricks are normalised out before the containment check.
     let candidate = match joined.canonicalize() {
         Ok(p) => p,
         Err(_) => {
-            // Walk up to the nearest existing ancestor, canonicalize it, re-join the rest.
             let mut existing = joined.as_path();
             let mut tail: Vec<std::ffi::OsString> = Vec::new();
             while !existing.exists() {
@@ -92,8 +109,21 @@ pub fn resolve(workspace: &Path, rel: &str) -> Result<PathBuf> {
             base
         }
     };
+    // Containment: must be inside the resolved workspace.
     if !candidate.starts_with(&ws) {
-        bail!("path '{rel}' is outside the workspace");
+        bail!("path '{bare}' is outside workspace [{ws_idx}]");
     }
     Ok(candidate)
+}
+
+/// Find which workspace contains the given absolute path.
+/// Returns the canonicalized workspace root if found.
+pub fn find_workspace(workspaces: &[PathBuf], abs: &Path) -> Option<PathBuf> {
+    for ws in workspaces {
+        let ws = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+        if abs.starts_with(&ws) {
+            return Some(ws);
+        }
+    }
+    None
 }
