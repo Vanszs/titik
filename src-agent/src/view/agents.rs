@@ -25,14 +25,14 @@
 //! lives in [`crate::controller::input::handle_agents`].
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
-use crate::app::mode::agents::source_label;
+use crate::app::mode::agents::{source_label, ToolPickerState};
 use crate::app::mode::{AgentEditField, AgentSubMode, AgentsState};
 use crate::view::theme::Palette;
 
@@ -96,6 +96,123 @@ pub fn draw(frame: &mut Frame, st: &AgentsState, palette: &Palette) {
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().fg(palette.dim)),
         footer_area,
+    );
+
+    // --- Tool picker overlay (rendered on top of everything else) ---
+    if let Some(picker) = &st.tool_picker {
+        draw_tool_picker(frame, picker, palette, frame.area());
+    }
+}
+
+/// Compute a centered overlay `Rect` with the given width and height,
+/// clamped to the available area.
+fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect { x, y, width: w, height: h }
+}
+
+/// Render the tool multi-select picker overlay.
+///
+/// Visual structure (borderless except for the TOP+BOTTOM title rules,
+/// matching the effort picker):
+///
+/// ```text
+///  tools
+/// ──────────────────────
+///  filter: foo_
+///  [x] read
+///  [ ] grep
+///  …
+/// ──────────────────────
+///  space toggle · …hint
+/// ```
+fn draw_tool_picker(
+    frame: &mut Frame,
+    picker: &ToolPickerState,
+    palette: &Palette,
+    area: Rect,
+) {
+    let filtered = picker.filtered_indices();
+    // Height: title (3) + filter line (1) + options (min 1, max 10) + hint (1).
+    let opt_rows = filtered.len().clamp(1, 10) as u16;
+    let total_h = 3 + 1 + opt_rows + 1;
+    let popup_w = 36_u16.min(area.width.saturating_sub(4));
+    let popup = centered_rect(area, popup_w, total_h);
+
+    // Clear the background so the overlay is opaque.
+    frame.render_widget(Clear, popup);
+
+    // Title bar (TOP + BOTTOM rules, title on top rule).
+    let title_block = Block::new()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(palette.dim))
+        .title(Span::styled(" tools ", Style::default().fg(palette.dim)));
+
+    // The title block occupies the top 3 rows; content below it is the body.
+    let title_rect = Rect { x: popup.x, y: popup.y, width: popup.width, height: 3 };
+    frame.render_widget(title_block, title_rect);
+
+    let body_y = popup.y + 3;
+    let body_w = popup.width.saturating_sub(2);
+    let body_x = popup.x + 1;
+
+    // Filter line.
+    let filter_text = if picker.filter.is_empty() {
+        format!("{:<width$}", "type to filter", width = body_w as usize)
+    } else {
+        let shown = format!("{}█", picker.filter);
+        format!("{:<width$}", shown, width = body_w as usize)
+    };
+    let filter_color = if picker.filter.is_empty() { palette.dim } else { palette.fg };
+    frame.render_widget(
+        Paragraph::new(Span::styled(filter_text, Style::default().fg(filter_color))),
+        Rect { x: body_x, y: body_y, width: body_w, height: 1 },
+    );
+
+    // Option rows.
+    let cursor = picker.cursor.min(filtered.len().saturating_sub(1));
+    let opt_area_y = body_y + 1;
+    // Scroll so the cursor row is always visible.
+    let scroll = cursor.saturating_sub((opt_rows as usize).saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().fg(palette.dim),
+        )));
+    } else {
+        for (fi, &oi) in filtered.iter().enumerate() {
+            let mark = if picker.checked[oi] { "[x]" } else { "[ ]" };
+            let label = format!("{} {}", mark, picker.options[oi]);
+            if fi == cursor {
+                lines.push(Line::from(Span::styled(
+                    format!(" {:<width$}", label, width = (body_w as usize).saturating_sub(1)),
+                    Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(" {label}"),
+                    Style::default().fg(palette.accent),
+                )));
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll as u16, 0)),
+        Rect { x: body_x, y: opt_area_y, width: body_w, height: opt_rows },
+    );
+
+    // Hint line (bottom of the popup).
+    let hint_y = opt_area_y + opt_rows;
+    let hint = "space toggle · type filter · enter ok · esc cancel";
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(palette.dim))),
+        Rect { x: body_x, y: hint_y, width: body_w, height: 1 },
     );
 }
 

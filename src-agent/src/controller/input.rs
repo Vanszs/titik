@@ -728,6 +728,47 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
         return Action::Quit;
     }
 
+    // --- Tool picker overlay (deepest priority: intercepts ALL keys) ---
+    if s.tool_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(p) = s.tool_picker.as_mut() {
+                    p.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = s.tool_picker.as_mut() {
+                    p.down();
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(p) = s.tool_picker.as_mut() {
+                    p.toggle();
+                }
+            }
+            KeyCode::Enter => {
+                s.confirm_tool_picker();
+            }
+            KeyCode::Esc => {
+                s.cancel_tool_picker();
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = s.tool_picker.as_mut() {
+                    p.backspace_filter();
+                }
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && c != ' ' =>
+            {
+                if let Some(p) = s.tool_picker.as_mut() {
+                    p.push_filter(c);
+                }
+            }
+            _ => {}
+        }
+        return Action::None;
+    }
+
     match s.mode {
         // --- DeleteConfirm: modal y/n ---
         AgentSubMode::DeleteConfirm => match key.code {
@@ -792,7 +833,12 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                         Action::None
                     }
                     KeyCode::Enter => {
-                        s.editing = true;
+                        if s.field == AgentEditField::Tools {
+                            // Tools field uses the picker overlay, not inline editing.
+                            s.open_tool_picker();
+                        } else {
+                            s.editing = true;
+                        }
                         Action::None
                     }
                     // Scope toggle is only meaningful in Create; bind it to ←/→

@@ -25,6 +25,139 @@ use std::path::PathBuf;
 
 use crate::model::agent_def::{load_registry, AgentDef, AgentSource};
 use crate::model::session::Session;
+use crate::tool::all_tools;
+
+/// Tool names excluded from the picker (internal / infra tools).
+const EXCLUDED_TOOLS: &[&str] = &["task", "pong", "dir_cache_update"];
+
+/// State for the tool multi-select picker overlay.
+///
+/// Opened from the Edit/Create form when the user presses Enter on the Tools
+/// field. Closed by Enter (confirm) or Esc (cancel). All mutations happen
+/// through the `AgentsState` helper methods so the cursor always stays within
+/// filtered bounds.
+#[derive(Debug, Clone)]
+pub struct ToolPickerState {
+    /// Full selectable tool name list (filtered copy of `all_tools()`, minus
+    /// the excluded internal tools).
+    pub options: Vec<String>,
+    /// Parallel to `options`; `true` = this tool is currently checked.
+    pub checked: Vec<bool>,
+    /// Index into the FILTERED view (see `filtered_indices`).
+    pub cursor: usize,
+    /// Live search string; filters `options` by substring match.
+    pub filter: String,
+}
+
+impl ToolPickerState {
+    /// Build from the current `draft_tools` comma-joined string.
+    ///
+    /// All tools from `all_tools()` except `EXCLUDED_TOOLS` are listed.
+    /// An option is pre-checked if its name appears in `draft_tools` (case-
+    /// insensitive, split on comma, trimmed).
+    fn from_draft(draft_tools: &str) -> Self {
+        let options: Vec<String> = all_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .filter(|n| !EXCLUDED_TOOLS.contains(&n.as_str()))
+            .collect();
+
+        let selected: Vec<String> = draft_tools
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let checked: Vec<bool> = options
+            .iter()
+            .map(|n| selected.contains(&n.to_lowercase()))
+            .collect();
+
+        Self {
+            options,
+            checked,
+            cursor: 0,
+            filter: String::new(),
+        }
+    }
+
+    /// Indices into `options` that match the current `filter`.
+    ///
+    /// If `filter` is empty, all indices are returned in order.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            (0..self.options.len()).collect()
+        } else {
+            let q = self.filter.to_lowercase();
+            self.options
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect()
+        }
+    }
+
+    /// Move the cursor up within the filtered list.
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor down within the filtered list.
+    pub fn down(&mut self) {
+        let len = self.filtered_indices().len();
+        if len == 0 {
+            return;
+        }
+        if self.cursor + 1 < len {
+            self.cursor += 1;
+        }
+    }
+
+    /// Toggle the checked state for the option at the current filtered cursor.
+    ///
+    /// No-op when the filtered list is empty.
+    pub fn toggle(&mut self) {
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let real = indices[self.cursor.min(indices.len() - 1)];
+        self.checked[real] = !self.checked[real];
+    }
+
+    /// Append a character to the filter and clamp the cursor.
+    pub fn push_filter(&mut self, c: char) {
+        self.filter.push(c);
+        self.clamp_cursor();
+    }
+
+    /// Remove the last character from the filter and clamp the cursor.
+    pub fn backspace_filter(&mut self) {
+        self.filter.pop();
+        self.clamp_cursor();
+    }
+
+    /// Clamp `cursor` so it stays within the current filtered bounds.
+    fn clamp_cursor(&mut self) {
+        let len = self.filtered_indices().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    /// The checked tool names, in `options` order.
+    pub fn selected(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .zip(self.checked.iter())
+            .filter(|(_, &c)| c)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+}
 
 /// Which scope a freshly-created agent is written to.
 ///
@@ -154,6 +287,11 @@ pub struct AgentsState {
     pub draft_body: String,
     /// The session's directory (for the Session scope target).
     pub session_dir: PathBuf,
+    /// When `Some`, the tool multi-select picker overlay is active.
+    ///
+    /// All key input is routed to the picker; the form underneath is frozen
+    /// until the picker is confirmed (Enter) or cancelled (Esc).
+    pub tool_picker: Option<ToolPickerState>,
 }
 
 impl AgentsState {
@@ -176,6 +314,7 @@ impl AgentsState {
             draft_tools: String::new(),
             draft_body: String::new(),
             session_dir: session.path.clone(),
+            tool_picker: None,
         }
     }
 
@@ -342,6 +481,28 @@ impl AgentsState {
         self.editing = false;
         self.in_detail = false;
         self.field = AgentEditField::Description;
+        self.tool_picker = None;
+    }
+
+    // --- Tool picker overlay ---
+
+    /// Open the tool multi-select picker, seeding checked state from the
+    /// current `draft_tools`.
+    pub fn open_tool_picker(&mut self) {
+        self.tool_picker = Some(ToolPickerState::from_draft(&self.draft_tools));
+    }
+
+    /// Confirm the picker: write the selected tools back into `draft_tools`
+    /// (comma-joined, options order) and close the overlay.
+    pub fn confirm_tool_picker(&mut self) {
+        if let Some(p) = self.tool_picker.take() {
+            self.draft_tools = p.selected().join(", ");
+        }
+    }
+
+    /// Cancel the picker without modifying `draft_tools`.
+    pub fn cancel_tool_picker(&mut self) {
+        self.tool_picker = None;
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime
