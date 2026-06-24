@@ -202,6 +202,12 @@ pub(super) fn run_loop(
                         state.rest.approval_reason = None;
                         state.rest.tool_idx = 0;
                         state.rest.tool_results.clear();
+                        // Clear any in-flight compaction animation so a failed
+                        // compaction (e.g. null content decode error) doesn't leave
+                        // the spinner stuck driving per-tick redraws indefinitely.
+                        state.rest.compact_anim_start = None;
+                        state.rest.compact_apply_at = None;
+                        state.rest.compact_pending = None;
                         still_streaming = false;
                         break;
                     }

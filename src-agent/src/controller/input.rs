@@ -198,9 +198,12 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         };
     }
 
-    // Ctrl+C: interrupt if waiting, else quit.
+    // Ctrl+C: interrupt if waiting OR a compaction animation is in flight
+    // (the animation keeps `compact_anim_start` set while the deferred apply
+    // is pending, and `waiting` may have already cleared if the model replied
+    // fast). Never quit mid-animation — that would leave the spinner stuck.
     if is_ctrl(&key, 'c') {
-        return if rest.waiting {
+        return if rest.waiting || rest.compact_anim_start.is_some() {
             Action::Interrupt
         } else {
             Action::Quit
@@ -227,7 +230,10 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
 
     match key.code {
         KeyCode::Esc => {
-            if rest.waiting {
+            // Interrupt if waiting OR a compaction animation is still running
+            // (compact_anim_start remains set during the deferred-apply window).
+            // Quitting mid-animation would leave the spinner permanently stuck.
+            if rest.waiting || rest.compact_anim_start.is_some() {
                 Action::Interrupt
             } else {
                 Action::Quit

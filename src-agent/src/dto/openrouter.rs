@@ -202,6 +202,12 @@ pub struct Choice {
 /// `role` is received as a string (e.g. `"assistant"`) but is unused by the
 /// caller; only `content` is extracted for the compaction summary.
 ///
+/// `content` is `Option<String>` because some models (e.g. deepseek-v4-flash)
+/// return `"content": null` on a non-streaming response instead of an empty
+/// string. `#[serde(default)]` additionally handles an absent field. Callers
+/// use `.unwrap_or_default()` (or the reasoning fallback) to treat null/absent
+/// as an empty string.
+///
 /// `reasoning` carries a reasoning model's thinking text: some models (e.g. the
 /// safeguard classifier) leave `content` empty and return their answer in this
 /// field instead, so the classifier path falls back to it. Defaults to `None`
@@ -210,7 +216,8 @@ pub struct Choice {
 pub struct ResponseMessage {
     #[allow(dead_code)]
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub reasoning: Option<String>,
 }

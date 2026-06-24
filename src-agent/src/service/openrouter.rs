@@ -405,7 +405,7 @@ impl OpenRouterClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message.content.unwrap_or_default())
             .ok_or_else(|| anyhow!("no choices returned"))
     }
 
@@ -460,7 +460,7 @@ impl OpenRouterClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message.content.unwrap_or_default())
             .ok_or_else(|| anyhow!("no choices returned"))
     }
 
@@ -556,7 +556,9 @@ impl OpenRouterClient {
             .ok_or_else(|| anyhow!("no choices returned"))?;
         // Prefer `content`; fall back to the model's `reasoning` (the verdict may
         // live in the thinking for a reasoning model). Error only if BOTH empty.
-        let content = message.content.trim();
+        // `content` may be null (some models return `"content": null`) — treat
+        // null/absent the same as an empty string and fall through to reasoning.
+        let content = message.content.as_deref().unwrap_or("").trim();
         if !content.is_empty() {
             return Ok(content.to_string());
         }
