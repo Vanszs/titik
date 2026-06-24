@@ -179,39 +179,45 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     let thinking_style = Style::default()
                         .fg(palette.dim)
                         .add_modifier(Modifier::ITALIC);
+                    let bar_style = Style::default().fg(palette.dim);
                     let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
                     // Native reasoning channel (the model's streamed `reasoning`,
                     // captured separately from `content`). Rendered first, dim +
-                    // italic, with the same wrapping + blank-line preservation as
-                    // the heuristic thinking block below. Display-only — it never
-                    // re-enters the conversation or disk (`#[serde(skip)]`).
+                    // italic, each line prefixed with the blockquote bar so the
+                    // whole thinking block reads as quoted text. Display-only — it
+                    // never re-enters the conversation or disk (`#[serde(skip)]`).
                     if let Some(reasoning) = msg.reasoning.as_deref() {
                         if !reasoning.is_empty() {
                             for line in reasoning.lines() {
-                                if line.trim().is_empty() {
-                                    logical.push(vec![]);
-                                } else {
-                                    let spans =
-                                        vec![Span::styled(line.to_string(), thinking_style)];
-                                    logical.extend(
-                                        crate::view::markdown::wrap_spans(&spans, wrap_w),
-                                    );
-                                }
+                                push_thinking_line(
+                                    &mut logical,
+                                    line,
+                                    thinking_style,
+                                    bar_style,
+                                    wrap_w,
+                                );
                             }
                         }
                     }
                     if let Some(thinking) = thinking_block {
-                        // Render each line of the thinking block dim+italic, wrapping
-                        // at wrap_w. Blank lines are preserved as empty visual rows so
-                        // paragraph breaks inside the thinking section survive.
+                        // Render each line of the thinking block dim+italic with the
+                        // blockquote bar; wrapping + blank-line rows are handled by
+                        // `push_thinking_line` so the bar survives every wrap.
                         for line in thinking.lines() {
-                            if line.trim().is_empty() {
-                                logical.push(vec![]);
-                            } else {
-                                let spans = vec![Span::styled(line.to_string(), thinking_style)];
-                                logical.extend(crate::view::markdown::wrap_spans(&spans, wrap_w));
-                            }
+                            push_thinking_line(
+                                &mut logical,
+                                line,
+                                thinking_style,
+                                bar_style,
+                                wrap_w,
+                            );
                         }
+                    }
+                    // Blank line between the (barred) thinking block and the answer
+                    // so the quote→answer transition is clear. Only when there IS a
+                    // thinking block AND an answer to separate.
+                    if !logical.is_empty() && !response_body.is_empty() {
+                        logical.push(vec![]);
                     }
                     if !response_body.is_empty() {
                         logical.extend(crate::view::markdown::render(response_body, palette, wrap_w));
@@ -284,17 +290,20 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
             let thinking_style = Style::default()
                 .fg(palette.dim)
                 .add_modifier(Modifier::ITALIC);
+            let bar_style = Style::default().fg(palette.dim);
             let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
-            // Partial reasoning first, dim+italic, per-line with blank-line
-            // preservation (mirrors the committed-message reasoning render).
+            // Partial reasoning first, dim+italic, each line prefixed with the
+            // blockquote bar (mirrors the committed-message reasoning render).
+            // These are emitted pre-wrapped, so render_block passes them through.
             if !partial_reasoning.is_empty() {
                 for line in partial_reasoning.lines() {
-                    if line.trim().is_empty() {
-                        logical.push(vec![]);
-                    } else {
-                        logical.push(vec![Span::styled(line.to_string(), thinking_style)]);
-                    }
+                    push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
                 }
+            }
+            // Blank line between the barred thinking block and the answer so the
+            // transition is clear, when both are present.
+            if !logical.is_empty() && !partial_content.is_empty() {
+                logical.push(vec![]);
             }
             // Then the partial answer in the theme fg (one logical line; wraps).
             if !partial_content.is_empty() {
@@ -332,24 +341,65 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
     } else {
         // Multiline editor: logical lines split on '\n'; the first carries the
         // accent prompt, every continuation a 4-col indent so it hangs under the
-        // prompt. A non-blinking block cursor is painted at the very end of the
-        // last line. The box height (`input_h`, computed above) grows with the
-        // wrapped content up to the cap.
+        // prompt. A non-blinking block caret is painted AT `rest.cursor` (a char
+        // index into the whole input, counting the '\n's), so mid-text edits show
+        // the caret in place rather than always at the end. The box height
+        // (`input_h`, computed above) grows with the wrapped content up to the cap.
+        //
+        // Map the flat char-index caret to (logical line, column): walk the lines
+        // accumulating their char counts plus 1 per consumed '\n'. The caret sits
+        // on the line where `consumed <= cursor <= consumed + line_chars` (the
+        // upper bound is the line's end, just before its '\n').
         let mut input_lines: Vec<Line> = Vec::new();
-        for (i, logical) in rest.input.split('\n').enumerate() {
-            if i == 0 {
-                input_lines.push(Line::from(vec![
-                    Span::styled("[$] ", Style::default().fg(palette.accent)),
-                    Span::raw(logical),
-                ]));
+        let cursor = rest.cursor;
+        let mut consumed = 0usize; // chars before the current logical line
+        let logicals: Vec<&str> = rest.input.split('\n').collect();
+        let last_idx = logicals.len().saturating_sub(1);
+        for (i, logical) in logicals.iter().enumerate() {
+            let line_chars = logical.chars().count();
+            // The caret falls on this line when its flat index lands within the
+            // line's char span. Use `<=` on the end so an end-of-line caret shows
+            // here; for non-final lines the '\n' position belongs to the NEXT line
+            // (handled by the `< end` guard) so it isn't drawn twice.
+            let on_this_line = if i == last_idx {
+                cursor >= consumed && cursor <= consumed + line_chars
             } else {
-                input_lines.push(Line::from(vec![Span::raw("    "), Span::raw(logical)]));
+                cursor >= consumed && cursor < consumed + line_chars + 1
+            };
+            // Prompt prefix: accent "[$] " on the first line, 4-col hang otherwise.
+            let prefix: Span = if i == 0 {
+                Span::styled("[$] ", Style::default().fg(palette.accent))
+            } else {
+                Span::raw("    ")
+            };
+            let mut spans: Vec<Span> = vec![prefix];
+            if on_this_line {
+                let col = (cursor - consumed).min(line_chars);
+                let before: String = logical.chars().take(col).collect();
+                let at: String = logical.chars().nth(col).map(String::from).unwrap_or_default();
+                let after: String = logical.chars().skip(col + 1).collect();
+                if !before.is_empty() {
+                    spans.push(Span::raw(before));
+                }
+                // The caret cell: reverse-video over the char under it, or a solid
+                // block when the caret is at end-of-line (no char to invert).
+                if at.is_empty() {
+                    spans.push(Span::styled("█", Style::default().fg(palette.accent)));
+                } else {
+                    spans.push(Span::styled(
+                        at,
+                        Style::default().add_modifier(Modifier::REVERSED),
+                    ));
+                }
+                if !after.is_empty() {
+                    spans.push(Span::raw(after));
+                }
+            } else {
+                spans.push(Span::raw(*logical));
             }
-        }
-        // Append a non-blinking block cursor to the last line so the caret is visible.
-        if let Some(last) = input_lines.last_mut() {
-            last.spans
-                .push(Span::styled("█", Style::default().fg(palette.accent)));
+            input_lines.push(Line::from(spans));
+            // Advance past this line's chars plus the '\n' that split consumed.
+            consumed += line_chars + 1;
         }
         frame.render_widget(
             Paragraph::new(input_lines).wrap(Wrap { trim: false }),
@@ -846,6 +896,47 @@ fn split_thinking(content: &str) -> (Option<&str>, &str) {
             (Some(thinking), response)
         }
         None => (None, content),
+    }
+}
+
+/// The blockquote bar drawn to the LEFT of every thinking/reasoning line, so the
+/// gray-italic "thinking" reads as quoted text distinct from the answer. A single
+/// dim vertical bar (U+258F) + a space — honours the minimalist top-down border
+/// style (one bar, never a box). The answer + tool lines get no bar.
+const THINK_BAR: &str = "▏ ";
+
+/// Render one logical line of THINKING text into barred visual lines.
+///
+/// Wraps `text` to `wrap_w` MINUS the bar width, then prefixes each wrapped
+/// visual line with a dim `THINK_BAR`, so the quote bar survives wrapping (it
+/// appears on every wrapped line, not just the first). `text` styling (dim +
+/// italic) is applied to the content spans; the bar is dim. A blank input line
+/// yields a single bar-only row so paragraph breaks inside the block keep the
+/// quote rail unbroken. The result is pushed as logical lines into `out` (the
+/// caller's accumulator), where they are later passed through `render_block`
+/// unwrapped (already exact-width).
+fn push_thinking_line(
+    out: &mut Vec<Vec<Span<'static>>>,
+    text: &str,
+    style: Style,
+    bar_style: Style,
+    wrap_w: usize,
+) {
+    let bar = Span::styled(THINK_BAR, bar_style);
+    // The bar eats 2 columns; wrap the text to the remainder so bar+text stays
+    // within wrap_w. Floor at 1 so a pathologically narrow pane can't wrap to 0.
+    let inner_w = wrap_w.saturating_sub(THINK_BAR.chars().count()).max(1);
+    if text.trim().is_empty() {
+        // Blank line inside the thinking block: keep the rail with a bar-only row.
+        out.push(vec![bar]);
+        return;
+    }
+    let spans = vec![Span::styled(text.to_string(), style)];
+    for visual in crate::view::markdown::wrap_spans(&spans, inner_w) {
+        let mut line = Vec::with_capacity(visual.len() + 1);
+        line.push(bar.clone());
+        line.extend(visual);
+        out.push(line);
     }
 }
 

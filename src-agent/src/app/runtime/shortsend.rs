@@ -80,6 +80,10 @@ pub(super) const DISENGAGE_PCT: u64 = 15;
 pub(super) fn estimate_conv_tokens(history: &[ChatMessage]) -> u64 {
     history
         .iter()
+        // Skip the System message: the ~10k base it carries is already accounted
+        // for as BASE_OVERHEAD (the engage math subtracts it from the window), so
+        // summing it here would double-count and trip the engage gate too early.
+        .filter(|m| m.role != Role::System)
         .map(|m| {
             let base = m.content.chars().count() as u64 / 4;
             let args: u64 = m

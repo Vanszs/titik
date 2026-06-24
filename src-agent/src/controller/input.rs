@@ -91,6 +91,9 @@ fn complete_file_ref(rest: &mut AppStateRest, matches: &[String]) {
     }
     // a FOLDER (trailing '/') gets NO space → palette stays open at the new depth
     rest.palette_sel = 0;
+    // The input was rewritten wholesale (truncate + push); park the caret at the
+    // end so it doesn't dangle inside the old, now-replaced @token.
+    rest.cursor_end();
 }
 
 /// Translate a raw key event into an [`Action`] based on the current [`Mode`].
@@ -277,6 +280,21 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             rest.backspace();
             Action::None
         }
+        // Caret movement within the input line (mid-text editing). Left/Right
+        // step one char; Home jumps to the start. End is handled below (it also
+        // doubles as "scroll to bottom" when the input is empty).
+        KeyCode::Left => {
+            rest.cursor_left();
+            Action::None
+        }
+        KeyCode::Right => {
+            rest.cursor_right();
+            Action::None
+        }
+        KeyCode::Home => {
+            rest.cursor_home();
+            Action::None
+        }
         KeyCode::Up => {
             // Command palette takes precedence; then file palette; then history recall.
             if !command::palette_matches(&rest.input).is_empty() {
@@ -317,6 +335,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 let sel = rest.palette_sel.min(cmd_matches.len() - 1);
                 rest.input = format!("{} ", cmd_matches[sel].0);
                 rest.palette_sel = 0;
+                rest.cursor_end(); // input replaced wholesale → caret to the end
             } else {
                 let fmatches: Vec<String> = file_ref_partial(&rest.input)
                     .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
@@ -339,9 +358,15 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        // End / Ctrl+End: jump to the bottom and resume following.
+        // End: with input present, move the caret to the end of the line (text
+        // editing). With an EMPTY input it keeps its old meaning — jump the
+        // transcript to the bottom and resume following.
         KeyCode::End => {
-            rest.reset_scroll();
+            if rest.input.is_empty() {
+                rest.reset_scroll();
+            } else {
+                rest.cursor_end();
+            }
             Action::None
         }
         // Shift+Tab toggles the tool-approval mode (Auto <-> Normal). Crossterm

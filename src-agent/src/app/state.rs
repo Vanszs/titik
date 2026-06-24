@@ -92,6 +92,13 @@ pub struct AppStateRest {
     /// Saved (session) before a /new or reconfigure prompt; restored on cancel.
     pub prev_session: Option<Session>,
     pub input: String,
+    /// Caret position within `input`, as a CHAR index (0..=char_count). Edits
+    /// (insert / backspace) and the Left/Right/Home/End keys move it; the view
+    /// paints the block cursor here instead of always at the end. Kept in char
+    /// units so multibyte input never splits a code point; converted to a byte
+    /// offset only at the `String::insert`/`remove` call site. Reset to the end
+    /// on any bulk replace (submit/clear, history recall, completion).
+    pub cursor: usize,
     /// Bash-style input history: index into the sent-user-message list while
     /// recalling (None = editing live input).
     pub hist_idx: Option<usize>,
@@ -264,6 +271,7 @@ impl AppStateRest {
             session: None,
             prev_session: None,
             input: String::new(),
+            cursor: 0,
             hist_idx: None,
             input_stash: String::new(),
             palette_sel: 0,
@@ -325,19 +333,66 @@ impl AppStateRest {
     }
 
     // input editing
+    //
+    // The caret (`cursor`) is a CHAR index into `input`. `byte_at` maps a char
+    // index to the byte offset `String::insert`/`remove` need, so non-ASCII input
+    // can never panic on a non-char-boundary. `char_len` is the count edits clamp
+    // against.
+
+    /// Char count of the current input (the caret's upper bound).
+    fn char_len(&self) -> usize {
+        self.input.chars().count()
+    }
+    /// Byte offset of char index `idx` (== input length when `idx >= char_len`).
+    fn byte_at(&self, idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Insert `c` at the caret and advance it (mid-text editing supported).
     pub fn push_char(&mut self, c: char) {
-        self.input.push(c);
+        let at = self.byte_at(self.cursor);
+        self.input.insert(at, c);
+        self.cursor += 1;
         self.palette_sel = 0;
         self.hist_idx = None;
     }
+    /// Delete the char BEFORE the caret and retreat it; no-op at the start.
     pub fn backspace(&mut self) {
-        self.input.pop();
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let at = self.byte_at(self.cursor);
+        self.input.remove(at);
         self.palette_sel = 0;
         self.hist_idx = None;
+    }
+    /// Move the caret one char left (no-op at the start).
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    /// Move the caret one char right (capped at the input length).
+    pub fn cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+    /// Jump the caret to the start of the input.
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+    /// Jump the caret to the end of the input. Also called after any bulk replace
+    /// (history recall, command/file completion) so the caret never dangles past
+    /// the new (possibly shorter) text.
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.char_len();
     }
     pub fn take_input(&mut self) -> String {
         self.palette_sel = 0;
         self.hist_idx = None;
+        self.cursor = 0;
         std::mem::take(&mut self.input)
     }
 
@@ -357,6 +412,7 @@ impl AppStateRest {
         };
         self.hist_idx = Some(next);
         self.input = users[next].clone();
+        self.cursor = self.char_len();
     }
     /// Recall the next (newer) sent user message; past the newest, restore the
     /// stashed live input and leave recall mode.
@@ -365,10 +421,12 @@ impl AppStateRest {
             Some(i) if i + 1 < users.len() => {
                 self.hist_idx = Some(i + 1);
                 self.input = users[i + 1].clone();
+                self.cursor = self.char_len();
             }
             Some(_) => {
                 self.hist_idx = None;
                 self.input = std::mem::take(&mut self.input_stash);
+                self.cursor = self.char_len();
             }
             None => {}
         }

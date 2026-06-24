@@ -284,8 +284,22 @@ pub(super) fn process_tools(
                         &call.function.arguments,
                     ));
                     if verdict.available && verdict.allow {
-                        // Definite allow → fall through and run it inline (no prompt).
-                        state.rest.approval_reason = None;
+                        // Definite allow. Auto runs it inline (no prompt — the user
+                        // delegated decisions); Normal still asks, because in Normal
+                        // mode the USER approves every risky op and the classifier
+                        // only informs. The allowed reason is surfaced so the prompt
+                        // shows the verdict was "ok".
+                        if mode == AgentMode::Auto {
+                            // Fall through and run it inline (no prompt).
+                            state.rest.approval_reason = None;
+                        } else {
+                            state.rest.approval_reason =
+                                Some(format!("classifier: ok — {}", verdict.reason));
+                            state.rest.awaiting_approval = true;
+                            state.rest.status =
+                                format!("approve {}? [y/n]", call.function.name);
+                            return;
+                        }
                     } else if verdict.available {
                         // Definite block. Auto records it and continues; Normal asks.
                         if mode == AgentMode::Auto {
