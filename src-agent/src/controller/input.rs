@@ -445,7 +445,7 @@ fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -
 /// Nested focus design (deepest first):
 ///
 /// 0. **picker** (`s.picker` is `Some`) – the FS directory picker overlay.
-///    Type to filter, ↑/↓ select, Tab or `/` descend into the highlighted dir,
+///    Type to filter, ↑/↓ select, Tab descends into the highlighted dir,
 ///    Enter confirms (applies to the path list), Esc cancels. Highest priority.
 ///
 /// 1. **list_editing** – a path-list field is open for per-entry management.
@@ -508,14 +508,9 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
                 s.picker_backspace();
                 Action::None
             }
-            // '/' descends into the highlighted match (mirrors the chat palette's
-            // folder-drill); any other printable char appends to the query.
+            // Any printable char appends to the query.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if c == '/' && s.picker.as_ref().is_some_and(|p| p.selected().is_some()) {
-                    s.picker_descend();
-                } else {
-                    s.picker_push_char(c);
-                }
+                s.picker_push_char(c);
                 Action::None
             }
             _ => Action::None,

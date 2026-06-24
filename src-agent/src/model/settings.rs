@@ -204,7 +204,7 @@ fn default_awareness_provider() -> String {
 }
 
 fn default_classifier_enabled() -> bool {
-    false
+    true
 }
 
 fn default_classifier_model() -> String {
