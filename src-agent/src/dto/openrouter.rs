@@ -327,6 +327,19 @@ pub struct TopProvider {
     pub context_length: Option<u64>,
 }
 
+/// Per-token pricing for a model entry from `GET /models`.
+///
+/// OpenRouter returns `pricing.prompt` and `pricing.completion` as decimal
+/// strings (USD per token). Both default to an empty string so a model that
+/// omits the pricing object still deserialises without error.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Pricing {
+    #[serde(default)]
+    pub prompt: String,     // USD per prompt token (decimal string)
+    #[serde(default)]
+    pub completion: String, // USD per completion token (decimal string)
+}
+
 /// One model entry from `GET /models`. Only the fields the effort-capability
 /// derivation needs are modelled; the rest of OpenRouter's rich model record is
 /// ignored. `reasoning` is absent for models with no thinking support.
@@ -334,6 +347,7 @@ pub struct TopProvider {
 /// the top-level field OpenRouter exposes on each model object.
 /// `top_provider` carries the provider-served context limit, which takes
 /// precedence over the nominal `context_length` when computing thresholds.
+/// `pricing` carries per-token costs for live cost estimation.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelInfo {
     pub id: String,
@@ -345,6 +359,8 @@ pub struct ModelInfo {
     pub context_length: Option<u64>,
     #[serde(default)]
     pub top_provider: Option<TopProvider>,
+    #[serde(default)]
+    pub pricing: Option<Pricing>,
 }
 
 /// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.

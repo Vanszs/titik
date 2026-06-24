@@ -696,6 +696,24 @@ pub(super) fn start_stream_task(
     // 6. Stamp the send instant so the NEXT turn can measure cache warmth from the
     //    gap since this send.
     state.rest.last_send_at = Some(Instant::now());
+    // 7. Stash live-pricing basis for the in-flight turn so the readout can tick
+    //    an estimated cost while the stream is running. Both fields are set for
+    //    every outgoing model request (initial + tool-round re-streams) so the
+    //    estimate stays live across rounds. `None` when the catalogue is missing
+    //    or has no pricing for this model — the readout then falls back to the
+    //    existing exact-cost-on-Usage behaviour.
+    state.rest.live_input_tokens = conv_tokens;
+    state.rest.live_price = reshape
+        .as_ref()
+        .and_then(|(_, settings, _)| {
+            state
+                .rest
+                .models_cache
+                .as_deref()
+                .and_then(|models| {
+                    crate::service::openrouter::pricing_for(models, &settings.model)
+                })
+        });
     let (tx, rx) = mpsc::unbounded_channel();
     state.rest.active_rx = Some(rx);
     let c = Arc::clone(client.as_ref().unwrap());
