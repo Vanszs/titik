@@ -164,6 +164,9 @@ pub(super) fn apply_slash(
                 // Fresh session → totals are 0; calling is harmless and keeps the
                 // readout reset when switching sessions.
                 state.rest.load_token_totals(&sess_path);
+                // Warm the new session: reindex its workspace and compute the
+                // awareness summary so /new is fully primed like a cold boot.
+                super::warm_session(state, client, handle);
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
             }

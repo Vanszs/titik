@@ -243,12 +243,6 @@ pub(super) fn apply_action(
                         return Ok(());
                     }
                 }
-                // Newly created session: kick off a background index of its workspace.
-                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
-                let dir_cache = state.rest.dir_cache.clone();
-                if let Some(wd) = workdir {
-                    crate::tool::dircache::reindex(wd, dir_cache);
-                }
             }
             if let Some(sess) = state.rest.session.as_mut() {
                 sess.settings.api_key = api_key.clone();
@@ -258,6 +252,10 @@ pub(super) fn apply_action(
             }
             state.rest.remember_creds(&api_key, &model, &provider);
             *client = state.rest.session.as_ref().map(build_client);
+            // Warm the confirmed session: reindex its workspace and compute the
+            // awareness summary so a creds-confirmed session is fully primed like
+            // a cold boot.
+            super::warm_session(state, client, handle);
             // Seed totals from the (new or picker-prefilled) session's log.
             if let Some(p) = state.rest.session.as_ref().map(|s| s.path.clone()) {
                 state.rest.load_token_totals(&p);
@@ -342,12 +340,10 @@ pub(super) fn apply_action(
                 *client = Some(build_client(&sess));
                 let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
-                // Kick off a background index of the selected session's workspace.
-                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
-                let dir_cache = state.rest.dir_cache.clone();
-                if let Some(wd) = workdir {
-                    crate::tool::dircache::reindex(wd, dir_cache);
-                }
+                // Warm the selected session: reindex its workspace and compute
+                // the awareness summary so picker-resume is fully primed like a
+                // cold boot.
+                super::warm_session(state, client, handle);
                 // Existing session: seed the running totals from its full sqlite
                 // log so the readout reflects prior usage.
                 state.rest.load_token_totals(&sess_path);

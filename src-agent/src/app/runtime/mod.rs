@@ -39,6 +39,30 @@ use event_loop::run_loop;
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Warm a newly-activated session to match a cold terminal launch: kick off a
+/// background reindex of its workspace and (best-effort) compute the project
+/// awareness summary. Safe to call whenever a session becomes the active one
+/// (startup, /new, picker-select, creds-confirm). No-op if no session.
+pub(super) fn warm_session(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
+    // Snapshot what we need, dropping the session borrow before block_on +
+    // the mutable write to state.rest.awareness_summary.
+    let (workdir, settings) = match state.rest.session.as_ref() {
+        Some(s) => (s.workdir(), s.settings.clone()),
+        None => return,
+    };
+    crate::tool::dircache::reindex(workdir.clone(), state.rest.dir_cache.clone());
+    if settings.awareness_enabled {
+        if let Some(c) = client.as_ref() {
+            let summary = handle.block_on(crate::app::awareness::summarize(c, &settings, &workdir));
+            state.rest.awareness_summary = summary;
+        }
+    }
+}
+
 /// Build a client from a session's settings.
 pub(super) fn build_client(s: &Session) -> Arc<OpenRouterClient> {
     Arc::new(OpenRouterClient::new(
@@ -146,13 +170,6 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
         state.rest.launch_dir = cwd;
     }
 
-    // If a session is already active (returning-user / startup-create path),
-    // kick off a background index of its workspace so the file cache is warm.
-    // Picker / first-run paths have no session yet; they trigger this later.
-    if let Some(sess) = state.rest.session.as_ref() {
-        crate::tool::dircache::reindex(sess.workdir(), state.rest.dir_cache.clone());
-    }
-
     // Terminal setup. Guard created BEFORE the Terminal so its Drop covers a
     // failing Terminal::new, any later `?`-error, and panic-unwind.
     let _guard = TerminalGuard::enter()?;
@@ -171,23 +188,11 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
         .filter(|s| !s.settings.api_key.is_empty())
         .map(build_client);
 
-    // Project self-awareness (Phase 2): if a session + client are already live
-    // at startup, summarise the project's docs via a cheap secondary model and
-    // stash it for injection into the system prompt. Best-effort and gated by
-    // `awareness_enabled` inside `summarize`; a quick small-model `block_on`
-    // here is acceptable (it never hard-blocks once the call returns/errors).
-    // Picker / first-run paths have no session yet; they get a summary lazily
-    // on the next trigger (post-`/compact`) instead.
-    if let (Some(c), Some(sess)) = (client.as_ref(), state.rest.session.as_ref()) {
-        if sess.settings.awareness_enabled {
-            let summary = handle.block_on(crate::app::awareness::summarize(
-                c,
-                &sess.settings,
-                &sess.workdir(),
-            ));
-            state.rest.awareness_summary = summary;
-        }
-    }
+    // Warm the session (reindex workspace + compute awareness summary) so a
+    // cold launch is fully primed before the first keystroke. Picker / first-run
+    // paths have no session yet; warm_session is a no-op for them and fires
+    // later when a session becomes active (picker-select / creds-confirm / /new).
+    warm_session(&mut state, &client, &handle);
 
     let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
 
