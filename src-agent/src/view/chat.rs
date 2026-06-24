@@ -150,6 +150,20 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Which tool calls have COMPLETED: a `tool`-role result message exists
+        // whose `tool_call_id` points back at the call. Built fresh every frame
+        // from the live conversation so the gear→check flip is NOT baked into the
+        // (one-shot) cached Assistant block — the result message is committed a
+        // round LATER than the assistant call, so the cached block can't carry the
+        // final glyph. The tool-call lines are therefore rendered fresh at frame
+        // assembly (below), consulting this set, while the heavy markdown body
+        // stays cached. `&str` borrows from `committed`, valid for this frame.
+        let completed_tool_ids: std::collections::HashSet<&str> = committed
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
         if cache.blocks.len() > committed.len() {
             cache.blocks.clear(); // shrank → stale prefix can't be trusted
         }
@@ -167,9 +181,11 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     true,
                 ),
                 Role::Assistant => {
-                    // Markdown body, then one dim line per requested tool call so
-                    // the user can see what the agent invoked. Appended as logical
-                    // lines so they get the hanging 2-col indent under the bullet.
+                    // Markdown body only. The per-tool-call lines are NOT cached
+                    // here: their leading glyph flips ⚙→✓ when the matching tool
+                    // result arrives (a later round), so they're rendered fresh at
+                    // frame assembly against `completed_tool_ids`. Caching them
+                    // would freeze a stuck gear forever.
                     //
                     // If the message contains wanderer lead-in lines (`Word: ...`),
                     // the entire block up to and including the LAST such line is
@@ -222,15 +238,8 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                     if !response_body.is_empty() {
                         logical.extend(crate::view::markdown::render(response_body, palette, wrap_w));
                     }
-                    if let Some(calls) = msg.tool_calls.as_ref() {
-                        for call in calls {
-                            let args = truncate_chars(&call.function.arguments, 60);
-                            logical.push(vec![Span::styled(
-                                format!("  ⚙ {}({})", call.function.name, args),
-                                Style::default().fg(palette.dim),
-                            )]);
-                        }
-                    }
+                    // Tool-call lines deliberately omitted here — rendered fresh at
+                    // assembly so the ⚙→✓ completion glyph stays live (see above).
                     render_block(logical, "● ", palette.fg, wrap_w, false)
                 }
                 Role::Tool => {
@@ -244,12 +253,15 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                         continue;
                     }
                     // Compact dim block: just the first line of the tool output,
-                    // truncated. Tool results are not markdown-rendered.
+                    // truncated. Tool results are not markdown-rendered. The `↳`
+                    // enter-arrow is dropped in favour of a plain dim indent so the
+                    // line reads as a sub-item under its now-checked (`✓`) call —
+                    // the finished turn renders as a checklist.
                     let first = msg.content.lines().next().unwrap_or("");
                     let first = truncate_chars(first, 80);
                     render_block(
                         vec![vec![Span::styled(first, Style::default().fg(palette.dim))]],
-                        "  ↳ ",
+                        "    ",
                         palette.dim,
                         wrap_w,
                         false,
@@ -261,13 +273,62 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         }
 
         // Assemble the frame: cached blocks (with blank separators) + the live
-        // streaming line (rendered fresh — it changes every token).
+        // streaming line (rendered fresh — it changes every token). `cache.blocks`
+        // is index-aligned with `committed` (one block per non-system message), so
+        // we zip them: the block carries the cached body, and for an Assistant turn
+        // the tool-call lines are appended fresh here (glued to the same block, no
+        // separator) with a live ⚙/✓ glyph from `completed_tool_ids`.
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut first = true;
-        for block in &cache.blocks {
-            // Empty blocks (hidden harness messages) leave no visual trace: skip
-            // both the block AND its blank separator so the transcript is clean.
-            if block.is_empty() {
+        for (i, block) in cache.blocks.iter().enumerate() {
+            // The fresh tool-call lines for this block, if it's an assistant turn
+            // that requested calls. A finished call (its id is in the completed set)
+            // gets an accent `✓ `; an in-flight one keeps the dim `⚙ `. Normally
+            // indented 2 cols so they hang under the `●` bullet, BUT when the
+            // assistant body is empty (a pure tool-call turn → empty cached block)
+            // the FIRST tool line takes the `● ` bullet so the block isn't a
+            // bullet-less orphan.
+            let has_body = !block.is_empty();
+            let tool_lines: Vec<Line<'static>> = committed
+                .get(i)
+                .filter(|m| m.role == Role::Assistant)
+                .and_then(|m| m.tool_calls.as_ref())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .enumerate()
+                        .map(|(ci, call)| {
+                            let args = truncate_chars(&call.function.arguments, 60);
+                            let done = completed_tool_ids.contains(call.id.as_str());
+                            let (glyph, glyph_style) = if done {
+                                ("✓ ", Style::default().fg(palette.accent))
+                            } else {
+                                ("⚙ ", Style::default().fg(palette.dim))
+                            };
+                            // First line of a body-less block carries the bullet;
+                            // every other tool line hangs under it with a 2-col indent.
+                            let prefix = if !has_body && ci == 0 {
+                                Span::styled("● ", Style::default().fg(palette.fg))
+                            } else {
+                                Span::raw("  ")
+                            };
+                            Line::from(vec![
+                                prefix,
+                                Span::styled(glyph, glyph_style),
+                                Span::styled(
+                                    format!("{}({})", call.function.name, args),
+                                    Style::default().fg(palette.dim),
+                                ),
+                            ])
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Empty blocks (hidden harness messages) with no tool lines leave no
+            // visual trace: skip both the block AND its blank separator so the
+            // transcript is clean. (A hidden message never carries tool calls.)
+            if block.is_empty() && tool_lines.is_empty() {
                 continue;
             }
             if !first {
@@ -275,6 +336,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
             }
             first = false;
             lines.extend(block.iter().cloned());
+            lines.extend(tool_lines);
         }
         // Live partial turn: the in-progress reasoning (dim+italic, on top) and
         // content (fg). Reasoning typically streams first (the model thinks, then
