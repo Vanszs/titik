@@ -12,14 +12,21 @@
 //!   ADVISORY only: classify the user's prompt and surface a toast if flagged.
 //!   It never blocks the turn (fail-open).
 //! - **TAC (tool-call classifier)** — [`classify_toolcall`]. Runs PER risky tool
-//!   call in Normal mode. A "safe" verdict lets a normally-risky tool auto-run; a
-//!   "block" verdict (or any error) forces the human approval prompt.
+//!   call in BOTH agent modes, INTENT-AWARE (it sees the user's latest request
+//!   plus the proposed call). An "allow" verdict auto-runs the call; a "block"
+//!   verdict is acted on by the caller per mode (Auto records a "blocked by
+//!   harness" result and continues; Normal prompts the human). If the classifier
+//!   is unavailable (error/timeout) the verdict's `available` flag is false and
+//!   the caller degrades to a human prompt in both modes.
 //!
-//! Both classifier calls reuse [`OpenRouterClient::complete_with`] against the
-//! configured `classifier_model` / `classifier_provider` — the same secondary-
-//! model path the awareness summary uses. They build a two-message conversation
-//! (System = the embedded policy text, User = the prompt / tool call) and parse a
-//! single `VERDICT:` line out of the reply.
+//! Both classifier calls run against the configured `classifier_model` /
+//! `classifier_provider`. PC uses the plain secondary-model path; TAC uses the
+//! dedicated [`OpenRouterClient::classify_with`] (low reasoning effort, with a
+//! content-or-reasoning fallback) so the safeguard reasoning model stays fast and
+//! its verdict is still read when it lands in `message.reasoning`. They build a
+//! two-message conversation (System = the embedded policy text, User = the prompt
+//! / the request + tool call) and parse a single `VERDICT:` line out of the
+//! reply, all bounded by an 8s timeout so the sync loop can't freeze.
 
 use std::path::Path;
 
@@ -27,25 +34,48 @@ use crate::dto::chat::{ChatMessage, Role};
 use crate::model::settings::Settings;
 use crate::service::openrouter::OpenRouterClient;
 
-/// A classifier decision. `allow = true` means proceed; `reason` is a short
-/// human-readable note (empty on a clean allow, the block reason otherwise).
+/// A classifier decision.
+///
+/// - `allow`: proceed when true.
+/// - `reason`: short human-readable note (empty on a clean allow, the block
+///   reason otherwise).
+/// - `available`: true when the classifier actually produced this verdict;
+///   false when it couldn't be reached (network error, timeout, empty or
+///   unparseable reply). The caller treats `available = false` specially —
+///   TAC degrades to a human prompt in BOTH agent modes rather than trusting
+///   `allow`, so a classifier outage never silently runs or blocks a call.
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub allow: bool,
     pub reason: String,
+    pub available: bool,
 }
 
 impl Verdict {
+    /// A successfully-parsed ALLOW.
     fn allow() -> Self {
         Self {
             allow: true,
             reason: String::new(),
+            available: true,
         }
     }
+    /// A successfully-parsed BLOCK with its reason.
     fn block(reason: impl Into<String>) -> Self {
         Self {
             allow: false,
             reason: reason.into(),
+            available: true,
+        }
+    }
+    /// The classifier could not be reached / its reply was unusable. `allow`
+    /// here is meaningless to the caller — `available = false` is the signal to
+    /// degrade to a human prompt.
+    fn unavailable() -> Self {
+        Self {
+            allow: false,
+            reason: "classifier unavailable".to_string(),
+            available: false,
         }
     }
 }
@@ -91,10 +121,13 @@ pub fn workspace_allowed(settings: &Settings, workdir: &Path, launch_dir: &Path)
 
 /// Parse a classifier reply into a [`Verdict`].
 ///
-/// Scans for the first line containing `VERDICT:`. `ALLOW` → allow; `BLOCK` →
-/// block with the text after `BLOCK` as the reason. If no `VERDICT:` line is
-/// found the reply is malformed; the caller decides how to treat that via
-/// `fallback` (PC fails open, TAC fails closed-to-approval).
+/// Scans for the first line containing `VERDICT:`. `ALLOW` → a parsed allow
+/// (`available = true`); `BLOCK` → a parsed block (`available = true`) with the
+/// text after `BLOCK` as the reason. If no `VERDICT:` line is found the reply is
+/// malformed and the `fallback` is returned verbatim — callers pass a fallback
+/// carrying `available = false` (PC keeps `allow = true` since it's advisory,
+/// TAC keeps `allow = false`), so an unparseable reply is treated as "classifier
+/// unavailable", never as a trusted verdict.
 fn parse_verdict(reply: &str, fallback: Verdict) -> Verdict {
     for line in reply.lines() {
         let Some((_, rest)) = line.split_once("VERDICT:") else {
@@ -123,31 +156,47 @@ fn parse_verdict(reply: &str, fallback: Verdict) -> Verdict {
     fallback
 }
 
+/// How long to wait for a classifier verdict before giving up. The safeguard
+/// model is a reasoning model, so a slow generation could otherwise stall the
+/// sync loop that drives this via `block_on`. On timeout the call degrades to
+/// the `fallback` (TAC → human prompt), so the UI can never freeze waiting on it.
+const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Run the classifier model over `messages` and parse its verdict.
 ///
-/// On any error (no key, network failure, empty reply) the `fallback` verdict is
-/// returned — the call never propagates an error or panics. `block_on`-friendly:
-/// it is a plain async fn the caller can drive from the sync loop.
+/// On any error (no key, network failure, empty reply) OR a timeout the
+/// `fallback` verdict is returned — the call never propagates an error or
+/// panics. The whole request is bounded by [`CLASSIFY_TIMEOUT`] so a slow
+/// reasoning model can't hang the loop. `block_on`-friendly: it is a plain async
+/// fn the caller can drive from the sync loop.
 async fn classify(
     client: &OpenRouterClient,
     settings: &Settings,
     messages: Vec<ChatMessage>,
     fallback: Verdict,
 ) -> Verdict {
-    match client
-        .complete_with(&settings.classifier_model, &settings.classifier_provider, messages)
-        .await
+    match tokio::time::timeout(
+        CLASSIFY_TIMEOUT,
+        client.classify_with(
+            &settings.classifier_model,
+            &settings.classifier_provider,
+            messages,
+        ),
+    )
+    .await
     {
-        Ok(reply) => parse_verdict(&reply, fallback),
-        Err(_) => fallback,
+        Ok(Ok(reply)) => parse_verdict(&reply, fallback),
+        // Inner error (network / empty reply) or outer timeout → unavailable.
+        _ => fallback,
     }
 }
 
 /// Prompt classifier (PC). Classify a user prompt; ADVISORY only.
 ///
-/// FAIL-OPEN: a malformed reply or a failed call returns `allow` (with the note
-/// "classifier unavailable") so the turn is never blocked by classifier trouble.
-/// The caller surfaces a block verdict as a toast and otherwise proceeds.
+/// FAIL-OPEN: a malformed reply or a failed call returns `allow = true` (with
+/// the note "classifier unavailable" and `available = false`) so the turn is
+/// never blocked by classifier trouble. The caller surfaces a block verdict as a
+/// toast and otherwise proceeds; it ignores `available` because PC is advisory.
 pub async fn classify_prompt(
     client: &OpenRouterClient,
     settings: &Settings,
@@ -161,41 +210,40 @@ pub async fn classify_prompt(
         client,
         settings,
         messages,
+        // Advisory fail-open: allow the turn, but mark it unavailable so the
+        // note is accurate.
         Verdict {
             allow: true,
             reason: "classifier unavailable".to_string(),
+            available: false,
         },
     )
     .await
 }
 
-/// Tool-call classifier (TAC). Classify a single tool call for auto-run safety.
+/// Tool-call classifier (TAC). Classify a single tool call for auto-run safety,
+/// INTENT-AWARE: it sees the user's latest request alongside the proposed call,
+/// so it can block a mutation the user never asked for (e.g. the user asked a
+/// question but the model tried to edit a file).
 ///
-/// FAIL-TO-APPROVAL: on a malformed reply or a failed call this returns
-/// `allow = false` with the reason "classifier unavailable". A false verdict
-/// routes the call into the normal human-approval prompt — which is the SAFE
-/// default for this cut: the user simply approves manually, and a classifier
-/// outage can never silently auto-run a risky call. (Fully failing the turn
-/// closed would be too aggressive, so we degrade to "ask the human" instead.)
+/// On a malformed reply, a failed call, or a timeout this returns a verdict with
+/// `available = false` — the caller degrades that to a human approval prompt in
+/// BOTH agent modes, so a classifier outage can never silently auto-run a risky
+/// call nor silently block it. A successfully-parsed verdict carries
+/// `available = true` (allow → auto-run; block → the caller acts on the mode).
 pub async fn classify_toolcall(
     client: &OpenRouterClient,
     settings: &Settings,
+    user_intent: &str,
     tool_name: &str,
     args_json: &str,
 ) -> Verdict {
-    let call = format!("tool: {tool_name}\narguments: {args_json}");
+    let call = format!(
+        "User request: {user_intent}\n\nProposed tool call:\ntool: {tool_name}\narguments: {args_json}"
+    );
     let messages = vec![
         ChatMessage::new(Role::System, crate::resources::classifier_toolcall()),
         ChatMessage::new(Role::User, call),
     ];
-    classify(
-        client,
-        settings,
-        messages,
-        Verdict {
-            allow: false,
-            reason: "classifier unavailable".to_string(),
-        },
-    )
-    .await
+    classify(client, settings, messages, Verdict::unavailable()).await
 }

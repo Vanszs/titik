@@ -194,11 +194,18 @@ pub struct Choice {
 ///
 /// `role` is received as a string (e.g. `"assistant"`) but is unused by the
 /// caller; only `content` is extracted for the compaction summary.
+///
+/// `reasoning` carries a reasoning model's thinking text: some models (e.g. the
+/// safeguard classifier) leave `content` empty and return their answer in this
+/// field instead, so the classifier path falls back to it. Defaults to `None`
+/// for models that don't emit it.
 #[derive(Debug, Deserialize)]
 pub struct ResponseMessage {
     #[allow(dead_code)]
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

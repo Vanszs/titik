@@ -458,6 +458,80 @@ impl OpenRouterClient {
             .ok_or_else(|| anyhow!("no choices returned"))
     }
 
+    /// Classifier completion against a DIFFERENT model/provider — the dedicated
+    /// path for the safety harness, kept separate from [`Self::complete_with`] so
+    /// the awareness summary path is unaffected.
+    ///
+    /// Same body as `complete_with` (no tools, `stream: false`, usage on, provider
+    /// pin from `provider`) but with `reasoning: {effort: "low"}` set: the
+    /// safeguard model (`gpt-oss-safeguard-20b`) is a reasoning model, so a low
+    /// effort keeps the verdict fast. Reasoning models often leave `content`
+    /// empty and put their answer in `message.reasoning`, so the reply is
+    /// `content` when non-empty (trimmed), else the `reasoning` text; an error if
+    /// BOTH are empty. Clean errors, no panics — callers (`harness::classify`)
+    /// degrade any `Err` to "classifier unavailable".
+    pub async fn classify_with(
+        &self,
+        model: &str,
+        provider: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            provider: provider_routing_for(provider),
+            usage: UsageRequest { include: true },
+            // Classifier calls use no tools.
+            tools: None,
+            // The safeguard model is a reasoning model; pin a low effort so the
+            // verdict lands quickly. `effort` and `enabled` are mutually
+            // exclusive — only `effort` is set.
+            reasoning: Some(ReasoningConfig {
+                effort: Some("low".to_string()),
+                enabled: None,
+            }),
+        };
+
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("{}", clean_error(status, &text)));
+        }
+
+        let chat_response: ChatResponse = response.json().await?;
+        let message = chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow!("no choices returned"))?;
+        // Prefer `content`; fall back to the model's `reasoning` (the verdict may
+        // live in the thinking for a reasoning model). Error only if BOTH empty.
+        let content = message.content.trim();
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+        if let Some(reasoning) = message.reasoning {
+            let reasoning = reasoning.trim();
+            if !reasoning.is_empty() {
+                return Ok(reasoning.to_string());
+            }
+        }
+        Err(anyhow!("empty classifier reply"))
+    }
+
     /// Fetch the OpenRouter model catalogue (`GET /models`).
     ///
     /// Drives the `/effort` capability menu: the returned [`ModelInfo`] list is

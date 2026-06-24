@@ -211,11 +211,11 @@ fn tool_is_risky(name: &str) -> bool {
 }
 
 /// Inputs for a tool-call-classifier (TAC) call, or `None` when TAC should not
-/// run: the harness is disabled, or there's no client/session. Returning `None`
-/// makes the caller fall through to the normal human approval prompt — the safe
-/// default (and the unchanged behaviour when the harness is off). The `Settings`
-/// and client `Arc` are cloned out so the caller's `block_on` doesn't hold a
-/// borrow of `state`.
+/// run: the harness is disabled, or there's no client/session. `None` makes the
+/// caller fall back to the ORIGINAL approval behaviour (Normal prompts a risky
+/// call, Auto runs it) — the unchanged path when the harness is off. The
+/// `Settings` and client `Arc` are cloned out so the caller's `block_on` doesn't
+/// hold a borrow of `state`.
 fn tac_inputs(
     state: &AppState,
     client: &Option<Arc<OpenRouterClient>>,
@@ -231,52 +231,95 @@ fn tac_inputs(
 /// Drive the tool-approval state machine for the current round.
 ///
 /// Walks `pending_tool_calls` from `tool_idx`, running each call and collecting
-/// its `(id, result)` into `tool_results`. In `Normal` mode it STOPS at the
-/// first risky (write/delete) call, sets `awaiting_approval`, and returns — the
-/// turn is resumed later by [`Action::ApproveTool`] / [`Action::DenyTool`]
-/// (which run/deny that one call, advance `tool_idx`, and call back in here).
-/// Once every call in the round has resolved it calls [`finish_tool_round`].
+/// its `(id, result)` into `tool_results`. Non-risky calls always run inline. A
+/// risky call (write/edit/delete/bash) is the decision point, and the policy
+/// depends on whether the tool-call classifier (TAC) is enabled:
+///
+/// **Classifier enabled** ([`tac_inputs`] is `Some`) — TAC runs in BOTH modes,
+/// intent-aware (it sees the last user message). Per verdict:
+/// - available + allow → run the call inline (both modes).
+/// - available + block → Auto records a `blocked by harness: <reason>` result
+///   and continues the loop WITHOUT a prompt; Normal pauses for `y/n` with the
+///   reason.
+/// - unavailable (error/timeout) → BOTH modes pause for `y/n` ("classifier
+///   unavailable"), degrading to a human decision rather than freezing.
+///
+/// **Classifier disabled** (`tac_inputs` is `None`) — original behaviour: Normal
+/// pauses a risky call for `y/n`; Auto runs it inline.
+///
+/// A pause sets `awaiting_approval` and returns; the turn is resumed later by
+/// [`Action::ApproveTool`] / [`Action::DenyTool`] (which run/deny that one call,
+/// advance `tool_idx`, and call back in here). Once every call in the round has
+/// resolved it calls [`finish_tool_round`].
 ///
 /// Each call/string is cloned out of `state.rest` before `run_tool` (which
-/// borrows `state` mutably) so there's no overlapping borrow of the vec.
+/// borrows `state` mutably) so there's no overlapping borrow of the vec. Reached
+/// only from the sync loop, so the `block_on` TAC call is safe.
 pub(super) fn process_tools(
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
     let mode = state.rest.agent_mode;
+    // The user's latest request, used to make TAC intent-aware. Cloned out once
+    // (empty when there's no user message) so the per-call `block_on` below holds
+    // no borrow of `state`. The most-recent User message is the real request even
+    // after the assistant's tool-call + tool-result messages were pushed.
+    let user_intent = state
+        .rest
+        .session
+        .as_ref()
+        .and_then(|sess| sess.conversation.last_user_content())
+        .unwrap_or_default();
     while state.rest.tool_idx < state.rest.pending_tool_calls.len() {
         let call = state.rest.pending_tool_calls[state.rest.tool_idx].clone();
-        if mode == AgentMode::Normal && tool_is_risky(&call.function.name) {
-            // Tool-call classifier (TAC): in Normal mode, a risky call is the
-            // decision point. When the harness is enabled, ask the classifier
-            // whether this specific call is safe to AUTO-RUN. A "safe" verdict
-            // upgrades the call to auto (skip the prompt); a "block" verdict — or
-            // any classifier error (fail-to-approval) — falls through to the
-            // human y/n. When the harness is DISABLED this whole branch is
-            // skipped and a risky call always prompts (unchanged behaviour).
-            let tac = tac_inputs(state, client);
-            let auto_ok = if let Some((c, settings)) = tac {
-                let verdict = handle.block_on(crate::app::harness::classify_toolcall(
-                    &c,
-                    &settings,
-                    &call.function.name,
-                    &call.function.arguments,
-                ));
-                // Stash the reason so a forced approval shows WHY it's asked.
-                state.rest.approval_reason =
-                    if verdict.allow { None } else { Some(verdict.reason) };
-                verdict.allow
-            } else {
-                false
-            };
-            if !auto_ok {
-                // Pause the turn for the user's decision; resumed by Approve/Deny.
-                state.rest.awaiting_approval = true;
-                state.rest.status = format!("approve {}? [y/n]", call.function.name);
-                return;
+        if tool_is_risky(&call.function.name) {
+            match tac_inputs(state, client) {
+                // Classifier enabled → run TAC in both modes and act on its verdict.
+                Some((c, settings)) => {
+                    let verdict = handle.block_on(crate::app::harness::classify_toolcall(
+                        &c,
+                        &settings,
+                        &user_intent,
+                        &call.function.name,
+                        &call.function.arguments,
+                    ));
+                    if verdict.available && verdict.allow {
+                        // Definite allow → fall through and run it inline (no prompt).
+                        state.rest.approval_reason = None;
+                    } else if verdict.available {
+                        // Definite block. Auto records it and continues; Normal asks.
+                        if mode == AgentMode::Auto {
+                            state.rest.tool_results.push((
+                                call.id.clone(),
+                                format!("blocked by harness: {}", verdict.reason),
+                            ));
+                            state.rest.tool_idx += 1;
+                            continue;
+                        }
+                        state.rest.approval_reason = Some(verdict.reason);
+                        state.rest.awaiting_approval = true;
+                        state.rest.status = format!("approve {}? [y/n]", call.function.name);
+                        return;
+                    } else {
+                        // Classifier unavailable → degrade to a human prompt in
+                        // BOTH modes (never silently run, block, or freeze).
+                        state.rest.approval_reason = Some("classifier unavailable".to_string());
+                        state.rest.awaiting_approval = true;
+                        state.rest.status = format!("approve {}? [y/n]", call.function.name);
+                        return;
+                    }
+                }
+                // Classifier disabled → original behaviour: Normal asks, Auto runs.
+                None => {
+                    if mode == AgentMode::Normal {
+                        state.rest.awaiting_approval = true;
+                        state.rest.status = format!("approve {}? [y/n]", call.function.name);
+                        return;
+                    }
+                    // Auto + classifier disabled → fall through and run inline.
+                }
             }
-            // TAC said safe → fall through and run it inline (no prompt).
         }
         let result = run_tool(state, &call);
         state.rest.tool_results.push((call.id.clone(), result));
