@@ -99,6 +99,10 @@ pub(super) fn advance_turn(
     // can never leak into the next round) and folded onto the committed message
     // below; never logged to disk or sent to the API.
     let reasoning = state.rest.take_reasoning();
+    // Capture before `reasoning` is moved into the commit below. Used by the
+    // plan gate: a non-empty reasoning channel satisfies the plan requirement
+    // (reasoning models emit their CoT there and leave content empty on tool turns).
+    let had_reasoning = reasoning.as_deref().is_some_and(|r| !r.trim().is_empty());
 
     // 2. Commit the assistant message (and log + count it). The assistant text
     //    may be empty on a tool-call turn — we still record the row so usage
@@ -200,7 +204,7 @@ pub(super) fn advance_turn(
     //     Every pending call gets a result, so there are no dangling tool_call IDs.
     if state.rest.needs_plan {
         state.rest.needs_plan = false;
-        let planned = buf.as_deref().is_some_and(|b| !b.trim().is_empty());
+        let planned = buf.as_deref().is_some_and(|b| !b.trim().is_empty()) || had_reasoning;
         if !planned {
             state.rest.tool_idx = 0;
             state.rest.tool_results.clear();
