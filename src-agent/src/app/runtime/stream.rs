@@ -302,12 +302,26 @@ pub(super) fn process_tools(
                         state.rest.status = format!("approve {}? [y/n]", call.function.name);
                         return;
                     } else {
-                        // Classifier unavailable → degrade to a human prompt in
-                        // BOTH modes (never silently run, block, or freeze).
-                        state.rest.approval_reason = Some("classifier unavailable".to_string());
-                        state.rest.awaiting_approval = true;
-                        state.rest.status = format!("approve {}? [y/n]", call.function.name);
-                        return;
+                        // Classifier unavailable.
+                        // Normal: degrade to a human y/n prompt (human decides).
+                        // Auto: fail-open — user has delegated decisions; a
+                        //       classifier outage must not halt or interrupt them.
+                        //       Run inline and surface a toast so the degradation
+                        //       is visible.
+                        if mode == AgentMode::Normal {
+                            state.rest.approval_reason =
+                                Some("classifier unavailable".to_string());
+                            state.rest.awaiting_approval = true;
+                            state.rest.status =
+                                format!("approve {}? [y/n]", call.function.name);
+                            return;
+                        }
+                        // Auto + unavailable → run inline, no prompt.
+                        state.rest.set_toast(format!(
+                            "harness: classifier unavailable — auto-ran {}",
+                            call.function.name
+                        ));
+                        // fall through to run_tool below
                     }
                 }
                 // Classifier disabled → original behaviour: Normal asks, Auto runs.
