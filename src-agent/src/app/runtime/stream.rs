@@ -350,6 +350,9 @@ pub(super) fn process_tools(
                 }
             }
         }
+        // Phase label for the comet: name the tool being executed so the
+        // shimmering status surfaces what the agent is doing this round.
+        state.rest.status = format!("running {}", call.function.name);
         let result = run_tool(state, &call);
         state.rest.tool_results.push((call.id.clone(), result));
         state.rest.tool_idx += 1;
@@ -394,7 +397,9 @@ fn finish_tool_round(
             return;
         }
     };
-    state.rest.status = "running tools…".into();
+    // The tool round is done; this re-stream is a model wait, so label it the same
+    // "thinking" phase the comet sweeps (not a tool run).
+    state.rest.status = "thinking".into();
     state.rest.begin_stream();
     start_stream_task(history, state, client, handle);
 }

@@ -66,7 +66,10 @@ pub(super) fn apply_action(
             state.rest.awaiting_approval = false;
             state.rest.tool_idx = 0;
             state.rest.tool_results.clear();
-            state.rest.status = "thinking...".into();
+            // Phase label for the comet: a single word the shimmer sweeps across
+            // (the elapsed counter is appended by the renderer). No trailing dots —
+            // the comet supplies the motion, `· Ns` supplies the elapsed.
+            state.rest.status = "thinking".into();
             start_stream_task(history, state, client, handle);
 
             // Prompt-classifier (PC), advisory + non-blocking: once per turn, if
@@ -164,7 +167,7 @@ pub(super) fn apply_action(
             state.rest.reset_scroll();
             state.rest.begin_stream();
             state.rest.waiting = true;
-            state.rest.status = "thinking...".into();
+            state.rest.status = "thinking".into();
             start_stream_task(history, state, client, handle);
         }
 

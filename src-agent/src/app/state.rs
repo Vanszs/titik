@@ -248,6 +248,13 @@ pub struct AppStateRest {
     /// Set true when the summarizer engages; a later wave reads and writes it.
     #[allow(dead_code)]
     pub summarizing: bool,
+    /// Start instant of the current WORKING wait — the moment the app entered a
+    /// model/tool/fold wait that should shimmer (i.e. `waiting && !awaiting_approval`).
+    /// Drives the status-line "comet" animation's elapsed counter and its travelling
+    /// head. Reconciled on the rising/falling edge in the event-loop tick: set to
+    /// `Some(now)` when shimmer becomes active and it's `None`; cleared to `None`
+    /// the moment work ends or an approval prompt takes over. `None` when idle.
+    pub work_since: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -320,6 +327,7 @@ impl AppStateRest {
             last_send_at: None,
             provider_caches: false,
             summarizing: false,
+            work_since: None,
         }
     }
 

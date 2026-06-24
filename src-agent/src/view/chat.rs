@@ -408,8 +408,32 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
     }
 
     // --- Status bar --- padded to align with the rest. Status text on the
-    // left (dim); the cumulative token/cost readout right-aligned (accent).
+    // left; the cumulative token/cost readout right-aligned (accent).
+    //
+    // While the app is WORKING (`work_since` is set — the event loop gates this to
+    // `waiting && !awaiting_approval`), the label animates: a travelling accent
+    // "comet" sweeps across the phase word with a dim ` · {secs}s` elapsed counter,
+    // so the app never looks stuck during first-token latency / tool exec / the
+    // fold. Idle (`ready`) and the `approve …? [y/n]` prompt render statically — a
+    // single plain dim span, no comet, no timer.
     let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
+    let status_line: Line<'static> = match rest.work_since {
+        Some(since) => {
+            let elapsed_ms = since.elapsed().as_millis();
+            let mut spans = comet_spans(&rest.status, elapsed_ms, palette);
+            // Dim elapsed counter, e.g. `thinking · 3s`. Whole seconds so it ticks
+            // calmly (the comet supplies the fast motion).
+            spans.push(Span::styled(
+                format!(" · {}s", elapsed_ms / 1000),
+                Style::default().fg(palette.dim),
+            ));
+            Line::from(spans)
+        }
+        None => Line::from(Span::styled(
+            rest.status.clone(),
+            Style::default().fg(palette.dim),
+        )),
+    };
     let readout = if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
         // Show the cached-prompt-token count right after the input arrow when the
         // last response hit the prompt cache (`cached:N`), so the saving is
@@ -438,10 +462,9 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(0), Constraint::Length(w)])
                 .split(status_area);
-            frame.render_widget(
-                Paragraph::new(rest.status.as_str()).style(Style::default().fg(palette.dim)),
-                cols[0],
-            );
+            // Per-span styles (the comet's colours, or the static dim) own the look;
+            // no paragraph-level base style so it doesn't flatten the comet head.
+            frame.render_widget(Paragraph::new(status_line), cols[0]);
             frame.render_widget(
                 Paragraph::new(r.as_str())
                     .style(Style::default().fg(palette.accent))
@@ -450,10 +473,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
             );
         }
         None => {
-            frame.render_widget(
-                Paragraph::new(rest.status.as_str()).style(Style::default().fg(palette.dim)),
-                status_area,
-            );
+            frame.render_widget(Paragraph::new(status_line), status_area);
         }
     }
 
@@ -839,6 +859,49 @@ fn render_compact_anim(frame: &mut Frame, area: Rect, start: std::time::Instant,
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the animated "comet" spans for the status label while the app is
+/// WORKING (waiting on the model / a tool / the fold).
+///
+/// A single bright accent **head** glides left→right across `text`, dragging a
+/// short two-char tail behind it (the char just behind the head in `palette.fg`,
+/// the one before that in `palette.dim`), over an otherwise-`dim` word. After the
+/// head reaches the end it spends a `GAP`-cell pause off the right edge, during
+/// which the whole word renders dim — the "breath" before the next sweep.
+///
+/// Time-driven only (no stored counter): the head position is derived from
+/// `elapsed_ms`, so it advances on every redraw and the caller just needs to keep
+/// repainting (the event loop forces ~12fps ticks while working). One span per
+/// char keeps the colour mapping trivial and multibyte-safe (operates on
+/// `chars()`); an empty `text` yields no spans (guarded `n == 0`).
+fn comet_spans(text: &str, elapsed_ms: u128, palette: &Palette) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    const FRAME_MS: u128 = 80; // ~12.5 fps advance cadence (matches the compact spinner)
+    const GAP: usize = 4; // dark pause length after the comet exits the right edge
+    // The head sweeps 0..n+GAP; once head >= n it sits in the gap (whole word dim).
+    let period = n + GAP;
+    let head = ((elapsed_ms / FRAME_MS) as usize) % period.max(1);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(n);
+    for (i, ch) in chars.iter().enumerate() {
+        // head = bright bold accent; head-1 = fg tail (one char behind); everything
+        // else (incl. head-2, which would be `dim` and so collapses with the rest)
+        // is dim. Checked against `head` via `i + 1 == head` so the comparison never
+        // underflows when head is small.
+        let style = if i == head {
+            Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+        } else if i + 1 == head {
+            Style::default().fg(palette.fg)
+        } else {
+            Style::default().fg(palette.dim)
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    spans
 }
 
 /// Compact token count: raw below 10k, else "10,1k" / "1,1m" (one decimal,

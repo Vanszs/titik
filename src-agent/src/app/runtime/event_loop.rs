@@ -301,17 +301,39 @@ pub(super) fn run_loop(
             }
         }
 
+        // Status-line "comet" activity clock. Shimmer is active whenever the app
+        // is in a WORKING wait that isn't paused on a y/n approval. Reconcile
+        // `work_since` against that on the rising/falling edge here (the single
+        // place that sees the settled `waiting`/`awaiting_approval` for the tick),
+        // rather than threading set/clear through every scattered mutation site:
+        //  - rising edge (active && None)   → stamp `now` so the elapsed counter
+        //    and the travelling head start from this moment.
+        //  - falling edge (!active && Some) → clear it; idle / approval renders the
+        //    status statically with no comet and no timer.
+        let shimmer_active = state.rest.waiting && !state.rest.awaiting_approval;
+        match (shimmer_active, state.rest.work_since.is_some()) {
+            (true, false) => state.rest.work_since = Some(std::time::Instant::now()),
+            (false, true) => state.rest.work_since = None,
+            _ => {}
+        }
+
         // While a compaction animation is in flight, mark every tick dirty so the
         // spinner/elapsed/bar actually advance (rendering is otherwise only
         // event-driven). The 8ms `waiting` poll above sets the frame cadence.
-        if state.rest.compact_anim_start.is_some() {
+        // The same applies while the comet shimmer is active: it must keep
+        // travelling even when NO stream events arrive (first-token latency, tool
+        // exec, the summarizer fold), so force a redraw each tick then too.
+        if state.rest.compact_anim_start.is_some() || shimmer_active {
             dirty = true;
         }
 
-        // 2. Input. 8ms poll while streaming so tokens flush at >=60fps; 100ms
-        //    idle (poll still wakes instantly on a keypress, so typing latency
-        //    is 0). Drain EVERY buffered event each tick so paste / fast typing
-        //    don't lag.
+        // 2. Input poll cadence. While WORKING (waiting), poll fast so two things
+        //    stay smooth: tokens flush at >=60fps when a stream is live, and the
+        //    comet redraws at ~12fps (80ms) even when nothing streams (the 8ms
+        //    poll is the upper bound on the redraw interval the comet needs). Idle
+        //    falls back to 100ms (poll still wakes instantly on a keypress, so
+        //    typing latency is 0) so a fully idle UI never busy-spins. Drain EVERY
+        //    buffered event each tick so paste / fast typing don't lag.
         let timeout = if state.rest.waiting {
             Duration::from_millis(8)
         } else {
