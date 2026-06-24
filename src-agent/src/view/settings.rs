@@ -26,7 +26,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph},
     Frame,
@@ -317,28 +317,38 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
     frame.render_widget(Paragraph::new(detail_lines), detail_inner);
 
     // --- Footer ---
-    // Plain dim hint line; no border (matches the flat style in the original).
+    // Full-width inverse status bar: background fills the entire footer line
+    // edge to edge; text is left-padded by 1 space so it doesn't touch the edge.
     // Context-sensitive: deepest active mode wins (picker → list → editing →
     // field nav → sidebar).
-    let footer_area = outer[2].inner(Margin { horizontal: 2, vertical: 0 });
-    let on_list_field = st.in_detail && SettingsState::is_path_list(st.current_field());
-    let hint = if st.picker.is_some() {
-        "type path · @rel or /abs · ↑/↓ select · Tab descend · Enter pick · Esc cancel"
-    } else if st.list_editing {
-        "↑/↓ entry · + add · - remove · Enter edit · Esc done"
-    } else if st.editing {
-        "type to edit · Enter/Esc done"
-    } else if on_list_field {
-        "Enter manage list"
-    } else if st.in_detail {
-        "↑/↓ field · Enter edit/toggle · ←/→ accent · ← back"
-    } else {
-        "↑/↓ category · →/Enter fields · Esc save & close"
-    };
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(palette.dim)),
-        footer_area,
-    );
+    let footer_rect = outer[2];
+    if footer_rect.width > 0 {
+        let on_list_field = st.in_detail && SettingsState::is_path_list(st.current_field());
+        let hint = if st.picker.is_some() {
+            "type path · @rel or /abs · ↑/↓ select · Tab descend · Enter pick · Esc cancel"
+        } else if st.list_editing {
+            "↑/↓ entry · + add · - remove · Enter edit · Esc done"
+        } else if st.editing {
+            "type to edit · Enter/Esc done"
+        } else if on_list_field {
+            "Enter manage list"
+        } else if st.in_detail {
+            "↑/↓ field · Enter edit/toggle · ←/→ accent · ← back"
+        } else {
+            "↑/↓ category · →/Enter fields · Esc save & close"
+        };
+        let bar_style = Style::default()
+            .fg(palette.sel_fg)
+            .bg(palette.sel_bg)
+            .add_modifier(Modifier::BOLD);
+        // Pad the hint with a leading space, then right-pad to the full width so
+        // the Paragraph's base style (bar_style) paints the background edge to edge.
+        let padded = format!(" {:<width$}", hint, width = footer_rect.width.saturating_sub(1) as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(padded))).style(bar_style),
+            footer_rect,
+        );
+    }
 
     // --- FS directory picker overlay ---
     // Mirrors the chat `@` palette: a compact bordered list (the contained-box

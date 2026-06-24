@@ -26,7 +26,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -91,12 +91,23 @@ pub fn draw(frame: &mut Frame, st: &AgentsState, palette: &Palette) {
     draw_detail(frame, st, palette, body_cols[1]);
 
     // --- Footer ---
-    let footer_area = outer[2].inner(Margin { horizontal: 2, vertical: 0 });
-    let hint = footer_hint(st);
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(palette.dim)),
-        footer_area,
-    );
+    // Full-width inverse status bar: background fills the entire footer line
+    // edge to edge; text is left-padded by 1 space so it doesn't touch the edge.
+    let footer_rect = outer[2];
+    if footer_rect.width > 0 {
+        let hint = footer_hint(st);
+        let bar_style = Style::default()
+            .fg(palette.sel_fg)
+            .bg(palette.sel_bg)
+            .add_modifier(Modifier::BOLD);
+        // Pad the hint with a leading space, then right-pad to the full width so
+        // the Paragraph's base style (bar_style) paints the background edge to edge.
+        let padded = format!(" {:<width$}", hint, width = footer_rect.width.saturating_sub(1) as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(padded))).style(bar_style),
+            footer_rect,
+        );
+    }
 
     // --- Tool picker overlay (rendered on top of everything else) ---
     if let Some(picker) = &st.tool_picker {
