@@ -29,7 +29,7 @@ pub struct Palette {
 /// UI. Unknown strings in `config.json` fall back to "green".
 ///
 /// Consumed by the `/settings` dashboard to cycle the accent draft.
-pub const ACCENTS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white", "orange"];
+pub const ACCENTS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white", "orange", "pink"];
 
 /// Resolve an accent name + theme into a concrete [`Color`].
 ///
@@ -53,6 +53,8 @@ pub(crate) fn resolve_accent(name: &str, dark: bool) -> Color {
         ("white",   false) => Color::Rgb(20, 20, 20),
         ("orange",  true)  => Color::Rgb(255, 140, 0),
         ("orange",  false) => Color::Rgb(200, 100, 0),
+        ("pink",    true)  => Color::Rgb(255, 105, 180),
+        ("pink",    false) => Color::Rgb(200, 60, 120),
         // Unknown accent string → fall back to the green mapping for the theme.
         (_,         true)  => Color::Rgb(57, 255, 20),
         (_,         false) => Color::Rgb(0, 128, 0),

@@ -94,11 +94,18 @@ pub(super) fn apply_slash(
             }
             let mut req = vec![ChatMessage::new(
                 Role::System,
-                "Summarise the following conversation concisely, preserving key facts, decisions, and context.",
+                "You are compacting a conversation to free up context. Write a concise SUMMARY of the conversation above for your own future reference — NOT a reply to the user. Capture: what the user is building or asking for; key decisions, facts, and constraints established; the current state; specific files, code, names, and values that matter; and any open threads or next steps. Use short labeled sections or terse bullet points. Be factual. Do not greet, do not continue the task, do not address the user.",
             )];
             req.extend(to_sum);
             state.rest.waiting = true;
             state.rest.status = "compacting...".into();
+            // Start the compaction animation clock. The renderer reads this to
+            // draw the spinner/elapsed/bar; the event loop reads it to redraw each
+            // tick and to enforce the minimum on-screen duration. Clear any stale
+            // deferred-apply bookkeeping from a prior compaction.
+            state.rest.compact_anim_start = Some(std::time::Instant::now());
+            state.rest.compact_apply_at = None;
+            state.rest.compact_pending = None;
             // Fresh channel for this request; the receiver lives in state so an
             // interrupt/new just drops it and the task's result is ignored.
             let (tx, rx) = mpsc::unbounded_channel();

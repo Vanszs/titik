@@ -57,6 +57,18 @@ impl AgentMode {
     }
 }
 
+/// Visual style of the transient toast box.
+///
+/// - `Error`: red box titled "error" — failures (the original behaviour).
+/// - `Info`: neutral accent box titled "info" — non-failure notices (e.g. the
+///   post-compaction summary). Rendered multi-line / wrapped, never red so an
+///   informational message doesn't read as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Error,
+    Info,
+}
+
 /// Per-frame cache of the transcript's rendered visual lines.
 ///
 /// Markdown rendering (pulldown-cmark + syntect highlighting) and span-wrapping
@@ -89,9 +101,10 @@ pub struct AppStateRest {
     /// Selected row in the `/` command palette (index into the filtered list).
     pub palette_sel: usize,
     pub status: String,
-    /// Transient error toast: (message, expiry instant). Shown at the top of the
-    /// transcript and auto-dismissed once the instant passes.
-    pub toast: Option<(String, std::time::Instant)>,
+    /// Transient toast: (message, expiry instant, kind). Shown at the top of the
+    /// transcript and auto-dismissed once the instant passes. `kind` selects the
+    /// box style (red "error" vs neutral "info").
+    pub toast: Option<(String, std::time::Instant, ToastKind)>,
     /// True while the `/help` overlay is shown. Any key closes it.
     pub help_open: bool,
     pub waiting: bool,
@@ -191,6 +204,20 @@ pub struct AppStateRest {
     /// doesn't refetch. `None` until the first successful fetch; a failed fetch
     /// leaves it `None` (the picker falls back to a generic option set).
     pub models_cache: Option<Vec<crate::dto::openrouter::ModelInfo>>,
+    /// Start instant of the `/compact` animation. `Some` only while a compaction
+    /// is in flight (set in `Command::Compact`, cleared once the result is
+    /// applied). The renderer uses it to draw the spinner + elapsed + indeterminate
+    /// bar, and the event loop uses it both to keep redrawing each tick (so the
+    /// animation actually animates) and to enforce the cosmetic minimum duration.
+    pub compact_anim_start: Option<std::time::Instant>,
+    /// Earliest instant the stashed compaction result may be applied. Set when a
+    /// fast `StreamEvent::Compacted` arrives before the minimum animation duration
+    /// has elapsed; the event loop applies `compact_pending` once `now >= this`.
+    pub compact_apply_at: Option<std::time::Instant>,
+    /// Stashed `(summary, kept_tail)` awaiting the minimum-duration gate. Held
+    /// only when a compaction finished faster than the minimum so the apply is
+    /// deferred (non-blocking) rather than slept on. Applied by the event loop.
+    pub compact_pending: Option<(String, Vec<crate::dto::chat::ChatMessage>)>,
 }
 
 impl AppState {
@@ -254,6 +281,9 @@ impl AppStateRest {
             harness_rx: None,
             approval_reason: None,
             models_cache: None,
+            compact_anim_start: None,
+            compact_apply_at: None,
+            compact_pending: None,
         }
     }
 
@@ -360,14 +390,28 @@ impl AppStateRest {
         self.last_provider = Some(provider.to_string());
     }
 
-    /// Show an error toast for ~6 seconds.
+    /// Show an error toast (red box) for ~6 seconds.
     pub fn set_toast(&mut self, msg: String) {
-        self.toast = Some((msg, std::time::Instant::now() + std::time::Duration::from_secs(6)));
+        self.toast = Some((
+            msg,
+            std::time::Instant::now() + std::time::Duration::from_secs(6),
+            ToastKind::Error,
+        ));
+    }
+    /// Show an informational toast (neutral box) for ~8 seconds. Used for
+    /// non-failure notices like the post-compaction summary, which is multi-line
+    /// and shouldn't read as an error.
+    pub fn set_toast_info(&mut self, msg: String) {
+        self.toast = Some((
+            msg,
+            std::time::Instant::now() + std::time::Duration::from_secs(8),
+            ToastKind::Info,
+        ));
     }
     /// Clear the toast if it has expired. Returns true if it was just cleared
     /// (so the caller can mark the frame dirty).
     pub fn tick_toast(&mut self) -> bool {
-        if let Some((_, until)) = &self.toast {
+        if let Some((_, until, _)) = &self.toast {
             if std::time::Instant::now() >= *until {
                 self.toast = None;
                 return true;

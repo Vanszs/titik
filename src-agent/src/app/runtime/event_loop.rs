@@ -54,6 +54,89 @@ fn exit_select(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// Minimum on-screen duration for the `/compact` animation. Cosmetic and short:
+/// a fast compaction is held this long (via a deferred apply) so the spinner +
+/// progress bar don't merely flash. Deliberately ~1s — long enough to read, not
+/// long enough to feel like a stall.
+const MIN_COMPACT_ANIM: Duration = Duration::from_millis(1000);
+
+/// Apply a finished compaction to the active session and finalize the UI.
+///
+/// This is the single apply path shared by both the immediate case (the model
+/// already took >= the minimum animation time) and the deferred case (a fast
+/// compaction held back by [`MIN_COMPACT_ANIM`]). It:
+/// - rebuilds the conversation (`apply_compaction` + `rebuild_system`) and saves,
+/// - refreshes the project-awareness summary (best-effort, gated by the setting),
+/// - invalidates the transcript cache so the same-length REPLACE doesn't leave a
+///   stale prefix (the summary is the new first block),
+/// - scrolls to the TOP so the user sees the fresh summary,
+/// - surfaces the summary text as a neutral (info) toast under the finish, and
+/// - clears the waiting/animation state.
+fn apply_compaction_result(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+    summary: String,
+    kept_tail: Vec<crate::dto::chat::ChatMessage>,
+) {
+    if let Some(sess) = state.rest.session.as_mut() {
+        sess.conversation
+            .apply_compaction(summary.clone(), kept_tail);
+        sess.rebuild_system();
+        let _ = sess.save();
+    }
+    // Refresh the project-awareness summary post-compaction: the project is often
+    // better understood after a compact, and this also satisfies the "applies on
+    // compaction" requirement. Best-effort; gated by `awareness_enabled` inside
+    // `summarize`. Clone the inputs out first so the `block_on` doesn't hold a
+    // borrow of `state.rest`.
+    let aware_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
+        (Some(c), Some(sess)) if sess.settings.awareness_enabled => {
+            Some((Arc::clone(c), sess.settings.clone(), sess.workdir()))
+        }
+        _ => None,
+    };
+    if let Some((c, settings, workdir)) = aware_inputs {
+        let s = handle.block_on(crate::app::awareness::summarize(&c, &settings, &workdir));
+        state.rest.awareness_summary = s;
+    }
+
+    // The transcript cache only rebuilds on a length SHRINK; compaction can be a
+    // same-length REPLACE, which would leave a stale prefix. Force a full rebuild
+    // so the new summary (first Assistant block) + kept tail render correctly.
+    state.rest.transcript_cache.borrow_mut().blocks.clear();
+    // Jump to the top of the transcript so the freshly-written summary is what the
+    // user sees once the animation clears (instead of the kept tail at the bottom).
+    state.rest.follow = false;
+    state.rest.scroll = 0;
+
+    // Surface the generated summary "under the finish animation" as a neutral,
+    // multi-line info toast (capped so a long summary stays contained).
+    state
+        .rest
+        .set_toast_info(format!("compacted ✓\n{}", cap_summary(&summary, 400)));
+
+    state.rest.waiting = false;
+    state.rest.status = "ready".into();
+    // Animation is done: stop the per-tick redraw + drop any deferral bookkeeping.
+    state.rest.compact_anim_start = None;
+    state.rest.compact_apply_at = None;
+    state.rest.compact_pending = None;
+}
+
+/// Trim and cap a summary for toast display: collapse leading/trailing
+/// whitespace, then keep at most `max` characters, appending an ellipsis when cut.
+fn cap_summary(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// The central event loop. Each tick: redraw if dirty, drain the active
 /// request's events, then drain all buffered terminal input. Rendering is
 /// dirty-flagged and polling is adaptive (8ms streaming / 100ms idle) so an
@@ -123,34 +206,26 @@ pub(super) fn run_loop(
                         break;
                     }
                     StreamEvent::Compacted { summary, kept_tail } => {
-                        if let Some(sess) = state.rest.session.as_mut() {
-                            sess.conversation.apply_compaction(summary, kept_tail);
-                            sess.rebuild_system();
-                            let _ = sess.save();
-                        }
-                        // Refresh the project-awareness summary post-compaction:
-                        // the project is often better understood after a compact,
-                        // and this also satisfies the "applies on compaction"
-                        // requirement. Best-effort; gated by `awareness_enabled`
-                        // inside `summarize`. Clone the inputs out first so the
-                        // `block_on` doesn't hold a borrow of `state.rest`.
-                        let aware_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
-                            (Some(c), Some(sess)) if sess.settings.awareness_enabled => Some((
-                                Arc::clone(c),
-                                sess.settings.clone(),
-                                sess.workdir(),
-                            )),
-                            _ => None,
-                        };
-                        if let Some((c, settings, workdir)) = aware_inputs {
-                            let summary = handle.block_on(crate::app::awareness::summarize(
-                                &c, &settings, &workdir,
-                            ));
-                            state.rest.awareness_summary = summary;
-                        }
-                        state.rest.waiting = false;
+                        // The model is done; the task is finished either way.
                         state.rest.current_task = None;
-                        state.rest.status = "ready".into();
+                        // Enforce a short cosmetic minimum so a fast compaction
+                        // doesn't flash the animation. If we haven't shown the
+                        // animation long enough yet, stash the result and defer
+                        // the apply to a later tick (NON-blocking — never sleep).
+                        let elapsed = state
+                            .rest
+                            .compact_anim_start
+                            .map(|t| t.elapsed())
+                            .unwrap_or(MIN_COMPACT_ANIM);
+                        if elapsed < MIN_COMPACT_ANIM {
+                            let start = state.rest.compact_anim_start.unwrap();
+                            state.rest.compact_apply_at = Some(start + MIN_COMPACT_ANIM);
+                            state.rest.compact_pending = Some((summary, kept_tail));
+                            // Keep `waiting` true so the 8ms poll + per-tick redraw
+                            // keep the animation running until the gate opens.
+                        } else {
+                            apply_compaction_result(state, client, handle, summary, kept_tail);
+                        }
                         still_streaming = false;
                         break;
                     }
@@ -188,6 +263,27 @@ pub(super) fn run_loop(
             if keep {
                 state.rest.harness_rx = Some(hrx);
             }
+        }
+
+        // 1c. Deferred compaction apply. A fast compaction stashes its result and
+        //     an `apply_at` instant so the animation holds for a short minimum
+        //     (cosmetic). Apply once that instant passes — driven by the loop tick,
+        //     never by sleeping, so input/animation stay responsive meanwhile.
+        if let Some(apply_at) = state.rest.compact_apply_at {
+            if std::time::Instant::now() >= apply_at {
+                if let Some((summary, kept_tail)) = state.rest.compact_pending.take() {
+                    apply_compaction_result(state, client, handle, summary, kept_tail);
+                }
+                state.rest.compact_apply_at = None;
+                dirty = true;
+            }
+        }
+
+        // While a compaction animation is in flight, mark every tick dirty so the
+        // spinner/elapsed/bar actually advance (rendering is otherwise only
+        // event-driven). The 8ms `waiting` poll above sets the frame cadence.
+        if state.rest.compact_anim_start.is_some() {
+            dirty = true;
         }
 
         // 2. Input. 8ms poll while streaming so tokens flush at >=60fps; 100ms

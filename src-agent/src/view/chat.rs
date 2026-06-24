@@ -78,7 +78,13 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         let prefixed = line.chars().count() + 4;
         input_rows += 1usize.max(prefixed.div_ceil(inner_w));
     }
-    let input_rows = input_rows.clamp(1, 8);
+    // While compacting, the input box shows the animation instead of the editor;
+    // reserve 2 inner rows (spinner line + progress bar) regardless of input text.
+    let input_rows = if rest.compact_anim_start.is_some() {
+        2
+    } else {
+        input_rows.clamp(1, 8)
+    };
     let input_h = (input_rows as u16) + 2; // + top & bottom borders
 
     // Layout: header (text + bottom rule) | transcript | input (top+bottom
@@ -263,37 +269,45 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         frame.render_widget(messages, body);
     } // cache borrow ends
 
-    // --- Input box --- `[$] {input}`, dim top + bottom borders. Multiline:
-    // logical lines split on '\n'; the first carries the accent prompt, every
-    // continuation a 4-col indent so it hangs under the prompt. A non-blinking
-    // block cursor is painted at the very end of the last line. The box height
-    // (`input_h`, computed above) grows with the wrapped content up to the cap.
-    let mut input_lines: Vec<Line> = Vec::new();
-    for (i, logical) in rest.input.split('\n').enumerate() {
-        if i == 0 {
-            input_lines.push(Line::from(vec![
-                Span::styled("[$] ", Style::default().fg(palette.accent)),
-                Span::raw(logical),
-            ]));
-        } else {
-            input_lines.push(Line::from(vec![Span::raw("    "), Span::raw(logical)]));
-        }
-    }
-    // Append a non-blinking block cursor to the last line so the caret is visible.
-    if let Some(last) = input_lines.last_mut() {
-        last.spans
-            .push(Span::styled("█", Style::default().fg(palette.accent)));
-    }
+    // --- Input box / compaction animation --- dim top + bottom borders. While a
+    // `/compact` is in flight we replace the input contents with an animated
+    // indicator (spinner + elapsed + indeterminate sweep) so the wait is legible;
+    // otherwise the normal `[$] {input}` editor is drawn.
     let input_block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim))
         .padding(Padding::horizontal(2));
     let input_inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
-    frame.render_widget(
-        Paragraph::new(input_lines).wrap(Wrap { trim: false }),
-        input_inner,
-    );
+    if let Some(start) = rest.compact_anim_start {
+        render_compact_anim(frame, input_inner, start, palette);
+    } else {
+        // Multiline editor: logical lines split on '\n'; the first carries the
+        // accent prompt, every continuation a 4-col indent so it hangs under the
+        // prompt. A non-blinking block cursor is painted at the very end of the
+        // last line. The box height (`input_h`, computed above) grows with the
+        // wrapped content up to the cap.
+        let mut input_lines: Vec<Line> = Vec::new();
+        for (i, logical) in rest.input.split('\n').enumerate() {
+            if i == 0 {
+                input_lines.push(Line::from(vec![
+                    Span::styled("[$] ", Style::default().fg(palette.accent)),
+                    Span::raw(logical),
+                ]));
+            } else {
+                input_lines.push(Line::from(vec![Span::raw("    "), Span::raw(logical)]));
+            }
+        }
+        // Append a non-blinking block cursor to the last line so the caret is visible.
+        if let Some(last) = input_lines.last_mut() {
+            last.spans
+                .push(Span::styled("█", Style::default().fg(palette.accent)));
+        }
+        frame.render_widget(
+            Paragraph::new(input_lines).wrap(Wrap { trim: false }),
+            input_inner,
+        );
+    }
 
     // --- Status bar --- padded to align with the rest. Status text on the
     // left (dim); the cumulative token/cost readout right-aligned (accent).
@@ -470,23 +484,37 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
-    // --- Error toast --- transient red box pinned to the top of the transcript.
-    if let Some((msg, _)) = rest.toast.as_ref() {
-        let err_color = Color::Rgb(255, 90, 90);
+    // --- Toast --- transient box pinned to the top of the transcript. `Error`
+    // is a red box ("error"); `Info` is a neutral accent box ("info") used for
+    // notices like the post-compaction summary. Both wrap to width and span
+    // multiple lines; the info box is capped taller so a short summary fits.
+    if let Some((msg, _, kind)) = rest.toast.as_ref() {
+        let (border_color, title, max_rows) = match kind {
+            crate::app::state::ToastKind::Error => (Color::Rgb(255, 90, 90), " error ", 6u16),
+            crate::app::state::ToastKind::Info => (palette.accent, " info ", 10u16),
+        };
         let tw = chunks[1].width;
         let inner_w = (tw as usize).saturating_sub(4).max(1);
-        let rows: Vec<Line> = crate::view::markdown::wrap_spans(
-            &[Span::styled(msg.clone(), Style::default().fg(palette.fg))],
-            inner_w,
-        )
-        .into_iter()
-        .map(Line::from)
-        .collect();
-        let h = ((rows.len() as u16) + 2).min(chunks[1].height.max(3));
+        // Wrap each logical line (the summary toast embeds a leading newline so the
+        // "compacted ✓" header sits on its own row above the body).
+        let rows: Vec<Line> = msg
+            .split('\n')
+            .flat_map(|logical| {
+                crate::view::markdown::wrap_spans(
+                    &[Span::styled(logical.to_string(), Style::default().fg(palette.fg))],
+                    inner_w,
+                )
+            })
+            .map(Line::from)
+            .collect();
+        // Cap the box height: never exceed the transcript, and clamp Info/Error to
+        // their own row budget so a long message stays contained.
+        let body_rows = (rows.len() as u16).min(max_rows);
+        let h = (body_rows + 2).min(chunks[1].height.max(3));
         let rect = Rect { x: chunks[1].x, y: chunks[1].y, width: tw, height: h };
         let block = Block::bordered()
-            .border_style(Style::default().fg(err_color))
-            .title(Span::styled(" error ", Style::default().fg(err_color)))
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(title, Style::default().fg(border_color)))
             .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);
@@ -645,6 +673,65 @@ fn truncate_chars(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Render the `/compact` waiting animation into `area` (the input box interior):
+/// a cycling braille spinner + "Compacting conversation… ({elapsed}s)" on the
+/// first row, and an indeterminate progress bar (a block sweeping across a hatch
+/// track) on the second row when there's height for it. Driven purely by
+/// `start.elapsed()` so it advances every redraw without any stored counter.
+fn render_compact_anim(frame: &mut Frame, area: Rect, start: std::time::Instant, palette: &Palette) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs();
+    // ~12.5 fps spinner cadence (80ms/frame) — smooth but not frantic.
+    let frame_idx = (elapsed.as_millis() / 80) as usize;
+    let glyph = SPINNER[frame_idx % SPINNER.len()];
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(palette.accent)),
+        Span::styled(
+            format!("Compacting conversation… ({secs}s)"),
+            Style::default().fg(palette.dim),
+        ),
+    ]));
+
+    // Indeterminate bar: a short solid block bounces across a hatched track. The
+    // position ping-pongs over the free span so it never just wraps/jumps.
+    if area.height >= 2 {
+        let track = (area.width as usize).max(1);
+        let block_w = 6usize.min(track);
+        let span = track.saturating_sub(block_w);
+        let pos = if span == 0 {
+            0
+        } else {
+            // Advance one cell per ~60ms, ping-ponging over [0, span].
+            let step = (elapsed.as_millis() / 60) as usize % (span * 2);
+            if step <= span { step } else { span * 2 - step }
+        };
+        let mut spans: Vec<Span> = Vec::with_capacity(3);
+        if pos > 0 {
+            spans.push(Span::styled("░".repeat(pos), Style::default().fg(palette.dim)));
+        }
+        spans.push(Span::styled(
+            "▓".repeat(block_w),
+            Style::default().fg(palette.accent),
+        ));
+        let trailing = track - pos - block_w;
+        if trailing > 0 {
+            spans.push(Span::styled(
+                "░".repeat(trailing),
+                Style::default().fg(palette.dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Compact token count: raw below 10k, else "10,1k" / "1,1m" (one decimal,
