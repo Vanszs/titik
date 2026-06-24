@@ -289,7 +289,7 @@ impl SettingsState {
             name: session.name.clone(),
             theme: config.theme.clone(),
             accent: config.accent.clone(),
-            workdir: session.settings.workdir.clone(),
+            workdir: session.workdir().display().to_string(),
             awareness_enabled: session.settings.awareness_enabled,
             awareness_inherit: session.settings.awareness_inherit,
             awareness_model: session.settings.awareness_model.clone(),

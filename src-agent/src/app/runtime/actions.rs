@@ -243,6 +243,12 @@ pub(super) fn apply_action(
                         return Ok(());
                     }
                 }
+                // Newly created session: kick off a background index of its workspace.
+                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
+                let dir_cache = state.rest.dir_cache.clone();
+                if let Some(wd) = workdir {
+                    crate::tool::dircache::reindex(wd, dir_cache);
+                }
             }
             if let Some(sess) = state.rest.session.as_mut() {
                 sess.settings.api_key = api_key.clone();
@@ -336,6 +342,12 @@ pub(super) fn apply_action(
                 *client = Some(build_client(&sess));
                 let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
+                // Kick off a background index of the selected session's workspace.
+                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
+                let dir_cache = state.rest.dir_cache.clone();
+                if let Some(wd) = workdir {
+                    crate::tool::dircache::reindex(wd, dir_cache);
+                }
                 // Existing session: seed the running totals from its full sqlite
                 // log so the readout reflects prior usage.
                 state.rest.load_token_totals(&sess_path);
@@ -440,6 +452,13 @@ pub(super) fn apply_action(
                     if let Err(e) = sess.save() {
                         state.rest.status = format!("error: {e}");
                     }
+                }
+                // c2) Reindex the dir cache against the (possibly changed) workdir.
+                //     Spawns a background thread; non-blocking.
+                let workdir = state.rest.session.as_ref().map(|s| s.workdir());
+                let dir_cache = state.rest.dir_cache.clone();
+                if let Some(wd) = workdir {
+                    crate::tool::dircache::reindex(wd, dir_cache);
                 }
                 // d) Rename LAST, and only when the name actually changed and is
                 //    non-empty. Doing it last means a rename failure can't lose the
