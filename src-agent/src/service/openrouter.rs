@@ -620,19 +620,22 @@ impl OpenRouterClient {
     /// Takes the fold system prompt + the pre-built user payload directly (a plain
     /// two-message request) rather than a message vec, since the caller always
     /// sends exactly system + user. Same body shape as `complete_with` (no tools,
-    /// `stream: false`, usage on, provider pin from `provider`) with one critical
-    /// difference:
-    /// - `reasoning: {enabled: false}` turns thinking OFF. This is non-negotiable:
-    ///   the returned text is PERSISTED as the rolling summary and replayed into
-    ///   every future send, so any leaked chain-of-thought would poison the
-    ///   conversation permanently. Thinking off keeps the reply clean and fills
-    ///   `content` directly. `effort` and `enabled` are mutually exclusive — only
-    ///   `enabled` is set. (No `response_format`: the summary is free-form prose.)
+    /// `stream: false`, usage on, provider pin from `provider`) with two critical
+    /// differences:
+    /// - `reasoning: {exclude: true}` keeps reasoning mandatory for endpoints that
+    ///   require it, but strips the `reasoning` field from the response. The summary
+    ///   is PERSISTED and replayed forever — a CoT bleed would poison the
+    ///   conversation permanently. Bleed-proof, verdict lands in `content`.
+    /// - `response_format` pins a STRICT `json_schema` (`{summary: string}`,
+    ///   `additionalProperties: false`) so even weak/4B models must emit exactly
+    ///   the summary object as JSON — never a verdict, refusal, or meta-commentary.
     ///
-    /// Returns the clean summary text: `message.content` when non-empty, else
-    /// `message.reasoning` (defensive — some models such as gpt-oss/deepseek leave
-    /// `content` empty and put the answer in `reasoning` even with thinking off),
-    /// else an error. Clean errors, no panics.
+    /// Returns the clean summary string extracted from `{"summary": "..."}`. On
+    /// parse failure or an empty `summary` field the function returns
+    /// `Err(anyhow!("unparseable summary"))` — no fallback to raw content or the
+    /// reasoning field (a model that ignores the schema fails-open; the caller
+    /// `update_summary` already swallows the error via `let _ =`, so no summary
+    /// is written that turn — acceptable). Clean errors, no panics.
     pub async fn summarize_fold(
         &self,
         model: &str,
@@ -641,6 +644,24 @@ impl OpenRouterClient {
         user_payload: &str,
     ) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
+        // Strict JSON-schema for the summary object. `strict: true` +
+        // `additionalProperties: false` force the model to emit exactly
+        // `{"summary": "<text>"}` and nothing else.
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "rolling_summary",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                }
+            }
+        });
         let messages = vec![
             ChatMessage::new(crate::dto::chat::Role::System, system_prompt),
             ChatMessage::new(crate::dto::chat::Role::User, user_payload),
@@ -665,8 +686,8 @@ impl OpenRouterClient {
                 enabled: None,
                 exclude: Some(true),
             }),
-            // Free-form summary prose; structured output is classifier-only.
-            response_format: None,
+            // Force the summary object as strict JSON.
+            response_format: Some(response_format),
             // No cap: fold summaries can be proportionally sized.
             max_tokens: None,
         };
@@ -694,14 +715,20 @@ impl OpenRouterClient {
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow!("no choices returned"))?;
-        // Content-only extraction: with `exclude: true` the response has no
-        // `reasoning` field, and we must NEVER fall back to it even if it appeared —
-        // raw CoT must not be persisted to the rolling summary.
+        // Strict-JSON extraction: parse `message.content` as `{"summary": "..."}`.
+        // No fallback to raw content or the reasoning field — a model that ignores
+        // the schema fails-open (the caller swallows the error), which is the correct
+        // behaviour: better to skip one turn's summary than to persist garbage.
         let content = message.content.as_deref().unwrap_or("").trim();
-        if !content.is_empty() {
-            return Ok(content.to_string());
-        }
-        Err(anyhow!("empty summary reply"))
+        let parsed: serde_json::Value =
+            serde_json::from_str(content).map_err(|_| anyhow!("unparseable summary"))?;
+        let summary = parsed
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("unparseable summary"))?;
+        Ok(summary.to_string())
     }
 
     /// Blob-rehydrate router completion against a DIFFERENT model/provider — the

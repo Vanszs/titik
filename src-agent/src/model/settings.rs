@@ -200,6 +200,12 @@ pub struct Settings {
     /// `6`. Old `settings.json` files load unchanged via the serde default.
     #[serde(default = "default_short_send_tail_n")]
     pub short_send_tail_n: i64,
+    /// Enable cache-warmth-adaptive summarization. When true, the runtime may
+    /// trigger a sliding-window summary when it detects the prompt cache has gone
+    /// cold, keeping costs low on providers with a sliding/refreshing prompt cache
+    /// (e.g. Anthropic). When false (the default), no such adaptation is attempted.
+    #[serde(default = "default_sliding_cache")]
+    pub sliding_cache: bool,
 }
 
 fn default_model() -> String {
@@ -242,6 +248,10 @@ fn default_short_send_tail_n() -> i64 {
     6
 }
 
+fn default_sliding_cache() -> bool {
+    false
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -262,6 +272,7 @@ impl Default for Settings {
             allowed_folders: Vec::new(),
             short_send_enabled: default_short_send_enabled(),
             short_send_tail_n: default_short_send_tail_n(),
+            sliding_cache: default_sliding_cache(),
         }
     }
 }

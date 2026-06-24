@@ -230,6 +230,17 @@ pub struct AppStateRest {
     /// away and acquires the new one. The clean-exit teardown in `runtime::run`
     /// removes it; a crash leaves a stale lock that PID-liveness later sweeps.
     pub held_lock: Option<std::path::PathBuf>,
+    /// Wall-clock instant of the most-recent send (user turn start). Stamped by
+    /// the submit handler in a later wave; used to estimate prompt-cache warmth.
+    #[allow(dead_code)]
+    pub last_send_at: Option<std::time::Instant>,
+    /// Latched true the first time a response reports `cached_tokens > 0`, meaning
+    /// the active provider supports and is using a prompt cache. Never reset.
+    pub provider_caches: bool,
+    /// Sticky engage-state for the cache-warmth-adaptive summarization hysteresis.
+    /// Set true when the summarizer engages; a later wave reads and writes it.
+    #[allow(dead_code)]
+    pub summarizing: bool,
 }
 
 impl AppState {
@@ -298,6 +309,9 @@ impl AppStateRest {
             compact_apply_at: None,
             compact_pending: None,
             held_lock: None,
+            last_send_at: None,
+            provider_caches: false,
+            summarizing: false,
         }
     }
 

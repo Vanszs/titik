@@ -164,6 +164,9 @@ pub enum SettingField {
     AllowedFolders,
     /// Toggle: master kill-switch for the short-send token saver.
     ShortSendEnabled,
+    /// Toggle: cache-warmth-adaptive summarization. On only for models with a
+    /// sliding/refreshing prompt cache (e.g. Anthropic).
+    SlidingCache,
 }
 
 impl SettingField {
@@ -186,6 +189,7 @@ impl SettingField {
             SettingField::ClassifierProvider => "Class. provider",
             SettingField::AllowedFolders     => "Allowed dirs",
             SettingField::ShortSendEnabled   => "Short-send",
+            SettingField::SlidingCache       => "Sliding cache",
         }
     }
 }
@@ -211,7 +215,7 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     },
     SettingCategory {
         name: "Session",
-        fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled],
+        fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled, SettingField::SlidingCache],
     },
     SettingCategory {
         name: "Awareness",
@@ -440,6 +444,8 @@ pub struct SettingsState {
     pub allowed_folders: Vec<String>,
     /// Draft: short-send token-saver master switch.
     pub short_send_enabled: bool,
+    /// Draft: cache-warmth-adaptive summarization toggle.
+    pub sliding_cache: bool,
     /// The session's effective working directory, captured at construction. Used
     /// as the base for resolving workspace-relative paths in the FS picker.
     pub cwd: PathBuf,
@@ -508,6 +514,7 @@ impl SettingsState {
             classifier_provider: session.settings.classifier_provider.clone(),
             allowed_folders,
             short_send_enabled: session.settings.short_send_enabled,
+            sliding_cache: session.settings.sliding_cache,
             cwd: effective_cwd,
             list_editing: false,
             list_sel: 0,
@@ -552,7 +559,8 @@ impl SettingsState {
             | SettingField::AwarenessModel
             | SettingField::AwarenessProvider
             | SettingField::ClassifierEnabled
-            | SettingField::ShortSendEnabled => None,
+            | SettingField::ShortSendEnabled
+            | SettingField::SlidingCache => None,
         }
     }
 
@@ -679,6 +687,9 @@ impl SettingsState {
             }
             SettingField::ShortSendEnabled => {
                 self.short_send_enabled = !self.short_send_enabled;
+            }
+            SettingField::SlidingCache => {
+                self.sliding_cache = !self.sliding_cache;
             }
             SettingField::Workdir | SettingField::AllowedFolders => {
                 // Path lists: drop into per-entry management, top row selected.

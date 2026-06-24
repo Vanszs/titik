@@ -1,6 +1,7 @@
 //! Async streaming bridge: spawn / abort / finalize a request task.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -541,33 +542,103 @@ pub(super) fn start_stream_task(
     // returns a NEW Vec; it does not touch `sess.conversation`, `messages.json`,
     // or the rendered transcript — display is entirely unaffected.
     //
-    // `context_limit`: the model's context-window size in tokens, looked up from
-    // the cached catalogue. `None` when the catalogue isn't available yet — shape
-    // falls back to its FALLBACK_CONTEXT constant in that case.
-    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String, Option<u64>)> =
+    // The OLD per-send "is the history near the window?" gate moves HERE (out of
+    // shape) so it can read the live cache-warmth + sticky engage state, which only
+    // exists on `state`. We compute the engage decision (a bool) + the token budget
+    // (`usable`) into locals FIRST — all the `state.rest` reads happen up front so
+    // they don't borrow-conflict with the per-session snapshot or the two writes
+    // below. Everything here is a no-op (`summarizing` stays false, the task sends
+    // the history unchanged) when there's no active session.
+    //
+    // The per-session snapshot the reshape task needs: (dir, settings, latest user
+    // message). Cloned out of the session up front so the spawned task holds no
+    // borrow of `state`, and so `settings` is available to size the window + read
+    // `sliding_cache` below without re-borrowing the session.
+    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String)> =
         state.rest.session.as_ref().map(|sess| {
             let user_intent = sess.conversation.last_user_content().unwrap_or_default();
-            let context_limit = state
+            (sess.path.clone(), sess.settings.clone(), user_intent)
+        });
+
+    // 1. Window: the model's context-window size in tokens, from the cached
+    //    catalogue. 128k is a safe fallback (the min-window policy is 100k+).
+    let window = reshape
+        .as_ref()
+        .and_then(|(_, settings, _)| {
+            state
                 .rest
                 .models_cache
                 .as_deref()
                 .and_then(|models| {
-                    crate::service::openrouter::context_length_for(models, &sess.settings.model)
-                });
-            (sess.path.clone(), sess.settings.clone(), user_intent, context_limit)
-        });
+                    crate::service::openrouter::context_length_for(models, &settings.model)
+                })
+        })
+        .unwrap_or(128_000);
+    // 2. Usable budget: the window minus the fixed system/tools/memory overhead,
+    //    floored so the percentages below never go degenerate on a tiny window.
+    let usable = window
+        .saturating_sub(super::shortsend::BASE_OVERHEAD)
+        .max(8_000);
+    // 3. Conversation size estimate (~4 chars/token over content + tool args).
+    let conv_tokens = super::shortsend::estimate_conv_tokens(&history);
+    // 4. Cache warmth: a warm cache (provider supports caching, the cache holds
+    //    tokens, and the last send was recent enough that it hasn't gone cold)
+    //    lets the conversation grow far larger before we summarize. The cold
+    //    window is longer when the provider runs a sliding/refreshing cache.
+    let sliding_cache = reshape
+        .as_ref()
+        .is_some_and(|(_, settings, _)| settings.sliding_cache);
+    let gap = state.rest.last_send_at.map(|t| t.elapsed());
+    let cold_window = if sliding_cache {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(120)
+    };
+    let cache_warm = state.rest.provider_caches
+        && state.rest.tokens_cached > 0
+        && gap.is_some_and(|g| g < cold_window);
+    let engage_pct = if cache_warm {
+        super::shortsend::ENGAGE_WARM_PCT
+    } else {
+        super::shortsend::ENGAGE_COLD_PCT
+    };
+    // 5. Sticky engage hysteresis: cross the (warmth-dependent) engage threshold to
+    //    turn summarizing ON; only fall back below DISENGAGE_PCT to turn it OFF.
+    //    The dead-zone between the two prevents flapping on/off each turn.
+    let enter = conv_tokens > engage_pct * usable / 100;
+    let exit = conv_tokens < super::shortsend::DISENGAGE_PCT * usable / 100;
+    if !state.rest.summarizing && enter {
+        state.rest.summarizing = true;
+    } else if state.rest.summarizing && exit {
+        state.rest.summarizing = false;
+    }
+    let summarizing = state.rest.summarizing;
+    // 6. Stamp the send instant so the NEXT turn can measure cache warmth from the
+    //    gap since this send.
+    state.rest.last_send_at = Some(Instant::now());
     let (tx, rx) = mpsc::unbounded_channel();
     state.rest.active_rx = Some(rx);
     let c = Arc::clone(client.as_ref().unwrap());
     let jh = handle.spawn(async move {
         // Reshape the wire payload just before POSTing. `shape` preserves the
         // system message at index 0 (with the project-files/awareness injection
-        // applied above), so the model still receives the real system prompt. It
-        // fails open — any error returns the original history — so this can never
-        // break the send.
+        // applied above, plus — when engaged — the condensed-history summary
+        // appended to its uncached tail), so the model still receives the real
+        // system prompt. It fails open — any error returns the original history —
+        // so this can never break the send. `summarizing` is the upstream engage
+        // decision; `usable` is the token budget the fold's band sizing uses.
         let history = match reshape {
-            Some((session_dir, settings, user_intent, context_limit)) => {
-                super::shortsend::shape(history, &session_dir, &c, &settings, &user_intent, context_limit).await
+            Some((session_dir, settings, user_intent)) => {
+                super::shortsend::shape(
+                    history,
+                    &session_dir,
+                    &c,
+                    &settings,
+                    &user_intent,
+                    summarizing,
+                    usable,
+                )
+                .await
             }
             None => history,
         };

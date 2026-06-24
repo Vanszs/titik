@@ -234,6 +234,12 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, palette: &Palette) {
                     let v = if st.short_send_enabled { "on" } else { "off" };
                     vec![Span::styled(v, Style::default().fg(palette.accent))]
                 }
+                SettingField::SlidingCache => {
+                    // Boolean toggle: on/off (on only for providers with a sliding
+                    // prompt cache, e.g. Anthropic).
+                    let v = if st.sliding_cache { "on" } else { "off" };
+                    vec![Span::styled(v, Style::default().fg(palette.accent))]
+                }
                 SettingField::AwarenessSource => {
                     // Boolean toggle: inherit the session model, or a custom one.
                     let v = if st.awareness_inherit {

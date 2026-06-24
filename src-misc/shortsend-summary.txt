@@ -14,4 +14,4 @@ Produce an UPDATED summary that merges the NEW MESSAGES into the EXISTING SUMMAR
 - NEVER inline large code blocks or command/tool output. When the conversation involves a captured blob, REFERENCE it as `[blob #<id>]` using the ids from AVAILABLE BLOBS instead of pasting its contents. The summary stays small; full content is fetched on demand later.
 - Write plain prose or terse bullet-style lines. Do not invent information that is not in the inputs.
 
-Output ONLY the updated summary text. No preamble, no "Here is", no section headings, no markdown fences, no meta-commentary, and no thinking — just the summary itself.
+Output a JSON object: {"summary": "<the updated summary text>"}. Put the entire summary in the "summary" field and output nothing else.

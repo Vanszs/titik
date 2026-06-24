@@ -189,6 +189,11 @@ pub(super) fn run_loop(
                         // away so the readout can show the cache hit even on a
                         // tool round-trip that commits no assistant text.
                         state.rest.tokens_cached = cached_tokens;
+                        // Latch: once any response reports cache hits we know this
+                        // provider supports prompt caching. Never reset.
+                        if cached_tokens > 0 {
+                            state.rest.provider_caches = true;
+                        }
                     }
                     StreamEvent::ToolCalls(calls) => {
                         // Stash the requested tool calls; do NOT break — Done

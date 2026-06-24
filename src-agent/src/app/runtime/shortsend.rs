@@ -44,6 +44,56 @@ use crate::model::settings::Settings;
 use crate::resources;
 use crate::service::openrouter::OpenRouterClient;
 
+// --- Cache-warmth-adaptive, hysteresis-driven summarization rail ---------------
+//
+// All of these are token budgets expressed as a PERCENTAGE of `usable`, where
+// `usable = context_window - BASE_OVERHEAD`. The engage decision (cold/warm +
+// sticky hysteresis) is made upstream in `start_stream_task`; the fold boundary
+// (token-band step-advance) is made in `update_summary`. Both consume `usable`.
+
+/// Fixed system+tools+memory token cost that never appears in `history` but DOES
+/// count against the model's context window. Subtracted off the window so every
+/// percentage below is taken against the budget actually available to the chat.
+pub(super) const BASE_OVERHEAD: u64 = 10_000;
+/// After a fold, the verbatim tail is shrunk down to roughly this % of `usable`.
+const TAIL_FLOOR_PCT: u64 = 5;
+/// Once the verbatim tail grows past this % of `usable`, refold (advance the
+/// watermark). Below it the fold is a no-op — the hysteresis dead-zone that
+/// avoids a summarizer call every single turn.
+const TAIL_HI_PCT: u64 = 15;
+/// Engage threshold (conversation size as % of `usable`) when the prompt cache is
+/// cold or absent: summarize sooner, since there's no warm cache to ride.
+pub(super) const ENGAGE_COLD_PCT: u64 = 20;
+/// Engage threshold when the cache is warm: let the conversation grow far larger
+/// before summarizing, since a warm cache makes the big prefix cheap.
+pub(super) const ENGAGE_WARM_PCT: u64 = 80;
+/// Sticky disengage floor: once engaged, KEEP summarizing until the conversation
+/// shrinks below this % of `usable`. The gap between this and the engage
+/// thresholds is the hysteresis band that prevents flapping on/off each turn.
+pub(super) const DISENGAGE_PCT: u64 = 15;
+
+/// Estimate the conversation's token cost from an API-bound history slice:
+/// `~4 chars/token` over each message's content plus its tool-call arguments
+/// (often the bulk of a turn). This is the SAME estimate shape the engage gate
+/// uses; `start_stream_task` calls it to size the conversation against `usable`
+/// before deciding whether to summarize. No tokenizer needed — fast + cheap.
+pub(super) fn estimate_conv_tokens(history: &[ChatMessage]) -> u64 {
+    history
+        .iter()
+        .map(|m| {
+            let base = m.content.chars().count() as u64 / 4;
+            let args: u64 = m
+                .tool_calls
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|tc| tc.function.arguments.chars().count() as u64 / 4)
+                .sum();
+            base + args
+        })
+        .sum()
+}
+
 /// Most blobs to rehydrate into a single send payload. A hard cap so the router
 /// can't undo the compression by recalling the whole archive — the summary
 /// already carries the gist; recalls are for the few items the question needs.
@@ -79,49 +129,91 @@ fn cap_chars(s: &str, cap: usize) -> String {
     s.chars().take(cap).collect()
 }
 
-/// Fold newly-archived messages into the session's rolling summary.
+/// Fold newly-archived messages into the session's rolling summary, advancing the
+/// summary watermark by a TOKEN BAND rather than a fixed message count.
 ///
-/// `tail_n` is how many of the newest messages are kept verbatim and therefore
-/// NEVER folded — only messages older than that tail are summarised.
+/// `usable = context_window - BASE_OVERHEAD` is the budget the percentages are
+/// taken against. The verbatim tail (messages after the current watermark) is
+/// allowed to grow up to [`TAIL_HI_PCT`] of `usable`; only when it crosses that
+/// high-water mark do we fold, and we fold just enough that the REMAINING tail
+/// drops back to ~[`TAIL_FLOOR_PCT`]. This hysteresis dead-zone means we do NOT
+/// pay for a summarizer call on every turn — only when the tail has genuinely
+/// grown past the band.
 ///
 /// Returns `Ok(true)` when a fold happened (a new summary was written) and
-/// `Ok(false)` when there was nothing new to fold (so the caller can skip the
-/// write entirely). Errors propagate from the secondary model call; the sqlite
-/// helpers are best-effort and degrade to empty rather than erroring.
+/// `Ok(false)` when there was nothing to fold (tail still within band, or no
+/// valid completed-exchange boundary) — so the caller can skip the write
+/// entirely. Errors propagate from the secondary model call; the sqlite helpers
+/// are best-effort and degrade to empty rather than erroring.
 pub async fn update_summary(
     session_dir: &Path,
     client: &OpenRouterClient,
     settings: &Settings,
-    tail_n: i64,
+    usable: u64,
 ) -> Result<bool> {
-    // Clamp: tail_n == 0 would make fold_up_to == max_id and fold the entire
-    // history including the would-be verbatim tail. Enforce a minimum of 1.
-    let tail_n = tail_n.max(1);
-
     // Existing summary state. Absent row (first ever fold) → empty text, covers 0.
     let cur = msglog::read_summary(session_dir);
     let existing_text = cur.as_ref().map(|s| s.text.as_str()).unwrap_or("");
     let covers_up_to = cur.as_ref().map(|s| s.covers_up_to).unwrap_or(0);
 
-    // Snap the fold boundary to a COMPLETED-exchange edge so a tool-call chain is
-    // never cut and the current, in-progress exchange is never summarised. An
-    // exchange runs from one `user` message up to (but not including) the next;
-    // the most recent `user` message begins the live exchange, which must stay
-    // verbatim. We take the position-based tail target (`max_id - tail_n`), then
-    // snap DOWN to the largest user-message id at or before it: folding stops just
-    // before that exchange, so [K .. end] (>= tail_n msgs, the whole current
-    // exchange) stays verbatim.
-    let max_id = msglog::max_message_id(session_dir);
-    let user_ids = msglog::user_message_ids(session_dir); // ascending
-    let target = max_id - tail_n;
-    let k = user_ids.iter().copied().filter(|&u| u <= target).max();
-    let fold_up_to = match k {
-        Some(k) => k - 1, // fold everything strictly before exchange K
-        None => return Ok(false), // no completed-exchange boundary far enough back → don't fold
-    };
-    if fold_up_to <= covers_up_to {
+    // The verbatim tail = every message after the current watermark. Measure its
+    // token cost (~4 chars/token over content) to decide whether it has grown out
+    // of band. (fetch returns id ASC, id > covers_up_to.)
+    let tail: Vec<msglog::ArchivedMsg> =
+        msglog::fetch_messages_since(session_dir, covers_up_to, DELTA_LIMIT);
+    if tail.is_empty() {
         return Ok(false);
     }
+    let tok = |s: &str| s.chars().count() as u64 / 4;
+    let tail_tokens: u64 = tail.iter().map(|m| tok(&m.content)).sum();
+
+    // Hysteresis dead-zone: the tail is still within band → no fold this turn.
+    // This is the whole point of the token-band design: a fold (a secondary LLM
+    // call) only fires when the tail has actually outgrown TAIL_HI_PCT.
+    let tail_hi = TAIL_HI_PCT * usable / 100;
+    if tail_tokens <= tail_hi {
+        return Ok(false);
+    }
+
+    // Pick the cut so the REMAINING verbatim tail is ~TAIL_FLOOR_PCT of usable.
+    // Walk the tail NEWEST→oldest accumulating tokens; the first message at which
+    // the kept-newest total reaches `tail_floor` is the youngest message we still
+    // keep. Everything OLDER than it is a fold candidate, so the walked cut point
+    // is the id of the message just before that kept boundary.
+    let tail_floor = (TAIL_FLOOR_PCT * usable / 100).max(1);
+    let mut kept = 0u64;
+    // Default the cut to "fold the whole tail" (cut at the newest id); the loop
+    // below raises it to the boundary where the kept-newest tokens hit the floor.
+    let mut cut_id = tail.last().map(|m| m.id).unwrap_or(covers_up_to);
+    for m in tail.iter().rev() {
+        kept += tok(&m.content);
+        if kept >= tail_floor {
+            // `m` is the oldest message we KEEP; fold everything strictly before it.
+            cut_id = m.id - 1;
+            break;
+        }
+    }
+
+    // Snap the cut DOWN to a COMPLETED-exchange edge so a tool-call chain is never
+    // cut and the current, in-progress exchange is never summarised. An exchange
+    // runs from one `user` message up to (but not including) the next; the most
+    // recent `user` message begins the live exchange, which must stay verbatim.
+    // Valid boundaries are `(user_id) - 1`: pick the LARGEST that is <= the walked
+    // cut, strictly > covers_up_to (so we actually advance), and < the last user
+    // message id (so the live exchange is never folded).
+    let user_ids = msglog::user_message_ids(session_dir); // ascending
+    let last_user = user_ids.last().copied().unwrap_or(i64::MAX);
+    let fold_up_to = match user_ids
+        .iter()
+        .copied()
+        .filter(|&u| u < last_user) // never fold the in-progress (last) exchange
+        .map(|u| u - 1)
+        .filter(|&b| b <= cut_id && b > covers_up_to)
+        .max()
+    {
+        Some(b) => b,
+        None => return Ok(false), // no completed-exchange boundary in range → don't fold
+    };
 
     // Pull everything after the last-covered id, then trim to the fold ceiling so
     // the verbatim tail stays out. (fetch returns id ASC, id > covers_up_to.)
@@ -251,40 +343,47 @@ fn build_router_payload(user_intent: &str, candidates: &[msglog::BlobRef]) -> St
 /// bleed into the payload.
 ///
 /// `history[0]` (the system message, already carrying any project-files/awareness
-/// injection from the caller) is preserved VERBATIM as index 0 of the output, so
-/// downstream system-message handling still lands on the real system message.
+/// injection from the caller) is preserved as index 0 of the output. The rolling
+/// summary + any rehydrated blobs are APPENDED to its content (after the volatile
+/// dir-listing/awareness tail), NOT emitted as a synthetic assistant turn — so the
+/// caching wire layer's mark-split still lands on the real system message, and the
+/// per-fold summary stays in the uncached tail (it must not bust the cached head).
 ///
-/// `context_limit` is the model's context-window size in tokens (from the OpenRouter
-/// catalogue). When `None`, a conservative fallback is used. Compression only fires
-/// when the estimated history size exceeds `COMPRESS_AT_PCT`% of the window — below
-/// that threshold the full history is sent verbatim (cheap via prompt caching).
+/// `summarizing` is the engage decision, made UPSTREAM in `start_stream_task`
+/// (cache-warmth + sticky hysteresis). When false, the full history is sent
+/// verbatim (cheap via prompt caching) and this is a no-op. `usable =
+/// context_window - BASE_OVERHEAD` is the token budget the fold's band sizing is
+/// taken against.
 pub async fn shape(
     history: Vec<ChatMessage>,
     session_dir: &Path,
     client: &OpenRouterClient,
     settings: &Settings,
     user_intent: &str,
-    context_limit: Option<u64>,
+    summarizing: bool,
+    usable: u64,
 ) -> Vec<ChatMessage> {
     // 1. Kill switch: short-send disabled → send the full history unchanged.
     if !settings.short_send_enabled {
         return history;
     }
 
-    // 2. Too short to be worth compressing. Need a system message plus enough
-    //    body that dropping the old part actually saves anything: the verbatim
-    //    tail is `tail_n` long, and we only win once there are messages OLDER than
-    //    the tail (which the summary then represents). `tail_n + 2` leaves room
-    //    for the system message + the injected summary turn + a non-trivial tail.
-    //    Also guard tail_n == 0: a zero tail would fold everything and produce a
-    //    degenerate payload (no verbatim messages at all).
-    let tail_n = settings.short_send_tail_n;
-    if tail_n < 1 || history.len() as i64 <= tail_n + 2 {
+    // 2. Engage gate. The cache-warmth + sticky-hysteresis decision is made
+    //    upstream (in `start_stream_task`); here we simply honour it. Not engaged
+    //    → send the full history (cheap via prompt caching; full fidelity).
+    if !summarizing {
         return history;
     }
-    let tail_n = tail_n as usize;
 
-    // 2b. Post-compaction guard: if the conversation already carries a compaction
+    // 2b. Too short to be worth compressing: need a system message plus a couple
+    //     of body messages, else dropping the old part saves nothing. Sized off
+    //     `usable` would be overkill for such a tiny payload — a small structural
+    //     floor is enough (we already know we're engaged).
+    if history.len() <= 3 {
+        return history;
+    }
+
+    // 2c. Post-compaction guard: if the conversation already carries a compaction
     //     summary turn (i.e. history[1] is an Assistant message whose content
     //     starts with "[summary of earlier conversation]"), stacking our own
     //     sqlite summary on top would produce a broken double-summary payload.
@@ -298,41 +397,11 @@ pub async fn shape(
         }
     }
 
-    // 2c. Threshold gate: only compress when we're actually near the model's context
-    //     window. Below the threshold the full history is cheap via prompt caching
-    //     AND weak models keep full context fidelity — compression only kicks in as
-    //     an overflow valve. Estimate token count at ~4 chars/token (fast, no
-    //     tokenizer needed). An unknown window falls back to FALLBACK_CONTEXT; when
-    //     in doubt, prefer sending the full history (fail-open).
-    const COMPRESS_AT_PCT: u64 = 75;
-    const FALLBACK_CONTEXT: u64 = 32_768; // conservative default when window is unknown
-    // ~4 chars/token. Include tool-call argument blobs (often large) and a fixed
-    // overhead for the system prompt + tool-definition schemas, which aren't in
-    // `history` but DO count against the model's context window.
-    const TOOL_DEF_OVERHEAD: u64 = 2_500;
-    let est_tokens: u64 = TOOL_DEF_OVERHEAD
-        + history
-            .iter()
-            .map(|m| {
-                let base = m.content.chars().count() as u64 / 4;
-                let args: u64 = m
-                    .tool_calls
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|tc| tc.function.arguments.chars().count() as u64 / 4)
-                    .sum();
-                base + args
-            })
-            .sum::<u64>();
-    let window = context_limit.unwrap_or(FALLBACK_CONTEXT);
-    if est_tokens < window * COMPRESS_AT_PCT / 100 {
-        return history; // plenty of room — send the full history, no compression
-    }
-
     // 3. Best-effort fold so the summary reflects everything older than the tail.
-    //    Errors / "nothing to fold" are ignored — we use whatever summary exists.
-    let _ = update_summary(session_dir, client, settings, tail_n as i64).await;
+    //    Token-band step-advance: this is a no-op unless the verbatim tail has
+    //    grown past TAIL_HI_PCT of `usable`. Errors / "nothing to fold" are ignored
+    //    — we use whatever summary already exists.
+    let _ = update_summary(session_dir, client, settings, usable).await;
 
     // 4. No summary yet → nothing to compress against; send the full history.
     let Some(sum) = msglog::read_summary(session_dir) else {
@@ -344,18 +413,18 @@ pub async fn shape(
     // advanced into yet. The fold only ever snaps `covers_up_to` to a
     // completed-exchange edge, so this auto-grows the verbatim window to cover the
     // whole live exchange and leaves NO gap between the summary and the tail.
-    // `tail_n` is a floor; clamp to >= 1 so we always keep at least one message.
+    // Clamp to >= 1 so we always keep at least one message. Part 3 bounds this to
+    // ~<= TAIL_HI_PCT of `usable`.
     let max_id = msglog::max_message_id(session_dir);
-    let keep = ((max_id - sum.covers_up_to).max(tail_n as i64)).max(1) as usize;
+    let keep = (max_id.saturating_sub(sum.covers_up_to)).max(1) as usize;
 
     // 5. Split into [system, body...]. Defensive: a missing/empty history or a
-    //    body shorter than the tail falls open to the original.
+    //    body shorter than the kept tail falls open to the original.
     if history.is_empty() {
         return history;
     }
-    let system = history[0].clone();
     let body = &history[1..];
-    if body.len() <= tail_n {
+    if body.is_empty() {
         return history;
     }
     // Keep the LAST `keep` messages verbatim (clamped to the body length);
@@ -399,20 +468,27 @@ pub async fn shape(
         }
     }
 
-    // 7. Assemble the summary-bearing assistant turn exactly like
-    //    `Conversation::apply_compaction`: an Assistant message whose content is
-    //    `"[summary of earlier conversation]\n" + summary`, with the rehydrated
-    //    blob blocks appended below.
-    let mut summary_content = format!("[summary of earlier conversation]\n{}", sum.text);
+    // 7. B-PLACEMENT: the summary goes into the SYSTEM message tail, NOT a
+    //    synthetic assistant turn. `history[0]` already ends (after
+    //    CACHE_SPLIT_MARK) with the volatile dir-listing/awareness block; append
+    //    the condensed-history summary, then the rehydrated blob blocks, after it.
+    //    Because all of this lands AFTER the mark, it rides in the UNCACHED tail —
+    //    correct, since the summary changes per fold and must not bust the cached
+    //    head. `shape` owns `history`, so we mutate index 0 in place.
+    let mut system = history[0].clone();
+    system.content.push_str(&format!(
+        "\n\n# Conversation so far (reference — earlier turns, condensed)\n{}",
+        sum.text
+    ));
     for block in &recalls {
-        summary_content.push_str(block);
+        system.content.push_str(block);
     }
-    let summary_turn = ChatMessage::new(Role::Assistant, summary_content);
 
-    // 8. Output: [ original system (index 0, unchanged), summary turn, tail... ].
-    let mut out: Vec<ChatMessage> = Vec::with_capacity(2 + tail.len());
+    // 8. Output: [ modified system (index 0), verbatim tail... ]. No synthetic
+    //    assistant summary turn — index 0 stays the system message so `to_wire`'s
+    //    mark-split still applies.
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(1 + tail.len());
     out.push(system);
-    out.push(summary_turn);
     out.extend(tail);
     out
 }

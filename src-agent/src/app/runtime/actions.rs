@@ -388,6 +388,7 @@ pub(super) fn apply_action(
                     s.classifier_provider.clone(),
                     s.allowed_folders.clone(),
                     s.short_send_enabled,
+                    s.sliding_cache,
                 )),
                 _ => None,
             };
@@ -408,6 +409,7 @@ pub(super) fn apply_action(
                 classifier_provider,
                 allowed_folders,
                 short_send_enabled,
+                sliding_cache,
             )) = drafts
             {
                 // Detect whether the OpenRouter-relevant creds changed so we only
@@ -465,6 +467,9 @@ pub(super) fn apply_action(
                     // Short-send kill switch: no client rebuild needed; the
                     // shape() call reads this flag per-send.
                     sess.settings.short_send_enabled = short_send_enabled;
+                    // Sliding-cache toggle: no client rebuild needed; a later
+                    // wave's summarization logic reads this flag per-send.
+                    sess.settings.sliding_cache = sliding_cache;
                 }
                 // b) Apply global theme/accent and persist config.json. Best-effort:
                 //    a write failure surfaces to the status line but does not abort
