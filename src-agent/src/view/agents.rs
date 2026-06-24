@@ -114,20 +114,18 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
     Rect { x, y, width: w, height: h }
 }
 
-/// Render the tool multi-select picker overlay.
+/// Render the tool multi-select picker overlay as a proper bordered modal.
 ///
-/// Visual structure (borderless except for the TOP+BOTTOM title rules,
-/// matching the effort picker):
+/// Visual structure (Borders::ALL box, backdrop dimmed):
 ///
 /// ```text
-///  tools
-/// ──────────────────────
-///  filter: foo_
-///  [x] read
-///  [ ] grep
-///  …
-/// ──────────────────────
-///  space toggle · …hint
+/// ┌─ tools (N selected) ────────────┐
+/// │ type to filter                  │
+/// │ [x] read                        │
+/// │ [ ] grep                        │
+/// │ …                               │
+/// │ space toggle · enter ok · esc   │
+/// └─────────────────────────────────┘
 /// ```
 fn draw_tool_picker(
     frame: &mut Frame,
@@ -136,30 +134,56 @@ fn draw_tool_picker(
     area: Rect,
 ) {
     let filtered = picker.filtered_indices();
-    // Height: title (3) + filter line (1) + options (min 1, max 10) + hint (1).
+    // Content rows: filter line (1) + options (min 1, max 10) + hint (1).
     let opt_rows = filtered.len().clamp(1, 10) as u16;
-    let total_h = 3 + 1 + opt_rows + 1;
-    let popup_w = 36_u16.min(area.width.saturating_sub(4));
+    let content_h = 1 + opt_rows + 1; // filter + options + hint
+    // Total height includes top and bottom borders.
+    let total_h = content_h + 2;
+    // Width: content is "[x] toolname" with 1-space left pad + padding.
+    // 36 inner chars + 2 borders = 38 total, clamped to frame.
+    let popup_w = 38_u16.min(area.width.saturating_sub(2));
     let popup = centered_rect(area, popup_w, total_h);
 
-    // Clear the background so the overlay is opaque.
-    frame.render_widget(Clear, popup);
+    // --- Dim the backdrop (everything outside the modal rect). ---
+    // We mutate the frame buffer directly: for each cell not inside the modal,
+    // set its foreground to palette.dim so the background recedes.
+    {
+        let buf = frame.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                // Skip cells that are inside (or on the border of) the modal.
+                if x >= popup.x && x < popup.right() && y >= popup.y && y < popup.bottom() {
+                    continue;
+                }
+                buf[(x, y)].set_fg(palette.dim);
+            }
+        }
+    }
 
-    // Title bar (TOP + BOTTOM rules, title on top rule).
-    let title_block = Block::new()
-        .borders(Borders::TOP | Borders::BOTTOM)
+    // --- Modal box: Clear → Block (Borders::ALL) → inner content. ---
+    let n_checked = picker.checked.iter().filter(|&&c| c).count();
+    let title = if n_checked > 0 {
+        format!(" tools ({n_checked} selected) ")
+    } else {
+        " tools ".to_string()
+    };
+    let modal_block = Block::bordered()
         .border_style(Style::default().fg(palette.dim))
-        .title(Span::styled(" tools ", Style::default().fg(palette.dim)));
+        .title(Span::styled(title, Style::default().fg(palette.accent)));
+    let inner = modal_block.inner(popup);
 
-    // The title block occupies the top 3 rows; content below it is the body.
-    let title_rect = Rect { x: popup.x, y: popup.y, width: popup.width, height: 3 };
-    frame.render_widget(title_block, title_rect);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(modal_block, popup);
 
-    let body_y = popup.y + 3;
-    let body_w = popup.width.saturating_sub(2);
-    let body_x = popup.x + 1;
+    // Bail out if the inner area is too small to render content.
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    // Filter line.
+    let body_w = inner.width;
+    let body_x = inner.x;
+
+    // Filter line (top row of inner area).
     let filter_text = if picker.filter.is_empty() {
         format!("{:<width$}", "type to filter", width = body_w as usize)
     } else {
@@ -169,12 +193,12 @@ fn draw_tool_picker(
     let filter_color = if picker.filter.is_empty() { palette.dim } else { palette.fg };
     frame.render_widget(
         Paragraph::new(Span::styled(filter_text, Style::default().fg(filter_color))),
-        Rect { x: body_x, y: body_y, width: body_w, height: 1 },
+        Rect { x: body_x, y: inner.y, width: body_w, height: 1 },
     );
 
     // Option rows.
     let cursor = picker.cursor.min(filtered.len().saturating_sub(1));
-    let opt_area_y = body_y + 1;
+    let opt_area_y = inner.y + 1;
     // Scroll so the cursor row is always visible.
     let scroll = cursor.saturating_sub((opt_rows as usize).saturating_sub(1));
 
@@ -190,12 +214,12 @@ fn draw_tool_picker(
             let label = format!("{} {}", mark, picker.options[oi]);
             if fi == cursor {
                 lines.push(Line::from(Span::styled(
-                    format!(" {:<width$}", label, width = (body_w as usize).saturating_sub(1)),
+                    format!("{:<width$}", label, width = body_w as usize),
                     Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
-                    format!(" {label}"),
+                    label,
                     Style::default().fg(palette.accent),
                 )));
             }
@@ -207,7 +231,7 @@ fn draw_tool_picker(
         Rect { x: body_x, y: opt_area_y, width: body_w, height: opt_rows },
     );
 
-    // Hint line (bottom of the popup).
+    // Hint line (last row of inner area).
     let hint_y = opt_area_y + opt_rows;
     let hint = "space toggle · type filter · enter ok · esc cancel";
     frame.render_widget(
