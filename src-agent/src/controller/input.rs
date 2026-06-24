@@ -296,7 +296,8 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Up => {
-            // Command palette takes precedence; then file palette; then history recall.
+            // Command palette takes precedence; then file palette; then within-input
+            // line movement; finally history recall (only when already on line 0).
             if !command::palette_matches(&rest.input).is_empty() {
                 rest.palette_sel = rest.palette_sel.saturating_sub(1);
             } else {
@@ -305,7 +306,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     rest.palette_sel = rest.palette_sel.saturating_sub(1);
-                } else {
+                } else if !rest.cursor_up() {
                     let users = user_messages(rest);
                     rest.history_prev(&users);
                 }
@@ -322,7 +323,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                     .unwrap_or_default();
                 if !fmatches.is_empty() {
                     rest.palette_sel = (rest.palette_sel + 1).min(fmatches.len() - 1);
-                } else {
+                } else if !rest.cursor_down() {
                     let users = user_messages(rest);
                     rest.history_next(&users);
                 }

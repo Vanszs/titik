@@ -389,6 +389,67 @@ impl AppStateRest {
     pub fn cursor_end(&mut self) {
         self.cursor = self.char_len();
     }
+
+    /// Move the caret up one visual line within a multi-line input.
+    ///
+    /// Returns `true` when the caret moved (so the caller can suppress history
+    /// recall), or `false` when the caret is already on the first line (single-
+    /// line input always returns `false`, preserving the existing history-recall
+    /// behaviour).
+    pub fn cursor_up(&mut self) -> bool {
+        // Walk chars up to cursor to compute (line, col) in char units.
+        let mut line: usize = 0;
+        let mut col: usize = 0;
+        for ch in self.input.chars().take(self.cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        if line == 0 {
+            return false; // already on the first line → let caller do history
+        }
+        // Collect char lengths per line (split on '\n').
+        let line_lens: Vec<usize> = self.input.split('\n').map(|l| l.chars().count()).collect();
+        let target_line = line - 1;
+        let target_col = col.min(line_lens[target_line]);
+        // Convert (target_line, target_col) back to a flat char index.
+        self.cursor = line_lens[..target_line].iter().sum::<usize>()
+            + target_line  // one '\n' per consumed line break
+            + target_col;
+        true
+    }
+
+    /// Move the caret down one visual line within a multi-line input.
+    ///
+    /// Returns `true` when the caret moved, `false` when already on the last
+    /// line (single-line input always returns `false`).
+    pub fn cursor_down(&mut self) -> bool {
+        let line_lens: Vec<usize> = self.input.split('\n').map(|l| l.chars().count()).collect();
+        let last_line = line_lens.len() - 1;
+        // Walk chars up to cursor to compute (line, col).
+        let mut line: usize = 0;
+        let mut col: usize = 0;
+        for ch in self.input.chars().take(self.cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        if line == last_line {
+            return false; // already on the last line → let caller do history
+        }
+        let target_line = line + 1;
+        let target_col = col.min(line_lens[target_line]);
+        self.cursor = line_lens[..target_line].iter().sum::<usize>()
+            + target_line  // one '\n' per consumed line break
+            + target_col;
+        true
+    }
     pub fn take_input(&mut self) -> String {
         self.palette_sel = 0;
         self.hist_idx = None;
