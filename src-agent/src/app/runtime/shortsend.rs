@@ -330,6 +330,32 @@ fn build_router_payload(user_intent: &str, candidates: &[msglog::BlobRef]) -> St
     out
 }
 
+/// Extract significant search terms from the user's latest message for the
+/// content-recall query: split on every non-alphanumeric boundary, lowercase,
+/// keep words of length >= 4 (drops stop-word-ish noise and punctuation), dedup
+/// preserving first-seen order, and cap at 8 (enough signal; keeps the LIKE OR
+/// chain small). Returns an empty vec when nothing qualifies — the caller then
+/// skips the content-search path entirely.
+fn significant_terms(user_intent: &str) -> Vec<String> {
+    const MAX_TERMS: usize = 8;
+    const MIN_LEN: usize = 4;
+    let mut out: Vec<String> = Vec::new();
+    for raw in user_intent.split(|c: char| !c.is_alphanumeric()) {
+        if raw.chars().count() < MIN_LEN {
+            continue;
+        }
+        let term = raw.to_lowercase();
+        if out.iter().any(|t| t == &term) {
+            continue; // dedup, first-seen order preserved
+        }
+        out.push(term);
+        if out.len() >= MAX_TERMS {
+            break;
+        }
+    }
+    out
+}
+
 /// Reshape the API-bound history into the short-send payload: drop the older
 /// turns in favour of the rolling summary + a verbatim tail, rehydrating only the
 /// archived blobs the router judges relevant to `user_intent`.
@@ -438,15 +464,47 @@ pub async fn shape(
     let keep = keep.min(body.len());
     let tail: Vec<ChatMessage> = body[body.len() - keep..].to_vec();
 
-    // 6. Router rehydrate. Candidate blobs are those in the SUMMARISED region
+    // 6. Rehydrate. Candidate blobs are those in the SUMMARISED region
     //    (msg_id <= covers_up_to), i.e. NOT in the verbatim tail — the tail still
-    //    carries its own heavy content in full. Ask the router which to inflate.
+    //    carries its own heavy content in full.
+    //
+    //    Two recall paths, content-search FIRST:
+    //    6a. CONTENT MATCH (the "db lookup"): pull significant terms from the
+    //        user's message and ask sqlite which summarised blobs' OWNING MESSAGE
+    //        text matches — independent of the (possibly border-first) snippet. A
+    //        literal content hit is a strong signal, so the top up-to-3 are
+    //        rehydrated DIRECTLY, no router round-trip. This is what fixes old /
+    //        diagram blobs whose snippet can never match (e.g. a WIRE-RAIL ASCII
+    //        diagram recalled by the word "WIRE").
+    //    6b. FALLBACK: only when content search finds NOTHING do we ask the
+    //        snippet router (`pick_blobs`) — for semantic queries with no keyword
+    //        overlap, where the snippet is still the best (only) signal.
+    //    Either way the rehydrated set is capped at MAX_REHYDRATE and formatted as
+    //    the existing `[recalled blob #<id>]\n{content}` blocks.
     let mut recalls: Vec<String> = Vec::new();
     let candidates: Vec<msglog::BlobRef> = msglog::list_blobs(session_dir)
         .into_iter()
         .filter(|b| b.msg_id <= sum.covers_up_to)
         .collect();
-    if !candidates.is_empty() {
+
+    // 6a. Content search over message text. `search_blobs` already filters to
+    //     msg_id <= covers_up_to and ranks by distinct-term-match count desc.
+    let terms = significant_terms(user_intent);
+    let content_hits: Vec<msglog::BlobRef> = if terms.is_empty() {
+        Vec::new()
+    } else {
+        msglog::search_blobs(session_dir, &terms, sum.covers_up_to)
+    };
+
+    if !content_hits.is_empty() {
+        // Direct rehydrate: a literal content match needs no router confirmation.
+        for hit in content_hits.iter().take(MAX_REHYDRATE) {
+            if let Some(content) = msglog::fetch_blob_content(session_dir, hit.msg_id) {
+                recalls.push(format!("\n\n[recalled blob #{}]\n{}", hit.id, content));
+            }
+        }
+    } else if !candidates.is_empty() {
+        // 6b. Fallback to the snippet router only when content search came up empty.
         let (model, provider) = awareness_route(settings);
         let payload = build_router_payload(user_intent, &candidates);
         // Best-effort: `pick_blobs` already returns an empty vec on any error.
