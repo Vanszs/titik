@@ -54,10 +54,11 @@ pub struct Resolved {
     pub model_id: String,
     pub endpoint: String,
     pub api_key: String,
-    // Carried by the resolver but not consumed on the request path YET: every
-    // method still emits the OpenAI-compatible wire body. The Anthropic body
-    // builder will branch on this (forward-compat; flagged as a known gap).
-    #[allow(dead_code)]
+    // The provider's wire type. Consumed at the call boundary via
+    // [`Resolved::is_routable`]: only `OpenAiCompatible` dispatches; an
+    // `AnthropicCompatible` route fails/skips (native Anthropic is deferred — see
+    // the `model/app_config` `ApiType` docs). The client itself never branches on
+    // this; the gate lives ONE level up, here at resolution.
     pub api_type: ApiType,
     pub route: Option<String>,
     // Consumed by the MAIN streaming path (passed as the `effort` param of
@@ -80,6 +81,16 @@ impl Resolved {
     /// the form the client's `provider_routing_for` expects.
     pub fn provider(&self) -> &str {
         self.route.as_deref().unwrap_or("")
+    }
+
+    /// Whether this route can actually be dispatched against the OpenAI-compatible
+    /// client. `false` for an `AnthropicCompatible` provider (native Anthropic is
+    /// deferred — see [`ApiType`]). The call boundary checks this BEFORE dispatch:
+    /// the interactive Main path emits a [`crate::service::StreamEvent::Error`] and
+    /// does not POST; secondary roles (awareness / shortsend fold+router /
+    /// safeguard) skip the call gracefully (no summary / no recall / fail-closed).
+    pub fn is_routable(&self) -> bool {
+        self.api_type.is_routable()
     }
 }
 

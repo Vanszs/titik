@@ -68,11 +68,15 @@ impl ApiType {
         }
     }
 
-    /// Full human-readable label used in the add-provider modal toggle.
+    /// Full human-readable label used in the add-provider modal toggle. The
+    /// Anthropic variant is tagged "(not wired)" because native Anthropic is
+    /// deferred (the type persists + is selectable, but no role routes to it yet —
+    /// see [`ApiType::is_routable`]), so a user picking it isn't surprised when it
+    /// never works.
     pub fn full_label(self) -> &'static str {
         match self {
             ApiType::OpenAiCompatible   => "OpenAI compatible",
-            ApiType::AnthropicCompatible => "Anthropic compatible",
+            ApiType::AnthropicCompatible => "Anthropic compatible (not wired)",
         }
     }
 

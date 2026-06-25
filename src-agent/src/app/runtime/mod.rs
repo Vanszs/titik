@@ -106,7 +106,14 @@ pub(super) fn warm_session(
             // Resolve the Awareness role for the summary call (endpoint + key +
             // model + upstream-route slug). Awareness always resolves (it falls
             // back to inherit-Main / legacy fields), but guard defensively.
-            if let Some(r) = resolve_role(&config, &settings, ModelRole::Awareness) {
+            //
+            // Call-boundary gate: skip the summary gracefully (leaving the existing
+            // `awareness_summary` unchanged — `None` at cold boot) when the route is
+            // an Anthropic-typed provider, which the OpenAI-compatible client can't
+            // dispatch (native Anthropic is deferred). Fail-soft, no crash.
+            if let Some(r) =
+                resolve_role(&config, &settings, ModelRole::Awareness).filter(|r| r.is_routable())
+            {
                 let summary = handle.block_on(crate::app::awareness::summarize(
                     c,
                     &settings,

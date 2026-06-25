@@ -653,11 +653,17 @@ pub(super) fn start_stream_task(
         Option<crate::app::resolve::Resolved>,
     )> = state.rest.session.as_ref().map(|sess| {
         let user_intent = sess.conversation.last_user_content().unwrap_or_default();
+        // Call-boundary gate for the SECONDARY fold/router calls: an Anthropic-typed
+        // Awareness route can't be dispatched (native Anthropic is deferred), so
+        // downgrade it to `None`. `shape` already treats `None` as "skip the fold +
+        // snippet-router" gracefully (existing summary still applies) — no summary /
+        // no recall, never a crash.
         let aware = crate::app::resolve::resolve_role(
             &state.rest.config,
             &sess.settings,
             crate::model::app_config::ModelRole::Awareness,
-        );
+        )
+        .filter(|r| r.is_routable());
         (sess.path.clone(), sess.settings.clone(), user_intent, aware)
     });
 
@@ -766,9 +772,21 @@ pub(super) fn start_stream_task(
         // this task; borrow it for the call. A `None` (no session) can't reach here
         // — the client only exists when Main resolves — but guard defensively.
         if let Some(m) = main {
-            let _ = c
-                .stream_complete(m.conn(), &m.model_id, m.provider(), &m.effort, history, tx)
-                .await;
+            // Call-boundary gate (FAIL LOUD): the OpenAI-compatible client must
+            // never POST its body to an Anthropic-typed provider — that endpoint
+            // speaks a different wire protocol (native Anthropic is deferred), so
+            // the request would 400/404 with an opaque error. Surface a clear
+            // error on the stream channel and DON'T dispatch; the drain folds it
+            // into the status line + toast exactly like any stream failure.
+            if !m.is_routable() {
+                let _ = tx.send(crate::service::StreamEvent::Error(
+                    "Anthropic-compatible providers are not wired yet".to_string(),
+                ));
+            } else {
+                let _ = c
+                    .stream_complete(m.conn(), &m.model_id, m.provider(), &m.effort, history, tx)
+                    .await;
+            }
         }
     });
     state.rest.current_task = Some(jh.abort_handle());

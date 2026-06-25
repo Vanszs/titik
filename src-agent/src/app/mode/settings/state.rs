@@ -803,6 +803,24 @@ impl SettingsState {
             .unwrap_or(false)
     }
 
+    /// `true` when the modal's selected provider can serve the per-model
+    /// provider-endpoints GET: it must be `OpenAiCompatible` (the endpoints
+    /// catalogue is an OpenRouter/OpenAI-shaped API — an Anthropic-typed provider
+    /// has no equivalent) AND an OpenRouter endpoint (the GET is OpenRouter-only).
+    /// The runtime checks this before firing `list_model_endpoints` so a non-
+    /// OpenRouter or Anthropic provider never triggers a doomed request — the modal
+    /// is resolved to an empty endpoints list instead. `false` when no modal is
+    /// open or the provider index is out of range.
+    pub fn mm_provider_has_endpoints_api(&self) -> bool {
+        self.model_modal
+            .as_ref()
+            .and_then(|m| self.providers.get(m.provider_idx))
+            .map(|p| {
+                p.api_type.is_routable() && p.endpoint.to_lowercase().contains("openrouter")
+            })
+            .unwrap_or(false)
+    }
+
     /// The fields the model modal exposes right now, in navigation order.
     ///
     /// Always `Name, Provider, Model, …, Save, Cancel`. A `Route` field is

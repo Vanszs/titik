@@ -660,8 +660,23 @@ pub(super) fn apply_action(
             // and send one EndpointsLoaded / EndpointsError when the request
             // resolves. The drain in `run_loop` folds it into the modal.
             //
-            // No client → there's nothing to fetch against; just clear the
-            // loading flag on the modal so the UI doesn't spin forever.
+            // Endpoints-API gate: `list_model_endpoints` is an OpenRouter-only GET,
+            // and only an OpenAI-compatible provider has it (an Anthropic-typed
+            // provider has no equivalent catalogue endpoint). When the modal's
+            // SELECTED provider isn't an OpenRouter OpenAI-compatible one, don't
+            // fire a doomed request: resolve the modal to an EMPTY endpoints list
+            // (the view renders "no providers found" / Auto-only routing) and clear
+            // loading. This keeps non-OpenRouter + Anthropic providers from
+            // spinning on a request that would 404/400.
+            if !matches!(&state.mode, Mode::Settings(s) if s.mm_provider_has_endpoints_api()) {
+                if let Mode::Settings(s) = &mut state.mode {
+                    if let Some(m) = s.model_modal.as_mut() {
+                        m.endpoints = Some(Vec::new());
+                        m.endpoints_loading = false;
+                    }
+                }
+                return Ok(());
+            }
             // No client, or no resolvable MAIN route → there's nothing to fetch
             // against; just clear the loading flag on the modal so the UI doesn't
             // spin forever. The endpoints GET goes against the MAIN connection (the

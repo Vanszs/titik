@@ -57,6 +57,19 @@ pub enum ApiType {
     AnthropicCompatible,
 }
 
+impl ApiType {
+    /// Whether the runtime can actually dispatch a request against this wire type.
+    /// Only `OpenAiCompatible` routes today — the client speaks the OpenAI
+    /// chat-completions contract exclusively. `AnthropicCompatible` is persisted +
+    /// selectable in the UI but DEFERRED: native Anthropic Messages is a distinct
+    /// protocol (its own adapter, not a rider on this pass), so it is treated as
+    /// unroutable. The single source of truth shared by the resolution-boundary
+    /// gate (`Resolved::is_routable`) and the UI affordance.
+    pub fn is_routable(self) -> bool {
+        matches!(self, ApiType::OpenAiCompatible)
+    }
+}
+
 /// Runtime role slot a model is assigned to. Exclusive (1:1 role→model) by
 /// convention; persisted in lowercase (`"main"`, `"awareness"`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

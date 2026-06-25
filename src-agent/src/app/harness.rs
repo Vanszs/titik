@@ -276,6 +276,14 @@ async fn classify(
     let Some(route) = resolve_role(config, settings, ModelRole::Safeguard) else {
         return unavailable("safeguard model not configured".to_string());
     };
+    // Call-boundary gate (fail-CLOSED): an Anthropic-typed safeguard provider can't
+    // be dispatched against the OpenAI-compatible client (native Anthropic is
+    // deferred). Treat it as UNAVAILABLE rather than POSTing a doomed body — the
+    // caller degrades that to a human prompt (TAC) / advisory toast (PC), never a
+    // silent allow.
+    if !route.is_routable() {
+        return unavailable("safeguard provider not wired (Anthropic)".to_string());
+    }
     match tokio::time::timeout(
         CLASSIFY_TIMEOUT,
         client.classify_with(route.conn(), &route.model_id, route.provider(), messages),
