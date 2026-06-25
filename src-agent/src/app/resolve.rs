@@ -27,15 +27,15 @@
 //! |-----------|---------------------------------------------------------------------|
 //! | Main      | legacy `settings.model` / `api_key` @ `DEFAULT_BASE_URL`            |
 //! | Compactor | resolve Main (compactor rides Main; no config slot of its own)      |
-//! | Awareness | `awareness_inherit` → resolve Main; else legacy `awareness_model`  |
+//! | Awareness | inherit Main (same route as the Main role)                          |
 //! | Safeguard | legacy `classifier_model` if set; else `None` (FAIL-CLOSED)        |
 //!
 //! ## Foot-gun (do not regress)
 //!
-//! `awareness_inherit` is ONLY consulted in the Awareness *fallback*. An Awareness
-//! model that is explicitly assigned (found in step 1 and whose provider resolves
-//! in step 2) ALWAYS wins over `awareness_inherit` — inherit is the behaviour when
-//! nothing is assigned, never an override of an assignment.
+//! An Awareness model that is explicitly assigned (found in step 1 and whose provider
+//! resolves in step 2) ALWAYS wins — explicit assignment is the only way to give
+//! Awareness its own model. When nothing is assigned, Awareness inherits Main so the
+//! call works on any provider the user has actually configured, not just OpenRouter.
 
 use crate::config::DEFAULT_BASE_URL;
 use crate::model::app_config::{ApiType, AppConfig, ModelEntry, ModelRole};
@@ -137,32 +137,18 @@ fn legacy_main(settings: &Settings) -> Resolved {
 }
 
 /// Per-role fallback used when no model is assigned to `role`, or the assigned
-/// model's provider is dangling. Encodes the table in this module's docs:
-/// Main/Compactor soft-fall-back to the legacy Main route; Awareness inherits Main
-/// (when `awareness_inherit`) else uses the legacy awareness fields; Safeguard
-/// uses the legacy classifier field if set, else fails CLOSED (`None`).
+/// model's provider is dangling. Only handles Main (soft-fallback to legacy
+/// settings fields) and Safeguard (fail-closed). Compactor and Awareness inherit
+/// the fully-resolved Main route instead — that redirect is handled in
+/// [`resolve_role`] before this function is called, so neither role reaches here.
 fn legacy_fallback(settings: &Settings, role: ModelRole) -> Option<Resolved> {
     match role {
         // Chat is the product — Main must never go dark.
         ModelRole::Main => Some(legacy_main(settings)),
-        // Compactor has never had its own config; it rides Main.
-        ModelRole::Compactor => Some(legacy_main(settings)),
-        ModelRole::Awareness => {
-            if settings.awareness_inherit {
-                // Inherit the Main route — only in the no-assignment fallback.
-                Some(legacy_main(settings))
-            } else {
-                // Legacy dedicated awareness fields @ DEFAULT_BASE_URL, no effort.
-                Some(Resolved {
-                    model_id: settings.awareness_model.clone(),
-                    endpoint: DEFAULT_BASE_URL.to_string(),
-                    api_key: settings.api_key.clone(),
-                    api_type: ApiType::OpenAiCompatible,
-                    route: None,
-                    effort: String::new(),
-                })
-            }
-        }
+        // Compactor and Awareness are redirected to resolve_role(Main) before
+        // reaching here; these arms are unreachable in practice but kept for
+        // exhaustiveness.
+        ModelRole::Compactor | ModelRole::Awareness => Some(legacy_main(settings)),
         ModelRole::Safeguard => {
             // FAIL-CLOSED: only the legacy classifier model rescues it; an empty
             // field yields `None`, which the harness caller degrades to a human
@@ -202,15 +188,25 @@ pub fn resolve_role(config: &AppConfig, settings: &Settings, role: ModelRole) ->
         .or_else(|| config.models.iter().find(|e| e.role == Some(role)));
 
     // 2. If a model is assigned AND its provider resolves, that route wins —
-    //    including an explicitly-assigned Awareness model, which beats
-    //    `awareness_inherit` (the inherit branch lives in the fallback only).
+    //    including an explicitly-assigned Awareness model (explicit assignment is
+    //    the only way to give Awareness its own dedicated model).
     if let Some(entry) = assigned {
         if let Some(resolved) = from_entry(config, settings, entry, role) {
             return Some(resolved);
         }
-        // Assigned but the provider_uuid is dangling → fall through to legacy.
+        // Assigned but the provider_uuid is dangling → fall through.
     }
 
-    // 3. No assignment, or a dangling provider → per-role legacy fallback.
+    // 3. Compactor and Awareness have no config slot of their own — both inherit
+    //    the FULLY-RESOLVED Main route (which honours config.models Main + its
+    //    provider connection's real endpoint/key). This must happen here, where
+    //    `config` is in scope, NOT inside `legacy_fallback`, which only has
+    //    `settings` and would wrongly hard-code DEFAULT_BASE_URL (OpenRouter).
+    //    No infinite recursion: Main never resolves to Compactor or Awareness.
+    if matches!(role, ModelRole::Compactor | ModelRole::Awareness) {
+        return resolve_role(config, settings, ModelRole::Main);
+    }
+
+    // 4. No assignment, or a dangling provider → per-role legacy fallback.
     legacy_fallback(settings, role)
 }
