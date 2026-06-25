@@ -76,3 +76,26 @@ pub enum StreamEvent {
         error: String,
     },
 }
+
+/// A single event on the startup-warming channel. The non-blocking `warm_session`
+/// refactor spawns the catalogue + awareness fetches as background tasks and
+/// shows an animated [`crate::app::mode::Mode::Loading`] splash; each task sends
+/// one of these when it resolves, and the event loop folds it into both
+/// `AppStateRest` (the cache / summary — always) and the live `LoadingState`
+/// (the step marker — only while still Loading). Lives on its own channel
+/// (`AppStateRest::warm_rx`), independent of streaming, mirroring `endpoints_rx`.
+// The shared `Warm` prefix is intentional: it reads clearly at the call/drain
+// site (`WarmEvent::WarmCatalogue`) and matches the dedicated-channel naming.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone)]
+pub enum WarmEvent {
+    /// The model catalogue fetch succeeded; carries the fetched models. Folded
+    /// into `models_cache` so the short-send threshold gate has a context window.
+    WarmCatalogue(Vec<crate::dto::openrouter::ModelInfo>),
+    /// The model catalogue fetch failed (network / non-routable Main). The cache
+    /// stays `None` (treated as "window unknown") and the step marker shows failed.
+    WarmCatalogueFailed,
+    /// The project-awareness summary resolved: `Some(text)` on success, `None`
+    /// when there were no docs / the call failed. Folded into `awareness_summary`.
+    WarmAwareness(Option<String>),
+}

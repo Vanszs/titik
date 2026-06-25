@@ -17,7 +17,7 @@ use tokio::task::AbortHandle;
 use crate::app::mode::Mode;
 use crate::model::app_config::AppConfig;
 use crate::model::session::Session;
-use crate::service::StreamEvent;
+use crate::service::{StreamEvent, WarmEvent};
 use crate::view::theme::Palette;
 
 pub struct AppState {
@@ -214,6 +214,14 @@ pub struct AppStateRest {
     /// [`StreamEvent::EndpointsError`]. Drained in `run_loop` independently of
     /// streaming. `None` when no endpoints fetch is in flight.
     pub endpoints_rx: Option<UnboundedReceiver<StreamEvent>>,
+    /// Receiver for the startup-warming background tasks. Opened by the
+    /// non-blocking `runtime::warm_session` when a returning-into-Chat session has
+    /// warm work to do; the spawned tasks send [`WarmEvent`]s (catalogue result +
+    /// awareness summary) which the event loop folds into `models_cache` /
+    /// `awareness_summary` (always) and the live `LoadingState` step markers (only
+    /// while still in `Mode::Loading`). Drained in `run_loop` independently of
+    /// streaming, mirroring `endpoints_rx`. `None` when no warm work is in flight.
+    pub warm_rx: Option<UnboundedReceiver<WarmEvent>>,
     /// Reason the tool-call classifier (TAC) flagged the currently-paused call,
     /// shown in the approval overlay so the user sees WHY approval is asked.
     /// `None` for an approval that wasn't classifier-driven. Cleared when the
@@ -329,6 +337,7 @@ impl AppStateRest {
             launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             harness_rx: None,
             endpoints_rx: None,
+            warm_rx: None,
             approval_reason: None,
             models_cache: None,
             compact_anim_start: None,

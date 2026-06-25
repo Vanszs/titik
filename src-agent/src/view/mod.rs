@@ -16,6 +16,7 @@ pub mod agents;
 pub mod chat;
 pub mod effort;
 pub mod key_input;
+pub mod loading;
 pub mod markdown;
 pub mod session_picker;
 pub mod settings;
@@ -46,5 +47,6 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         ),
         Mode::Agents(a) => agents::draw(frame, a, &palette),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
+        Mode::Loading(s) => loading::draw(frame, s, &palette),
     }
 }

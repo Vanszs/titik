@@ -18,6 +18,7 @@
 
 mod key_input;
 mod effort;
+mod loading;
 mod picker;
 pub mod settings;
 pub mod agents;
@@ -25,6 +26,7 @@ pub mod agents;
 pub use agents::{AgentEditField, AgentScope, AgentSubMode, AgentsState};
 pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
+pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
 pub use settings::{
     filter_models, SettingField, SettingsState, PICKER_MAX,
@@ -42,6 +44,13 @@ pub enum Mode {
     /// Normal chat view: messages are rendered and the user types in the
     /// input bar.  All chat-specific state lives in `AppStateRest`.
     Chat,
+    /// Startup warming splash: a btop-style animated loading screen shown while a
+    /// returning-into-Chat session warms ASYNCHRONOUSLY (catalogue fetch + project
+    /// awareness summary run as background tasks instead of blocking the UI thread
+    /// before the event loop starts). The inner [`LoadingState`] tracks the three
+    /// step markers + the spinner frame; the loop switches to `Chat` once the
+    /// catalogue + awareness steps are terminal (or the user presses Esc to skip).
+    Loading(LoadingState),
     /// In-app settings dashboard (`/settings`): edit per-session credentials,
     /// the session name, and the global theme/accent. The inner
     /// [`SettingsState`] holds working drafts that are applied on save.

@@ -13,7 +13,7 @@
 //! belonging to the active mode and `AppStateRest`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crate::app::mode::{AgentsState, EffortPickerState, KeyInputForm, Mode, PickerState, SettingsState};
+use crate::app::mode::{AgentsState, EffortPickerState, KeyInputForm, LoadingState, Mode, PickerState, SettingsState, WarmStatus};
 use crate::app::state::{AppState, AppStateRest};
 use crate::controller::command::{self, Command};
 
@@ -82,6 +82,13 @@ pub enum Action {
     /// edit; the modal's loading flags are already set by the caller. The
     /// runtime opens a fresh `endpoints_rx` channel and spawns the fetch.
     FetchModelEndpoints(String),
+    // --- Loading splash actions ---
+    /// Esc on the startup loading splash — skip the remaining warm steps and drop
+    /// straight into Chat. The background warm tasks keep running; their results
+    /// still populate `state.rest.*` via the `warm_rx` drain. The handler already
+    /// marked any non-terminal step `Skipped` for correctness; the runtime just
+    /// swaps the mode to `Chat`.
+    SkipLoading,
 }
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -134,6 +141,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Settings(s) => handle_settings(s, &mut state.rest, key),
         Mode::Agents(a) => handle_agents(a, &mut state.rest, key),
         Mode::Effort(e) => handle_effort(e, &mut state.rest, key),
+        Mode::Loading(l) => handle_loading(l, key),
     }
 }
 
@@ -191,8 +199,9 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 }
             }
         }
-        // No text entry in the session/effort pickers — paste is a no-op.
-        Mode::SessionPicker(_) | Mode::Effort(_) => {}
+        // No text entry in the session/effort pickers or the loading splash —
+        // paste is a no-op.
+        Mode::SessionPicker(_) | Mode::Effort(_) | Mode::Loading(_) => {}
     }
 }
 
@@ -1210,6 +1219,38 @@ fn handle_effort(e: &mut EffortPickerState, _rest: &mut AppStateRest, key: KeyEv
             Some(opt) => Action::SaveEffort(opt.clone()),
             None => Action::EffortCancel,
         },
+        _ => Action::None,
+    }
+}
+
+/// Handle a key press while the startup loading splash is shown.
+///
+/// `Esc` skips the remaining warm work: mark any still-`Running` step `Skipped`
+/// (especially awareness — the slow one this skip exists for) and return
+/// [`Action::SkipLoading`] so the runtime drops into Chat immediately. The
+/// background warm tasks keep running; their results still populate
+/// `AppStateRest` via the `warm_rx` drain even after the skip.
+///
+/// Every other key is ignored — the splash has no text entry, so a stray key
+/// must not crash or leak into the chat input underneath.
+fn handle_loading(l: &mut LoadingState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => {
+            // Mark non-terminal steps Skipped for correctness (the splash is about
+            // to be replaced by Chat, but leaving a step stuck on Running would be
+            // wrong if anything reads it). Workspace is included so nothing dangles.
+            if matches!(l.workspace, WarmStatus::Running) {
+                l.workspace = WarmStatus::Skipped;
+            }
+            if matches!(l.catalogue, WarmStatus::Running) {
+                l.catalogue = WarmStatus::Skipped;
+            }
+            if matches!(l.awareness, WarmStatus::Running) {
+                l.awareness = WarmStatus::Skipped;
+            }
+            Action::SkipLoading
+        }
+        // No text entry on the splash: swallow every other key.
         _ => Action::None,
     }
 }

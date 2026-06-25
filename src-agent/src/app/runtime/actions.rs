@@ -285,18 +285,21 @@ pub(super) fn apply_action(
                 .filter(|r| !r.api_key.is_empty())
                 .map(|_| build_client())
             });
-            // Warm the confirmed session: reindex its workspace and compute the
-            // awareness summary so a creds-confirmed session is fully primed like
-            // a cold boot.
-            super::warm_session(state, client, handle);
             // Seed totals from the (new or picker-prefilled) session's log.
             if let Some(p) = state.rest.session.as_ref().map(|s| s.path.clone()) {
                 state.rest.load_token_totals(&p);
             }
             state.rest.prev_session = None; // committed; discard fallback
             state.rest.reset_scroll();
+            // Land in Chat first, THEN warm: `warm_session` is non-blocking and may
+            // upgrade the mode to `Mode::Loading` (animated splash) when it has warm
+            // work to spawn, so it must run LAST to get the final word. With no warm
+            // work it leaves the mode as the Chat we just set.
             state.mode = Mode::Chat;
             state.rest.status = "ready".into();
+            // Warm the confirmed session: reindex its workspace + (async) fetch the
+            // catalogue and awareness summary so it's primed like a cold boot.
+            super::warm_session(state, client, handle);
         }
 
         Action::CancelKeyInput => {
@@ -398,16 +401,20 @@ pub(super) fn apply_action(
                 *client = Some(build_client());
                 let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
-                // Warm the selected session: reindex its workspace and compute
-                // the awareness summary so picker-resume is fully primed like a
-                // cold boot.
-                super::warm_session(state, client, handle);
                 // Existing session: seed the running totals from its full sqlite
                 // log so the readout reflects prior usage.
                 state.rest.load_token_totals(&sess_path);
                 state.rest.reset_scroll();
+                // Land in Chat first, THEN warm: `warm_session` is non-blocking and
+                // may upgrade the mode to `Mode::Loading` (animated splash) when it
+                // has warm work to spawn, so it must run LAST to get the final word.
+                // With no warm work it leaves the mode as the Chat we just set.
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
+                // Warm the selected session: reindex its workspace + (async) fetch
+                // the catalogue and awareness summary so picker-resume is primed
+                // like a cold boot.
+                super::warm_session(state, client, handle);
             }
         }
 
@@ -718,6 +725,16 @@ pub(super) fn apply_action(
                     }),
                 };
             });
+        }
+
+        Action::SkipLoading => {
+            // Esc on the loading splash: drop straight into Chat. The warm tasks
+            // keep running in the background and their results still populate
+            // `state.rest.*` via the `warm_rx` drain (the receiver is untouched
+            // here). The session/chat state was already set up by the activation
+            // path that opened the splash, so we only swap the mode.
+            state.mode = Mode::Chat;
+            state.rest.status = "ready".into();
         }
     }
     Ok(())

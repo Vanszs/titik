@@ -189,11 +189,15 @@ pub(super) fn apply_slash(
                 // Fresh session → totals are 0; calling is harmless and keeps the
                 // readout reset when switching sessions.
                 state.rest.load_token_totals(&sess_path);
-                // Warm the new session: reindex its workspace and compute the
-                // awareness summary so /new is fully primed like a cold boot.
-                super::warm_session(state, client, handle);
+                // Land in Chat first, THEN warm: `warm_session` is non-blocking and
+                // may upgrade the mode to `Mode::Loading` (animated splash) when it
+                // has warm work to spawn, so it must run LAST to get the final word.
+                // With no warm work it leaves the mode as the Chat we just set.
                 state.mode = Mode::Chat;
                 state.rest.status = "ready".into();
+                // Warm the new session: reindex its workspace + (async) fetch the
+                // catalogue and awareness summary so /new is primed like a cold boot.
+                super::warm_session(state, client, handle);
             }
         }
 

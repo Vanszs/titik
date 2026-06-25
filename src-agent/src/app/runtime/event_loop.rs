@@ -11,11 +11,11 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 
-use crate::app::mode::Mode;
+use crate::app::mode::{Mode, WarmStatus};
 use crate::app::state::AppState;
 use crate::controller;
 use crate::dto::chat::Role;
-use crate::service::{openrouter::OpenRouterClient, StreamEvent};
+use crate::service::{openrouter::OpenRouterClient, StreamEvent, WarmEvent};
 use crate::view;
 
 use super::actions::apply_action;
@@ -354,6 +354,101 @@ pub(super) fn run_loop(
             }
         }
 
+        // 1b-3. Drain the startup-warming channel. Fully independent of streaming:
+        //        the background catalogue + awareness tasks each send one
+        //        [`WarmEvent`]. ALWAYS fold the result into `state.rest.*` (the
+        //        cache / summary) regardless of the current mode — a result that
+        //        lands AFTER an Esc-to-chat must still populate them — and update
+        //        the live `LoadingState` step marker only while still in
+        //        `Mode::Loading`. Take() the receiver so the arms can mutate the
+        //        mode + rest; put it back unless the channel has closed (both warm
+        //        tasks finished and dropped their senders → `Disconnected`).
+        if let Some(mut wrx) = state.rest.warm_rx.take() {
+            let mut keep = true;
+            loop {
+                match wrx.try_recv() {
+                    Ok(WarmEvent::WarmCatalogue(models)) => {
+                        let n = models.len();
+                        // Always populate the cache (drives the short-send window).
+                        state.rest.models_cache = Some(models);
+                        if let Mode::Loading(s) = &mut state.mode {
+                            s.catalogue = WarmStatus::Done(format!("{n} models"));
+                        }
+                        dirty = true;
+                    }
+                    Ok(WarmEvent::WarmCatalogueFailed) => {
+                        // No cache write (it stays None → window unknown). Only the
+                        // splash step changes, and only while still Loading.
+                        if let Mode::Loading(s) = &mut state.mode {
+                            s.catalogue = WarmStatus::Failed;
+                        }
+                        dirty = true;
+                    }
+                    Ok(WarmEvent::WarmAwareness(summary)) => {
+                        let had = summary.is_some();
+                        // Always populate the summary (appended to the system
+                        // message on every request), even if we've already skipped
+                        // to chat.
+                        state.rest.awareness_summary = summary;
+                        if let Mode::Loading(s) = &mut state.mode {
+                            // Some → ready; None → "no docs" (treated as a benign
+                            // terminal Done detail, not a hard failure).
+                            s.awareness = if had {
+                                WarmStatus::Done("ready".into())
+                            } else {
+                                WarmStatus::Done("no docs".into())
+                            };
+                        }
+                        dirty = true;
+                    }
+                    // Channel drained for now: keep listening on later ticks.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    // Both warm tasks finished and dropped their senders: done.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if keep {
+                state.rest.warm_rx = Some(wrx);
+            }
+        }
+
+        // 1b-4. Loading splash: workspace step, transition, and animation. While in
+        //        `Mode::Loading` the splash is driven entirely from the loop tick.
+        if let Mode::Loading(s) = &mut state.mode {
+            // Workspace step: mark Done once the background reindex has SETTLED
+            // (indexing flag cleared). Poll the cache readiness each tick; this
+            // never gates the transition (a slow reindex must not hold up chat).
+            if matches!(s.workspace, WarmStatus::Running) {
+                let settled = state
+                    .rest
+                    .dir_cache
+                    .read()
+                    .map(|c| !c.indexing)
+                    .unwrap_or(false);
+                if settled {
+                    s.workspace = WarmStatus::Done(String::new());
+                }
+            }
+            // TRANSITION: once the catalogue + awareness steps are both terminal
+            // (Done / Skipped / Failed) switch into Chat. The session/chat state was
+            // already set up by the activation path; we only swap the mode. The
+            // workspace step is intentionally excluded from this gate.
+            if s.ready_to_enter() {
+                state.mode = Mode::Chat;
+                dirty = true;
+            } else {
+                // ANIMATION: still loading — advance the spinner and force a redraw
+                // each tick so the braille frames actually cycle. Paired with the
+                // fast (8ms) poll cadence below (which also wakes on `Mode::Loading`)
+                // so the loop never idle-sleeps the spinner.
+                s.frame = s.frame.wrapping_add(1);
+                dirty = true;
+            }
+        }
+
         // 1c. Deferred compaction apply. A fast compaction stashes its result and
         //     an `apply_at` instant so the animation holds for a short minimum
         //     (cosmetic). Apply once that instant passes — driven by the loop tick,
@@ -421,7 +516,10 @@ pub(super) fn run_loop(
         //    falls back to 100ms (poll still wakes instantly on a keypress, so
         //    typing latency is 0) so a fully idle UI never busy-spins. Drain EVERY
         //    buffered event each tick so paste / fast typing don't lag.
-        let timeout = if state.rest.waiting {
+        // Also poll fast while the loading splash is up so its braille spinner
+        // animates smoothly (the per-tick `frame`++ above needs the loop to wake
+        // at the fast cadence, not idle-sleep for 100ms between frames).
+        let timeout = if state.rest.waiting || matches!(state.mode, Mode::Loading(_)) {
             Duration::from_millis(8)
         } else {
             Duration::from_millis(100)
