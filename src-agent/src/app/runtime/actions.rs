@@ -741,22 +741,19 @@ pub(super) fn apply_action(
                 }
                 return Ok(());
             }
-            // No client, or no resolvable MAIN route → there's nothing to fetch
-            // against; just clear the loading flag on the modal so the UI doesn't
-            // spin forever. The endpoints GET goes against the MAIN connection (the
-            // catalogue/endpoints are keyed to the chat endpoint); resolve it into
-            // an owned `Resolved` and MOVE it into the task (so the task holds no
-            // borrow of `state.rest.config`, and `r.conn()` is built inside).
-            let route = client.as_ref().and_then(|_| {
-                state.rest.session.as_ref().and_then(|s| {
-                    crate::app::resolve::resolve_role(
-                        &state.rest.config,
-                        &s.settings,
-                        crate::model::app_config::ModelRole::Main,
-                    )
-                })
-            });
-            let (Some(c), Some(route)) = (client.as_ref(), route) else {
+            // No client, or no connection for the modal's OWN provider → nothing
+            // to fetch against; clear the loading flag so the UI doesn't spin.
+            // The endpoints GET must go against the EDITED MODEL's provider
+            // connection (OpenRouter), NOT the Main role's connection (which may
+            // be on a completely different provider). Pull (endpoint, api_key)
+            // from `mm_provider_conn` and MOVE the owned Strings into the task
+            // (no borrow of `state` crosses the spawn boundary).
+            let provider_conn = if let Mode::Settings(s) = &state.mode {
+                s.mm_provider_conn()
+            } else {
+                None
+            };
+            let (Some(c), Some((endpoint, api_key))) = (client.as_ref(), provider_conn) else {
                 if let Mode::Settings(s) = &mut state.mode {
                     if let Some(m) = s.model_modal.as_mut() {
                         m.endpoints_loading = false;
@@ -764,6 +761,14 @@ pub(super) fn apply_action(
                 }
                 return Ok(());
             };
+            if endpoint.trim().is_empty() {
+                if let Mode::Settings(s) = &mut state.mode {
+                    if let Some(m) = s.model_modal.as_mut() {
+                        m.endpoints_loading = false;
+                    }
+                }
+                return Ok(());
+            }
             let c = Arc::clone(c);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             state.rest.endpoints_rx = Some(rx);
@@ -771,7 +776,11 @@ pub(super) fn apply_action(
                 // A dropped receiver (modal closed / a newer fetch superseded
                 // this one) makes the send a no-op — same contract as the
                 // streaming + harness channels.
-                let _ = match c.list_model_endpoints(route.conn(), &model_id).await {
+                let conn = crate::service::openrouter::Conn {
+                    endpoint: &endpoint,
+                    api_key: &api_key,
+                };
+                let _ = match c.list_model_endpoints(conn, &model_id).await {
                     Ok(eps) => tx.send(crate::service::StreamEvent::EndpointsLoaded {
                         model_id,
                         endpoints: eps,
