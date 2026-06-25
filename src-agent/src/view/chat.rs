@@ -496,12 +496,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
             Style::default().fg(palette.dim),
         )),
     };
-    let streaming_now = rest.streaming.is_some();
-    let readout = if rest.tokens_in > 0
-        || rest.tokens_out > 0
-        || rest.cost > 0.0
-        || (streaming_now && rest.live_price.is_some())
-    {
+    let readout = if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
         // Show the cached-prompt-token count right after the input arrow when the
         // last response hit the prompt cache (`cached:N`), so the saving is
         // visible; omitted entirely on a cold prefix to keep the readout quiet.
@@ -510,50 +505,13 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         } else {
             String::new()
         };
-        if streaming_now {
-            if let Some((p_in, p_out)) = rest.live_price {
-                // Live estimate: approximate output tokens from char count (~4 chars/token).
-                let out_est = (rest
-                    .streaming
-                    .as_deref()
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0) as u64)
-                    / 4;
-                let in_disp = rest.tokens_in + rest.live_input_tokens;
-                let out_disp = rest.tokens_out + out_est;
-                let cost_disp = rest.cost
-                    + (rest.live_input_tokens as f64) * p_in
-                    + (out_est as f64) * p_out;
-                Some(format!(
-                    "↑{}{} ↓{}  ~${:.4}",
-                    fmt_count(in_disp),
-                    cached,
-                    fmt_count(out_disp),
-                    cost_disp
-                ))
-            } else {
-                // Streaming but no pricing — show exact cumulative if available.
-                if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
-                    Some(format!(
-                        "↑{}{} ↓{}  ${:.4}",
-                        fmt_count(rest.tokens_in),
-                        cached,
-                        fmt_count(rest.tokens_out),
-                        rest.cost
-                    ))
-                } else {
-                    None
-                }
-            }
-        } else {
-            Some(format!(
-                "↑{}{} ↓{}  ${:.4}",
-                fmt_count(rest.tokens_in),
-                cached,
-                fmt_count(rest.tokens_out),
-                rest.cost
-            ))
-        }
+        Some(format!(
+            "↑{}{} ↓{}  ${:.4}",
+            fmt_count(rest.tokens_in),
+            cached,
+            fmt_count(rest.tokens_out),
+            rest.cost
+        ))
     } else {
         None
     };

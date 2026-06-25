@@ -150,27 +150,6 @@ pub fn effort_caps(models: &[ModelInfo], model_id: &str) -> EffortCaps {
     }
 }
 
-/// Return the per-token pricing for `model_id` from a `GET /models` listing.
-///
-/// Returns `Some((prompt_price, completion_price))` in USD-per-token when the
-/// model is found and both pricing strings parse as finite `f64` values. Returns
-/// `None` when the model is absent from the listing, has no `pricing` object, or
-/// either price string is missing / unparseable. The caller treats `None` as
-/// "pricing unknown" and falls back to showing no live estimate. Never panics.
-pub fn pricing_for(models: &[ModelInfo], model_id: &str) -> Option<(f64, f64)> {
-    let pricing = models
-        .iter()
-        .find(|m| m.id == model_id)
-        .and_then(|m| m.pricing.as_ref())?;
-    let prompt = pricing.prompt.trim().parse::<f64>().ok()?;
-    let completion = pricing.completion.trim().parse::<f64>().ok()?;
-    if prompt.is_finite() && completion.is_finite() {
-        Some((prompt, completion))
-    } else {
-        None
-    }
-}
-
 /// Return the context-window size (tokens) for `model_id` from a `GET /models`
 /// listing. Returns `None` when the model is absent from the listing or its
 /// `context_length` field was not reported. The caller falls back to a hardcoded

@@ -258,16 +258,6 @@ pub struct AppStateRest {
     /// The missing-root set we last warned about, so the toast fires only when
     /// the set changes (not on every reindex).
     pub warned_missing_roots: Vec<String>,
-    /// Per-token pricing for the in-flight turn: `(prompt_price, completion_price)`
-    /// in USD per token, looked up from the models catalogue when a request is about
-    /// to stream. `None` when the catalogue is unavailable or the model has no
-    /// pricing data — falls back to the existing exact-cost-on-Usage behaviour.
-    /// Cleared at the start of each new turn (set fresh in `start_stream_task`).
-    pub live_price: Option<(f64, f64)>,
-    /// Estimated prompt-token count for the in-flight turn, computed from the
-    /// conversation history just before the request is sent. Added to the display
-    /// only during streaming; never written to the cumulative `tokens_in` total.
-    pub live_input_tokens: u64,
 }
 
 impl AppState {
@@ -342,8 +332,6 @@ impl AppStateRest {
             summarizing: false,
             work_since: None,
             warned_missing_roots: Vec::new(),
-            live_price: None,
-            live_input_tokens: 0,
         }
     }
 
