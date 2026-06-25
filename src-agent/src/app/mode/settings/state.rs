@@ -585,58 +585,45 @@ impl SettingsState {
         }
     }
 
-    /// Move focus up in the modal (clamp 0..=5).
+    /// Move focus up in the modal (clamp 0..=4).
     pub fn modal_up(&mut self) {
         if let Some(m) = self.prov_modal.as_mut() {
             m.field = m.field.saturating_sub(1);
         }
     }
 
-    /// Move focus down in the modal (clamp 0..=5).
+    /// Move focus down in the modal (clamp 0..=4).
     pub fn modal_down(&mut self) {
         if let Some(m) = self.prov_modal.as_mut() {
-            m.field = (m.field + 1).min(5);
+            m.field = (m.field + 1).min(4);
         }
     }
 
-    /// Move focus left in the modal: toggles type on field 2, moves Cancel→Save on field 5.
+    /// Move focus left in the modal: moves Cancel→Save on field 4.
     pub fn modal_left(&mut self) {
         if let Some(m) = self.prov_modal.as_mut() {
-            if m.field == 2 {
-                m.api_type = m.api_type.toggle();
-            } else if m.field == 5 {
+            if m.field == 4 {
+                m.field = 3;
+            }
+        }
+    }
+
+    /// Move focus right in the modal: moves Save→Cancel on field 3.
+    pub fn modal_right(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            if m.field == 3 {
                 m.field = 4;
             }
         }
     }
 
-    /// Move focus right in the modal: toggles type on field 2, moves Save→Cancel on field 4.
-    pub fn modal_right(&mut self) {
-        if let Some(m) = self.prov_modal.as_mut() {
-            if m.field == 2 {
-                m.api_type = m.api_type.toggle();
-            } else if m.field == 4 {
-                m.field = 5;
-            }
-        }
-    }
-
-    /// Toggle the api_type field in the modal (no-op unless field == 2).
-    pub fn modal_toggle_type(&mut self) {
-        if let Some(m) = self.prov_modal.as_mut() {
-            if m.field == 2 {
-                m.api_type = m.api_type.toggle();
-            }
-        }
-    }
-
-    /// Append `c` to the active text field in the modal (field 0=name, 1=endpoint, 3=api_key).
+    /// Append `c` to the active text field in the modal (field 0=name, 1=endpoint, 2=api_key).
     pub fn modal_push_char(&mut self, c: char) {
         if let Some(m) = self.prov_modal.as_mut() {
             match m.field {
                 0 => m.name.push(c),
                 1 => m.endpoint.push(c),
-                3 => m.api_key.push(c),
+                2 => m.api_key.push(c),
                 _ => {}
             }
         }
@@ -648,7 +635,7 @@ impl SettingsState {
             match m.field {
                 0 => { m.name.pop(); }
                 1 => { m.endpoint.pop(); }
-                3 => { m.api_key.pop(); }
+                2 => { m.api_key.pop(); }
                 _ => {}
             }
         }

@@ -608,9 +608,9 @@ fn draw_provider_modal(
     palette: &Palette,
     area: Rect,
 ) {
-    // Modal dimensions: ~50 wide, 10 tall (header + 5 rows + blank + save + 2 borders).
+    // Modal dimensions: ~50 wide, 9 tall (header + 4 rows + blank + save + 2 borders).
     const MODAL_W: u16 = 52;
-    const MODAL_H: u16 = 10;
+    const MODAL_H: u16 = 9;
     let w = MODAL_W.min(area.width.saturating_sub(2));
     let h = MODAL_H.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -669,19 +669,9 @@ fn draw_provider_modal(
         lines.push(Line::from(vec![label, Span::styled(val, Style::default().fg(vc))]));
     }
 
-    // Row 2: Type toggle
+    // Row 2: API key
     {
         let active = modal.field == 2;
-        let lc = if active { palette.accent } else { palette.dim };
-        let label = Span::styled(format!("{:<width$}", "Type", width = label_w), Style::default().fg(lc));
-        let toggle_text = format!("\u{2039} {} \u{203a}", modal.api_type.full_label());
-        let tc = if active { palette.accent } else { palette.dim };
-        lines.push(Line::from(vec![label, Span::styled(toggle_text, Style::default().fg(tc))]));
-    }
-
-    // Row 3: API key
-    {
-        let active = modal.field == 3;
         let lc = if active { palette.accent } else { palette.dim };
         let label = Span::styled(format!("{:<width$}", "API key", width = label_w), Style::default().fg(lc));
         let mut val = truncate(&modal.api_key, val_w.saturating_sub(1));
@@ -703,12 +693,12 @@ fn draw_provider_modal(
     let inner_w     = inner.width as usize;
     let pad_left    = inner_w.saturating_sub(group_len) / 2;
     let pad_right   = inner_w.saturating_sub(group_len).saturating_sub(pad_left);
-    let save_style = if modal.field == 4 {
+    let save_style = if modal.field == 3 {
         Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
     } else {
         Style::default().fg(palette.accent)
     };
-    let cancel_style = if modal.field == 5 {
+    let cancel_style = if modal.field == 4 {
         Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
     } else {
         Style::default().fg(palette.accent)

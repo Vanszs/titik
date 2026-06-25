@@ -68,11 +68,12 @@ impl ApiType {
         }
     }
 
-    /// Full human-readable label used in the add-provider modal toggle. The
-    /// Anthropic variant is tagged "(not wired)" because native Anthropic is
-    /// deferred (the type persists + is selectable, but no role routes to it yet —
-    /// see [`ApiType::is_routable`]), so a user picking it isn't surprised when it
-    /// never works.
+    /// Full human-readable label for the api type. The Anthropic variant is tagged
+    /// "(not wired)" because native Anthropic is deferred (the type persists but no
+    /// role routes to it yet — see [`ApiType::is_routable`]). Kept for
+    /// forward-compat; the UI Type field was removed (new providers are always
+    /// `OpenAiCompatible`).
+    #[allow(dead_code)]
     pub fn full_label(self) -> &'static str {
         match self {
             ApiType::OpenAiCompatible   => "OpenAI compatible",
@@ -80,7 +81,9 @@ impl ApiType {
         }
     }
 
-    /// Flip between the two variants.
+    /// Flip between the two variants. Kept for forward-compat; not called from
+    /// the UI since the Type field was removed.
+    #[allow(dead_code)]
     pub fn toggle(self) -> Self {
         match self {
             ApiType::OpenAiCompatible   => ApiType::AnthropicCompatible,
@@ -118,7 +121,7 @@ pub struct ProviderModal {
     pub endpoint: String,
     pub api_type: ApiType,
     pub api_key: String,
-    /// Active field: 0=name, 1=endpoint, 2=type, 3=api_key, 4=Save button, 5=Cancel button.
+    /// Active field: 0=name, 1=endpoint, 2=api_key, 3=Save button, 4=Cancel button.
     pub field: usize,
 }
 

@@ -727,14 +727,12 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
             }
             KeyCode::Enter => {
                 let field = s.prov_modal.as_ref().map(|m| m.field).unwrap_or(0);
-                if field == 4 {
+                if field == 3 {
                     s.save_provider_modal();
-                } else if field == 5 {
+                } else if field == 4 {
                     s.close_provider_modal();
-                } else if field == 2 {
-                    s.modal_toggle_type();
                 } else {
-                    // fields 0 (name), 1 (endpoint), 3 (api_key): advance to next
+                    // fields 0 (name), 1 (endpoint), 2 (api_key): advance to next
                     s.modal_down();
                 }
             }
