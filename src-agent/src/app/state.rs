@@ -308,6 +308,19 @@ pub struct AppStateRest {
     /// The missing-root set we last warned about, so the toast fires only when
     /// the set changes (not on every reindex).
     pub warned_missing_roots: Vec<String>,
+    /// All sub-agents spawned this session (running + finished). Drained each tick
+    /// by the event loop; finished ones stay in the list for the UI to show their
+    /// final state.
+    pub subagents: Vec<crate::app::subagent::SubAgent>,
+    /// True while the sub-agent panel is open (toggled by the sub-agent UI).
+    #[allow(dead_code)]
+    pub subagents_open: bool,
+    /// Selected row in the sub-agent list (index into `subagents`).
+    #[allow(dead_code)]
+    pub subagent_sel: usize,
+    /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
+    #[allow(dead_code)]
+    pub next_subagent_id: usize,
 }
 
 impl AppState {
@@ -387,6 +400,10 @@ impl AppStateRest {
             summarizing: false,
             work_since: None,
             warned_missing_roots: Vec::new(),
+            subagents: Vec::new(),
+            subagents_open: false,
+            subagent_sel: 0,
+            next_subagent_id: 0,
         }
     }
 

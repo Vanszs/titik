@@ -475,6 +475,140 @@ pub(super) fn run_loop(
             }
         }
 
+        // 1b-3c. Drain each sub-agent's event channel. Sub-agents live in
+        //        `state.rest.subagents`; each has its own `rx`. We iterate by index so
+        //        we can reborrow mutably after collecting events into a local vec (borrow
+        //        checker: the collect loop holds &mut subagents[i].rx; the apply loop
+        //        needs &mut subagents[i].{status,transcript} and later &mut session).
+        //        Pattern mirrors warm_rx: try_recv() in a loop, dirty=true on any event.
+        {
+            use crate::app::subagent::{AgentEvent, SubAgentStatus};
+
+            // Char-safe truncation helper (avoids panicking on multibyte boundaries).
+            fn trunc(s: &str, max: usize) -> String {
+                if s.chars().count() <= max {
+                    s.to_string()
+                } else {
+                    let cut: String = s.chars().take(max).collect();
+                    format!("{cut}…")
+                }
+            }
+
+            for i in 0..state.rest.subagents.len() {
+                // --- collect phase: drain rx into a local vec ---
+                let mut disconnected = false;
+                let events: Vec<AgentEvent> = {
+                    let sa = &mut state.rest.subagents[i];
+                    let mut evs = Vec::new();
+                    loop {
+                        match sa.rx.try_recv() {
+                            Ok(ev) => evs.push(ev),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                break;
+                            }
+                        }
+                    }
+                    evs
+                };
+
+                // Channel closed (task ended): mark Killed if still Running.
+                if disconnected {
+                    let sa = &mut state.rest.subagents[i];
+                    if matches!(sa.status, SubAgentStatus::Running) {
+                        sa.status = SubAgentStatus::Killed;
+                        dirty = true;
+                    }
+                }
+
+                if events.is_empty() {
+                    continue;
+                }
+                dirty = true;
+
+                // --- apply phase: fold events onto the sub-agent ---
+                // done_fold carries (id, agent_name, result) for the session fold below.
+                let mut done_fold: Option<(usize, String, String)> = None;
+                {
+                    let sa = &mut state.rest.subagents[i];
+                    for ev in events {
+                        match ev {
+                            AgentEvent::Token(t) => {
+                                // Merge consecutive token chunks into the last transcript
+                                // line when it is still a "token" line (not a marker line)
+                                // and short. Push a new line otherwise.
+                                let is_marker = sa.transcript.last().is_some_and(|l| {
+                                    l.starts_with("— ")
+                                        || l.starts_with("→ ")
+                                        || l.starts_with("✓ ")
+                                        || l.starts_with("done:")
+                                        || l.starts_with("error:")
+                                });
+                                if !is_marker
+                                    && sa.transcript.last().is_some_and(|l| l.len() < 200)
+                                {
+                                    if let Some(last) = sa.transcript.last_mut() {
+                                        last.push_str(&t);
+                                    }
+                                } else {
+                                    sa.transcript.push(t);
+                                }
+                                // Cap growth at ~200 lines.
+                                if sa.transcript.len() > 200 {
+                                    let drop = sa.transcript.len() - 200;
+                                    sa.transcript.drain(..drop);
+                                }
+                            }
+                            AgentEvent::Step(n) => {
+                                sa.transcript.push(format!("— step {n} —"));
+                            }
+                            AgentEvent::ToolStarted { name, args } => {
+                                sa.transcript.push(format!("→ {name} {}", trunc(&args, 120)));
+                            }
+                            AgentEvent::ToolDone { name, result } => {
+                                let first = result.lines().next().unwrap_or("").trim();
+                                sa.transcript.push(format!("✓ {name}: {}", trunc(first, 120)));
+                            }
+                            AgentEvent::Done(s) => {
+                                sa.transcript.push(format!("done: {}", trunc(&s, 200)));
+                                sa.status = SubAgentStatus::Done(s.clone());
+                                // Capture for the session fold (happens exactly once
+                                // per Done event; Done is terminal so this fires once).
+                                done_fold = Some((sa.id, sa.agent_name.clone(), s));
+                            }
+                            AgentEvent::Error(e) => {
+                                sa.transcript.push(format!("error: {e}"));
+                                sa.status = SubAgentStatus::Error(e);
+                            }
+                        }
+                    }
+                }
+
+                // --- session fold: inject a reference turn for Done ---
+                // Appended as an assistant turn (matches how compaction summaries
+                // are injected) so the main session retains a record of the result.
+                if let Some((sa_id, sa_name, result)) = done_fold {
+                    if let Some(sess) = state.rest.session.as_mut() {
+                        let note = trunc(
+                            &format!("[sub-agent #{sa_id} {sa_name}] finished: {result}"),
+                            400,
+                        );
+                        // Log to sqlite (no usage/cost for a sub-agent fold).
+                        let _ = crate::model::msglog::append(
+                            &sess.path,
+                            crate::dto::chat::Role::Assistant,
+                            &note,
+                            None,
+                        );
+                        // Append as a display-only assistant turn (no reasoning block).
+                        sess.conversation.push_assistant(note, None);
+                        let _ = sess.save();
+                    }
+                }
+            }
+        }
+
         // 1b-4. Loading splash: workspace step, transition, and animation. While in
         //        `Mode::Loading` the splash is driven entirely from the loop tick.
         if let Mode::Loading(s) = &mut state.mode {
