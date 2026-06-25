@@ -243,11 +243,17 @@ fn tool_is_risky(name: &str) -> bool {
 fn tac_inputs(
     state: &AppState,
     client: &Option<Arc<OpenRouterClient>>,
-) -> Option<(Arc<OpenRouterClient>, crate::model::settings::Settings)> {
+) -> Option<(
+    Arc<OpenRouterClient>,
+    crate::model::app_config::AppConfig,
+    crate::model::settings::Settings,
+)> {
     match (client.as_ref(), state.rest.session.as_ref()) {
-        (Some(c), Some(sess)) if sess.settings.classifier_enabled => {
-            Some((Arc::clone(c), sess.settings.clone()))
-        }
+        (Some(c), Some(sess)) if sess.settings.classifier_enabled => Some((
+            Arc::clone(c),
+            state.rest.config.clone(),
+            sess.settings.clone(),
+        )),
         _ => None,
     }
 }
@@ -300,9 +306,10 @@ pub(super) fn process_tools(
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.
-                Some((c, settings)) => {
+                Some((c, config, settings)) => {
                     let verdict = handle.block_on(crate::app::harness::classify_toolcall(
                         &c,
+                        &config,
                         &settings,
                         &user_intent,
                         &call.function.name,
@@ -631,20 +638,34 @@ pub(super) fn start_stream_task(
     // the history unchanged) when there's no active session.
     //
     // The per-session snapshot the reshape task needs: (dir, settings, latest user
-    // message). Cloned out of the session up front so the spawned task holds no
-    // borrow of `state`, and so `settings` is available to size the window + read
-    // `sliding_cache` below without re-borrowing the session.
-    let reshape: Option<(std::path::PathBuf, crate::model::settings::Settings, String)> =
-        state.rest.session.as_ref().map(|sess| {
-            let user_intent = sess.conversation.last_user_content().unwrap_or_default();
-            (sess.path.clone(), sess.settings.clone(), user_intent)
-        });
+    // message, resolved Awareness route). Cloned out of the session up front so the
+    // spawned task holds no borrow of `state`, and so `settings` is available to
+    // size the window + read `sliding_cache` below without re-borrowing the session.
+    //
+    // `shape`'s fold + snippet-router ride the AWARENESS role; resolve it HERE
+    // (before the spawn) into an owned `Resolved` so the moved-into-task value
+    // carries no borrow of `state.rest.config`. `None` (an unresolved Awareness
+    // role) makes `shape` skip the fold/router (existing summary still applies).
+    let reshape: Option<(
+        std::path::PathBuf,
+        crate::model::settings::Settings,
+        String,
+        Option<crate::app::resolve::Resolved>,
+    )> = state.rest.session.as_ref().map(|sess| {
+        let user_intent = sess.conversation.last_user_content().unwrap_or_default();
+        let aware = crate::app::resolve::resolve_role(
+            &state.rest.config,
+            &sess.settings,
+            crate::model::app_config::ModelRole::Awareness,
+        );
+        (sess.path.clone(), sess.settings.clone(), user_intent, aware)
+    });
 
     // 1. Window: the model's context-window size in tokens, from the cached
     //    catalogue. 128k is a safe fallback (the min-window policy is 100k+).
     let window = reshape
         .as_ref()
-        .and_then(|(_, settings, _)| {
+        .and_then(|(_, settings, _, _)| {
             state
                 .rest
                 .models_cache
@@ -667,7 +688,7 @@ pub(super) fn start_stream_task(
     //    window is longer when the provider runs a sliding/refreshing cache.
     let sliding_cache = reshape
         .as_ref()
-        .is_some_and(|(_, settings, _)| settings.sliding_cache);
+        .is_some_and(|(_, settings, _, _)| settings.sliding_cache);
     let gap = state.rest.last_send_at.map(|t| t.elapsed());
     let cold_window = if sliding_cache {
         Duration::from_secs(300)
@@ -708,12 +729,13 @@ pub(super) fn start_stream_task(
         // so this can never break the send. `summarizing` is the upstream engage
         // decision; `usable` is the token budget the fold's band sizing uses.
         let history = match reshape {
-            Some((session_dir, settings, user_intent)) => {
+            Some((session_dir, settings, user_intent, route)) => {
                 super::shortsend::shape(
                     history,
                     &session_dir,
                     &c,
                     &settings,
+                    route,
                     &user_intent,
                     summarizing,
                     usable,

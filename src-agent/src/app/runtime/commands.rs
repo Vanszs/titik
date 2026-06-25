@@ -192,20 +192,31 @@ pub(super) fn apply_slash(
                 state.rest.status = "busy — wait for response".into();
                 return Ok(());
             }
-            let (Some(c), Some(model)) = (
+            let (Some(c), Some(settings)) = (
                 client.as_ref(),
-                state.rest.session.as_ref().map(|s| s.settings.model.clone()),
+                state.rest.session.as_ref().map(|s| s.settings.clone()),
             ) else {
                 state.rest.status = "no active session".into();
                 return Ok(());
             };
+            let model = settings.model.clone();
+            // Resolve the MAIN role for the catalogue fetch (the catalogue is keyed
+            // to the chat endpoint). Snapshot the route into an owned local BEFORE
+            // the `block_on` + cache write so neither borrows `state.rest`.
+            let main = crate::app::resolve::resolve_role(
+                &state.rest.config,
+                &settings,
+                crate::model::app_config::ModelRole::Main,
+            );
 
             // Fetch the model catalogue once and cache it. A network failure
             // leaves the cache `None`, which the option-build step below treats
             // as "capabilities unknown" and falls back to a generic menu.
             if state.rest.models_cache.is_none() {
-                if let Ok(models) = handle.block_on(c.list_models()) {
-                    state.rest.models_cache = Some(models);
+                if let Some(r) = main.as_ref() {
+                    if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
+                        state.rest.models_cache = Some(models);
+                    }
                 }
             }
 
@@ -273,12 +284,24 @@ pub(super) fn apply_slash(
             }
             // Warm the model catalogue so the Models Select omnisearch has data
             // (best-effort; a network failure leaves the cache None and the modal
-            // simply shows no results). Mirrors the /effort prefetch. Must run
-            // before the immutable `session` borrow below, as it mutates rest.
+            // simply shows no results). Mirrors the /effort prefetch. Resolved
+            // against the MAIN role (the catalogue is keyed to the chat endpoint).
+            // Must run before the immutable `session` borrow below, as it mutates
+            // rest. Snapshot the Main route into an owned local first so neither the
+            // `block_on` nor the cache write borrows `state.rest`.
             if state.rest.models_cache.is_none() {
                 if let Some(c) = client.as_ref() {
-                    if let Ok(models) = handle.block_on(c.list_models()) {
-                        state.rest.models_cache = Some(models);
+                    let main = state.rest.session.as_ref().and_then(|s| {
+                        crate::app::resolve::resolve_role(
+                            &state.rest.config,
+                            &s.settings,
+                            crate::model::app_config::ModelRole::Main,
+                        )
+                    });
+                    if let Some(r) = main.as_ref() {
+                        if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
+                            state.rest.models_cache = Some(models);
+                        }
                     }
                 }
             }

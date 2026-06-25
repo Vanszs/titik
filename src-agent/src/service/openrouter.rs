@@ -21,6 +21,23 @@ use crate::dto::openrouter::{
 };
 use crate::service::StreamEvent;
 
+/// A resolved provider connection for a single secondary-model request: the
+/// `endpoint` (base URL) + `api_key` that used to be baked onto the client.
+///
+/// A cheap borrow (two `&str`, `Copy`), built fresh at the call site from the
+/// role's resolved route. The interactive chat (`stream_complete`) and `/compact`
+/// (`complete`) still read the baked `self.base_url`/`self.api_key`; every other
+/// request method takes its endpoint+key through this value instead, so a
+/// secondary role on a DIFFERENT provider/key Just Works with no client rebuild
+/// (auth + URL are already pure string interpolation on a header-less client).
+#[derive(Clone, Copy, Debug)]
+pub struct Conn<'a> {
+    /// Base URL, e.g. `https://openrouter.ai/api/v1`. Was `self.base_url`.
+    pub endpoint: &'a str,
+    /// Bearer token for this connection. Was `self.api_key`.
+    pub api_key: &'a str,
+}
+
 pub struct OpenRouterClient {
     http: reqwest::Client,
     api_key: String,
@@ -487,9 +504,9 @@ impl OpenRouterClient {
             .ok_or_else(|| anyhow!("no choices returned"))
     }
 
-    /// One-off non-streaming completion against a DIFFERENT model/provider,
-    /// reusing this client's http + api_key + base_url. provider "" = default
-    /// routing.
+    /// One-off non-streaming completion against a DIFFERENT model/provider on the
+    /// connection `conn` (its `endpoint` + `api_key`), reusing this client's http.
+    /// provider "" = default routing.
     ///
     /// Generic helper for secondary-model calls (project-awareness summaries
     /// today; a future request classifier reuses the same path). Builds the
@@ -498,11 +515,12 @@ impl OpenRouterClient {
     /// content; clean errors, no panics.
     pub async fn complete_with(
         &self,
+        conn: Conn<'_>,
         model: &str,
         provider: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", conn.endpoint);
         let body = ChatRequest {
             model: model.to_string(),
             messages: to_wire(messages),
@@ -522,7 +540,7 @@ impl OpenRouterClient {
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)
@@ -568,11 +586,12 @@ impl OpenRouterClient {
     /// because the caller surfaces it. Clean errors, no panics.
     pub async fn classify_with(
         &self,
+        conn: Conn<'_>,
         model: &str,
         provider: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", conn.endpoint);
         // Strict JSON-schema for the verdict object. `strict: true` +
         // `additionalProperties: false` force the model to emit exactly
         // `{"allow": <bool>, "reason": <string>}` and nothing else.
@@ -617,7 +636,7 @@ impl OpenRouterClient {
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)
@@ -671,12 +690,13 @@ impl OpenRouterClient {
     /// is written that turn — acceptable). Clean errors, no panics.
     pub async fn summarize_fold(
         &self,
+        conn: Conn<'_>,
         model: &str,
         provider: Option<&str>,
         system_prompt: &str,
         user_payload: &str,
     ) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", conn.endpoint);
         // Strict JSON-schema for the summary object. `strict: true` +
         // `additionalProperties: false` force the model to emit exactly
         // `{"summary": "<text>"}` and nothing else.
@@ -728,7 +748,7 @@ impl OpenRouterClient {
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)
@@ -788,12 +808,13 @@ impl OpenRouterClient {
     /// other secondary-model paths.
     pub async fn pick_blobs(
         &self,
+        conn: Conn<'_>,
         model: &str,
         provider: &str,
         system_prompt: &str,
         user_payload: &str,
     ) -> Result<Vec<i64>> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", conn.endpoint);
         // Strict JSON-schema for the id list. `strict: true` +
         // `additionalProperties: false` force the model to emit exactly
         // `{"blob_ids": [<integer>, ...]}` and nothing else.
@@ -845,7 +866,7 @@ impl OpenRouterClient {
         let response = match self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)
@@ -899,7 +920,8 @@ impl OpenRouterClient {
         Ok(ids)
     }
 
-    /// Fetch the OpenRouter model catalogue (`GET /models`).
+    /// Fetch the OpenRouter model catalogue (`GET /models`) on the connection
+    /// `conn` (its `endpoint` + `api_key`).
     ///
     /// Drives the `/effort` capability menu: the returned [`ModelInfo`] list is
     /// passed to [`effort_caps`] to decide which options the current model
@@ -907,12 +929,12 @@ impl OpenRouterClient {
     /// anyway for consistency with the other calls. Returns the `data` array;
     /// clean errors, no panics. Callers treat any `Err` as "capabilities
     /// unknown" and fall back to a generic menu.
-    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let url = format!("{}/models", self.base_url);
+    pub async fn list_models(&self, conn: Conn<'_>) -> Result<Vec<ModelInfo>> {
+        let url = format!("{}/models", conn.endpoint);
         let response = self
             .http
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .send()
@@ -929,20 +951,23 @@ impl OpenRouterClient {
     }
 
     /// Fetch the provider endpoint list for a single model
-    /// (`GET /models/{model_id}/endpoints`).
-    // dead_code: consumed by models-select UI (not yet wired).
-    #[allow(dead_code)]
+    /// (`GET /models/{model_id}/endpoints`) on the connection `conn` (its
+    /// `endpoint` + `api_key`).
     ///
     /// `model_id` is the slash-separated `author/slug` string as returned by
     /// [`Self::list_models`] (e.g. `"openai/gpt-4o-mini"`). The slash is
     /// already the correct path separator for the OpenRouter URL, so the string
-    /// is interpolated verbatim: `{base_url}/models/openai/gpt-4o-mini/endpoints`.
-    pub async fn list_model_endpoints(&self, model_id: &str) -> Result<Vec<ModelEndpoint>> {
-        let url = format!("{}/models/{}/endpoints", self.base_url, model_id);
+    /// is interpolated verbatim: `{endpoint}/models/openai/gpt-4o-mini/endpoints`.
+    pub async fn list_model_endpoints(
+        &self,
+        conn: Conn<'_>,
+        model_id: &str,
+    ) -> Result<Vec<ModelEndpoint>> {
+        let url = format!("{}/models/{}/endpoints", conn.endpoint, model_id);
         let response = self
             .http
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .send()

@@ -36,13 +36,11 @@
 //! model that is explicitly assigned (found in step 1 and whose provider resolves
 //! in step 2) ALWAYS wins over `awareness_inherit` — inherit is the behaviour when
 //! nothing is assigned, never an override of an assignment.
-//!
-//! Nothing calls this yet; it is wired into the call sites in a later stage, hence
-//! the `#[allow(dead_code)]` on the public surface.
 
 use crate::config::DEFAULT_BASE_URL;
 use crate::model::app_config::{ApiType, AppConfig, ModelEntry, ModelRole};
 use crate::model::settings::Settings;
+use crate::service::openrouter::Conn;
 
 /// One fully-resolved route for a runtime role: everything a client call needs to
 /// reach the right model on the right provider, with no further config lookups.
@@ -51,15 +49,39 @@ use crate::model::settings::Settings;
 /// `effort` carries the reasoning-effort token and is only ever non-empty for the
 /// Main role (the only role that exposes effort today); every other role resolves
 /// it to `String::new()`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub model_id: String,
     pub endpoint: String,
     pub api_key: String,
+    // Carried by the resolver but not consumed on the request path YET: every
+    // method still emits the OpenAI-compatible wire body. The Anthropic body
+    // builder will branch on this (forward-compat; flagged as a known gap).
+    #[allow(dead_code)]
     pub api_type: ApiType,
     pub route: Option<String>,
+    // Consumed only by the MAIN streaming path, which still reads the client's
+    // baked `self.effort` this stage (the chat path is refactored next stage).
+    // Non-empty only for the Main role; every other role resolves it to "".
+    #[allow(dead_code)]
     pub effort: String,
+}
+
+impl Resolved {
+    /// Borrow this route's `endpoint` + `api_key` as a [`Conn`] for a secondary
+    /// client call (the connection part of the route — "where + auth").
+    pub fn conn(&self) -> Conn<'_> {
+        Conn {
+            endpoint: &self.endpoint,
+            api_key: &self.api_key,
+        }
+    }
+
+    /// The OpenRouter upstream-provider pin as a slug (`""` = automatic routing),
+    /// the form the client's `provider_routing_for` expects.
+    pub fn provider(&self) -> &str {
+        self.route.as_deref().unwrap_or("")
+    }
 }
 
 /// Build a [`Resolved`] from an assigned [`ModelEntry`] by resolving its provider
@@ -160,7 +182,6 @@ fn legacy_fallback(settings: &Settings, role: ModelRole) -> Option<Resolved> {
 /// legacy fallback applies (see [`legacy_fallback`]). Returns `None` only for an
 /// unresolved Safeguard (fail-closed); every other role always resolves to
 /// `Some`.
-#[allow(dead_code)]
 pub fn resolve_role(config: &AppConfig, settings: &Settings, role: ModelRole) -> Option<Resolved> {
     // 1. Pick the assigned model: per-session overrides first, then the global
     //    catalogue. (`role` is Copy; both finds compare against `Some(role)`.)

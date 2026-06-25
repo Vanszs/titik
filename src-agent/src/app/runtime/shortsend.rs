@@ -38,6 +38,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::app::resolve::Resolved;
 use crate::dto::chat::{ChatMessage, Role};
 use crate::model::msglog;
 use crate::model::settings::Settings;
@@ -103,21 +104,6 @@ pub(super) fn estimate_conv_tokens(history: &[ChatMessage]) -> u64 {
 /// already carries the gist; recalls are for the few items the question needs.
 const MAX_REHYDRATE: usize = 3;
 
-/// Pick the secondary model + provider for short-send's own LLM calls (the fold
-/// and the router). Mirrors [`update_summary`]'s selection EXACTLY: inherit the
-/// session's own model/provider when `awareness_inherit`, else use the dedicated
-/// awareness model/provider. An empty provider means default routing.
-fn awareness_route(settings: &Settings) -> (&str, &str) {
-    if settings.awareness_inherit {
-        (settings.model.as_str(), settings.provider.as_str())
-    } else {
-        (
-            settings.awareness_model.as_str(),
-            settings.awareness_provider.as_str(),
-        )
-    }
-}
-
 /// Upper bound on how many delta messages to pull in one fold. Large enough that
 /// a normal session's un-summarised backlog fits in a single pass; the verbatim
 /// tail is excluded separately by the `fold_up_to` cap.
@@ -152,7 +138,7 @@ fn cap_chars(s: &str, cap: usize) -> String {
 pub async fn update_summary(
     session_dir: &Path,
     client: &OpenRouterClient,
-    settings: &Settings,
+    route: &Resolved,
     usable: u64,
 ) -> Result<bool> {
     // Existing summary state. Absent row (first ever fold) → empty text, covers 0.
@@ -240,15 +226,14 @@ pub async fn update_summary(
 
     let user_payload = build_payload(existing_text, &delta, &blobs);
 
-    // Reuse the awareness model/provider selection — no new settings in this phase.
-    // Inherit the session's own model/provider, or use the dedicated awareness
-    // model. An empty provider means default routing.
-    let (model, provider) = awareness_route(settings);
-
+    // Short-send rides the resolved Awareness route (its connection + model +
+    // upstream-route slug), resolved by the caller. `summarize_fold` treats an
+    // empty provider as default routing.
     let new_text = client
         .summarize_fold(
-            model,
-            Some(provider),
+            route.conn(),
+            &route.model_id,
+            Some(route.provider()),
             resources::shortsend_summary_prompt(),
             &user_payload,
         )
@@ -384,11 +369,19 @@ fn significant_terms(user_intent: &str) -> Vec<String> {
 /// verbatim (cheap via prompt caching) and this is a no-op. `usable =
 /// context_window - BASE_OVERHEAD` is the token budget the fold's band sizing is
 /// taken against.
+///
+/// `route` is the resolved Awareness route (short-send's fold + snippet-router
+/// share the Awareness role), snapshotted by the caller BEFORE the spawn. `None`
+/// (an unresolved Awareness role) skips the fold and the snippet-router branch —
+/// an existing summary + content-search recalls still apply, nothing is folded or
+/// router-rehydrated this turn.
+#[allow(clippy::too_many_arguments)]
 pub async fn shape(
     history: Vec<ChatMessage>,
     session_dir: &Path,
     client: &OpenRouterClient,
     settings: &Settings,
+    route: Option<Resolved>,
     user_intent: &str,
     summarizing: bool,
     usable: u64,
@@ -430,8 +423,12 @@ pub async fn shape(
     // 3. Best-effort fold so the summary reflects everything older than the tail.
     //    Token-band step-advance: this is a no-op unless the verbatim tail has
     //    grown past TAIL_HI_PCT of `usable`. Errors / "nothing to fold" are ignored
-    //    — we use whatever summary already exists.
-    let _ = update_summary(session_dir, client, settings, usable).await;
+    //    — we use whatever summary already exists. Skipped entirely when the
+    //    Awareness role doesn't resolve (no `route`): we can't fold without a route,
+    //    so we fall back to the existing summary.
+    if let Some(route) = route.as_ref() {
+        let _ = update_summary(session_dir, client, route, usable).await;
+    }
 
     // 4. No summary yet → nothing to compress against; send the full history.
     let Some(sum) = msglog::read_summary(session_dir) else {
@@ -503,13 +500,21 @@ pub async fn shape(
                 recalls.push(format!("\n\n[recalled blob #{}]\n{}", hit.id, content));
             }
         }
-    } else if !candidates.is_empty() {
-        // 6b. Fallback to the snippet router only when content search came up empty.
-        let (model, provider) = awareness_route(settings);
+    } else if let (false, Some(route)) = (candidates.is_empty(), route.as_ref()) {
+        // 6b. Fallback to the snippet router only when content search came up empty
+        //     AND the Awareness role resolved (the router rides that route). With no
+        //     route we rehydrate nothing via the router — content-search recalls
+        //     (6a) above are unaffected.
         let payload = build_router_payload(user_intent, &candidates);
         // Best-effort: `pick_blobs` already returns an empty vec on any error.
         let picked = client
-            .pick_blobs(model, provider, resources::shortsend_router_prompt(), &payload)
+            .pick_blobs(
+                route.conn(),
+                &route.model_id,
+                route.provider(),
+                resources::shortsend_router_prompt(),
+                &payload,
+            )
             .await
             .unwrap_or_default();
         for id in picked {

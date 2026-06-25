@@ -30,8 +30,10 @@ use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
+use crate::app::resolve::resolve_role;
 use crate::app::state::AppState;
 use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
+use crate::model::app_config::ModelRole;
 use crate::model::{app_config::AppConfig, session::Session, settings::Settings, store};
 use crate::service::openrouter::OpenRouterClient;
 
@@ -77,27 +79,44 @@ pub(super) fn warm_session(
     // picker-select, creds-confirm — acquires the lock.
     reconcile_session_lock(state);
     // Snapshot what we need, dropping the session borrow before block_on +
-    // the mutable write to state.rest.awareness_summary.
+    // the mutable write to state.rest.awareness_summary. `config` is cloned out so
+    // the role resolution below doesn't borrow `state` across the `block_on`.
     let (workdir, settings, workdirs) = match state.rest.session.as_ref() {
         Some(s) => (s.workdir(), s.settings.clone(), s.workdirs()),
         None => return,
     };
+    let config = state.rest.config.clone();
     crate::tool::dircache::reindex(workdirs, state.rest.dir_cache.clone());
     // Best-effort: prefetch the model catalogue so `context_length` is available
-    // for the threshold gate in `shortsend::shape`. A failed fetch leaves
+    // for the threshold gate in `shortsend::shape`. Resolved against the MAIN role
+    // (the catalogue is keyed to the chat endpoint). A failed fetch leaves
     // `models_cache` as `None`, which the threshold gate treats as unknown → uses
     // the fallback window constant instead. Never blocks the session or panics.
     if state.rest.models_cache.is_none() {
         if let Some(c) = client.as_ref() {
-            if let Ok(models) = handle.block_on(c.list_models()) {
-                state.rest.models_cache = Some(models);
+            if let Some(main) = resolve_role(&config, &settings, ModelRole::Main) {
+                if let Ok(models) = handle.block_on(c.list_models(main.conn())) {
+                    state.rest.models_cache = Some(models);
+                }
             }
         }
     }
     if settings.awareness_enabled {
         if let Some(c) = client.as_ref() {
-            let summary = handle.block_on(crate::app::awareness::summarize(c, &settings, &workdir));
-            state.rest.awareness_summary = summary;
+            // Resolve the Awareness role for the summary call (endpoint + key +
+            // model + upstream-route slug). Awareness always resolves (it falls
+            // back to inherit-Main / legacy fields), but guard defensively.
+            if let Some(r) = resolve_role(&config, &settings, ModelRole::Awareness) {
+                let summary = handle.block_on(crate::app::awareness::summarize(
+                    c,
+                    &settings,
+                    r.conn(),
+                    &r.model_id,
+                    r.provider(),
+                    &workdir,
+                ));
+                state.rest.awareness_summary = summary;
+            }
         }
     }
 }

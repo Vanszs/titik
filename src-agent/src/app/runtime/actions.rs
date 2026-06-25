@@ -80,16 +80,20 @@ pub(super) fn apply_action(
             // any stale receiver from a prior turn first.
             state.rest.harness_rx = None;
             let pc_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
-                (Some(c), Some(sess)) if sess.settings.classifier_enabled => {
-                    Some((Arc::clone(c), sess.settings.clone()))
-                }
+                (Some(c), Some(sess)) if sess.settings.classifier_enabled => Some((
+                    Arc::clone(c),
+                    state.rest.config.clone(),
+                    sess.settings.clone(),
+                )),
                 _ => None,
             };
-            if let Some((c, settings)) = pc_inputs {
+            if let Some((c, config, settings)) = pc_inputs {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 state.rest.harness_rx = Some(rx);
                 handle.spawn(async move {
-                    let v = crate::app::harness::classify_prompt(&c, &settings, &pc_prompt).await;
+                    let v =
+                        crate::app::harness::classify_prompt(&c, &config, &settings, &pc_prompt)
+                            .await;
                     // A dropped receiver (turn superseded / app closing) makes
                     // this a no-op — same contract as the streaming channel.
                     let _ = tx.send(crate::service::StreamEvent::HarnessVerdict {
@@ -627,7 +631,22 @@ pub(super) fn apply_action(
             //
             // No client → there's nothing to fetch against; just clear the
             // loading flag on the modal so the UI doesn't spin forever.
-            let Some(c) = client.as_ref() else {
+            // No client, or no resolvable MAIN route → there's nothing to fetch
+            // against; just clear the loading flag on the modal so the UI doesn't
+            // spin forever. The endpoints GET goes against the MAIN connection (the
+            // catalogue/endpoints are keyed to the chat endpoint); resolve it into
+            // an owned `Resolved` and MOVE it into the task (so the task holds no
+            // borrow of `state.rest.config`, and `r.conn()` is built inside).
+            let route = client.as_ref().and_then(|_| {
+                state.rest.session.as_ref().and_then(|s| {
+                    crate::app::resolve::resolve_role(
+                        &state.rest.config,
+                        &s.settings,
+                        crate::model::app_config::ModelRole::Main,
+                    )
+                })
+            });
+            let (Some(c), Some(route)) = (client.as_ref(), route) else {
                 if let Mode::Settings(s) = &mut state.mode {
                     if let Some(m) = s.model_modal.as_mut() {
                         m.endpoints_loading = false;
@@ -642,7 +661,7 @@ pub(super) fn apply_action(
                 // A dropped receiver (modal closed / a newer fetch superseded
                 // this one) makes the send a no-op — same contract as the
                 // streaming + harness channels.
-                let _ = match c.list_model_endpoints(&model_id).await {
+                let _ = match c.list_model_endpoints(route.conn(), &model_id).await {
                     Ok(eps) => tx.send(crate::service::StreamEvent::EndpointsLoaded {
                         model_id,
                         endpoints: eps,

@@ -18,7 +18,7 @@ use std::path::Path;
 
 use crate::dto::chat::{ChatMessage, Role};
 use crate::model::settings::Settings;
-use crate::service::openrouter::OpenRouterClient;
+use crate::service::openrouter::{Conn, OpenRouterClient};
 
 /// Project doc filenames probed at depth 1 of the workspace, in priority order.
 /// Case-sensitive (matched verbatim) — the same names the rest of the app uses.
@@ -39,13 +39,22 @@ fn cap_chars(s: &str, cap: usize) -> String {
     s.chars().take(cap).collect()
 }
 
-/// Read depth-1 project docs and summarize them via the secondary model.
+/// Read depth-1 project docs and summarize them via the secondary model on the
+/// resolved Awareness route (`conn` = endpoint + key; `model` + `provider` = the
+/// upstream-route slug, `""` = default routing).
+///
+/// The caller resolves the Awareness role (`resolve_role(config, settings,
+/// Awareness)`) and passes its connection in, so an awareness model on a
+/// different provider/key than the chat path is reached without a client rebuild.
 ///
 /// Returns `None` if awareness is disabled, no docs are found, or the model
 /// call fails — the caller treats `None` as "no summary" and carries on.
 pub async fn summarize(
     client: &OpenRouterClient,
     settings: &Settings,
+    conn: Conn<'_>,
+    model: &str,
+    provider: &str,
     workdir: &Path,
 ) -> Option<String> {
     if !settings.awareness_enabled {
@@ -79,25 +88,16 @@ pub async fn summarize(
         return None; // no docs to summarise
     }
 
-    // Pick the model/provider: inherit the session's own, or use the dedicated
-    // awareness model. `complete_with` treats an empty provider as default
-    // routing, so an inherited empty provider behaves the same as the chat path.
-    let (model, provider) = if settings.awareness_inherit {
-        (settings.model.as_str(), settings.provider.as_str())
-    } else {
-        (
-            settings.awareness_model.as_str(),
-            settings.awareness_provider.as_str(),
-        )
-    };
-
     let messages = vec![
         ChatMessage::new(Role::System, SUMMARY_SYSTEM),
         ChatMessage::new(Role::User, corpus),
     ];
 
+    // The model/provider/connection come from the caller's resolved Awareness
+    // route (session override > config > legacy inherit/dedicated fields).
+    // `complete_with` treats an empty provider as default routing.
     // Best-effort: any error (no key, network, bad provider) → no summary.
-    match client.complete_with(model, provider, messages).await {
+    match client.complete_with(conn, model, provider, messages).await {
         Ok(s) => {
             let s = s.trim();
             if s.is_empty() {

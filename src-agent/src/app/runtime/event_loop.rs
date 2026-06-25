@@ -88,17 +88,35 @@ fn apply_compaction_result(
     // Refresh the project-awareness summary post-compaction: the project is often
     // better understood after a compact, and this also satisfies the "applies on
     // compaction" requirement. Best-effort; gated by `awareness_enabled` inside
-    // `summarize`. Clone the inputs out first so the `block_on` doesn't hold a
-    // borrow of `state.rest`.
+    // `summarize`. Clone the inputs out first (including `config` for the role
+    // resolution) so the `block_on` doesn't hold a borrow of `state.rest`.
     let aware_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
-        (Some(c), Some(sess)) if sess.settings.awareness_enabled => {
-            Some((Arc::clone(c), sess.settings.clone(), sess.workdir()))
-        }
+        (Some(c), Some(sess)) if sess.settings.awareness_enabled => Some((
+            Arc::clone(c),
+            state.rest.config.clone(),
+            sess.settings.clone(),
+            sess.workdir(),
+        )),
         _ => None,
     };
-    if let Some((c, settings, workdir)) = aware_inputs {
-        let s = handle.block_on(crate::app::awareness::summarize(&c, &settings, &workdir));
-        state.rest.awareness_summary = s;
+    if let Some((c, config, settings, workdir)) = aware_inputs {
+        // Resolve the Awareness role (endpoint + key + model + upstream-route slug)
+        // for the summary call; Awareness always resolves, but guard defensively.
+        if let Some(r) = crate::app::resolve::resolve_role(
+            &config,
+            &settings,
+            crate::model::app_config::ModelRole::Awareness,
+        ) {
+            let s = handle.block_on(crate::app::awareness::summarize(
+                &c,
+                &settings,
+                r.conn(),
+                &r.model_id,
+                r.provider(),
+                &workdir,
+            ));
+            state.rest.awareness_summary = s;
+        }
     }
 
     // The transcript cache only rebuilds on a length SHRINK; compaction can be a

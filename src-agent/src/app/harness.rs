@@ -19,10 +19,13 @@
 //!   is unavailable (error/timeout) the verdict's `available` flag is false and
 //!   the caller degrades to a human prompt in both modes.
 //!
-//! Both classifier calls run against the configured `classifier_model` /
-//! `classifier_provider` via the dedicated [`OpenRouterClient::classify_with`],
+//! Both classifier calls run against the resolved Safeguard route
+//! (`resolve_role(config, settings, Safeguard)` → endpoint + key + model +
+//! upstream-route slug) via the dedicated [`OpenRouterClient::classify_with`],
 //! which turns thinking OFF and pins a strict JSON schema so the safeguard model
 //! returns a machine-parseable `{allow, reason}` object fast and deterministically.
+//! An unresolved Safeguard route (fail-closed) becomes an unavailable verdict,
+//! degraded to a human prompt (TAC) / advisory toast (PC) by the caller.
 //! They build a two-message conversation (System = the embedded policy text, User
 //! = the prompt / the request + tool call) and parse the reply with
 //! [`parse_verdict`] (JSON-first, with a lenient text-scan fallback), all bounded
@@ -32,7 +35,9 @@
 
 use std::path::Path;
 
+use crate::app::resolve::resolve_role;
 use crate::dto::chat::{ChatMessage, Role};
+use crate::model::app_config::{AppConfig, ModelRole};
 use crate::model::settings::Settings;
 use crate::service::openrouter::OpenRouterClient;
 
@@ -251,6 +256,7 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12)
 /// / approval box is accurate. Bounded by [`CLASSIFY_TIMEOUT`]; `block_on`-safe.
 async fn classify(
     client: &OpenRouterClient,
+    config: &AppConfig,
     settings: &Settings,
     messages: Vec<ChatMessage>,
     unavailable_allow: bool,
@@ -262,13 +268,17 @@ async fn classify(
         reason,
         available: false,
     };
+    // Resolve the Safeguard route (session override > config > legacy classifier
+    // field). FAIL-CLOSED: an unresolved safeguard (unassigned / missing provider /
+    // empty key, with no legacy classifier model) yields `None` → an unavailable
+    // verdict, exactly as when the classifier can't be reached. The caller degrades
+    // that to a human prompt (TAC) / advisory toast (PC) rather than auto-allowing.
+    let Some(route) = resolve_role(config, settings, ModelRole::Safeguard) else {
+        return unavailable("safeguard model not configured".to_string());
+    };
     match tokio::time::timeout(
         CLASSIFY_TIMEOUT,
-        client.classify_with(
-            &settings.classifier_model,
-            &settings.classifier_provider,
-            messages,
-        ),
+        client.classify_with(route.conn(), &route.model_id, route.provider(), messages),
     )
     .await
     {
@@ -289,6 +299,7 @@ async fn classify(
 /// and otherwise proceeds; it ignores `available` because PC is advisory.
 pub async fn classify_prompt(
     client: &OpenRouterClient,
+    config: &AppConfig,
     settings: &Settings,
     user_prompt: &str,
 ) -> Verdict {
@@ -298,7 +309,7 @@ pub async fn classify_prompt(
     ];
     // Advisory fail-open: on an unavailable classifier, allow the turn but keep
     // the real reason for the toast.
-    classify(client, settings, messages, true).await
+    classify(client, config, settings, messages, true).await
 }
 
 /// Tool-call classifier (TAC). Classify a single tool call for auto-run safety,
@@ -313,6 +324,7 @@ pub async fn classify_prompt(
 /// `available = true` (allow → auto-run; block → the caller acts on the mode).
 pub async fn classify_toolcall(
     client: &OpenRouterClient,
+    config: &AppConfig,
     settings: &Settings,
     user_intent: &str,
     tool_name: &str,
@@ -327,5 +339,5 @@ pub async fn classify_toolcall(
     ];
     // TAC fail-closed on unavailable: `allow = false` so the caller degrades to a
     // human decision per mode; the real reason rides along for the prompt/toast.
-    classify(client, settings, messages, false).await
+    classify(client, config, settings, messages, false).await
 }
