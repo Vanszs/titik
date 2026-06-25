@@ -76,6 +76,12 @@ pub enum Action {
     /// Esc from the agents dashboard (Browse, LIST focused) — discard any drafts
     /// and return to Chat.
     CloseAgents,
+    /// Fetch the provider-endpoint list for the given model id (the inner
+    /// `String`) on a background task. Emitted by the model modal when an
+    /// OpenRouter model is selected (search) or an existing model is opened for
+    /// edit; the modal's loading flags are already set by the caller. The
+    /// runtime opens a fresh `endpoints_rx` channel and spawns the fetch.
+    FetchModelEndpoints(String),
 }
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -539,12 +545,199 @@ fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -
 ///    Esc saves all drafts and closes the dashboard (`Action::SaveSettings`).
 ///    Enter / Right move focus to the detail pane.
 ///
-/// `_rest` is accepted for handler-signature consistency but unused.
-fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEvent) -> Action {
-    use crate::app::mode::SettingField;
+/// `rest` is used by the models-modal omnisearch (it reads `rest.models_cache`
+/// to navigate/select catalogue results); the other branches don't touch it.
+fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    use crate::app::mode::{filter_models, SettingField};
 
     if is_ctrl(&key, 'c') {
         return Action::Quit;
+    }
+
+    // --- Add/edit-model modal (deepest level: intercepts ALL keys except Ctrl+C) ---
+    if s.model_modal.is_some() {
+        use crate::app::mode::settings::ModelField;
+        let or = s.mm_provider_is_openrouter();
+        let cur = s.mm_current_field();
+        let query = s.mm_query().to_string();
+        // Omnisearch is live only on the Model field, for an OpenRouter provider,
+        // once the user has typed something.
+        let search_mode = cur == Some(ModelField::Model) && or && !query.is_empty();
+
+        // Selecting a model arms its provider-endpoints load: `mm_select_model`
+        // sets the modal's loading flags, and we hand the chosen id back to the
+        // runtime here so it spawns the fetch (the drain folds the result in).
+        let mut modal_action = Action::None;
+
+        if search_mode {
+            let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+            match key.code {
+                KeyCode::Esc => {
+                    s.close_model_modal();
+                }
+                KeyCode::Up => {
+                    s.mm_result_up();
+                }
+                KeyCode::Down => {
+                    let len = filter_models(cache, &query).len();
+                    s.mm_result_down(len.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let results = filter_models(cache, &query);
+                    if !results.is_empty() {
+                        let sel = s
+                            .model_modal
+                            .as_ref()
+                            .map(|m| m.result_sel)
+                            .unwrap_or(0)
+                            .min(results.len() - 1);
+                        let id = cache[results[sel]].id.clone();
+                        // Set the model + arm the loading flags, then trigger the
+                        // background endpoints fetch for the chosen id. (Search
+                        // mode is OpenRouter-only, so an endpoints API always
+                        // exists for this path.)
+                        s.mm_select_model(id.clone());
+                        modal_action = Action::FetchModelEndpoints(id);
+                    }
+                }
+                // Tab escapes the search and advances to the next field.
+                KeyCode::Tab => {
+                    s.mm_down();
+                }
+                KeyCode::Backspace => {
+                    s.mm_backspace();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    s.mm_push_char(c);
+                }
+                _ => {}
+            }
+        } else if cur == Some(ModelField::Route) {
+            // Route field: Up/Down navigate the provider options (Auto + each
+            // fetched endpoint), Enter commits the highlighted choice. Same
+            // dual-semantics as the omnisearch results: here ↑/↓ drive the list,
+            // NOT the modal field cursor. Tab/Left/Right still move fields.
+            //
+            // Boundary-escape: Up at the first option (sel == 0) exits the Route
+            // list upward to the previous field; Down at the last option exits
+            // downward to the next field. This prevents the user from getting
+            // trapped in the Route list. Enter commits AND advances to the next
+            // field so it gives visible forward progress.
+            let count = s.mm_route_option_count();
+            let sel   = s.mm_route_sel();
+            match key.code {
+                KeyCode::Esc => {
+                    s.close_model_modal();
+                }
+                KeyCode::Up => {
+                    if sel > 0 {
+                        s.mm_route_up();
+                    } else {
+                        s.mm_up();
+                    }
+                }
+                KeyCode::Down => {
+                    if sel + 1 < count {
+                        s.mm_route_down();
+                    } else {
+                        s.mm_down();
+                    }
+                }
+                KeyCode::Enter => {
+                    s.mm_route_commit();
+                    s.mm_down();
+                }
+                // Tab advances out of the Route field to the next one.
+                KeyCode::Tab => {
+                    s.mm_down();
+                }
+                KeyCode::Left => {
+                    s.mm_left();
+                }
+                KeyCode::Right => {
+                    s.mm_right();
+                }
+                _ => {}
+            }
+        } else {
+            // Field navigation (Name / Provider / Model-as-text / [Role] / Save / Cancel).
+            match key.code {
+                KeyCode::Esc => {
+                    s.close_model_modal();
+                }
+                KeyCode::Up => {
+                    s.mm_up();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    s.mm_down();
+                }
+                KeyCode::Left => {
+                    s.mm_left();
+                }
+                KeyCode::Right => {
+                    s.mm_right();
+                }
+                KeyCode::Enter => {
+                    match cur {
+                        Some(ModelField::Save) => s.save_model_modal(false),
+                        Some(ModelField::SaveSession) => s.save_model_modal(true),
+                        Some(ModelField::Cancel) => s.close_model_modal(),
+                        // Name / Provider / Model / Role: advance to the next field.
+                        _ => s.mm_down(),
+                    }
+                }
+                KeyCode::Backspace => {
+                    s.mm_backspace();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    s.mm_push_char(c);
+                }
+                _ => {}
+            }
+        }
+        return modal_action;
+    }
+
+    // --- Add-provider modal (deepest level: intercepts ALL keys except Ctrl+C) ---
+    if s.prov_modal.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                s.close_provider_modal();
+            }
+            KeyCode::Up => {
+                s.modal_up();
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                s.modal_down();
+            }
+            KeyCode::Left => {
+                s.modal_left();
+            }
+            KeyCode::Right => {
+                s.modal_right();
+            }
+            KeyCode::Enter => {
+                let field = s.prov_modal.as_ref().map(|m| m.field).unwrap_or(0);
+                if field == 4 {
+                    s.save_provider_modal();
+                } else if field == 5 {
+                    s.close_provider_modal();
+                } else if field == 2 {
+                    s.modal_toggle_type();
+                } else {
+                    // fields 0 (name), 1 (endpoint), 3 (api_key): advance to next
+                    s.modal_down();
+                }
+            }
+            KeyCode::Backspace => {
+                s.modal_backspace();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                s.modal_push_char(c);
+            }
+            _ => {}
+        }
+        return Action::None;
     }
 
     if s.picker.is_some() {
@@ -639,6 +832,81 @@ fn handle_settings(s: &mut SettingsState, _rest: &mut AppStateRest, key: KeyEven
             _ => Action::None,
         }
     } else if s.in_detail {
+        // --- Providers category: custom navigation for the provider list ---
+        if s.is_providers_category() {
+            match key.code {
+                KeyCode::Esc => {
+                    s.focus_sidebar();
+                }
+                KeyCode::Up => {
+                    s.prov_up();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    s.prov_down();
+                }
+                KeyCode::Char('+') => {
+                    s.open_provider_modal();
+                }
+                KeyCode::Enter => {
+                    if s.prov_on_add_button() {
+                        s.open_provider_modal();
+                    }
+                }
+                _ if is_ctrl(&key, 'x') => {
+                    s.prov_arm_or_delete();
+                }
+                _ => {
+                    s.prov_disarm();
+                }
+            }
+            return Action::None;
+        }
+
+        // --- Models Select category: custom navigation for the models list ---
+        if s.is_models_category() {
+            // Opening an existing OpenRouter model for edit arms its endpoints
+            // load; the chosen id is returned to the runtime so it spawns the
+            // fetch (an existing model's providers load on open).
+            let mut models_action = Action::None;
+            match key.code {
+                KeyCode::Esc => {
+                    s.focus_sidebar();
+                }
+                KeyCode::Up => {
+                    s.model_up();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    s.model_down();
+                }
+                // Catalogue prefetch happens on /settings open, so '+' just opens
+                // the modal — no Action needed in Pass A.
+                KeyCode::Char('+') => {
+                    s.open_model_modal_add();
+                }
+                KeyCode::Enter => {
+                    if s.model_on_add_button() {
+                        s.open_model_modal_add();
+                    } else {
+                        s.open_model_modal_edit(s.model_sel);
+                        // If the opened model's provider is OpenRouter and it has
+                        // a model id, arm the loading flags + fetch its providers.
+                        // Non-OpenRouter / empty id → no endpoints API, so this
+                        // returns None and the modal opens without a fetch.
+                        if let Some(id) = s.mm_arm_endpoints_load() {
+                            models_action = Action::FetchModelEndpoints(id);
+                        }
+                    }
+                }
+                _ if is_ctrl(&key, 'x') => {
+                    s.model_arm_or_delete();
+                }
+                _ => {
+                    s.model_disarm();
+                }
+            }
+            return models_action;
+        }
+
         match key.code {
             // Return to the sidebar (also exits editing/list/picker state).
             KeyCode::Esc => {

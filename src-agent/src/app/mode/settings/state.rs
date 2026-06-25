@@ -6,6 +6,7 @@ use crate::view::theme::ACCENTS;
 
 use super::super::SettingField;
 use super::picker::{PathPicker, PickerMode};
+use super::{ApiType, ModelDraft, ModelField, ModelModal, ModelRole, ProviderDraft, ProviderModal};
 
 /// Working state for the in-app `/settings` dashboard.
 ///
@@ -78,6 +79,24 @@ pub struct SettingsState {
     /// Active filesystem directory picker overlay, if any. When `Some` it has
     /// keyboard focus (deepest nesting level) until confirmed or cancelled.
     pub picker: Option<PathPicker>,
+    /// In-memory list of API provider drafts (stub only, not persisted).
+    pub providers: Vec<ProviderDraft>,
+    /// Selected row in the providers list. Index == `providers.len()` means the
+    /// `[+ add]` button row is highlighted.
+    pub prov_sel: usize,
+    /// `true` after the first Ctrl+X: next Ctrl+X confirms the delete.
+    pub prov_delete_armed: bool,
+    /// Active add-provider modal, if open.
+    pub prov_modal: Option<ProviderModal>,
+    /// In-memory list of model drafts (stub only, not persisted).
+    pub models: Vec<ModelDraft>,
+    /// Selected row in the models list. Index == `models.len()` means the
+    /// `[+ add model]` button row is highlighted.
+    pub model_sel: usize,
+    /// `true` after the first Ctrl+X on a model row: next Ctrl+X confirms.
+    pub model_delete_armed: bool,
+    /// Active add/edit-model modal, if open.
+    pub model_modal: Option<ModelModal>,
 }
 
 impl SettingsState {
@@ -135,6 +154,34 @@ impl SettingsState {
             list_editing: false,
             list_sel: 0,
             picker: None,
+            providers: vec![
+                ProviderDraft {
+                    name: "OpenRouter".into(),
+                    endpoint: "https://openrouter.ai/api/v1".into(),
+                    api_type: ApiType::OpenAiCompatible,
+                    api_key: "sk-or-demo".into(),
+                },
+                ProviderDraft {
+                    name: "Anthropic".into(),
+                    endpoint: "https://api.anthropic.com".into(),
+                    api_type: ApiType::AnthropicCompatible,
+                    api_key: "sk-ant-demo".into(),
+                },
+            ],
+            prov_sel: 0,
+            prov_delete_armed: false,
+            prov_modal: None,
+            models: vec![ModelDraft {
+                name: "chat".into(),
+                model_id: "openai/gpt-4o-mini".into(),
+                provider_idx: 0,
+                role: None,
+                route: None,
+                session_only: false,
+            }],
+            model_sel: 0,
+            model_delete_armed: false,
+            model_modal: None,
         }
     }
 
@@ -226,9 +273,14 @@ impl SettingsState {
         }
     }
 
-    /// Move focus to the detail pane (only if the current category has fields).
+    /// Move focus to the detail pane (only if the current category has fields,
+    /// or if the category is one of the special interactive screens — API
+    /// Providers / Models Select — which carry no [`SettingField`] rows).
     pub fn focus_detail(&mut self) {
-        if !super::SETTING_CATEGORIES[self.cat].fields.is_empty() {
+        if !super::SETTING_CATEGORIES[self.cat].fields.is_empty()
+            || self.is_providers_category()
+            || self.is_models_category()
+        {
             self.in_detail = true;
             self.field = 0;
         }
@@ -433,5 +485,644 @@ impl SettingsState {
             (cur + len - 1) % len
         };
         self.accent = ACCENTS[next].to_string();
+    }
+
+    // --- API Providers screen helpers ---
+
+    /// `true` when the selected category is "API Providers".
+    pub fn is_providers_category(&self) -> bool {
+        super::SETTING_CATEGORIES[self.cat].name == "API Providers"
+    }
+
+    /// Move selection up in the providers list; clears the delete-armed flag.
+    pub fn prov_up(&mut self) {
+        self.prov_sel = self.prov_sel.saturating_sub(1);
+        self.prov_delete_armed = false;
+    }
+
+    /// Move selection down in the providers list (max index = providers.len()
+    /// which is the add-button row); clears the delete-armed flag.
+    pub fn prov_down(&mut self) {
+        self.prov_sel = (self.prov_sel + 1).min(self.providers.len());
+        self.prov_delete_armed = false;
+    }
+
+    /// `true` when the `[+ add]` button row is highlighted.
+    pub fn prov_on_add_button(&self) -> bool {
+        self.prov_sel == self.providers.len()
+    }
+
+    /// First Ctrl+X arms the delete; second Ctrl+X confirms it.
+    /// Has no effect when the add-button row is selected.
+    pub fn prov_arm_or_delete(&mut self) {
+        if self.prov_on_add_button() {
+            return;
+        }
+        if self.prov_delete_armed {
+            // Confirm: remove the entry.
+            if self.prov_sel < self.providers.len() {
+                self.providers.remove(self.prov_sel);
+            }
+            self.prov_delete_armed = false;
+            // Clamp selection to the new length.
+            let max = self.providers.len(); // add-button index
+            if self.prov_sel > max {
+                self.prov_sel = max;
+            }
+        } else {
+            self.prov_delete_armed = true;
+        }
+    }
+
+    /// Cancel the armed-delete state (any key other than Ctrl+X).
+    pub fn prov_disarm(&mut self) {
+        self.prov_delete_armed = false;
+    }
+
+    /// Open the add-provider modal with a blank draft.
+    pub fn open_provider_modal(&mut self) {
+        self.prov_modal = Some(ProviderModal::new());
+    }
+
+    /// Close the add-provider modal without saving.
+    pub fn close_provider_modal(&mut self) {
+        self.prov_modal = None;
+    }
+
+    /// Save the modal draft as a new provider and close the modal.
+    pub fn save_provider_modal(&mut self) {
+        if let Some(m) = self.prov_modal.take() {
+            let name     = m.name.trim().to_string();
+            let endpoint = m.endpoint.trim().to_string();
+            let api_key  = m.api_key.trim().to_string();
+            self.providers.push(ProviderDraft {
+                name,
+                endpoint,
+                api_type: m.api_type,
+                api_key,
+            });
+            // Select the newly added entry (last real index).
+            self.prov_sel = self.providers.len().saturating_sub(1);
+        }
+    }
+
+    /// Move focus up in the modal (clamp 0..=5).
+    pub fn modal_up(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            m.field = m.field.saturating_sub(1);
+        }
+    }
+
+    /// Move focus down in the modal (clamp 0..=5).
+    pub fn modal_down(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            m.field = (m.field + 1).min(5);
+        }
+    }
+
+    /// Move focus left in the modal: toggles type on field 2, moves Cancel→Save on field 5.
+    pub fn modal_left(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            if m.field == 2 {
+                m.api_type = m.api_type.toggle();
+            } else if m.field == 5 {
+                m.field = 4;
+            }
+        }
+    }
+
+    /// Move focus right in the modal: toggles type on field 2, moves Save→Cancel on field 4.
+    pub fn modal_right(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            if m.field == 2 {
+                m.api_type = m.api_type.toggle();
+            } else if m.field == 4 {
+                m.field = 5;
+            }
+        }
+    }
+
+    /// Toggle the api_type field in the modal (no-op unless field == 2).
+    pub fn modal_toggle_type(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            if m.field == 2 {
+                m.api_type = m.api_type.toggle();
+            }
+        }
+    }
+
+    /// Append `c` to the active text field in the modal (field 0=name, 1=endpoint, 3=api_key).
+    pub fn modal_push_char(&mut self, c: char) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            match m.field {
+                0 => m.name.push(c),
+                1 => m.endpoint.push(c),
+                3 => m.api_key.push(c),
+                _ => {}
+            }
+        }
+    }
+
+    /// Delete the last character of the active text field in the modal.
+    pub fn modal_backspace(&mut self) {
+        if let Some(m) = self.prov_modal.as_mut() {
+            match m.field {
+                0 => { m.name.pop(); }
+                1 => { m.endpoint.pop(); }
+                3 => { m.api_key.pop(); }
+                _ => {}
+            }
+        }
+    }
+
+    // --- Models Select screen helpers ---
+
+    /// `true` when the selected category is "Models Select".
+    pub fn is_models_category(&self) -> bool {
+        super::SETTING_CATEGORIES[self.cat].name == "Models Select"
+    }
+
+    /// Move selection up in the models list; clears the delete-armed flag.
+    pub fn model_up(&mut self) {
+        self.model_sel = self.model_sel.saturating_sub(1);
+        self.model_delete_armed = false;
+    }
+
+    /// Move selection down in the models list (max index = models.len() which is
+    /// the add-button row); clears the delete-armed flag.
+    pub fn model_down(&mut self) {
+        self.model_sel = (self.model_sel + 1).min(self.models.len());
+        self.model_delete_armed = false;
+    }
+
+    /// `true` when the `[+ add model]` button row is highlighted.
+    pub fn model_on_add_button(&self) -> bool {
+        self.model_sel == self.models.len()
+    }
+
+    /// First Ctrl+X arms the delete; second Ctrl+X confirms it. No effect when
+    /// the add-button row is selected.
+    pub fn model_arm_or_delete(&mut self) {
+        if self.model_on_add_button() {
+            return;
+        }
+        if self.model_delete_armed {
+            // Confirm: remove the entry.
+            if self.model_sel < self.models.len() {
+                self.models.remove(self.model_sel);
+            }
+            self.model_delete_armed = false;
+            // Clamp selection to the new length (add-button index).
+            let max = self.models.len();
+            if self.model_sel > max {
+                self.model_sel = max;
+            }
+        } else {
+            self.model_delete_armed = true;
+        }
+    }
+
+    /// Cancel the armed-delete state (any key other than Ctrl+X).
+    pub fn model_disarm(&mut self) {
+        self.model_delete_armed = false;
+    }
+
+    /// Open the add-model modal with a blank draft (default provider index 0).
+    pub fn open_model_modal_add(&mut self) {
+        self.model_modal = Some(ModelModal::new_add(0));
+    }
+
+    /// Open the edit-model modal, prefilled from `models[idx]`.
+    pub fn open_model_modal_edit(&mut self, idx: usize) {
+        if let Some(m) = self.models.get(idx) {
+            self.model_modal = Some(ModelModal {
+                editing_idx: Some(idx),
+                name: m.name.clone(),
+                provider_idx: m.provider_idx,
+                model_id: m.model_id.clone(),
+                field: 0,
+                role: m.role,
+                query: String::new(),
+                result_sel: 0,
+                // Carry the stored route forward. `route_sel` starts at 0 and is
+                // re-synced when endpoints load / the user navigates the list.
+                route: m.route.clone(),
+                route_sel: 0,
+                endpoints: None,
+                endpoints_loading: false,
+                endpoints_for: None,
+            });
+        }
+    }
+
+    /// Close the add/edit-model modal without saving.
+    pub fn close_model_modal(&mut self) {
+        self.model_modal = None;
+    }
+
+    /// Save the modal draft as a model (replace when editing, else append) and
+    /// close the modal; selects the affected row.
+    ///
+    /// `session_only` is `true` when the caller chose "Save session" (scoped to
+    /// this session only) and `false` for plain "Save" (global scope). Persistence
+    /// is stubbed — the flag is stored in-memory only.
+    ///
+    /// Role-steal: when the saved role is `Some(r)`, every OTHER model that
+    /// currently holds `r` is set to unassigned before the target is written.
+    pub fn save_model_modal(&mut self, session_only: bool) {
+        if let Some(m) = self.model_modal.take() {
+            let draft = ModelDraft {
+                name: m.name.trim().to_string(),
+                model_id: m.model_id.trim().to_string(),
+                provider_idx: m.provider_idx,
+                role: m.role,
+                route: m.route.clone(),
+                session_only,
+            };
+            // Determine the target index before inserting/replacing.
+            let target_idx = match m.editing_idx {
+                Some(i) if i < self.models.len() => i,
+                _ => self.models.len(), // will be the pushed index
+            };
+            // Role-steal: clear the role from any other model that already holds it.
+            if let Some(r) = draft.role {
+                for (i, other) in self.models.iter_mut().enumerate() {
+                    if i != target_idx && other.role == Some(r) {
+                        other.role = None;
+                    }
+                }
+            }
+            match m.editing_idx {
+                Some(i) if i < self.models.len() => {
+                    self.models[i] = draft;
+                    self.model_sel = i;
+                }
+                _ => {
+                    self.models.push(draft);
+                    self.model_sel = self.models.len().saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// `true` when the modal's selected provider is an OpenRouter endpoint
+    /// (its [`ProviderDraft::endpoint`], lowercased, contains `"openrouter"`).
+    /// `false` when no modal is open or the provider index is out of range.
+    pub fn mm_provider_is_openrouter(&self) -> bool {
+        self.model_modal
+            .as_ref()
+            .and_then(|m| self.providers.get(m.provider_idx))
+            .map(|p| p.endpoint.to_lowercase().contains("openrouter"))
+            .unwrap_or(false)
+    }
+
+    /// The fields the model modal exposes right now, in navigation order.
+    ///
+    /// Always `Name, Provider, Model, …, Save, Cancel`. A `Route` field is
+    /// inserted when the provider is OpenRouter AND a model is selected (so the
+    /// user can pin an upstream provider or leave it on Auto); a `Role` field is
+    /// inserted in EDIT mode. The modal's `field` index addresses into this vec.
+    pub fn model_modal_fields(&self) -> Vec<ModelField> {
+        let mut v = vec![ModelField::Name, ModelField::Provider, ModelField::Model];
+        if let Some(m) = &self.model_modal {
+            if self.mm_provider_is_openrouter() && !m.model_id.is_empty() {
+                v.push(ModelField::Route);
+            }
+            if m.is_edit() {
+                v.push(ModelField::Role);
+            }
+        }
+        v.push(ModelField::Save);
+        v.push(ModelField::SaveSession);
+        v.push(ModelField::Cancel);
+        v
+    }
+
+    /// The [`ModelField`] currently focused in the model modal, or `None` when
+    /// no modal is open (or `field` somehow points past the computed list).
+    pub fn mm_current_field(&self) -> Option<ModelField> {
+        let m = self.model_modal.as_ref()?;
+        self.model_modal_fields().get(m.field).copied()
+    }
+
+    /// The number of Route options (Auto + one per fetched endpoint). `1` when
+    /// no endpoints are loaded (just the Auto entry).
+    pub fn mm_route_option_count(&self) -> usize {
+        1 + self
+            .model_modal
+            .as_ref()
+            .and_then(|m| m.endpoints.as_ref())
+            .map(|e| e.len())
+            .unwrap_or(0)
+    }
+
+    /// Move focus up one field (clamps at 0).
+    pub fn mm_up(&mut self) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.field = m.field.saturating_sub(1);
+        }
+    }
+
+    /// Move focus down one field (clamps at the last computed field).
+    pub fn mm_down(&mut self) {
+        let max = self.model_modal_fields().len().saturating_sub(1);
+        if let Some(m) = self.model_modal.as_mut() {
+            m.field = (m.field + 1).min(max);
+        }
+    }
+
+    /// Move left in the model modal, dispatching on the focused field:
+    /// - Provider → cycle provider backward (wrapping, resets search), then
+    ///   re-clamp `field` since the Route field may appear/disappear.
+    /// - Role     → cycle role backward.
+    /// - Save/SaveSession/Cancel → step left within the button group, clamping at Save.
+    /// - everything else (Name/Model/Route) → no-op.
+    pub fn mm_left(&mut self) {
+        let n = self.providers.len();
+        match self.mm_current_field() {
+            Some(ModelField::Provider) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    if n > 0 {
+                        m.provider_idx = (m.provider_idx + n - 1) % n;
+                        m.query.clear();
+                        m.result_sel = 0;
+                    }
+                }
+                self.mm_clamp_field();
+            }
+            Some(ModelField::Role) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    // None → Compactor → Safeguard → Awareness → Main → None
+                    m.role = match m.role {
+                        None => Some(ModelRole::ALL[ModelRole::ALL.len() - 1]),
+                        Some(r) => {
+                            let pos = ModelRole::ALL.iter().position(|x| *x == r).unwrap_or(0);
+                            if pos == 0 {
+                                None
+                            } else {
+                                Some(ModelRole::ALL[pos - 1])
+                            }
+                        }
+                    };
+                }
+            }
+            // Button group: Save → SaveSession → Cancel; Left steps backward, clamping at Save.
+            Some(ModelField::SaveSession) => {
+                self.mm_focus_field(ModelField::Save);
+            }
+            Some(ModelField::Cancel) => {
+                self.mm_focus_field(ModelField::SaveSession);
+            }
+            Some(ModelField::Save) => {
+                // Already at the leftmost button — no-op.
+            }
+            _ => {}
+        }
+    }
+
+    /// Move right in the model modal, dispatching on the focused field:
+    /// - Provider → cycle provider forward (wrapping, resets search), then
+    ///   re-clamp `field` since the Route field may appear/disappear.
+    /// - Role     → cycle role forward.
+    /// - Save/SaveSession/Cancel → step right within the button group, clamping at Cancel.
+    /// - everything else (Name/Model/Route) → no-op.
+    pub fn mm_right(&mut self) {
+        let n = self.providers.len();
+        match self.mm_current_field() {
+            Some(ModelField::Provider) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    if n > 0 {
+                        m.provider_idx = (m.provider_idx + 1) % n;
+                        m.query.clear();
+                        m.result_sel = 0;
+                    }
+                }
+                self.mm_clamp_field();
+            }
+            Some(ModelField::Role) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    // None → Main → Awareness → Safeguard → Compactor → None
+                    m.role = match m.role {
+                        None => Some(ModelRole::ALL[0]),
+                        Some(r) => {
+                            let pos = ModelRole::ALL.iter().position(|x| *x == r).unwrap_or(0);
+                            let next = pos + 1;
+                            if next >= ModelRole::ALL.len() {
+                                None
+                            } else {
+                                Some(ModelRole::ALL[next])
+                            }
+                        }
+                    };
+                }
+            }
+            // Button group: Save → SaveSession → Cancel; Right steps forward, clamping at Cancel.
+            Some(ModelField::Save) => {
+                self.mm_focus_field(ModelField::SaveSession);
+            }
+            Some(ModelField::SaveSession) => {
+                self.mm_focus_field(ModelField::Cancel);
+            }
+            Some(ModelField::Cancel) => {
+                // Already at the rightmost button — no-op.
+            }
+            _ => {}
+        }
+    }
+
+    /// Point `field` at `target` if it exists in the current computed field list.
+    fn mm_focus_field(&mut self, target: ModelField) {
+        if let Some(pos) = self.model_modal_fields().iter().position(|f| *f == target) {
+            if let Some(m) = self.model_modal.as_mut() {
+                m.field = pos;
+            }
+        }
+    }
+
+    /// Clamp `field` to the current computed field list (used after the Route
+    /// field appears/disappears from a provider change).
+    fn mm_clamp_field(&mut self) {
+        let max = self.model_modal_fields().len().saturating_sub(1);
+        if let Some(m) = self.model_modal.as_mut() {
+            if m.field > max {
+                m.field = max;
+            }
+        }
+    }
+
+    /// Move the Route option cursor up (clamps at 0). No-op unless the Route
+    /// field is focused.
+    pub fn mm_route_up(&mut self) {
+        if self.mm_current_field() != Some(ModelField::Route) {
+            return;
+        }
+        if let Some(m) = self.model_modal.as_mut() {
+            m.route_sel = m.route_sel.saturating_sub(1);
+        }
+    }
+
+    /// Move the Route option cursor down (clamps at the last option). No-op
+    /// unless the Route field is focused.
+    pub fn mm_route_down(&mut self) {
+        if self.mm_current_field() != Some(ModelField::Route) {
+            return;
+        }
+        let max = self.mm_route_option_count().saturating_sub(1);
+        if let Some(m) = self.model_modal.as_mut() {
+            m.route_sel = (m.route_sel + 1).min(max);
+        }
+    }
+
+    /// Commit the highlighted Route option to `route`: option 0 = Auto (`None`);
+    /// option `i` pins `endpoints[i-1]`'s provider name (fallback `name`). Stays
+    /// on the Route field. No-op unless the Route field is focused.
+    pub fn mm_route_commit(&mut self) {
+        if self.mm_current_field() != Some(ModelField::Route) {
+            return;
+        }
+        if let Some(m) = self.model_modal.as_mut() {
+            if m.route_sel == 0 {
+                m.route = None;
+            } else if let Some(eps) = m.endpoints.as_ref() {
+                if let Some(ep) = eps.get(m.route_sel - 1) {
+                    let pick = ep
+                        .provider_name
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| ep.name.clone().filter(|s| !s.is_empty()));
+                    // Only commit when we actually resolved a name; otherwise
+                    // leave the existing route untouched (skip).
+                    if pick.is_some() {
+                        m.route = pick;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append `c` to the active model-modal text field: Name → name; Model → the
+    /// omnisearch query when the provider is OpenRouter, else the raw model id.
+    /// The Route/Role/button fields ignore typed chars.
+    pub fn mm_push_char(&mut self, c: char) {
+        let or = self.mm_provider_is_openrouter();
+        match self.mm_current_field() {
+            Some(ModelField::Name) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    m.name.push(c);
+                }
+            }
+            Some(ModelField::Model) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    if or {
+                        m.query.push(c);
+                        m.result_sel = 0;
+                    } else {
+                        m.model_id.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete the last char of the active model-modal text field (mirrors
+    /// [`Self::mm_push_char`]).
+    pub fn mm_backspace(&mut self) {
+        let or = self.mm_provider_is_openrouter();
+        match self.mm_current_field() {
+            Some(ModelField::Name) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    m.name.pop();
+                }
+            }
+            Some(ModelField::Model) => {
+                if let Some(m) = self.model_modal.as_mut() {
+                    if or {
+                        m.query.pop();
+                        if m.query.is_empty() {
+                            m.result_sel = 0;
+                        }
+                    } else {
+                        m.model_id.pop();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit the chosen `model_id` from the omnisearch: set it on the modal,
+    /// clear the query/selection, and arm the provider-endpoints load. The flags
+    /// (`endpoints = None`, `endpoints_loading = true`, `endpoints_for = id`) make
+    /// the UI show "loading providers…" immediately; the input layer returns
+    /// [`Action::FetchModelEndpoints`](crate::controller::input::Action::FetchModelEndpoints)
+    /// so the runtime spawns the actual fetch.
+    pub fn mm_select_model(&mut self, model_id: String) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.model_id = model_id.clone();
+            m.query.clear();
+            m.result_sel = 0;
+            // A different model has different upstream providers — reset the
+            // route choice back to Auto so a stale pin can't carry over.
+            m.route = None;
+            m.route_sel = 0;
+            m.endpoints = None;
+            m.endpoints_loading = true;
+            m.endpoints_for = Some(model_id);
+        }
+    }
+
+    /// Arm a provider-endpoints load for the OPEN model modal, returning the
+    /// model id to fetch (so the input layer can hand it to
+    /// [`Action::FetchModelEndpoints`](crate::controller::input::Action::FetchModelEndpoints)).
+    ///
+    /// Used by the edit-open path: when an existing model is opened for edit and
+    /// its provider is OpenRouter with a non-empty `model_id`, this sets the
+    /// loading flags (`endpoints = None`, `endpoints_loading = true`,
+    /// `endpoints_for = id`) so the UI shows "loading providers…" at once, and
+    /// returns `Some(id)`. Returns `None` (and changes nothing) when no modal is
+    /// open, the provider isn't OpenRouter, or the model id is empty — those
+    /// cases have no endpoints API to call.
+    pub fn mm_arm_endpoints_load(&mut self) -> Option<String> {
+        if !self.mm_provider_is_openrouter() {
+            return None;
+        }
+        let m = self.model_modal.as_mut()?;
+        let id = m.model_id.trim().to_string();
+        if id.is_empty() {
+            return None;
+        }
+        m.endpoints = None;
+        m.endpoints_loading = true;
+        m.endpoints_for = Some(id.clone());
+        Some(id)
+    }
+
+    /// The current `route_sel` index in the model modal (0 when no modal is
+    /// open). Used by the input handler to decide whether Up/Down should move
+    /// within the Route list or escape to the adjacent field.
+    pub fn mm_route_sel(&self) -> usize {
+        self.model_modal.as_ref().map(|m| m.route_sel).unwrap_or(0)
+    }
+
+    /// The current omnisearch query (empty string when no modal is open). Lets
+    /// the input handler compute the result set against the model cache.
+    pub fn mm_query(&self) -> &str {
+        self.model_modal.as_ref().map(|m| m.query.as_str()).unwrap_or("")
+    }
+
+    /// Move the omnisearch result cursor up (clamps at 0).
+    pub fn mm_result_up(&mut self) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.result_sel = m.result_sel.saturating_sub(1);
+        }
+    }
+
+    /// Move the omnisearch result cursor down, clamped to `max` (the last valid
+    /// result index = `results.len().saturating_sub(1)`).
+    pub fn mm_result_down(&mut self, max: usize) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.result_sel = (m.result_sel + 1).min(max);
+        }
     }
 }

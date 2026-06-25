@@ -38,7 +38,12 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Mode::Chat => chat::draw(frame, &state.rest, &palette),
         Mode::KeyInput(form) => key_input::draw(frame, form, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
-        Mode::Settings(s) => settings::draw(frame, s, &palette),
+        Mode::Settings(s) => settings::draw(
+            frame,
+            s,
+            state.rest.models_cache.as_deref().unwrap_or(&[]),
+            &palette,
+        ),
         Mode::Agents(a) => agents::draw(frame, a, &palette),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
     }

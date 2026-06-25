@@ -16,8 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::{APP_TITLE, HTTP_REFERER};
 use crate::dto::chat::{sanitize_tool_arguments, ChatMessage, ToolCall};
 use crate::dto::openrouter::{
-    to_wire, ChatRequest, ChatResponse, ModelInfo, ModelsResponse, ReasoningConfig, StreamChunk,
-    ToolDef, ToolFunctionDef, UsageRequest,
+    to_wire, ChatRequest, ChatResponse, EndpointsResponse, ModelEndpoint, ModelInfo, ModelsResponse,
+    ReasoningConfig, StreamChunk, ToolDef, ToolFunctionDef, UsageRequest,
 };
 use crate::service::StreamEvent;
 
@@ -926,5 +926,35 @@ impl OpenRouterClient {
 
         let models: ModelsResponse = response.json().await?;
         Ok(models.data)
+    }
+
+    /// Fetch the provider endpoint list for a single model
+    /// (`GET /models/{model_id}/endpoints`).
+    // dead_code: consumed by models-select UI (not yet wired).
+    #[allow(dead_code)]
+    ///
+    /// `model_id` is the slash-separated `author/slug` string as returned by
+    /// [`Self::list_models`] (e.g. `"openai/gpt-4o-mini"`). The slash is
+    /// already the correct path separator for the OpenRouter URL, so the string
+    /// is interpolated verbatim: `{base_url}/models/openai/gpt-4o-mini/endpoints`.
+    pub async fn list_model_endpoints(&self, model_id: &str) -> Result<Vec<ModelEndpoint>> {
+        let url = format!("{}/models/{}/endpoints", self.base_url, model_id);
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", HTTP_REFERER)
+            .header("X-Title", APP_TITLE)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("{}", clean_error(status, &text)));
+        }
+
+        let endpoints: EndpointsResponse = response.json().await?;
+        Ok(endpoints.data.endpoints)
     }
 }

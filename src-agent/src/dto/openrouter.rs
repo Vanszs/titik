@@ -327,6 +327,18 @@ pub struct TopProvider {
     pub context_length: Option<u64>,
 }
 
+/// Per-token USD pricing for a model or endpoint. Fields are strings because
+/// OpenRouter represents these as decimal strings (e.g. `"0.00000015"`).
+// dead_code: UI layer will consume these fields once the models-select feature lands.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModelPricing {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub completion: Option<String>,
+}
+
 /// One model entry from `GET /models`. Only the fields the effort-capability
 /// derivation needs are modelled; the rest of OpenRouter's rich model record is
 /// ignored. `reasoning` is absent for models with no thinking support.
@@ -334,9 +346,14 @@ pub struct TopProvider {
 /// the top-level field OpenRouter exposes on each model object.
 /// `top_provider` carries the provider-served context limit, which takes
 /// precedence over the nominal `context_length` when computing thresholds.
+/// `name` is the human-readable display name; `pricing` is the per-token cost.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelInfo {
     pub id: String,
+    // dead_code: consumed by models-select UI (not yet wired).
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub supported_parameters: Vec<String>,
     #[serde(default)]
@@ -345,12 +362,61 @@ pub struct ModelInfo {
     pub context_length: Option<u64>,
     #[serde(default)]
     pub top_provider: Option<TopProvider>,
+    // dead_code: consumed by models-select UI (not yet wired).
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
 }
 
 /// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.
 #[derive(Debug, Deserialize)]
 pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Per-model provider endpoints  (`GET /models/{author}/{slug}/endpoints`)
+// ---------------------------------------------------------------------------
+
+/// One provider entry from `GET /models/{author}/{slug}/endpoints`.
+// dead_code: consumed by models-select UI (not yet wired).
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModelEndpoint {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub provider_name: Option<String>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub uptime_last_30m: Option<f64>,
+    #[serde(default)]
+    pub status: Option<i64>,
+}
+
+/// Inner `data` object of [`EndpointsResponse`].
+// dead_code: consumed by models-select UI (not yet wired).
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct EndpointsData {
+    #[serde(default)]
+    pub endpoints: Vec<ModelEndpoint>,
+}
+
+/// Top-level envelope of `GET /models/{author}/{slug}/endpoints`:
+/// `{ "data": { "endpoints": [ ModelEndpoint, ... ] } }`.
+// dead_code: consumed by models-select UI (not yet wired).
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct EndpointsResponse {
+    pub data: EndpointsData,
 }
 
 // ---------------------------------------------------------------------------

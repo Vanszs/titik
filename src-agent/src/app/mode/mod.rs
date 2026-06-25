@@ -27,7 +27,7 @@ pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
 pub use picker::PickerState;
 pub use settings::{
-    SettingField, SettingsState, PICKER_MAX,
+    filter_models, SettingField, SettingsState, PICKER_MAX,
     SETTING_CATEGORIES,
 };
 

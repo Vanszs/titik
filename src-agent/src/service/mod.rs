@@ -55,4 +55,24 @@ pub enum StreamEvent {
     /// channel. `allow = false` surfaces a toast; the turn is NEVER blocked by it
     /// (the stream already proceeded). `allow = true` is silent.
     HarnessVerdict { allow: bool, reason: String },
+    /// A model's provider-endpoint list finished loading. Delivered on the
+    /// dedicated `endpoints_rx` channel (drained in `run_loop`, independent of
+    /// streaming) by a background task spawned when the model modal selects /
+    /// opens an OpenRouter model. `model_id` is the model the endpoints belong to
+    /// (used as a stale-guard against the modal's `endpoints_for`).
+    EndpointsLoaded {
+        model_id: String,
+        endpoints: Vec<crate::dto::openrouter::ModelEndpoint>,
+    },
+    /// The provider-endpoint fetch for `model_id` failed; `error` is the cause.
+    /// Folded into the modal as an empty endpoint list (rendered as "no
+    /// providers found"), so a failed fetch resolves the loading state instead
+    /// of spinning forever. `error` is carried for diagnostics (Debug) but the
+    /// drain renders the failure as the empty list rather than surfacing the
+    /// text, so it is not otherwise read.
+    EndpointsError {
+        model_id: String,
+        #[allow(dead_code)]
+        error: String,
+    },
 }

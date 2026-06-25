@@ -252,10 +252,14 @@ pub(super) fn run_loop(
                         break;
                     }
                     // The advisory PC verdict is delivered on the dedicated
-                    // `harness_rx` channel (drained below), never on a streaming
-                    // request's channel — so this arm is unreachable here. Ignore
-                    // it to keep the match exhaustive without affecting the stream.
-                    StreamEvent::HarnessVerdict { .. } => {}
+                    // `harness_rx` channel (drained below), and the per-model
+                    // provider endpoints on `endpoints_rx` (drained below) — never
+                    // on a streaming request's channel. So these arms are
+                    // unreachable here; ignore them to keep the match exhaustive
+                    // without affecting the stream.
+                    StreamEvent::HarnessVerdict { .. }
+                    | StreamEvent::EndpointsLoaded { .. }
+                    | StreamEvent::EndpointsError { .. } => {}
                 }
             }
             if still_streaming {
@@ -284,6 +288,51 @@ pub(super) fn run_loop(
             }
             if keep {
                 state.rest.harness_rx = Some(hrx);
+            }
+        }
+
+        // 1b-2. Drain the per-model provider-endpoints channel. Fully independent
+        //       of streaming and the harness channel: the background fetch sends
+        //       exactly one EndpointsLoaded / EndpointsError, which is folded into
+        //       the open model modal — but ONLY when its `model_id` still matches
+        //       the modal's `endpoints_for` (the stale-guard, so a rapid
+        //       re-selection can't show a previous model's providers). Take() the
+        //       receiver so the match can mutate the mode; put it back unless the
+        //       fetch resolved (or the channel closed).
+        if let Some(mut erx) = state.rest.endpoints_rx.take() {
+            let mut keep = true;
+            while let Ok(ev) = erx.try_recv() {
+                match ev {
+                    StreamEvent::EndpointsLoaded { model_id, endpoints } => {
+                        if let Mode::Settings(s) = &mut state.mode {
+                            if let Some(m) = s.model_modal.as_mut() {
+                                if m.endpoints_for.as_deref() == Some(model_id.as_str()) {
+                                    m.endpoints = Some(endpoints);
+                                    m.endpoints_loading = false;
+                                }
+                            }
+                        }
+                        dirty = true;
+                        keep = false;
+                    }
+                    StreamEvent::EndpointsError { model_id, .. } => {
+                        if let Mode::Settings(s) = &mut state.mode {
+                            if let Some(m) = s.model_modal.as_mut() {
+                                if m.endpoints_for.as_deref() == Some(model_id.as_str()) {
+                                    // Empty list => "no providers found" display.
+                                    m.endpoints = Some(Vec::new());
+                                    m.endpoints_loading = false;
+                                }
+                            }
+                        }
+                        dirty = true;
+                        keep = false;
+                    }
+                    _ => {}
+                }
+            }
+            if keep {
+                state.rest.endpoints_rx = Some(erx);
             }
         }
 

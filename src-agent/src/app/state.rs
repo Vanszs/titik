@@ -207,6 +207,13 @@ pub struct AppStateRest {
     /// `run_loop` independently of the streaming channel, so PC never blocks or
     /// interferes with streaming. `None` when no PC task is in flight.
     pub harness_rx: Option<UnboundedReceiver<StreamEvent>>,
+    /// Receiver for a model's provider-endpoint fetch. Opened (replacing any
+    /// previous, which drops an in-flight older fetch's receiver — the desired
+    /// stale-cancel) when the model modal selects/opens an OpenRouter model;
+    /// the spawned task sends one [`StreamEvent::EndpointsLoaded`] or
+    /// [`StreamEvent::EndpointsError`]. Drained in `run_loop` independently of
+    /// streaming. `None` when no endpoints fetch is in flight.
+    pub endpoints_rx: Option<UnboundedReceiver<StreamEvent>>,
     /// Reason the tool-call classifier (TAC) flagged the currently-paused call,
     /// shown in the approval overlay so the user sees WHY approval is asked.
     /// `None` for an approval that wasn't classifier-driven. Cleared when the
@@ -321,6 +328,7 @@ impl AppStateRest {
             awareness_summary: None,
             launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             harness_rx: None,
+            endpoints_rx: None,
             approval_reason: None,
             models_cache: None,
             compact_anim_start: None,

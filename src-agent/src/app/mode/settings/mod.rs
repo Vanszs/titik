@@ -10,8 +10,245 @@ mod state;
 pub use picker::PICKER_MAX;
 pub use state::SettingsState;
 
+/// Role slot a model is assigned to in the agent runtime.
+///
+/// Roles are exclusive (1:1 role→model): assigning a role steals it from any
+/// other model that currently holds it.  `None` means unassigned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelRole {
+    Main,
+    Awareness,
+    Safeguard,
+    Compactor,
+}
+
+/// A single navigable field within the add/edit-model modal.
+///
+/// The concrete field SET is computed at runtime by
+/// [`SettingsState::model_modal_fields`] because two fields are conditional:
+/// `Route` appears only for an OpenRouter provider with a model selected, and
+/// `Role` appears only in EDIT mode. The modal's `field` index addresses into
+/// that computed `Vec<ModelField>`, so there are no hardcoded layout indices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelField {
+    Name,
+    Provider,
+    Model,
+    Route,
+    Role,
+    Save,
+    SaveSession,
+    Cancel,
+}
+
+impl ModelRole {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModelRole::Main      => "main",
+            ModelRole::Awareness => "awareness",
+            ModelRole::Safeguard => "safeguard",
+            ModelRole::Compactor => "compactor",
+        }
+    }
+
+    pub const ALL: [ModelRole; 4] = [
+        ModelRole::Main,
+        ModelRole::Awareness,
+        ModelRole::Safeguard,
+        ModelRole::Compactor,
+    ];
+}
+
+/// The wire protocol type of an API provider endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApiType {
+    OpenAiCompatible,
+    AnthropicCompatible,
+}
+
+impl ApiType {
+    /// Short label used in the providers table column.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            ApiType::OpenAiCompatible   => "OpenAI",
+            ApiType::AnthropicCompatible => "Anthropic",
+        }
+    }
+
+    /// Full human-readable label used in the add-provider modal toggle.
+    pub fn full_label(self) -> &'static str {
+        match self {
+            ApiType::OpenAiCompatible   => "OpenAI compatible",
+            ApiType::AnthropicCompatible => "Anthropic compatible",
+        }
+    }
+
+    /// Flip between the two variants.
+    pub fn toggle(self) -> Self {
+        match self {
+            ApiType::OpenAiCompatible   => ApiType::AnthropicCompatible,
+            ApiType::AnthropicCompatible => ApiType::OpenAiCompatible,
+        }
+    }
+}
+
+/// One API provider entry stored in-memory (stub only, not persisted).
+#[derive(Clone, Debug)]
+pub struct ProviderDraft {
+    pub name: String,
+    pub endpoint: String,
+    pub api_type: ApiType,
+    pub api_key: String,
+}
+
+/// State for the "Add API provider" modal overlay.
+#[derive(Clone, Debug)]
+pub struct ProviderModal {
+    pub name: String,
+    pub endpoint: String,
+    pub api_type: ApiType,
+    pub api_key: String,
+    /// Active field: 0=name, 1=endpoint, 2=type, 3=api_key, 4=Save button, 5=Cancel button.
+    pub field: usize,
+}
+
+impl ProviderModal {
+    pub fn new() -> Self {
+        Self {
+            name: String::new(),
+            endpoint: String::new(),
+            api_type: ApiType::OpenAiCompatible,
+            api_key: String::new(),
+            field: 0,
+        }
+    }
+}
+
+/// One model entry stored in-memory (stub only, not persisted). Maps a custom
+/// display name to a concrete `model_id`, served by the API provider at
+/// `provider_idx` in [`SettingsState::providers`].
+#[derive(Clone, Debug)]
+pub struct ModelDraft {
+    /// Custom display name shown in the models table.
+    pub name: String,
+    /// Concrete model identifier, e.g. `"openai/gpt-4o-mini"`.
+    pub model_id: String,
+    /// Index into [`SettingsState::providers`] — which API provider serves it.
+    pub provider_idx: usize,
+    /// Role slot assigned to this model; `None` = unassigned.
+    pub role: Option<ModelRole>,
+    /// Pinned upstream provider for OpenRouter routing: the chosen endpoint's
+    /// provider name. `None` = Auto (let OpenRouter route). Only meaningful for
+    /// OpenRouter-served models; ignored for other providers.
+    pub route: Option<String>,
+    /// `true` = saved for this session only (not persisted globally);
+    /// `false` = global scope. Stub flag — persistence is not yet implemented.
+    #[allow(dead_code)]
+    pub session_only: bool,
+}
+
+/// State for the "Add / Edit model" modal overlay.
+///
+/// When the chosen provider is OpenRouter and the Model field is focused, the
+/// modal hosts a live omnisearch over the cached model catalogue (`query` +
+/// `result_sel`). Selecting/opening an OpenRouter model arms the `endpoints*`
+/// fields: a background fetch loads the model's provider endpoints, which the
+/// view renders as a read-only providers list (price + uptime per provider).
+///
+/// The field layout is computed (never hardcoded): `field` indexes into the
+/// `Vec<ModelField>` returned by [`SettingsState::model_modal_fields`]. The base
+/// run is `Name, Provider, Model`; a `Route` field is inserted (OpenRouter +
+/// model selected) and a `Role` field is inserted (EDIT mode); `Save, Cancel`
+/// always close the list. Resolve the focused field with
+/// [`SettingsState::mm_current_field`] instead of comparing raw indices.
+#[derive(Clone, Debug)]
+pub struct ModelModal {
+    /// `Some(i)` = editing `models[i]`; `None` = adding a new entry.
+    pub editing_idx: Option<usize>,
+    /// Draft custom display name.
+    pub name: String,
+    /// Index into [`SettingsState::providers`] (which provider serves the model).
+    pub provider_idx: usize,
+    /// Draft concrete model id.
+    pub model_id: String,
+    /// Active field index (see layout comment above).
+    pub field: usize,
+    /// Draft role assignment; `None` = unassigned.  Only editable in EDIT mode.
+    pub role: Option<ModelRole>,
+    /// Model omnisearch query (used when provider is OpenRouter and the Model
+    /// field is focused).
+    pub query: String,
+    /// Highlighted row in the omnisearch results list.
+    pub result_sel: usize,
+    /// Pinned upstream provider for OpenRouter routing: the chosen endpoint's
+    /// provider name. `None` = Auto (let OpenRouter route). Mirrors
+    /// [`ModelDraft::route`]; committed into the draft on save.
+    pub route: Option<String>,
+    /// Cursor into the Route options list (0 = Auto; 1..=N index `endpoints`).
+    pub route_sel: usize,
+    // --- endpoints area: per-model provider list (display only) ---
+    /// Fetched per-model provider endpoints. `None` until a fetch resolves;
+    /// `Some(vec)` once loaded (an empty vec means "no providers found", also
+    /// used to resolve a failed fetch). Rendered by `draw_model_modal`.
+    pub endpoints: Option<Vec<crate::dto::openrouter::ModelEndpoint>>,
+    /// `true` while the endpoints fetch is in flight (the view shows "loading
+    /// providers…"); cleared when the fetch resolves.
+    pub endpoints_loading: bool,
+    /// The model id the in-flight / cached `endpoints` belong to. Used as a
+    /// stale-guard in the drain so a rapid re-selection can't show a previous
+    /// model's providers.
+    pub endpoints_for: Option<String>,
+}
+
+impl ModelModal {
+    /// Blank ADD-mode modal targeting provider `provider_idx`.
+    pub fn new_add(provider_idx: usize) -> Self {
+        Self {
+            editing_idx: None,
+            name: String::new(),
+            provider_idx,
+            model_id: String::new(),
+            field: 0,
+            role: None,
+            query: String::new(),
+            result_sel: 0,
+            route: None,
+            route_sel: 0,
+            endpoints: None,
+            endpoints_loading: false,
+            endpoints_for: None,
+        }
+    }
+
+    /// `true` when this modal is in EDIT mode.
+    pub fn is_edit(&self) -> bool {
+        self.editing_idx.is_some()
+    }
+}
+
+/// Filter the cached model catalogue by a (case-insensitive) substring match on
+/// the model `id` or its human-readable `name`, returning up to 50 catalogue
+/// indices. Used to drive the modal's model omnisearch.
+pub fn filter_models(cache: &[crate::dto::openrouter::ModelInfo], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    cache
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.id.to_lowercase().contains(&q)
+                || m.name
+                    .as_deref()
+                    .map(|n| n.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .take(50)
+        .collect()
+}
+
 /// A single editable/toggleable field within a settings category.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(dead_code)]
 pub enum SettingField {
     ApiKey,
     Model,
@@ -72,6 +309,7 @@ impl SettingField {
 /// A named group of related settings fields shown in the sidebar.
 pub struct SettingCategory {
     pub name: &'static str,
+    pub group: &'static str,
     pub fields: &'static [SettingField],
 }
 
@@ -81,33 +319,23 @@ pub struct SettingCategory {
 /// handler iterate over this slice generically.
 pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     SettingCategory {
-        name: "Connection",
-        fields: &[SettingField::ApiKey, SettingField::Model, SettingField::Provider],
-    },
-    SettingCategory {
         name: "Appearance",
+        group: "general",
         fields: &[SettingField::Theme, SettingField::Accent],
     },
     SettingCategory {
         name: "Session",
+        group: "general",
         fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled, SettingField::SlidingCache],
     },
     SettingCategory {
-        name: "Awareness",
-        fields: &[
-            SettingField::AwarenessEnabled,
-            SettingField::AwarenessSource,
-            SettingField::AwarenessModel,
-            SettingField::AwarenessProvider,
-        ],
+        name: "API Providers",
+        group: "models",
+        fields: &[],
     },
     SettingCategory {
-        name: "Harness",
-        fields: &[
-            SettingField::ClassifierEnabled,
-            SettingField::ClassifierModel,
-            SettingField::ClassifierProvider,
-            SettingField::AllowedFolders,
-        ],
+        name: "Models Select",
+        group: "models",
+        fields: &[],
     },
 ];

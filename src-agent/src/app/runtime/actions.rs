@@ -557,6 +557,44 @@ pub(super) fn apply_action(
             state.mode = Mode::Chat;
             state.rest.status = "ready".into();
         }
+
+        Action::FetchModelEndpoints(model_id) => {
+            // Spawn the per-model provider-endpoints fetch on a background task
+            // (mirrors the advisory prompt-classifier spawn in `Action::Submit`):
+            // open a fresh channel, stash its receiver (replacing any in-flight
+            // older fetch — dropping that receiver is the desired stale-cancel),
+            // and send one EndpointsLoaded / EndpointsError when the request
+            // resolves. The drain in `run_loop` folds it into the modal.
+            //
+            // No client → there's nothing to fetch against; just clear the
+            // loading flag on the modal so the UI doesn't spin forever.
+            let Some(c) = client.as_ref() else {
+                if let Mode::Settings(s) = &mut state.mode {
+                    if let Some(m) = s.model_modal.as_mut() {
+                        m.endpoints_loading = false;
+                    }
+                }
+                return Ok(());
+            };
+            let c = Arc::clone(c);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.rest.endpoints_rx = Some(rx);
+            handle.spawn(async move {
+                // A dropped receiver (modal closed / a newer fetch superseded
+                // this one) makes the send a no-op — same contract as the
+                // streaming + harness channels.
+                let _ = match c.list_model_endpoints(&model_id).await {
+                    Ok(eps) => tx.send(crate::service::StreamEvent::EndpointsLoaded {
+                        model_id,
+                        endpoints: eps,
+                    }),
+                    Err(e) => tx.send(crate::service::StreamEvent::EndpointsError {
+                        model_id,
+                        error: e.to_string(),
+                    }),
+                };
+            });
+        }
     }
     Ok(())
 }

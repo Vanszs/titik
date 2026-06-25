@@ -271,6 +271,17 @@ pub(super) fn apply_slash(
                 state.rest.status = "busy — wait for response".into();
                 return Ok(());
             }
+            // Warm the model catalogue so the Models Select omnisearch has data
+            // (best-effort; a network failure leaves the cache None and the modal
+            // simply shows no results). Mirrors the /effort prefetch. Must run
+            // before the immutable `session` borrow below, as it mutates rest.
+            if state.rest.models_cache.is_none() {
+                if let Some(c) = client.as_ref() {
+                    if let Ok(models) = handle.block_on(c.list_models()) {
+                        state.rest.models_cache = Some(models);
+                    }
+                }
+            }
             let Some(session) = state.rest.session.as_ref() else {
                 state.rest.status = "no active session".into();
                 return Ok(());
