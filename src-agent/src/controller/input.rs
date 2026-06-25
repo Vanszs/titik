@@ -44,6 +44,12 @@ pub enum Action {
     /// Setup wizard finished; carry the entered endpoint, api key, and model out
     /// so the runtime can build a provider-agnostic config from them.
     SaveCreds { endpoint: String, api_key: String, model: String },
+    /// Setup wizard advanced from the connection step to the model step with an
+    /// OpenRouter endpoint: prefetch the model catalogue so step 2's live search
+    /// has results. The runtime serves a fresh disk cache directly, else spawns a
+    /// network fetch on the shared `warm_rx` channel (mirroring `warm_session`).
+    /// A no-op for a non-OpenRouter endpoint (never emitted there).
+    FetchWizardCatalogue { endpoint: String, api_key: String },
     /// Esc on a credentials form that was NOT opened from the picker — return
     /// to the normal Chat view.
     CancelKeyInput,
@@ -439,13 +445,90 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
 /// move between fields WITHIN the current step; Enter advances (field → step →
 /// finish) and Esc walks back (step 1 → step 0 → cancel).
 ///
+/// Step 1 (model) has TWO modes, keyed on [`KeyInputForm::is_openrouter`]:
+/// - **OpenRouter** → a live omnisearch over `rest.models_cache`. Chars edit
+///   `form.query`; ↑/↓ move `form.result_sel` over `filter_models(cache, query)`;
+///   Enter picks the highlighted result into `form.model` (or, when there are no
+///   results, falls back to the raw trimmed query so manual entry never traps)
+///   and finishes. The catalogue is prefetched on the step-0→1 advance via
+///   [`Action::FetchWizardCatalogue`].
+/// - **Other endpoint** → a plain text Model box (chars edit `form.model`).
+///
 /// Esc on step 0 has three cases:
 /// 1. `first_run = true` → no prior client exists, so Esc must quit rather than drop back to a broken Chat view.
 /// 2. `from_picker = true` → form was opened from the `--resume` session picker, so Esc returns there (`CancelKeyInputToPicker`).
 /// 3. Otherwise → Esc cancels back to the existing Chat view.
 fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    use crate::app::mode::filter_models;
+
     if is_ctrl(&key, 'c') {
         return Action::Quit;
+    }
+
+    // --- Step 1 (model) on an OpenRouter endpoint: live catalogue omnisearch ---
+    // This intercepts ALL keys for the model step so the search box + results list
+    // own the input (chars → query, ↑/↓ → result_sel, Enter → pick/finish). Esc
+    // still walks back to the connection step. The non-OpenRouter model step and
+    // the whole connection step fall through to the generic handler below.
+    if form.step == 1 && form.is_openrouter() {
+        let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+        return match key.code {
+            KeyCode::Esc => {
+                // Non-destructive: back to the connection step (clears the query).
+                form.back_step();
+                Action::None
+            }
+            KeyCode::Up => {
+                form.result_sel = form.result_sel.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                // Clamp to the last filtered result (0 when there are none).
+                let n = filter_models(cache, &form.query).len();
+                form.result_sel = (form.result_sel + 1).min(n.saturating_sub(1));
+                Action::None
+            }
+            KeyCode::Enter => {
+                let results = filter_models(cache, &form.query);
+                if !results.is_empty() {
+                    // Pick the highlighted catalogue model.
+                    let sel = form.result_sel.min(results.len() - 1);
+                    form.model = cache[results[sel]].id.clone();
+                    Action::SaveCreds {
+                        endpoint: form.endpoint.trim().to_string(),
+                        api_key: form.api_key.trim().to_string(),
+                        model: form.model.clone(),
+                    }
+                } else {
+                    // No results (catalogue still loading, or the query matches
+                    // nothing): fall back to the raw query as a manual model id so
+                    // the wizard never traps. Finish only when it's non-empty.
+                    let typed = form.query.trim();
+                    if typed.is_empty() {
+                        rest.status = "model required".into();
+                        Action::None
+                    } else {
+                        form.model = typed.to_string();
+                        Action::SaveCreds {
+                            endpoint: form.endpoint.trim().to_string(),
+                            api_key: form.api_key.trim().to_string(),
+                            model: form.model.clone(),
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                form.query.pop();
+                form.result_sel = 0;
+                Action::None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.query.push(c);
+                form.result_sel = 0; // new filter → reset the highlight
+                Action::None
+            }
+            _ => Action::None,
+        };
     }
 
     match key.code {
@@ -485,15 +568,27 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
                         rest.status = "api key required".into();
                         Action::None
                     } else {
+                        // Advance to the model step. For an OpenRouter endpoint,
+                        // ALSO prefetch the catalogue so step 2's live search has
+                        // results (advance first so the form is already on step 1
+                        // when the fetch resolves). Non-OpenRouter: just advance.
+                        let or = form.is_openrouter();
                         form.advance_step();
-                        Action::None
+                        if or {
+                            Action::FetchWizardCatalogue {
+                                endpoint: form.endpoint.trim().to_string(),
+                                api_key: form.api_key.trim().to_string(),
+                            }
+                        } else {
+                            Action::None
+                        }
                     }
                 } else {
                     form.next_field();
                     Action::None
                 }
             } else {
-                // Model step: finish if the model is non-empty.
+                // Model step (non-OpenRouter plain text): finish if non-empty.
                 if form.can_finish() {
                     Action::SaveCreds {
                         endpoint: form.endpoint.trim().to_string(),

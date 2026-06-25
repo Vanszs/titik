@@ -5,8 +5,10 @@
 //!
 //! Steps:
 //! - **0 — connection:** `Endpoint` (any OpenAI-compatible base URL) + `API key`.
-//! - **1 — model:** `Model` id (PLAIN TEXT this pass; OpenRouter omnisearch is a
-//!   later pass, gated on [`KeyInputForm::is_openrouter`]).
+//! - **1 — model:** `Model` id. For an OpenRouter endpoint this is a LIVE search
+//!   over the cached model catalogue (search line + gray rule + windowed results
+//!   dropdown, mirroring `settings::draw_model_modal`); for any other endpoint it
+//!   stays a plain text box. Branch is keyed on [`KeyInputForm::is_openrouter`].
 //!
 //! Layout: a single left-aligned block of BLOCK_W columns, horizontally centred
 //! in the frame and placed in the upper portion (≈25 % down). Every element
@@ -27,8 +29,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::mode::KeyInputForm;
+use crate::app::mode::{filter_models, KeyInputForm};
+use crate::dto::openrouter::ModelInfo;
 use crate::view::theme::Palette;
+
+/// Maximum number of catalogue rows shown in the step-1 omnisearch dropdown.
+const RESULTS_MAX: usize = 8;
 
 /// Total width (chars) of the content block. Clamped to the available area.
 const BLOCK_W: u16 = 58;
@@ -96,10 +102,86 @@ fn hint_line(text: &'static str, palette: &Palette) -> Line<'static> {
     ])
 }
 
+/// Build a dim status/hint line for the omnisearch dropdown, indented by `indent`
+/// columns (the value column start). Used for `fetching models…`, the empty-query
+/// hint, and the no-matches message.
+fn dim_indented(text: &str, indent: usize, palette: &Palette) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!("{:indent$}", "")),
+        Span::styled(text.to_string(), Style::default().fg(palette.dim)),
+    ])
+}
+
+/// Truncate `s` to at most `max` chars, appending `…` when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        chars[..max.saturating_sub(1)].iter().collect::<String>() + "\u{2026}"
+    }
+}
+
+/// Build one omnisearch result row for catalogue model `info`, indented to the
+/// value column. The selected row gets the inverse `sel_fg`/`sel_bg` highlight
+/// spanning the value column width; unselected rows show the `id` in `fg` and the
+/// optional display `name` trailing in `dim`. `val_w` is the value column width.
+fn result_line(
+    info: &ModelInfo,
+    selected: bool,
+    indent: usize,
+    val_w: usize,
+    palette: &Palette,
+) -> Line<'static> {
+    let id = info.id.clone();
+    let name = info.name.as_deref().unwrap_or("");
+    let pad = Span::raw(format!("{:indent$}", ""));
+    if selected {
+        // Inverse-highlight the whole value column so the cursor row is obvious.
+        let text = if name.is_empty() {
+            format!(" {id} ")
+        } else {
+            format!(" {id}  {name} ")
+        };
+        let text = truncate(&text, val_w.max(1));
+        Line::from(vec![
+            pad,
+            Span::styled(
+                text,
+                Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
+            ),
+        ])
+    } else {
+        let id_disp = truncate(&id, val_w.saturating_sub(2).max(1));
+        let mut spans = vec![pad, Span::styled(id_disp, Style::default().fg(palette.fg))];
+        if !name.is_empty() {
+            let used = id.chars().count();
+            let rem = val_w.saturating_sub(used + 2);
+            if rem > 1 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    truncate(name, rem),
+                    Style::default().fg(palette.dim),
+                ));
+            }
+        }
+        Line::from(spans)
+    }
+}
+
 // ── main draw ────────────────────────────────────────────────────────────────
 
 /// Render the setup wizard for `form` using the given colour `palette`.
-pub fn draw(frame: &mut Frame, form: &KeyInputForm, palette: &Palette) {
+///
+/// `models_cache` is the cached OpenRouter model catalogue, threaded through so
+/// step 1's live search can render results (empty slice when the catalogue
+/// hasn't been fetched yet — rendered as a dim `fetching models…` line, since a
+/// real OpenRouter catalogue is never empty). Ignored for a non-OpenRouter
+/// endpoint (the Model field is a plain text box there).
+pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], palette: &Palette) {
     let area = frame.area();
 
     // ── Vertical layout ──────────────────────────────────────────────────────
@@ -217,9 +299,52 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, palette: &Palette) {
         // API key underline rule.
         render_line(frame, rule_line(rule_w, key_active, palette), row);
         // row not needed after last field
+    } else if form.is_openrouter() {
+        // Step 1 (OpenRouter): the Model field becomes a LIVE catalogue search —
+        // the query as the input value, the accent underline, and a windowed
+        // results dropdown below (mirrors `settings::draw_model_modal`).
+        //
+        // Search input row: label "Model" + the live query + cursor block.
+        render_line(frame, field_line("Model", &form.query, true, palette), row);
+        row += 1;
+        // Underline rule (active accent, same as every active field on the form).
+        render_line(frame, rule_line(rule_w, true, palette), row);
+        row += 1;
+
+        // Results dropdown, indented to the value column. The result set is
+        // `filter_models` for BOTH empty and non-empty queries (an empty query
+        // matches every model, in catalogue order) so the highlight + Up/Down
+        // exactly track the controller, which navigates the same vector.
+        let indent = LABEL_W + GAP;
+        if models_cache.is_empty() {
+            // No catalogue yet (None upstream → empty slice): the fetch spawned on
+            // the step-0→1 advance hasn't resolved. A real OpenRouter catalogue is
+            // never empty, so an empty slice unambiguously means "still fetching".
+            render_line(frame, dim_indented("fetching models\u{2026}", indent, palette), row);
+        } else {
+            // Show the "type to search" hint above the list while the query is empty.
+            if form.query.trim().is_empty() {
+                render_line(frame, dim_indented("type to search models\u{2026}", indent, palette), row);
+                row += 1;
+            }
+            let results = filter_models(models_cache, &form.query);
+            if results.is_empty() {
+                render_line(frame, dim_indented("no matching models", indent, palette), row);
+            } else {
+                let sel = form.result_sel.min(results.len() - 1);
+                // Autoscroll: anchor the window so the selected row stays visible.
+                let start = if sel < RESULTS_MAX { 0 } else { sel + 1 - RESULTS_MAX };
+                let end = (start + RESULTS_MAX).min(results.len());
+                for (vi, &mi) in results[start..end].iter().enumerate() {
+                    let i = start + vi;
+                    let info = &models_cache[mi];
+                    render_line(frame, result_line(info, i == sel, indent, rule_w, palette), row);
+                    row += 1;
+                }
+            }
+        }
     } else {
-        // Step 1: single Model field.
-        // Model field row (always the only/active field on this step).
+        // Step 1 (non-OpenRouter): plain editable Model id with a bottom rule.
         render_line(frame, field_line("Model", &form.model, true, palette), row);
         row += 1;
         // Model underline rule (always active accent on this step).
@@ -233,6 +358,9 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, palette: &Palette) {
     // Pinned to the bottom of the frame, dim, centred.
     let footer_text = if form.step == 0 {
         "tab/\u{2191}\u{2193} switch \u{00b7} enter next \u{00b7} esc cancel \u{00b7} ctrl+c quit"
+    } else if form.is_openrouter() {
+        // Step 1 search mode: ↑↓ navigates the catalogue results.
+        "\u{2191}\u{2193} pick \u{00b7} enter finish \u{00b7} esc back \u{00b7} ctrl+c quit"
     } else {
         "enter finish \u{00b7} esc back \u{00b7} ctrl+c quit"
     };

@@ -10,8 +10,9 @@ use crate::config::DEFAULT_MODEL;
 use crate::model::app_config::{ApiType, ModelEntry, ModelRole, ProviderConn};
 use crate::controller::input::Action;
 use crate::dto::chat::Role;
-use crate::model::{msglog, session::Session, store};
-use crate::service::openrouter::OpenRouterClient;
+use crate::model::{catalogue, msglog, session::Session, store};
+use crate::service::openrouter::{Conn, OpenRouterClient};
+use crate::service::WarmEvent;
 
 use super::build_client;
 use super::commands::apply_slash;
@@ -235,6 +236,45 @@ pub(super) fn apply_action(
             state.rest.waiting = false;
             state.rest.current_task = None;
             state.rest.status = "denied — stopped".into();
+        }
+
+        Action::FetchWizardCatalogue { endpoint, api_key } => {
+            // First-run step-2 omnisearch primer: make the model catalogue
+            // available to the wizard's live search. Disk-cache first; only hit
+            // the network on a stale/absent cache. The existing `warm_rx` drain in
+            // run_loop ALWAYS sets `state.rest.models_cache`, so we reuse it as the
+            // sink — no new channel, no second catalogue fetcher.
+            //
+            // Fresh disk cache → fill `models_cache` synchronously, no network.
+            if let Some((models, age)) = catalogue::load(&endpoint) {
+                if catalogue::is_fresh(age) {
+                    state.rest.models_cache = Some(models);
+                    return Ok(());
+                }
+            }
+            // Stale/absent: spawn the fetch on the shared warm channel (this is the
+            // first-run path — nothing else is warming, so a fresh receiver here is
+            // safe to (re)assign). Build a keyless client if one isn't pinned yet
+            // (creds aren't saved until SaveCreds); the `Conn` carries auth + URL.
+            let c = match client.as_ref() {
+                Some(c) => Arc::clone(c),
+                None => build_client(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.rest.warm_rx = Some(rx);
+            // Own the creds in the task; build the borrowing `Conn` inside it.
+            handle.spawn(async move {
+                let conn = Conn { endpoint: &endpoint, api_key: &api_key };
+                // On Ok: persist to disk (best-effort) AND publish to the cache via
+                // the warm drain. A dropped receiver (wizard left) makes the send a
+                // no-op — same contract as the other channels. On Err: send nothing,
+                // so the cache stays None and the view shows "fetching models…"; the
+                // raw-query fallback still lets the user type a model id and finish.
+                if let Ok(models) = c.list_models(conn).await {
+                    catalogue::save(&endpoint, &models);
+                    let _ = tx.send(WarmEvent::WarmCatalogue(models));
+                }
+            });
         }
 
         Action::SaveCreds { endpoint, api_key, model } => {
