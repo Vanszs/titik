@@ -10,7 +10,7 @@ use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
 use crate::dto::chat::{ChatMessage, Role};
-use crate::model::store;
+use crate::model::{catalogue, store};
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 
 use super::stream::abort_current;
@@ -234,10 +234,26 @@ pub(super) fn apply_slash(
             // Fetch the model catalogue once and cache it. A network failure
             // leaves the cache `None`, which the option-build step below treats
             // as "capabilities unknown" and falls back to a generic menu.
+            // Try the disk cache first; only hit the network when absent or stale.
             if state.rest.models_cache.is_none() {
                 if let Some(r) = main.as_ref() {
-                    if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
-                        state.rest.models_cache = Some(models);
+                    // Check disk cache before network (best-effort, sync read).
+                    let disk = catalogue::load(&r.endpoint);
+                    match disk {
+                        Some((models, age)) if catalogue::is_fresh(age) => {
+                            // Fresh on disk — use it, skip the network call.
+                            state.rest.models_cache = Some(models);
+                        }
+                        other => {
+                            // Stale or absent: try the network.
+                            if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
+                                catalogue::save(&r.endpoint, &models);
+                                state.rest.models_cache = Some(models);
+                            } else if let Some((models, _)) = other {
+                                // Network failed but we have stale data — use it.
+                                state.rest.models_cache = Some(models);
+                            }
+                        }
                     }
                 }
             }
@@ -321,8 +337,23 @@ pub(super) fn apply_slash(
                         )
                     });
                     if let Some(r) = main.as_ref() {
-                        if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
-                            state.rest.models_cache = Some(models);
+                        // Check disk cache before network (best-effort, sync read).
+                        let disk = catalogue::load(&r.endpoint);
+                        match disk {
+                            Some((models, age)) if catalogue::is_fresh(age) => {
+                                // Fresh on disk — use it, skip the network call.
+                                state.rest.models_cache = Some(models);
+                            }
+                            other => {
+                                // Stale or absent: try the network.
+                                if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
+                                    catalogue::save(&r.endpoint, &models);
+                                    state.rest.models_cache = Some(models);
+                                } else if let Some((models, _)) = other {
+                                    // Network failed but we have stale data — use it.
+                                    state.rest.models_cache = Some(models);
+                                }
+                            }
                         }
                     }
                 }

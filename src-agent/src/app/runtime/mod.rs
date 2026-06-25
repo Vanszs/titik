@@ -34,7 +34,7 @@ use crate::app::resolve::resolve_role;
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::model::app_config::ModelRole;
-use crate::model::{app_config::AppConfig, settings::Settings, store};
+use crate::model::{app_config::AppConfig, catalogue, settings::Settings, store};
 use crate::service::openrouter::OpenRouterClient;
 use crate::service::WarmEvent;
 
@@ -129,20 +129,82 @@ pub(super) fn warm_session(
         }
     });
 
+    // Check the disk cache before deciding whether to spawn a network task.
+    // This is a synchronous local-file read — fine on the startup path.
+    // Three outcomes for the catalogue:
+    //   - `Some((models, fresh))` where `fresh` is true  → use cached, no network task
+    //   - `Some((models, fresh))` where `fresh` is false → use cached immediately,
+    //                                                       still spawn a background refresh
+    //   - `None`                                          → no cache; spawn fetch as before
+    enum CatalogueDecision {
+        /// Already loaded from disk (may still spawn a background refresh if stale).
+        FromDisk { models: Vec<crate::dto::openrouter::ModelInfo>, is_fresh: bool },
+        /// Need a network fetch (no usable cache).
+        FetchNeeded,
+        /// Not needed or unroutable — no action.
+        Skip,
+    }
+    let catalogue_decision = if want_catalogue {
+        if let Some(route) = main_route.as_ref() {
+            let endpoint = route.endpoint.clone();
+            match catalogue::load(&endpoint) {
+                Some((models, age)) => {
+                    let fresh = catalogue::is_fresh(age);
+                    CatalogueDecision::FromDisk { models, is_fresh: fresh }
+                }
+                None => CatalogueDecision::FetchNeeded,
+            }
+        } else {
+            // Wanted but unroutable → skip (no network, no disk load possible).
+            CatalogueDecision::Skip
+        }
+    } else {
+        CatalogueDecision::Skip
+    };
+
+    // For fresh-from-disk, populate the in-memory cache RIGHT NOW (synchronously)
+    // so the cache is available before the splash even starts.
+    let catalogue_prefilled = match &catalogue_decision {
+        CatalogueDecision::FromDisk { models, .. } => {
+            let n = models.len();
+            state.rest.models_cache = Some(models.clone());
+            Some(n)
+        }
+        _ => None,
+    };
+
+    // Determine whether we need to spawn a catalogue network task.
+    // - FetchNeeded: spawn a full fetch task.
+    // - FromDisk { is_fresh: false }: spawn a background refresh (stale cache).
+    // - FromDisk { is_fresh: true } or Skip: no network task.
+    let need_catalogue_task = matches!(
+        &catalogue_decision,
+        CatalogueDecision::FetchNeeded
+            | CatalogueDecision::FromDisk { is_fresh: false, .. }
+    );
+
     // Is there any actual network warm work to run? (A spawnable catalogue or
-    // awareness task.) If not — no client, catalogue cached, awareness disabled
-    // or unroutable — do NOT enter the loading splash; leave the mode as-is so
-    // this path behaves exactly as before for the no-work case.
-    let has_work = main_route.is_some() || aware_route.is_some();
-    if !has_work {
+    // awareness task.) If not — no client, catalogue cached (fresh), awareness
+    // disabled or unroutable — do NOT enter the loading splash; leave the mode
+    // as-is so this path behaves exactly as before for the no-work case.
+    let has_network_work = (need_catalogue_task && main_route.is_some()) || aware_route.is_some();
+    if !has_network_work && catalogue_prefilled.is_none() {
+        // Nothing to do at all.
+        return;
+    }
+    if !has_network_work && catalogue_prefilled.is_some() {
+        // Loaded fresh from disk, awareness not needed — skip the splash entirely.
         return;
     }
 
-    // Build the per-step status for the splash. Workspace is Running (the reindex
-    // just kicked off; the drain flips it to Done once the cache settles).
-    // Catalogue/awareness are Running when a task will run, else Skipped (wanted
-    // but unroutable) or Pending (not wanted at all).
-    let catalogue = if main_route.is_some() {
+    // Build the per-step status for the splash.
+    // When data was loaded from disk (fresh or stale), the catalogue step starts
+    // as Done immediately — the user already has data and we just refresh in
+    // the background. Otherwise Running (network fetch pending) or Skipped.
+    let catalogue_status = if let Some(n) = catalogue_prefilled {
+        // Loaded from disk: already terminal — Done with a "(cached)" note.
+        WarmStatus::Done(format!("{n} models (cached)"))
+    } else if need_catalogue_task && main_route.is_some() {
         WarmStatus::Running
     } else if want_catalogue {
         WarmStatus::Skipped // wanted but no routable Main route
@@ -160,7 +222,7 @@ pub(super) fn warm_session(
         started: std::time::Instant::now(),
         frame: 0,
         workspace: WarmStatus::Running,
-        catalogue,
+        catalogue: catalogue_status,
         awareness,
     });
 
@@ -170,19 +232,26 @@ pub(super) fn warm_session(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     state.rest.warm_rx = Some(rx);
 
-    // Catalogue task: resolve Main (done above) and fetch the model catalogue so
-    // `context_length` feeds the short-send threshold gate. Move the owned route
-    // in and build `conn()` inside; never borrows `state`.
-    if let (Some(c), Some(route)) = (client.as_ref(), main_route) {
-        let c = Arc::clone(c);
-        let tx = tx.clone();
-        handle.spawn(async move {
-            let ev = match c.list_models(route.conn()).await {
-                Ok(models) => WarmEvent::WarmCatalogue(models),
-                Err(_) => WarmEvent::WarmCatalogueFailed,
-            };
-            let _ = tx.send(ev);
-        });
+    // Catalogue task: fetch the model catalogue (fresh fetch or background
+    // refresh). On success, save to disk AND send WarmCatalogue so the in-memory
+    // cache is updated. Move the owned route in; never borrows `state`.
+    if need_catalogue_task {
+        if let (Some(c), Some(route)) = (client.as_ref(), main_route) {
+            let c = Arc::clone(c);
+            let tx = tx.clone();
+            let endpoint = route.endpoint.clone();
+            handle.spawn(async move {
+                let ev = match c.list_models(route.conn()).await {
+                    Ok(models) => {
+                        // Persist the fresh catalogue to disk (best-effort).
+                        catalogue::save(&endpoint, &models);
+                        WarmEvent::WarmCatalogue(models)
+                    }
+                    Err(_) => WarmEvent::WarmCatalogueFailed,
+                };
+                let _ = tx.send(ev);
+            });
+        }
     }
 
     // Awareness task: read the depth-1 docs + summarize on the resolved Awareness
