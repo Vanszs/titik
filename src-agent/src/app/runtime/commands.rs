@@ -13,7 +13,7 @@ use crate::dto::chat::{ChatMessage, Role};
 use crate::model::store;
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 
-use super::stream::abort_current;
+use super::stream::{abort_current, build_tool_ctx};
 
 /// Generic effort menu used when the model catalogue can't be fetched (network
 /// failure). Covers the common tokens so the user can still set something; the
@@ -381,6 +381,72 @@ pub(super) fn apply_slash(
                 abort_current(&mut state.rest);
             }
             state.rest.should_quit = true;
+        }
+
+        Command::Task(args) => {
+            // Guard: needs an active client + session.
+            if client.is_none() || state.rest.session.is_none() {
+                state.rest.status = "no active session".into();
+                return Ok(());
+            }
+            // Split the first whitespace token as the agent name; the rest is
+            // the task text (original casing preserved).
+            let mut tokens = args.splitn(2, char::is_whitespace);
+            let agent_name = tokens.next().unwrap_or("").trim().to_string();
+            let task_text = tokens.next().unwrap_or("").trim().to_string();
+            if agent_name.is_empty() || task_text.is_empty() {
+                state.rest.status = "usage: /task <agent> <task>".into();
+                return Ok(());
+            }
+
+            // Snapshot inputs before borrowing state mutably below.
+            let ctx = build_tool_ctx(state);
+            let (session_dir, config, settings, awareness, memory_md) = {
+                let sess = state.rest.session.as_ref().unwrap();
+                let session_dir = sess.path.clone();
+                let config = state.rest.config.clone();
+                let settings = sess.settings.clone();
+                let awareness = state
+                    .rest
+                    .awareness_summary
+                    .clone()
+                    .unwrap_or_default();
+                // Read MEMORY.md from the session memory dir if present.
+                let memory_md = std::fs::read_to_string(session_dir.join("memory").join("MEMORY.md"))
+                    .unwrap_or_default();
+                (session_dir, config, settings, awareness, memory_md)
+            };
+
+            let registry = crate::model::agent_def::AgentRegistry::load(Some(&session_dir));
+            let id = state.rest.next_subagent_id;
+            let client_arc = std::sync::Arc::clone(client.as_ref().unwrap());
+
+            match crate::app::subagent::spawn_subagent(
+                &client_arc,
+                handle,
+                &registry,
+                &config,
+                &settings,
+                ctx,
+                &awareness,
+                &memory_md,
+                id,
+                &agent_name,
+                &task_text,
+            ) {
+                Some(sub) => {
+                    state.rest.next_subagent_id += 1;
+                    state.rest.subagents.push(sub);
+                    state.rest.subagents_open = true;
+                    state
+                        .rest
+                        .set_toast_info(format!("started sub-agent #{id} ({agent_name})"));
+                    state.rest.status = format!("started sub-agent #{id} ({agent_name})");
+                }
+                None => {
+                    state.rest.status = format!("unknown agent: {agent_name}");
+                }
+            }
         }
 
         Command::Unknown(s) => {

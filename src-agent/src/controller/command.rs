@@ -7,7 +7,8 @@
 //!
 //! Supported commands: `/compact`, `/new`, `/mode`, `/effort`,
 //! `/rename [session] <name>`, `/settings` (alias `/config`),
-//! `/resume` (alias `/sessions`), `/help`, `/quit` (aliases: `/q`, `/exit`).
+//! `/resume` (alias `/sessions`), `/task <agent> <task>`,
+//! `/help`, `/quit` (aliases: `/q`, `/exit`).
 
 /// User-facing slash commands shown in the `/` palette, in display order.
 /// (name, one-line description). Source of truth for the palette UI.
@@ -18,6 +19,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/effort", "Set model reasoning/thinking effort"),
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/agents", "Create, modify, or delete agent definitions"),
+    ("/task", "Run an agent on a task in the background"),
     ("/compact", "Summarize and compact the conversation"),
     ("/rename", "Rename the current session"),
     ("/select", "Dump history to the terminal to copy/paste"),
@@ -62,6 +64,8 @@ pub enum Command {
     Settings,
     /// Open the `/agents` management dashboard (alias: `/agent`).
     Agents,
+    /// Run a named agent on a task in the background. Holds `<agent> <task>`.
+    Task(String),
     /// Open the session picker to switch to a different session (alias: `/sessions`).
     Resume,
     /// Dump the conversation to the normal terminal for native copy/paste.
@@ -102,6 +106,7 @@ pub fn parse(line: &str) -> Command {
         "effort" => Command::Effort,
         "settings" | "config" => Command::Settings,
         "agents" | "agent" => Command::Agents,
+        "task" => Command::Task(rest.to_string()),
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,

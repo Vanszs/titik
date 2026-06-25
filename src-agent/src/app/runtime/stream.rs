@@ -450,14 +450,12 @@ fn finish_tool_round(
     start_stream_task(history, state, client, handle);
 }
 
-/// Run a single tool call against the session workspace and return its result
-/// string (an `error: …` line on failure / unknown tool). Reads the session for
-/// the workspace path and clones the shared dir cache up front, then dispatches
-/// to the matching [`crate::tool::Tool`].
+/// Build a [`crate::tool::ToolCtx`] from the current session + shared dir cache.
 ///
-/// `pub(super)` so the approve/deny action handlers can run a single tool when
-/// resuming the approval machine.
-pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
+/// Centralises the workspace/workspaces/memory_dir construction so that both
+/// `run_tool` (inline tool calls) and the `/task` spawner (sub-agent launch)
+/// use the EXACT same paths and dir-cache reference.
+pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
     let session_ref = state.rest.session.as_ref();
     let workspace = session_ref
         .as_ref()
@@ -470,12 +468,23 @@ pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
     let memory_dir = session_ref
         .as_ref()
         .map(|s| s.path.join("memory"));
-    let ctx = crate::tool::ToolCtx {
+    crate::tool::ToolCtx {
         workspace,
         workspaces,
         dir_cache: state.rest.dir_cache.clone(),
         memory_dir,
-    };
+    }
+}
+
+/// Run a single tool call against the session workspace and return its result
+/// string (an `error: …` line on failure / unknown tool). Reads the session for
+/// the workspace path and clones the shared dir cache up front, then dispatches
+/// to the matching [`crate::tool::Tool`].
+///
+/// `pub(super)` so the approve/deny action handlers can run a single tool when
+/// resuming the approval machine.
+pub(super) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
+    let ctx = build_tool_ctx(state);
     crate::tool::execute_tool(&ctx, call)
 }
 
