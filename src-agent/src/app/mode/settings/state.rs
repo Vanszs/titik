@@ -6,7 +6,7 @@ use crate::view::theme::ACCENTS;
 
 use super::super::SettingField;
 use super::picker::{PathPicker, PickerMode};
-use super::{ApiType, ModelDraft, ModelField, ModelModal, ModelRole, ProviderDraft, ProviderModal};
+use super::{ModelDraft, ModelField, ModelModal, ModelRole, ProviderDraft, ProviderModal};
 
 /// Working state for the in-app `/settings` dashboard.
 ///
@@ -128,6 +128,43 @@ impl SettingsState {
         } else {
             session.settings.allowed_folders.clone()
         };
+        // Provider drafts come straight from the global catalogue (empty on a
+        // fresh install — no demo seeds).
+        let providers: Vec<ProviderDraft> = config
+            .providers
+            .iter()
+            .map(|p| ProviderDraft {
+                uuid: p.uuid.clone(),
+                name: p.name.clone(),
+                endpoint: p.endpoint.clone(),
+                api_type: p.api_type,
+                api_key: p.api_key.clone(),
+            })
+            .collect();
+        // Model drafts: global catalogue entries (session_only = false) followed
+        // by this session's override-layer models (session_only = true). Each
+        // entry's `provider_uuid` is resolved back to a positional `provider_idx`
+        // against the providers built above; a dangling uuid (provider deleted
+        // out-of-band) falls back to idx 0 so the row surfaces for re-pick rather
+        // than vanishing.
+        let map_entry = |m: &crate::model::app_config::ModelEntry, session_only: bool| ModelDraft {
+            uuid: m.uuid.clone(),
+            name: m.name.clone(),
+            model_id: m.model_id.clone(),
+            provider_idx: config.provider_index_by_uuid(&m.provider_uuid).unwrap_or(0),
+            role: m.role,
+            route: m.route.clone(),
+            session_only,
+        };
+        let mut models: Vec<ModelDraft> =
+            config.models.iter().map(|m| map_entry(m, false)).collect();
+        models.extend(
+            session
+                .settings
+                .session_models
+                .iter()
+                .map(|m| map_entry(m, true)),
+        );
         Self {
             cat: 0,
             field: 0,
@@ -154,31 +191,11 @@ impl SettingsState {
             list_editing: false,
             list_sel: 0,
             picker: None,
-            providers: vec![
-                ProviderDraft {
-                    name: "OpenRouter".into(),
-                    endpoint: "https://openrouter.ai/api/v1".into(),
-                    api_type: ApiType::OpenAiCompatible,
-                    api_key: "sk-or-demo".into(),
-                },
-                ProviderDraft {
-                    name: "Anthropic".into(),
-                    endpoint: "https://api.anthropic.com".into(),
-                    api_type: ApiType::AnthropicCompatible,
-                    api_key: "sk-ant-demo".into(),
-                },
-            ],
+            providers,
             prov_sel: 0,
             prov_delete_armed: false,
             prov_modal: None,
-            models: vec![ModelDraft {
-                name: "chat".into(),
-                model_id: "openai/gpt-4o-mini".into(),
-                provider_idx: 0,
-                role: None,
-                route: None,
-                session_only: false,
-            }],
+            models,
             model_sel: 0,
             model_delete_armed: false,
             model_modal: None,
@@ -549,13 +566,15 @@ impl SettingsState {
         self.prov_modal = None;
     }
 
-    /// Save the modal draft as a new provider and close the modal.
+    /// Save the modal draft as a new provider and close the modal. Mints a fresh
+    /// uuid for the new entry (the add-provider modal only ever creates).
     pub fn save_provider_modal(&mut self) {
         if let Some(m) = self.prov_modal.take() {
             let name     = m.name.trim().to_string();
             let endpoint = m.endpoint.trim().to_string();
             let api_key  = m.api_key.trim().to_string();
             self.providers.push(ProviderDraft {
+                uuid: super::new_uuid(),
                 name,
                 endpoint,
                 api_type: m.api_type,
@@ -697,6 +716,7 @@ impl SettingsState {
         if let Some(m) = self.models.get(idx) {
             self.model_modal = Some(ModelModal {
                 editing_idx: Some(idx),
+                uuid: m.uuid.clone(),
                 name: m.name.clone(),
                 provider_idx: m.provider_idx,
                 model_id: m.model_id.clone(),
@@ -732,6 +752,13 @@ impl SettingsState {
     pub fn save_model_modal(&mut self, session_only: bool) {
         if let Some(m) = self.model_modal.take() {
             let draft = ModelDraft {
+                // Preserve the carried identity (edit) or the freshly minted one
+                // (add); mint as a last resort if it somehow arrived empty.
+                uuid: if m.uuid.is_empty() {
+                    super::new_uuid()
+                } else {
+                    m.uuid.clone()
+                },
                 name: m.name.trim().to_string(),
                 model_id: m.model_id.trim().to_string(),
                 provider_idx: m.provider_idx,

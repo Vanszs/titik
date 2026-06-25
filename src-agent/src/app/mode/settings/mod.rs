@@ -10,17 +10,17 @@ mod state;
 pub use picker::PICKER_MAX;
 pub use state::SettingsState;
 
-/// Role slot a model is assigned to in the agent runtime.
+/// The persisted catalogue enums double as the UI draft enums — the variants are
+/// identical and re-using them avoids a second enum + conversion glue. The
+/// inherent `impl` blocks below (label/short_label/full_label/toggle/ALL) attach
+/// the UI-only helpers to these re-exported in-crate types.
 ///
-/// Roles are exclusive (1:1 role→model): assigning a role steals it from any
-/// other model that currently holds it.  `None` means unassigned.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ModelRole {
-    Main,
-    Awareness,
-    Safeguard,
-    Compactor,
-}
+/// `ModelRole`: role slot a model is assigned to in the agent runtime. Roles are
+/// exclusive (1:1 role→model): assigning a role steals it from any other model
+/// that currently holds it. `None` means unassigned.
+///
+/// `ApiType`: the wire protocol type of an API provider endpoint.
+pub use crate::model::app_config::{ApiType, ModelRole};
 
 /// A single navigable field within the add/edit-model modal.
 ///
@@ -59,13 +59,6 @@ impl ModelRole {
     ];
 }
 
-/// The wire protocol type of an API provider endpoint.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ApiType {
-    OpenAiCompatible,
-    AnthropicCompatible,
-}
-
 impl ApiType {
     /// Short label used in the providers table column.
     pub fn short_label(self) -> &'static str {
@@ -92,9 +85,22 @@ impl ApiType {
     }
 }
 
-/// One API provider entry stored in-memory (stub only, not persisted).
+/// Mint a fresh random UUID (v4) as a `String`. Used when CREATING a new
+/// provider/model draft in the UI so its identity is stable across the edit
+/// session (before the first config save) and matches the persisted
+/// [`crate::model::app_config`] uuid scheme.
+pub fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// One API provider entry, mirrored to/from a persisted
+/// [`crate::model::app_config::ProviderConn`]. `uuid` carries the persisted
+/// identity so a reorder/delete/edit round-trips without losing the
+/// model→provider linkage.
 #[derive(Clone, Debug)]
 pub struct ProviderDraft {
+    /// Persisted identity (matches the `ProviderConn` uuid). Minted on create.
+    pub uuid: String,
     pub name: String,
     pub endpoint: String,
     pub api_type: ApiType,
@@ -129,6 +135,9 @@ impl ProviderModal {
 /// `provider_idx` in [`SettingsState::providers`].
 #[derive(Clone, Debug)]
 pub struct ModelDraft {
+    /// Persisted identity (matches the `ModelEntry` uuid). Minted on create;
+    /// preserved on edit so a saved model keeps its catalogue identity.
+    pub uuid: String,
     /// Custom display name shown in the models table.
     pub name: String,
     /// Concrete model identifier, e.g. `"openai/gpt-4o-mini"`.
@@ -165,6 +174,11 @@ pub struct ModelDraft {
 pub struct ModelModal {
     /// `Some(i)` = editing `models[i]`; `None` = adding a new entry.
     pub editing_idx: Option<usize>,
+    /// Persisted identity carried through the modal: minted fresh in
+    /// [`Self::new_add`], cloned from the edited draft on edit-open, and written
+    /// back onto the saved [`ModelDraft`]. Empty falls back to a freshly minted
+    /// uuid on save.
+    pub uuid: String,
     /// Draft custom display name.
     pub name: String,
     /// Index into [`SettingsState::providers`] (which provider serves the model).
@@ -201,10 +215,12 @@ pub struct ModelModal {
 }
 
 impl ModelModal {
-    /// Blank ADD-mode modal targeting provider `provider_idx`.
+    /// Blank ADD-mode modal targeting provider `provider_idx`. Mints a fresh
+    /// uuid so a model added in this session has a stable identity before save.
     pub fn new_add(provider_idx: usize) -> Self {
         Self {
             editing_idx: None,
+            uuid: new_uuid(),
             name: String::new(),
             provider_idx,
             model_id: String::new(),

@@ -206,6 +206,15 @@ pub struct Settings {
     /// (e.g. Anthropic). When false (the default), no such adaptation is attempted.
     #[serde(default = "default_sliding_cache")]
     pub sliding_cache: bool,
+    /// Per-session override layer for the global model catalogue: models the user
+    /// saved for THIS session only (the `/settings` "Save session" path). They are
+    /// never written to the global `config.json`; they live here so they survive a
+    /// reload without leaking into other sessions. Mirrors the global
+    /// [`crate::model::app_config::ModelEntry`] shape (each still references a
+    /// provider by uuid). Empty by default so old `settings.json` files load
+    /// unchanged.
+    #[serde(default)]
+    pub session_models: Vec<crate::model::app_config::ModelEntry>,
 }
 
 fn default_model() -> String {
@@ -273,6 +282,7 @@ impl Default for Settings {
             short_send_enabled: default_short_send_enabled(),
             short_send_tail_n: default_short_send_tail_n(),
             sliding_cache: default_sliding_cache(),
+            session_models: Vec::new(),
         }
     }
 }

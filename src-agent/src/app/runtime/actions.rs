@@ -7,6 +7,7 @@ use anyhow::Result;
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
+use crate::model::app_config::{ModelEntry, ProviderConn};
 use crate::controller::input::Action;
 use crate::dto::chat::Role;
 use crate::model::{msglog, session::Session, store};
@@ -392,6 +393,8 @@ pub(super) fn apply_action(
                     s.allowed_folders.clone(),
                     s.short_send_enabled,
                     s.sliding_cache,
+                    s.providers.clone(),
+                    s.models.clone(),
                 )),
                 _ => None,
             };
@@ -413,6 +416,8 @@ pub(super) fn apply_action(
                 allowed_folders,
                 short_send_enabled,
                 sliding_cache,
+                provider_drafts,
+                model_drafts,
             )) = drafts
             {
                 // Detect whether the OpenRouter-relevant creds changed so we only
@@ -450,6 +455,54 @@ pub(super) fn apply_action(
                         .map(|p| vec![p.display().to_string()])
                         .unwrap_or_default();
                 }
+                // Map provider drafts -> persisted ProviderConn (preserve uuid;
+                // mint one only if a draft somehow arrived without it).
+                let provider_conns: Vec<ProviderConn> = provider_drafts
+                    .iter()
+                    .map(|d| ProviderConn {
+                        uuid: if d.uuid.is_empty() {
+                            uuid::Uuid::new_v4().to_string()
+                        } else {
+                            d.uuid.clone()
+                        },
+                        name: d.name.clone(),
+                        api_type: d.api_type,
+                        endpoint: d.endpoint.clone(),
+                        api_key: d.api_key.clone(),
+                    })
+                    .collect();
+                // Map model drafts -> persisted ModelEntry, resolving the draft's
+                // positional `provider_idx` back to a `provider_uuid` against the
+                // FRESHLY built provider_conns (so a model added in this same edit
+                // session that points at a brand-new provider still resolves). A
+                // dangling idx yields an empty provider_uuid (surfaces for re-pick).
+                let to_entry = |d: &crate::app::mode::settings::ModelDraft| ModelEntry {
+                    uuid: if d.uuid.is_empty() {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        d.uuid.clone()
+                    },
+                    name: d.name.clone(),
+                    model_id: d.model_id.clone(),
+                    provider_uuid: provider_conns
+                        .get(d.provider_idx)
+                        .map(|p| p.uuid.clone())
+                        .unwrap_or_default(),
+                    route: d.route.clone(),
+                    role: d.role,
+                };
+                // Global catalogue: session_only == false. Session override layer:
+                // session_only == true (persisted to settings.json, never config).
+                let model_entries: Vec<ModelEntry> = model_drafts
+                    .iter()
+                    .filter(|d| !d.session_only)
+                    .map(&to_entry)
+                    .collect();
+                let session_model_entries: Vec<ModelEntry> = model_drafts
+                    .iter()
+                    .filter(|d| d.session_only)
+                    .map(&to_entry)
+                    .collect();
                 if let Some(sess) = state.rest.session.as_mut() {
                     sess.settings.api_key = api_key;
                     sess.settings.model = model;
@@ -473,12 +526,18 @@ pub(super) fn apply_action(
                     // Sliding-cache toggle: no client rebuild needed; a later
                     // wave's summarization logic reads this flag per-send.
                     sess.settings.sliding_cache = sliding_cache;
+                    // Session-only models live in the per-session override layer,
+                    // never in the global config. Persisted via sess.save() below.
+                    sess.settings.session_models = session_model_entries;
                 }
-                // b) Apply global theme/accent and persist config.json. Best-effort:
-                //    a write failure surfaces to the status line but does not abort
-                //    the rest of the save.
+                // b) Apply global theme/accent + the provider/model catalogue and
+                //    persist config.json in one write. Best-effort: a write failure
+                //    surfaces to the status line but does not abort the rest of the
+                //    save.
                 state.rest.config.theme = theme;
                 state.rest.config.accent = accent;
+                state.rest.config.providers = provider_conns;
+                state.rest.config.models = model_entries;
                 if let Err(e) = state.rest.config.save() {
                     state.rest.status = format!("config save failed: {e}");
                 }
