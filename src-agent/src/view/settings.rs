@@ -546,8 +546,8 @@ fn draw_role_picker(
     use crate::app::mode::settings::ModelRole;
 
     let n = ModelRole::ALL.len();
-    // Content rows: one per role + a hint line. Borders add 2.
-    let content_h = n as u16 + 1;
+    // Content rows: one per role + two hint lines (split for narrow modals). Borders add 2.
+    let content_h = n as u16 + 2;
     let total_h = content_h + 2;
     // Width: "[x] awareness" is short; a 28-col inner is comfortable. Clamp to frame.
     let popup_w = 30_u16.min(area.width.saturating_sub(2));
@@ -609,9 +609,13 @@ fn draw_role_picker(
         }
     }
 
-    // Footer hint line (last inner row).
+    // Footer hint: two lines so narrow modals don't truncate.
     lines.push(Line::from(Span::styled(
-        "space toggle \u{b7} enter ok \u{b7} esc cancel",
+        "space toggle",
+        Style::default().fg(palette.dim),
+    )));
+    lines.push(Line::from(Span::styled(
+        "enter ok \u{b7} esc cancel",
         Style::default().fg(palette.dim),
     )));
 

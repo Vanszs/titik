@@ -179,9 +179,9 @@ fn draw_tool_picker(
     area: Rect,
 ) {
     let filtered = picker.filtered_indices();
-    // Content rows: filter line (1) + options (min 1, max 10) + hint (1).
+    // Content rows: filter line (1) + options (min 1, max 10) + hint (2 lines, split for narrow modals).
     let opt_rows = filtered.len().clamp(1, 10) as u16;
-    let content_h = 1 + opt_rows + 1; // filter + options + hint
+    let content_h = 1 + opt_rows + 2; // filter + options + hint (2 lines)
     // Total height includes top and bottom borders.
     let total_h = content_h + 2;
     // Width: content is "[x] toolname" with 1-space left pad + padding.
@@ -276,12 +276,15 @@ fn draw_tool_picker(
         Rect { x: body_x, y: opt_area_y, width: body_w, height: opt_rows },
     );
 
-    // Hint line (last row of inner area).
+    // Hint lines (last two rows of inner area): split for narrow modals.
     let hint_y = opt_area_y + opt_rows;
-    let hint = "space toggle · type filter · enter ok · esc cancel";
     frame.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(palette.dim))),
+        Paragraph::new(Span::styled("space toggle", Style::default().fg(palette.dim))),
         Rect { x: body_x, y: hint_y, width: body_w, height: 1 },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled("enter ok \u{b7} esc cancel", Style::default().fg(palette.dim))),
+        Rect { x: body_x, y: hint_y + 1, width: body_w, height: 1 },
     );
 }
 
@@ -306,9 +309,9 @@ fn draw_provider_picker(
     palette: &Palette,
     area: Rect,
 ) {
-    // Content rows: options (min 1, max 10) + a hint line. Borders add 2.
+    // Content rows: options (min 1, max 10) + two hint lines (split for narrow modals). Borders add 2.
     let opt_rows = picker.options.len().clamp(1, 10) as u16;
-    let content_h = opt_rows + 1;
+    let content_h = opt_rows + 2;
     let total_h = content_h + 2;
     let popup_w = 40_u16.min(area.width.saturating_sub(2));
     let popup = centered_rect(area, popup_w, total_h);
@@ -367,14 +370,21 @@ fn draw_provider_picker(
         Rect { x: body_x, y: inner.y, width: body_w, height: opt_rows },
     );
 
-    // Hint line (last inner row).
+    // Hint lines (last two inner rows): split for narrow modals.
     let hint_y = inner.y + opt_rows;
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "↑↓ select · enter ok · esc cancel",
+            "\u{2191}\u{2193} select",
             Style::default().fg(palette.dim),
         )),
         Rect { x: body_x, y: hint_y, width: body_w, height: 1 },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "enter ok \u{b7} esc cancel",
+            Style::default().fg(palette.dim),
+        )),
+        Rect { x: body_x, y: hint_y + 1, width: body_w, height: 1 },
     );
 }
 
