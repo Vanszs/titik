@@ -8,6 +8,7 @@
 //! - [`resolve`] – per-role route resolution (model + provider + endpoint + key)
 //! - [`runtime`] – event loop, terminal setup/teardown, and the main `run` function that ties controller + view together
 //! - [`state`] – [`AppState`] (mode + rest) and [`AppStateRest`] (shared fields used across all modes: messages, input, client, …)
+//! - [`subagent`] – self-contained autonomous sub-agent runtime (LLM-tool loop in a background task)
 //!
 //! [`run`] is re-exported at this level so callers only need `app::run(opts)`.
 
@@ -17,5 +18,6 @@ pub mod mode;
 pub mod resolve;
 pub mod runtime;
 pub mod state;
+pub mod subagent;
 
 pub use runtime::run;

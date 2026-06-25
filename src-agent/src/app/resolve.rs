@@ -38,6 +38,7 @@
 //! call works on any provider the user has actually configured, not just OpenRouter.
 
 use crate::config::DEFAULT_BASE_URL;
+use crate::model::agent_def::AgentDef;
 use crate::model::app_config::{ApiType, AppConfig, ModelEntry, ModelRole};
 use crate::model::settings::Settings;
 use crate::service::openrouter::Conn;
@@ -211,4 +212,59 @@ pub fn resolve_role(config: &AppConfig, settings: &Settings, role: ModelRole) ->
 
     // 4. No assignment, or a dangling provider → per-role legacy fallback.
     legacy_fallback(settings, role)
+}
+
+/// Resolve the concrete route for a sub-agent ([`AgentDef`]).
+///
+/// A sub-agent carries its OWN model + provider on the definition, independent of
+/// the runtime role catalogue:
+///
+/// 1. If the agent names a `model` AND its `provider_uuid` resolves to a known
+///    provider connection, dispatch against THAT provider (endpoint + key + wire
+///    type), pinning the agent's legacy `provider` routing slug as the upstream
+///    route. This is the explicit-assignment path and always wins.
+/// 2. Otherwise — the agent has no model, or its `provider_uuid` is absent /
+///    dangling — inherit the fully-resolved Main route so the sub-agent runs on
+///    whatever provider the user has actually configured (never silently dark).
+///
+/// In BOTH cases the agent's own reasoning `effort` overrides the route's effort
+/// when set (an agent declares its own thinking budget); an unset effort keeps the
+/// inherited one. Returns `None` only when the agent has no usable model AND Main
+/// itself can't resolve — practically never, since Main has a legacy soft-fallback.
+///
+/// Currently only called by the (Stage-1 inert) sub-agent spawn path, so it is
+/// unreferenced from the binary until that path is wired in — hence the allow.
+#[allow(dead_code)]
+pub fn resolve_agent(config: &AppConfig, settings: &Settings, agent: &AgentDef) -> Option<Resolved> {
+    // The agent's declared effort, applied on top of whichever route we land on.
+    let agent_effort = agent.effort.clone();
+    let with_effort = |mut r: Resolved| -> Resolved {
+        if let Some(e) = &agent_effort {
+            r.effort = e.clone();
+        }
+        r
+    };
+
+    // 1. Explicit model + resolvable provider connection → dispatch there.
+    if let Some(model_id) = agent.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        if let Some(uuid) = agent.provider_uuid.as_deref().filter(|u| !u.trim().is_empty()) {
+            if let Some(provider) = config.providers.iter().find(|p| p.uuid == uuid) {
+                return Some(with_effort(Resolved {
+                    model_id: model_id.to_string(),
+                    endpoint: provider.endpoint.clone(),
+                    api_key: provider.api_key.clone(),
+                    api_type: provider.api_type,
+                    // The legacy free-text `provider` field is an OpenRouter
+                    // upstream-routing slug (None = automatic routing).
+                    route: agent.provider.clone(),
+                    effort: String::new(),
+                }));
+            }
+        }
+        // A named model whose provider is absent/dangling falls through to Main —
+        // better to run on the configured Main provider than to go dark.
+    }
+
+    // 2. No usable model/provider → inherit the Main route.
+    resolve_role(config, settings, ModelRole::Main).map(with_effort)
 }
