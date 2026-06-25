@@ -742,7 +742,7 @@ impl SettingsState {
     /// two models ever share a role.
     pub fn save_model_modal(&mut self, session_only: bool) {
         if let Some(m) = self.model_modal.take() {
-            let draft = ModelDraft {
+            let mut draft = ModelDraft {
                 // Preserve the carried identity (edit) or the freshly minted one
                 // (add); mint as a last resort if it somehow arrived empty.
                 uuid: if m.uuid.is_empty() {
@@ -757,28 +757,46 @@ impl SettingsState {
                 route: m.route.clone(),
                 session_only,
             };
-            // Determine the target index before inserting/replacing.
-            let target_idx = match m.editing_idx {
-                Some(i) if i < self.models.len() => i,
-                _ => self.models.len(), // will be the pushed index
+
+            // Determine the operation and target index:
+            //   - Same scope (edit in place): replace the existing entry.
+            //   - Scope changed (e.g. global entry saved as session): add a NEW
+            //     copy with a fresh uuid; leave the original entry untouched so
+            //     it keeps its scope and role in the global catalogue.
+            //   - No editing_idx (new entry): push as usual.
+            let editing = m.editing_idx.filter(|&i| i < self.models.len());
+            let target_idx = match editing {
+                Some(i) if self.models[i].session_only == session_only => {
+                    // Same scope — replace in place (keep carried uuid).
+                    i
+                }
+                Some(_) => {
+                    // Scope changed — mint a fresh uuid so the original entry
+                    // keeps its own identity; the new copy is appended.
+                    draft.uuid = super::new_uuid();
+                    self.models.len() // will be the pushed index
+                }
+                None => self.models.len(), // new entry — push
             };
-            // Per-role steal: drop each role the target now holds from every OTHER
-            // model so each role stays on at most one model (the target keeps all
-            // of its own roles).
+
+            // Per-role steal: drop each claimed role from every OTHER model of
+            // THE SAME SCOPE only. A session model must not strip roles from
+            // global models, and vice versa, so both a global main and a session
+            // main can coexist (with session winning via resolve_role).
             for (i, other) in self.models.iter_mut().enumerate() {
-                if i != target_idx {
+                if i != target_idx && other.session_only == draft.session_only {
                     other.roles.retain(|r| !draft.roles.contains(r));
                 }
             }
-            match m.editing_idx {
-                Some(i) if i < self.models.len() => {
-                    self.models[i] = draft;
-                    self.model_sel = i;
-                }
-                _ => {
-                    self.models.push(draft);
-                    self.model_sel = self.models.len().saturating_sub(1);
-                }
+
+            if target_idx < self.models.len() {
+                // Replace in place (same-scope edit).
+                self.models[target_idx] = draft;
+                self.model_sel = target_idx;
+            } else {
+                // Append (new entry or cross-scope copy).
+                self.models.push(draft);
+                self.model_sel = self.models.len().saturating_sub(1);
             }
         }
     }
