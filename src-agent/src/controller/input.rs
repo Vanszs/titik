@@ -682,6 +682,32 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
         return Action::Quit;
     }
 
+    // --- Role checkbox picker (DEEPEST level: a modal-on-modal over the model
+    //     modal; intercepts ALL keys before the rest of the model-modal handling).
+    //     Up/Down move the cursor, Space toggles the row, Enter commits the
+    //     selection into `roles`, Esc discards. ---
+    if s.mm_role_picker_open() {
+        match key.code {
+            KeyCode::Up => {
+                s.mm_role_picker_up();
+            }
+            KeyCode::Down => {
+                s.mm_role_picker_down();
+            }
+            KeyCode::Char(' ') => {
+                s.mm_role_picker_toggle();
+            }
+            KeyCode::Enter => {
+                s.confirm_role_picker();
+            }
+            KeyCode::Esc => {
+                s.cancel_role_picker();
+            }
+            _ => {}
+        }
+        return Action::None;
+    }
+
     // --- Add/edit-model modal (deepest level: intercepts ALL keys except Ctrl+C) ---
     if s.model_modal.is_some() {
         use crate::app::mode::settings::ModelField;
@@ -788,25 +814,16 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 _ => {}
             }
         } else if cur == Some(ModelField::Role) {
-            // Role field: a chip multi-select. ←→ move the chip cursor; Space
-            // toggles the focused role on/off (the global per-role steal happens
-            // on save). Enter advances to the next field; Up leaves upward,
-            // Down/Tab leave downward (same non-trap nav as other fields).
+            // Role field (picker closed): the value is a read-only summary;
+            // Enter opens the Role checkbox picker overlay (handled above once
+            // open). Up/Down|Tab just move off the field (non-trap nav, same as
+            // the other fields); Esc closes the whole modal.
             match key.code {
                 KeyCode::Esc => {
                     s.close_model_modal();
                 }
-                KeyCode::Left => {
-                    s.mm_role_left();
-                }
-                KeyCode::Right => {
-                    s.mm_role_right();
-                }
-                KeyCode::Char(' ') => {
-                    s.mm_role_toggle();
-                }
                 KeyCode::Enter => {
-                    s.mm_down();
+                    s.open_role_picker();
                 }
                 KeyCode::Up => {
                     s.mm_up();

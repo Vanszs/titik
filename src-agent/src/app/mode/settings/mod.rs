@@ -60,6 +60,61 @@ impl ModelRole {
     ];
 }
 
+/// State for the role multi-select picker overlay (model EDIT modal).
+///
+/// A bordered checkbox modal mirroring the `/agents` tool picker, but simpler:
+/// the option set is fixed ([`ModelRole::ALL`], 4 entries) so there is NO text
+/// filter. Opened from the model modal's Role field (Enter); closed by Enter
+/// (confirm → write `selected_roles()` back into `ModelModal::roles`) or Esc
+/// (cancel → discard). `checked` is parallel to `ModelRole::ALL`.
+#[derive(Clone, Debug)]
+pub struct RolePickerState {
+    /// Parallel to [`ModelRole::ALL`]; `true` = this role is currently checked.
+    pub checked: Vec<bool>,
+    /// Highlighted row, in `0..ModelRole::ALL.len()`.
+    pub cursor: usize,
+}
+
+impl RolePickerState {
+    /// Seed the checkbox state from the model's current `roles`: each option is
+    /// pre-checked when its [`ModelRole`] appears in `roles`.
+    pub fn from_roles(roles: &[ModelRole]) -> Self {
+        let checked: Vec<bool> = ModelRole::ALL
+            .iter()
+            .map(|r| roles.contains(r))
+            .collect();
+        Self { checked, cursor: 0 }
+    }
+
+    /// Move the cursor up (clamps at 0).
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor down (clamps at the last role).
+    pub fn down(&mut self) {
+        if self.cursor + 1 < ModelRole::ALL.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Flip the checked state of the role under the cursor.
+    pub fn toggle(&mut self) {
+        let i = self.cursor.min(ModelRole::ALL.len() - 1);
+        self.checked[i] = !self.checked[i];
+    }
+
+    /// The checked roles, in [`ModelRole::ALL`] order.
+    pub fn selected_roles(&self) -> Vec<ModelRole> {
+        ModelRole::ALL
+            .iter()
+            .zip(self.checked.iter())
+            .filter(|(_, &c)| c)
+            .map(|(r, _)| *r)
+            .collect()
+    }
+}
+
 impl ApiType {
     /// Short label used in the providers table column.
     pub fn short_label(self) -> &'static str {
@@ -197,11 +252,13 @@ pub struct ModelModal {
     /// Active field index (see layout comment above).
     pub field: usize,
     /// Draft role assignments; empty = unassigned. A model may hold several
-    /// roles. Only editable in EDIT mode, via the Role chip multi-select.
+    /// roles. Only editable in EDIT mode, via the Role checkbox picker overlay
+    /// (the committed value — the picker writes its selection back here on OK).
     pub roles: Vec<ModelRole>,
-    /// Which role chip the multi-select cursor sits on (`0..ModelRole::ALL.len()`).
-    /// Used by the Role field to highlight + toggle the focused chip.
-    pub role_cursor: usize,
+    /// When `Some`, the Role checkbox picker overlay is open over this modal.
+    /// All key input routes to the picker; the modal underneath is frozen until
+    /// it confirms (Enter → commit into `roles`) or cancels (Esc → discard).
+    pub role_picker: Option<RolePickerState>,
     /// Model omnisearch query (used when provider is OpenRouter and the Model
     /// field is focused).
     pub query: String,
@@ -239,7 +296,7 @@ impl ModelModal {
             model_id: String::new(),
             field: 0,
             roles: Vec::new(),
-            role_cursor: 0,
+            role_picker: None,
             query: String::new(),
             result_sel: 0,
             route: None,

@@ -384,13 +384,17 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], p
             && st.model_modal.as_ref().map(|m| !m.query.is_empty()).unwrap_or(false);
         let on_route = cur_mf == Some(crate::app::mode::settings::ModelField::Route);
         let on_role  = cur_mf == Some(crate::app::mode::settings::ModelField::Role);
+        let role_picker_open = st.mm_role_picker_open();
         let hint = if st.model_modal.is_some() {
-            if model_search {
+            if role_picker_open {
+                // The Role checkbox picker owns input while open.
+                "↑↓ role · space toggle · enter ok · esc cancel"
+            } else if model_search {
                 "↑↓ result · enter pick · tab next · esc cancel"
             } else if on_route {
                 "↑↓ provider/move · enter pin + next · esc cancel"
             } else if on_role {
-                "←→ role · space toggle · enter next · esc cancel"
+                "enter roles · esc cancel"
             } else {
                 "↑↓ field · ←→ provider · enter select · esc cancel"
             }
@@ -507,7 +511,111 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], p
     if let Some(modal) = st.model_modal.as_ref() {
         let or = st.mm_provider_is_openrouter();
         draw_model_modal(frame, st, modal, or, models_cache, palette, frame.area());
+
+        // Role checkbox picker overlay: a modal-on-modal, drawn LAST so it floats
+        // over the model modal it belongs to.
+        if let Some(picker) = modal.role_picker.as_ref() {
+            draw_role_picker(frame, picker, palette, frame.area());
+        }
     }
+}
+
+/// Render the Role checkbox picker overlay (model EDIT modal) as a bordered
+/// modal over a dimmed backdrop.
+///
+/// Mirrors the `/agents` tool picker (`view/agents.rs::draw_tool_picker`) but
+/// SIMPLER — the option set is the fixed [`ModelRole::ALL`] (4 entries), so there
+/// is no "type to filter" line. Each role is a `[ ] label` / `[x] label` row; the
+/// cursor row carries the inverse highlight. A footer line shows the key hints.
+///
+/// ```text
+/// ┌─ roles ─────────────────┐
+/// │ [x] main                │
+/// │ [ ] awareness           │
+/// │ [ ] safeguard           │
+/// │ [ ] compactor           │
+/// │ space toggle · enter ok…│
+/// └─────────────────────────┘
+/// ```
+fn draw_role_picker(
+    frame: &mut Frame,
+    picker: &crate::app::mode::settings::RolePickerState,
+    palette: &Palette,
+    area: Rect,
+) {
+    use crate::app::mode::settings::ModelRole;
+
+    let n = ModelRole::ALL.len();
+    // Content rows: one per role + a hint line. Borders add 2.
+    let content_h = n as u16 + 1;
+    let total_h = content_h + 2;
+    // Width: "[x] awareness" is short; a 28-col inner is comfortable. Clamp to frame.
+    let popup_w = 30_u16.min(area.width.saturating_sub(2));
+    let w = popup_w;
+    let h = total_h.min(area.height.saturating_sub(2)).max(3);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    // Dim everything outside the modal (fg dim + bg reset — same as the other
+    // settings modals, so a stacked overlay still recedes the layer beneath it).
+    {
+        let buf = frame.buffer_mut();
+        for cy in area.top()..area.bottom() {
+            for cx in area.left()..area.right() {
+                if cx >= popup.x && cx < popup.right() && cy >= popup.y && cy < popup.bottom() {
+                    continue;
+                }
+                buf[(cx, cy)].set_fg(palette.dim).set_bg(Color::Reset);
+            }
+        }
+    }
+
+    let modal_block = Block::bordered()
+        .border_style(Style::default().fg(palette.accent))
+        .title(Span::styled(" roles ", Style::default().fg(palette.accent)));
+    let inner = modal_block.inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(modal_block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let body_w = inner.width as usize;
+    let cursor = picker.cursor.min(n.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, role) in ModelRole::ALL.iter().enumerate() {
+        let checked = picker.checked.get(i).copied().unwrap_or(false);
+        let mark = if checked { "[x]" } else { "[ ]" };
+        if i == cursor {
+            // Cursor row: full-width inverse highlight.
+            let text = format!("{} {}", mark, role.label());
+            lines.push(Line::from(Span::styled(
+                format!("{:<width$}", text, width = body_w),
+                Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
+            )));
+        } else {
+            // Checkbox accent when checked, dim when not; label follows the box.
+            let box_color = if checked { palette.accent } else { palette.dim };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().fg(box_color)),
+                Span::styled(
+                    format!(" {}", role.label()),
+                    Style::default().fg(if checked { palette.fg } else { palette.dim }),
+                ),
+            ]));
+        }
+    }
+
+    // Footer hint line (last inner row).
+    lines.push(Line::from(Span::styled(
+        "space toggle \u{b7} enter ok \u{b7} esc cancel",
+        Style::default().fg(palette.dim),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render the API Providers interactive screen inside `area`.
@@ -1208,38 +1316,32 @@ fn draw_model_modal(
         }
     }
 
-    // Row: Role chip multi-select (edit mode only). The four roles render as a
-    // horizontal chip row: an ASSIGNED role (in `modal.roles`) is accent and
-    // bracket-wrapped (`[main]`); an UNASSIGNED one is dim and space-wrapped
-    // (` main `). When the Role field is focused, the chip at `role_cursor` gets
-    // the inverse highlight so the cursor is visible.
+    // Row: Role readout (edit mode only). A single labelled summary line — the
+    // comma-joined assigned role labels, or "none". Enter on this field opens the
+    // Role checkbox picker overlay (the actual multi-select UI). Accent label +
+    // fg value when the Role field is focused; dim otherwise.
     if modal.is_edit() {
-        let active  = focused(ModelField::Role);
-        let lc      = if active { palette.accent } else { palette.dim };
-        let label   = Span::styled(
+        let active = focused(ModelField::Role);
+        let lc     = if active { palette.accent } else { palette.dim };
+        let label  = Span::styled(
             format!("{:<width$}", "Role", width = label_w),
             Style::default().fg(lc),
         );
-        let mut spans: Vec<Span> = vec![label];
-        for (i, role) in ModelRole::ALL.iter().enumerate() {
-            let assigned = modal.roles.contains(role);
-            let chip = if assigned {
-                format!("[{}]", role.label())
-            } else {
-                format!(" {} ", role.label())
-            };
-            let style = if active && i == modal.role_cursor {
-                // Cursor chip: inverse highlight (visible regardless of assignment).
-                Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
-            } else if assigned {
-                Style::default().fg(palette.accent)
-            } else {
-                Style::default().fg(palette.dim)
-            };
-            spans.push(Span::styled(chip, style));
-            spans.push(Span::raw(" "));
-        }
-        lines.push(Line::from(spans));
+        let value = if modal.roles.is_empty() {
+            "none".to_string()
+        } else {
+            modal
+                .roles
+                .iter()
+                .map(|r: &ModelRole| r.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let vc = if active { palette.fg } else { palette.dim };
+        lines.push(Line::from(vec![
+            label,
+            Span::styled(truncate(&value, val_w), Style::default().fg(vc)),
+        ]));
     }
 
     // Blank line before the buttons.

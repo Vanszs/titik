@@ -6,7 +6,7 @@ use crate::view::theme::ACCENTS;
 
 use super::super::SettingField;
 use super::picker::{PathPicker, PickerMode};
-use super::{ModelDraft, ModelField, ModelModal, ModelRole, ProviderDraft, ProviderModal};
+use super::{ModelDraft, ModelField, ModelModal, ProviderDraft, ProviderModal, RolePickerState};
 
 /// Working state for the in-app `/settings` dashboard.
 ///
@@ -710,7 +710,7 @@ impl SettingsState {
                 model_id: m.model_id.clone(),
                 field: 0,
                 roles: m.roles.clone(),
-                role_cursor: 0,
+                role_picker: None,
                 query: String::new(),
                 result_sel: 0,
                 // Carry the stored route forward. `route_sel` starts at 0 and is
@@ -873,9 +873,8 @@ impl SettingsState {
     /// - Save/SaveSession/Cancel → step left within the button group, clamping at Save.
     /// - everything else (Name/Model/Route) → no-op.
     ///
-    /// The Role field is NOT handled here: it's a chip multi-select whose ←→ move
-    /// the chip cursor ([`Self::mm_role_left`]/[`Self::mm_role_right`]), driven
-    /// directly from the input layer.
+    /// The Role field is NOT handled here: Enter on it opens the Role checkbox
+    /// picker overlay ([`Self::open_role_picker`]); ←→ do nothing on that field.
     pub fn mm_left(&mut self) {
         let n = self.providers.len();
         match self.mm_current_field() {
@@ -957,36 +956,62 @@ impl SettingsState {
         }
     }
 
-    // --- Role chip multi-select (EDIT-mode Role field) ---
+    // --- Role checkbox picker overlay (EDIT-mode Role field) ---
 
-    /// Move the role-chip cursor left over `0..ModelRole::ALL.len()` (clamps at
-    /// 0). Drives which chip the Role field highlights/toggles.
-    pub fn mm_role_left(&mut self) {
+    /// `true` when the Role checkbox picker overlay is open over the model modal.
+    /// Lets the input layer route keys to the picker first (its own deepest
+    /// nesting level) without borrowing the modal mutably to check.
+    pub fn mm_role_picker_open(&self) -> bool {
+        self.model_modal
+            .as_ref()
+            .map(|m| m.role_picker.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Open the Role checkbox picker, seeding its checked state from the modal's
+    /// current `roles`. No-op when no modal is open.
+    pub fn open_role_picker(&mut self) {
         if let Some(m) = self.model_modal.as_mut() {
-            m.role_cursor = m.role_cursor.saturating_sub(1);
+            m.role_picker = Some(RolePickerState::from_roles(&m.roles));
         }
     }
 
-    /// Move the role-chip cursor right over `0..ModelRole::ALL.len()` (clamps at
-    /// the last chip).
-    pub fn mm_role_right(&mut self) {
-        let max = ModelRole::ALL.len().saturating_sub(1);
+    /// Confirm the Role picker: commit its selection into the modal's `roles`
+    /// (the global per-role steal still runs later, on save) and close the
+    /// overlay. No-op when no modal/picker is open.
+    pub fn confirm_role_picker(&mut self) {
         if let Some(m) = self.model_modal.as_mut() {
-            m.role_cursor = (m.role_cursor + 1).min(max);
-        }
-    }
-
-    /// Toggle membership of the focused chip's role (`ModelRole::ALL[role_cursor]`)
-    /// in the modal's `roles`: add when absent, remove when present. The global
-    /// per-role steal runs later, on save.
-    pub fn mm_role_toggle(&mut self) {
-        if let Some(m) = self.model_modal.as_mut() {
-            let role = ModelRole::ALL[m.role_cursor.min(ModelRole::ALL.len() - 1)];
-            if let Some(pos) = m.roles.iter().position(|r| *r == role) {
-                m.roles.remove(pos);
-            } else {
-                m.roles.push(role);
+            if let Some(p) = m.role_picker.take() {
+                m.roles = p.selected_roles();
             }
+        }
+    }
+
+    /// Cancel the Role picker without modifying `roles` (discard the selection).
+    pub fn cancel_role_picker(&mut self) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.role_picker = None;
+        }
+    }
+
+    /// Move the Role picker cursor up. No-op when the picker is closed.
+    pub fn mm_role_picker_up(&mut self) {
+        if let Some(p) = self.model_modal.as_mut().and_then(|m| m.role_picker.as_mut()) {
+            p.up();
+        }
+    }
+
+    /// Move the Role picker cursor down. No-op when the picker is closed.
+    pub fn mm_role_picker_down(&mut self) {
+        if let Some(p) = self.model_modal.as_mut().and_then(|m| m.role_picker.as_mut()) {
+            p.down();
+        }
+    }
+
+    /// Toggle the checkbox under the Role picker cursor. No-op when closed.
+    pub fn mm_role_picker_toggle(&mut self) {
+        if let Some(p) = self.model_modal.as_mut().and_then(|m| m.role_picker.as_mut()) {
+            p.toggle();
         }
     }
 
