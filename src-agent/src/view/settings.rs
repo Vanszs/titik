@@ -1185,13 +1185,13 @@ fn draw_model_modal(
 
                 if modal.endpoints_loading {
                     lines.push(Line::from(Span::styled(
-                        "loading providers\u{2026}",
+                        "loading routes\u{2026}",
                         Style::default().fg(palette.dim),
                     )));
                 } else if let Some(eps) = modal.endpoints.as_ref() {
                     if eps.is_empty() {
                         lines.push(Line::from(Span::styled(
-                            "no providers found",
+                            "no routes for this model",
                             Style::default().fg(palette.dim),
                         )));
                     } else {
@@ -1292,7 +1292,7 @@ fn draw_model_modal(
                     // Model set but endpoints not loaded yet (e.g. a fetch failed
                     // to even start): a neutral hint rather than a blank gap.
                     lines.push(Line::from(Span::styled(
-                        "loading providers\u{2026}",
+                        "loading routes\u{2026}",
                         Style::default().fg(palette.dim),
                     )));
                 } else {
