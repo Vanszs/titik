@@ -24,7 +24,9 @@ pub mod theme;
 
 use ratatui::Frame;
 use crate::app::mode::Mode;
+use crate::app::resolve::{resolve_role};
 use crate::app::state::AppState;
+use crate::model::app_config::ModelRole;
 
 /// Render the entire terminal frame for the current application state.
 ///
@@ -43,7 +45,17 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     let cache = state.rest.models_cache.as_deref().unwrap_or(&[]);
     let cache_endpoint = state.rest.models_cache_endpoint.as_deref();
     match &state.mode {
-        Mode::Chat => chat::draw(frame, &state.rest, &palette),
+        Mode::Chat => {
+            // Resolve the actual Main model that will be used for chat requests.
+            // Session overrides win over the global catalogue; falls back to
+            // settings.model (the legacy field) when nothing is configured.
+            let resolved_model: String = state.rest.session.as_ref()
+                .and_then(|s| resolve_role(&state.rest.config, &s.settings, ModelRole::Main))
+                .map(|r| r.model_id)
+                .or_else(|| state.rest.session.as_ref().map(|s| s.settings.model.clone()))
+                .unwrap_or_default();
+            chat::draw(frame, &state.rest, &resolved_model, &palette);
+        }
         Mode::KeyInput(form) => key_input::draw(frame, form, cache, cache_endpoint, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
         Mode::Settings(s) => settings::draw(frame, s, cache, cache_endpoint, &palette),

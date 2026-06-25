@@ -59,10 +59,15 @@ use crate::view::theme::Palette;
 
 /// Render the chat screen from `rest` using the given colour `palette`.
 ///
+/// `resolved_model` is the concrete model id that will actually be sent for
+/// chat requests (already resolved through session overrides and the global
+/// catalogue by `view::draw`). It is used in the header so the displayed
+/// model always matches what the request layer will use.
+///
 /// Borrows throughout — no per-frame clones of the transcript or streaming
 /// buffer. The header has a dim bottom border + padding; the input has dim
 /// top + bottom borders + padding; the transcript is flat.
-pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
+pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palette: &Palette) {
     // --- Input height ---
     // The input box grows to fit its wrapped content (capped). Compute the row
     // count BEFORE the layout split so the layout can reserve the right height.
@@ -101,8 +106,12 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
         .split(frame.area());
 
     // --- Header --- `simple-coder · {name} [{model}]`, dim bottom border.
+    // `resolved_model` is the concrete model id that stream.rs will actually use
+    // (resolved through session overrides + the global catalogue by view::draw),
+    // so the header and the request always agree. Fall back to DEFAULT_MODEL
+    // when the session is absent.
     let (name, model): (&str, &str) = match rest.session.as_ref() {
-        Some(s) => (s.name.as_str(), s.settings.model.as_str()),
+        Some(s) => (s.name.as_str(), if resolved_model.is_empty() { s.settings.model.as_str() } else { resolved_model }),
         None => (APP_TITLE, DEFAULT_MODEL),
     };
     let header_line = Line::from(vec![
