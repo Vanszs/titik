@@ -146,6 +146,35 @@ pub fn resolve_read(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
     Ok(primary)
 }
 
+/// Pure tool dispatcher: given a ready [`ToolCtx`] and a [`ToolCall`], loop
+/// all built-in tools, parse arguments, dispatch to the matching tool's
+/// [`Tool::run`], and return the result string. Does NOT touch any app state.
+///
+/// Error strings match exactly what `run_tool` produced before the refactor:
+/// - `"error: <msg>"` on a tool execution failure
+/// - `"error: unknown tool '<name>'"` when no tool matches
+pub fn execute_tool(ctx: &ToolCtx, call: &crate::dto::chat::ToolCall) -> String {
+    // OpenAI/OpenRouter send `arguments` as a JSON-encoded string; an empty or
+    // malformed payload degrades to `{}` so the tool sees no arguments. Sanitize
+    // first: a non-delta provider may have produced a duplicated `{...}{...}`
+    // string (valid JSON document + trailing copy) that `from_str` would reject
+    // outright — collapsing it to one clean value here recovers the real arguments
+    // (e.g. the bash `command`) instead of silently degrading to `{}`. A single
+    // clean value is unchanged, so the normal path is unaffected.
+    let sanitized = crate::dto::chat::sanitize_tool_arguments(&call.function.arguments);
+    let args: serde_json::Value =
+        serde_json::from_str(&sanitized).unwrap_or_else(|_| serde_json::json!({}));
+    for tool in all_tools() {
+        if tool.name() == call.function.name {
+            return match tool.run(ctx, &args) {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            };
+        }
+    }
+    format!("error: unknown tool '{}'", call.function.name)
+}
+
 /// Find which workspace contains the given absolute path.
 /// Returns the canonicalized workspace root if found.
 pub fn find_workspace(workspaces: &[PathBuf], abs: &Path) -> Option<PathBuf> {
