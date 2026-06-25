@@ -6,7 +6,10 @@ use anyhow::Result;
 
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::state::AppState;
-use crate::config::DEFAULT_MODEL;
+use crate::config::{
+    DEFAULT_AWARENESS_MODEL, DEFAULT_AWARENESS_PROVIDER, DEFAULT_CLASSIFIER_MODEL,
+    DEFAULT_CLASSIFIER_PROVIDER, DEFAULT_MODEL,
+};
 use crate::model::app_config::{ApiType, ModelEntry, ModelRole, ProviderConn};
 use crate::controller::input::Action;
 use crate::dto::chat::Role;
@@ -328,7 +331,7 @@ pub(super) fn apply_action(
                     uuid: uuid::Uuid::new_v4().to_string(),
                     name: "main".to_string(),
                     model_id: model.clone(),
-                    provider_uuid,
+                    provider_uuid: provider_uuid.clone(),
                     // Omnisearch routing is a later pass; no upstream pin here.
                     route: None,
                     // First-run only ever assigns Main (unchanged behavior); the
@@ -336,6 +339,29 @@ pub(super) fn apply_action(
                     roles: vec![ModelRole::Main],
                     role: None,
                 });
+                // OpenRouter first-run: auto-register the cheap groq-pinned
+                // Awareness and Safeguard model entries so the harness works
+                // out-of-the-box without manual configuration.
+                if endpoint.to_lowercase().contains("openrouter") {
+                    state.rest.config.models.push(ModelEntry {
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                        name: "awareness".to_string(),
+                        model_id: DEFAULT_AWARENESS_MODEL.into(),
+                        provider_uuid: provider_uuid.clone(),
+                        route: Some(DEFAULT_AWARENESS_PROVIDER.into()),
+                        roles: vec![ModelRole::Awareness],
+                        role: None,
+                    });
+                    state.rest.config.models.push(ModelEntry {
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                        name: "safeguard".to_string(),
+                        model_id: DEFAULT_CLASSIFIER_MODEL.into(),
+                        provider_uuid,
+                        route: Some(DEFAULT_CLASSIFIER_PROVIDER.into()),
+                        roles: vec![ModelRole::Safeguard],
+                        role: None,
+                    });
+                }
                 if let Err(e) = state.rest.config.save() {
                     state.rest.status = format!("config save failed: {e}");
                 }
