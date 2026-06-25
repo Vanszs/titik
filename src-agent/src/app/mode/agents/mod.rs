@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 use crate::model::agent_def::{load_registry, AgentDef, AgentSource};
+use crate::model::app_config::{AppConfig, ProviderConn};
 use crate::model::session::Session;
 use crate::tool::all_tools;
 
@@ -159,6 +160,72 @@ impl ToolPickerState {
     }
 }
 
+/// State for the single-select API-provider picker overlay.
+///
+/// Opened from the Edit/Create form when the user presses Enter on the Provider
+/// field. Unlike the multi-select tool picker this is a pick-ONE list: the
+/// option set is `[ (None, "inherit session"), (Some(uuid), name)… ]`, and the
+/// cursor row is the chosen value. Closed by Enter (confirm → write the cursor's
+/// uuid into `draft_provider_uuid`) or Esc (cancel → discard).
+#[derive(Debug, Clone)]
+pub struct ProviderPickerState {
+    /// One row per choice: `(uuid_or_none, display_name)`. The first row is
+    /// always the `None` "inherit session" sentinel; the rest are the configured
+    /// provider connections in catalogue order.
+    pub options: Vec<(Option<String>, String)>,
+    /// Highlighted row, in `0..options.len()`.
+    pub cursor: usize,
+}
+
+impl ProviderPickerState {
+    /// Build the option list from the configured providers, placing the cursor on
+    /// the row matching `current` (the agent's current `provider_uuid`).
+    ///
+    /// Row 0 is the `None` "inherit session" sentinel; rows `1..=N` are the
+    /// providers in order. The cursor lands on the row whose uuid equals
+    /// `current` (or row 0 when `current` is `None` or no longer exists).
+    pub fn from_providers(providers: &[ProviderConn], current: &Option<String>) -> Self {
+        let mut options: Vec<(Option<String>, String)> =
+            vec![(None, "inherit session".to_string())];
+        for p in providers {
+            let name = if p.name.trim().is_empty() {
+                p.endpoint.clone()
+            } else {
+                p.name.clone()
+            };
+            options.push((Some(p.uuid.clone()), name));
+        }
+        let cursor = match current {
+            Some(uuid) => options
+                .iter()
+                .position(|(u, _)| u.as_deref() == Some(uuid.as_str()))
+                .unwrap_or(0),
+            None => 0,
+        };
+        Self { options, cursor }
+    }
+
+    /// Move the cursor up (clamps at 0).
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor down (clamps at the last option).
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.options.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The uuid at the cursor: `None` for the "inherit session" row, else the
+    /// chosen provider's uuid.
+    pub fn selected(&self) -> Option<String> {
+        self.options
+            .get(self.cursor)
+            .and_then(|(u, _)| u.clone())
+    }
+}
+
 /// Which scope a freshly-created agent is written to.
 ///
 /// Mirrors [`crate::model::agent_def::AgentScope`] but owns no borrow, so it can
@@ -277,10 +344,20 @@ pub struct AgentsState {
     pub draft_name: String,
     /// Draft: description.
     pub draft_description: String,
-    /// Draft: model slug (empty = inherit).
+    /// Draft: model slug (empty = inherit). Edited via omnisearch when the
+    /// selected provider is OpenRouter, else as plain text.
     pub draft_model: String,
-    /// Draft: provider slug (empty = default).
+    /// Draft: LEGACY provider routing slug (empty = default). Kept only so old
+    /// agent files round-trip; the editor's Provider field drives
+    /// `draft_provider_uuid` instead.
     pub draft_provider: String,
+    /// Draft: chosen API provider connection uuid (`None` = inherit session).
+    /// This is what the editor's Provider field selects, via the provider picker.
+    pub draft_provider_uuid: Option<String>,
+    /// Live omnisearch query for the Model field (OpenRouter providers only).
+    pub model_query: String,
+    /// Highlighted row in the Model omnisearch results list.
+    pub model_result_sel: usize,
     /// Draft: tool allow-list, raw comma/space separated text.
     pub draft_tools: String,
     /// Draft: markdown body / system prompt.
@@ -292,6 +369,10 @@ pub struct AgentsState {
     /// All key input is routed to the picker; the form underneath is frozen
     /// until the picker is confirmed (Enter) or cancelled (Esc).
     pub tool_picker: Option<ToolPickerState>,
+    /// When `Some`, the single-select API-provider picker overlay is active
+    /// (opened from the Provider field). Like `tool_picker` it owns all key
+    /// input while open; the deepest modal in the agents editor.
+    pub provider_picker: Option<ProviderPickerState>,
 }
 
 impl AgentsState {
@@ -311,10 +392,14 @@ impl AgentsState {
             draft_description: String::new(),
             draft_model: String::new(),
             draft_provider: String::new(),
+            draft_provider_uuid: None,
+            model_query: String::new(),
+            model_result_sel: 0,
             draft_tools: String::new(),
             draft_body: String::new(),
             session_dir: session.path.clone(),
             tool_picker: None,
+            provider_picker: None,
         }
     }
 
@@ -437,6 +522,9 @@ impl AgentsState {
         self.draft_description = a.description.clone();
         self.draft_model = a.model.clone().unwrap_or_default();
         self.draft_provider = a.provider.clone().unwrap_or_default();
+        self.draft_provider_uuid = a.provider_uuid.clone();
+        self.model_query = String::new();
+        self.model_result_sel = 0;
         self.draft_tools = a.tools.join(", ");
         self.draft_body = a.prompt.clone();
         self.mode = AgentSubMode::Edit;
@@ -451,6 +539,9 @@ impl AgentsState {
         self.draft_description = String::new();
         self.draft_model = String::new();
         self.draft_provider = String::new();
+        self.draft_provider_uuid = None;
+        self.model_query = String::new();
+        self.model_result_sel = 0;
         self.draft_tools = String::new();
         self.draft_body = TEMPLATE_BODY.to_string();
         self.create_scope = AgentScope::Session;
@@ -482,6 +573,7 @@ impl AgentsState {
         self.in_detail = false;
         self.field = AgentEditField::Description;
         self.tool_picker = None;
+        self.provider_picker = None;
     }
 
     // --- Tool picker overlay ---
@@ -503,6 +595,58 @@ impl AgentsState {
     /// Cancel the picker without modifying `draft_tools`.
     pub fn cancel_tool_picker(&mut self) {
         self.tool_picker = None;
+    }
+
+    // --- Provider picker overlay ---
+
+    /// Open the single-select API-provider picker, seeding the cursor from the
+    /// current `draft_provider_uuid`.
+    pub fn open_provider_picker(&mut self, providers: &[ProviderConn]) {
+        self.provider_picker = Some(ProviderPickerState::from_providers(
+            providers,
+            &self.draft_provider_uuid,
+        ));
+    }
+
+    /// Confirm the picker: write the cursor's choice into `draft_provider_uuid`
+    /// and close the overlay. The provider changed, so the Model omnisearch state
+    /// is reset (its OpenRouter-ness — hence the catalogue it searches — depends
+    /// on the chosen provider).
+    pub fn confirm_provider_picker(&mut self) {
+        if let Some(p) = self.provider_picker.take() {
+            self.draft_provider_uuid = p.selected();
+            self.model_query = String::new();
+            self.model_result_sel = 0;
+        }
+    }
+
+    /// Cancel the picker without modifying `draft_provider_uuid`.
+    pub fn cancel_provider_picker(&mut self) {
+        self.provider_picker = None;
+    }
+
+    /// Whether the Model field should use the OpenRouter omnisearch.
+    ///
+    /// Rule (the simplest correct one): when a provider is explicitly chosen
+    /// (`draft_provider_uuid` is `Some`), it's OpenRouter iff that connection's
+    /// endpoint contains `"openrouter"`. When inheriting the session provider
+    /// (`None`), fall back to "the catalogue is non-empty" — `models_cache` only
+    /// ever holds the OpenRouter catalogue, so a populated cache means the
+    /// inherited provider is the OpenRouter one driving the omnisearch.
+    pub fn selected_provider_is_openrouter(
+        &self,
+        config: &AppConfig,
+        models_cache: &[crate::dto::openrouter::ModelInfo],
+    ) -> bool {
+        match &self.draft_provider_uuid {
+            Some(uuid) => config
+                .providers
+                .iter()
+                .find(|p| &p.uuid == uuid)
+                .map(|p| p.endpoint.to_lowercase().contains("openrouter"))
+                .unwrap_or(false),
+            None => !models_cache.is_empty(),
+        }
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime
@@ -539,7 +683,10 @@ impl AgentsState {
             name,
             description: self.draft_description.trim().to_string(),
             model: opt(&self.draft_model),
+            // Legacy routing slug: written through from any back-compat draft.
             provider: opt(&self.draft_provider),
+            // The chosen API provider connection (None = inherit session).
+            provider_uuid: self.draft_provider_uuid.clone(),
             tools,
             prompt: self.draft_body.clone(),
             ..AgentDef::default()

@@ -189,17 +189,26 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         }
         Mode::Agents(a) => {
             // Only meaningful while typing into a draft field; newlines collapse
-            // to spaces except in the multiline body.
+            // to spaces except in the multiline body. The Model field on an
+            // OpenRouter provider is an omnisearch, so paste feeds its query.
             if a.editing {
-                let body = a.field == crate::app::mode::AgentEditField::Body;
+                use crate::app::mode::AgentEditField;
+                let model_search = a.field == AgentEditField::Model
+                    && a.selected_provider_is_openrouter(
+                        &state.rest.config,
+                        state.rest.models_cache.as_deref().unwrap_or(&[]),
+                    );
+                let body = a.field == AgentEditField::Body;
                 for c in text.chars() {
-                    if c == '\r' {
-                        continue;
-                    }
-                    if c == '\n' {
-                        if body {
+                    if c == '\r' || c == '\n' {
+                        if c == '\n' && body {
                             a.newline();
                         }
+                        continue;
+                    }
+                    if model_search {
+                        a.model_query.push(c);
+                        a.model_result_sel = 0;
                     } else {
                         a.push_char(c);
                     }
@@ -1161,14 +1170,41 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
 ///    `n` starts Create; `d` deletes the selected file-backed agent; Esc closes
 ///    the dashboard (`Action::CloseAgents`).
 fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
-    use crate::app::mode::{AgentEditField, AgentSubMode};
+    use crate::app::mode::{filter_models, AgentEditField, AgentSubMode};
     use crate::model::agent_def::AgentSource;
 
     if is_ctrl(&key, 'c') {
         return Action::Quit;
     }
 
-    // --- Tool picker overlay (deepest priority: intercepts ALL keys) ---
+    // --- Provider picker overlay (DEEPEST priority: intercepts ALL keys) ---
+    // Single-select pick-one list: ↑/↓ navigate, Enter commits the cursor's
+    // provider into the draft, Esc discards. Sits above the tool picker (both are
+    // mutually exclusive, but only one can ever be open at a time).
+    if s.provider_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(p) = s.provider_picker.as_mut() {
+                    p.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = s.provider_picker.as_mut() {
+                    p.down();
+                }
+            }
+            KeyCode::Enter => {
+                s.confirm_provider_picker();
+            }
+            KeyCode::Esc => {
+                s.cancel_provider_picker();
+            }
+            _ => {}
+        }
+        return Action::None;
+    }
+
+    // --- Tool picker overlay (intercepts ALL keys) ---
     if s.tool_picker.is_some() {
         match key.code {
             KeyCode::Up => {
@@ -1222,8 +1258,72 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
 
         // --- Edit / Create ---
         AgentSubMode::Edit | AgentSubMode::Create => {
-            if s.editing {
-                // Typing into the highlighted draft field.
+            // Is the Model field being edited as an OpenRouter omnisearch? (Model
+            // field + editing + the chosen provider is OpenRouter.) When so, keys
+            // drive the query + results list instead of plain text editing.
+            let model_search = s.editing
+                && s.field == AgentEditField::Model
+                && s.selected_provider_is_openrouter(
+                    &rest.config,
+                    rest.models_cache.as_deref().unwrap_or(&[]),
+                );
+
+            if model_search {
+                // --- Model omnisearch over the OpenRouter catalogue ---
+                let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+                match key.code {
+                    // Leave search without committing (keeps the existing model).
+                    KeyCode::Esc => {
+                        s.editing = false;
+                        s.model_query = String::new();
+                        s.model_result_sel = 0;
+                        Action::None
+                    }
+                    KeyCode::Up => {
+                        s.model_result_sel = s.model_result_sel.saturating_sub(1);
+                        Action::None
+                    }
+                    KeyCode::Down => {
+                        let n = filter_models(cache, &s.model_query).len();
+                        s.model_result_sel =
+                            (s.model_result_sel + 1).min(n.saturating_sub(1));
+                        Action::None
+                    }
+                    KeyCode::Enter => {
+                        let results = filter_models(cache, &s.model_query);
+                        if !results.is_empty() {
+                            // Pick the highlighted catalogue model.
+                            let sel = s.model_result_sel.min(results.len() - 1);
+                            s.draft_model = cache[results[sel]].id.clone();
+                        } else {
+                            // No-trap fallback: an empty result set commits the raw
+                            // query as a manual model id (only when non-empty, so a
+                            // bare Enter on an empty box just leaves the model as-is).
+                            let typed = s.model_query.trim();
+                            if !typed.is_empty() {
+                                s.draft_model = typed.to_string();
+                            }
+                        }
+                        s.editing = false;
+                        s.model_query = String::new();
+                        s.model_result_sel = 0;
+                        Action::None
+                    }
+                    KeyCode::Backspace => {
+                        s.model_query.pop();
+                        s.model_result_sel = 0;
+                        Action::None
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        s.model_query.push(c);
+                        s.model_result_sel = 0; // new filter → reset the highlight
+                        Action::None
+                    }
+                    _ => Action::None,
+                }
+            } else if s.editing {
+                // Typing into the highlighted draft field (plain text fields,
+                // incl. the Model field for a non-OpenRouter provider).
                 // Ctrl+J always inserts a body newline (reliable multiline key).
                 if is_ctrl(&key, 'j') {
                     s.newline();
@@ -1273,11 +1373,27 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                         Action::None
                     }
                     KeyCode::Enter => {
-                        if s.field == AgentEditField::Tools {
+                        match s.field {
                             // Tools field uses the picker overlay, not inline editing.
-                            s.open_tool_picker();
-                        } else {
-                            s.editing = true;
+                            AgentEditField::Tools => {
+                                s.open_tool_picker();
+                            }
+                            // Provider field uses the single-select provider picker.
+                            AgentEditField::Provider => {
+                                s.open_provider_picker(&rest.config.providers);
+                            }
+                            // Model field on an OpenRouter provider enters the
+                            // omnisearch (editing=true with an empty query shows
+                            // the search box); every other field, plus the Model
+                            // field on a non-OpenRouter provider, is plain text.
+                            AgentEditField::Model => {
+                                s.model_query = String::new();
+                                s.model_result_sel = 0;
+                                s.editing = true;
+                            }
+                            _ => {
+                                s.editing = true;
+                            }
                         }
                         Action::None
                     }

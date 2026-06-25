@@ -81,8 +81,19 @@ pub struct AgentDef {
 
     /// OpenRouter provider routing slug (e.g. `"groq"`). `None` means default
     /// routing.
+    ///
+    /// LEGACY back-compat: older agent files carried a free-text `provider`
+    /// routing slug. It is still READ + WRITTEN so those files round-trip, but
+    /// the editor's Provider field now drives [`Self::provider_uuid`] (a chosen
+    /// API provider *connection*) instead of this routing slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+
+    /// The chosen API provider connection (a [`crate::model::app_config::ProviderConn`]
+    /// uuid) this agent dispatches against. `None` = inherit the session's
+    /// provider. Distinct from the legacy `provider` routing slug above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_uuid: Option<String>,
 
     /// Allow-list of tool names this agent may invoke. The `"task"` tool is never
     /// auto-included (recursion guard). An empty/absent list means the safe
@@ -137,6 +148,7 @@ impl Default for AgentDef {
             description: String::new(),
             model: None,
             provider: None,
+            provider_uuid: None,
             tools: Vec::new(),
             steps: None,
             effort: None,
@@ -194,6 +206,9 @@ impl AgentDef {
         }
         if let Some(provider) = &self.provider {
             fm.insert(key("provider"), sval(provider));
+        }
+        if let Some(provider_uuid) = &self.provider_uuid {
+            fm.insert(key("provider_uuid"), sval(provider_uuid));
         }
         if !self.tools.is_empty() {
             let seq = self.tools.iter().map(|t| sval(t)).collect();
