@@ -11,7 +11,6 @@
 
 pub mod agent_def;
 pub mod app_config;
-pub mod catalogue;
 pub mod conversation;
 pub mod memory;
 pub mod msglog;

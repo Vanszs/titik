@@ -57,16 +57,21 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Render the agents dashboard for `st` using the given colour `palette`.
 ///
-/// `config` supplies the API provider catalogue (to resolve a `provider_uuid`
-/// to its display name) and `models_cache` the OpenRouter model catalogue (for
-/// the Model omnisearch). Both are threaded down to the detail/editor rows.
+/// `config` supplies the API provider catalogue (to resolve a `provider_uuid` to
+/// its display name), `settings` the active session's settings (to resolve the
+/// "inherit" omnisearch endpoint — the session Main route), `models_cache` the
+/// on-demand model catalogue, and `cache_endpoint` the endpoint it was fetched for
+/// (so the Model omnisearch can tell "this is my endpoint's catalogue" from "still
+/// fetching"). All are threaded down to the detail/editor rows.
 ///
 /// All colours flow through `palette` — no hardcoded `Color::` values.
 pub fn draw(
     frame: &mut Frame,
     st: &AgentsState,
     config: &AppConfig,
+    settings: Option<&crate::model::settings::Settings>,
     models_cache: &[ModelInfo],
+    cache_endpoint: Option<&str>,
     palette: &Palette,
 ) {
     // Outer vertical zones: header | body | footer.
@@ -100,14 +105,14 @@ pub fn draw(
         .split(outer[1]);
 
     draw_list(frame, st, palette, body_cols[0]);
-    draw_detail(frame, st, config, models_cache, palette, body_cols[1]);
+    draw_detail(frame, st, config, settings, models_cache, cache_endpoint, palette, body_cols[1]);
 
     // --- Footer ---
     // Full-width inverse status bar: background fills the entire footer line
     // edge to edge; text is left-padded by 1 space so it doesn't touch the edge.
     let footer_rect = outer[2];
     if footer_rect.width > 0 {
-        let hint = footer_hint(st, config, models_cache);
+        let hint = footer_hint(st, config, settings);
         let bar_style = Style::default()
             .fg(palette.sel_fg)
             .bg(palette.sel_bg)
@@ -437,20 +442,29 @@ fn draw_list(
 }
 
 /// Render the DETAIL pane based on the active sub-mode.
+#[allow(clippy::too_many_arguments)]
 fn draw_detail(
     frame: &mut Frame,
     st: &AgentsState,
     config: &AppConfig,
+    settings: Option<&crate::model::settings::Settings>,
     models_cache: &[ModelInfo],
+    cache_endpoint: Option<&str>,
     palette: &Palette,
     area: ratatui::layout::Rect,
 ) {
     let inner = area.inner(Margin { horizontal: 2, vertical: 1 });
     let lines = match st.mode {
         AgentSubMode::Browse => browse_lines(st, config, palette, inner.width as usize),
-        AgentSubMode::Edit | AgentSubMode::Create => {
-            editor_lines(st, config, models_cache, palette, inner.width as usize)
-        }
+        AgentSubMode::Edit | AgentSubMode::Create => editor_lines(
+            st,
+            config,
+            settings,
+            models_cache,
+            cache_endpoint,
+            palette,
+            inner.width as usize,
+        ),
         AgentSubMode::DeleteConfirm => delete_lines(st, palette),
     };
     frame.render_widget(Paragraph::new(lines), inner);
@@ -529,18 +543,29 @@ fn browse_lines<'a>(
 }
 
 /// Detail rows for Edit / Create: one labelled draft field per row.
+#[allow(clippy::too_many_arguments)]
 fn editor_lines<'a>(
     st: &'a AgentsState,
     config: &AppConfig,
+    settings: Option<&crate::model::settings::Settings>,
     models_cache: &[ModelInfo],
+    cache_endpoint: Option<&str>,
     palette: &Palette,
     width: usize,
 ) -> Vec<Line<'a>> {
     let value_w = width.saturating_sub(16).max(4);
     let mut lines = Vec::new();
-    // Whether the Model field is the OpenRouter omnisearch (drives both the
-    // Model row rendering and whether Enter opens a search vs. plain edit).
-    let model_is_openrouter = st.selected_provider_is_openrouter(config, models_cache);
+    // The endpoint+key the Model omnisearch fetches against (chosen provider, or
+    // inherited session Main); `None` → the Model field is a plain text box.
+    let omni_conn = settings.and_then(|st_settings| st.model_omnisearch_conn(config, st_settings));
+    // Whether the Model field is a live omnisearch (drives both the Model row
+    // rendering and whether Enter opens a search vs. plain edit).
+    let model_omni = omni_conn.is_some();
+    // Does the cache hold THIS endpoint's catalogue? (still fetching otherwise)
+    let cache_matches = omni_conn
+        .as_ref()
+        .map(|(ep, _)| cache_endpoint == Some(ep.as_str()))
+        .unwrap_or(false);
 
     // Create shows the chosen scope on its own (non-editing) top row.
     if st.mode == AgentSubMode::Create {
@@ -609,10 +634,11 @@ fn editor_lines<'a>(
             continue;
         }
 
-        if f == AgentEditField::Model && model_is_openrouter {
-            // OpenRouter omnisearch. While searching this field, the row hosts a
-            // live query box and a results dropdown beneath it; otherwise it shows
-            // the committed model id (or an "(inherit)" placeholder).
+        if f == AgentEditField::Model && model_omni {
+            // Live catalogue omnisearch (any provider with an endpoint). While
+            // searching this field, the row hosts a live query box and a results
+            // dropdown beneath it; otherwise it shows the committed model id (or an
+            // "(inherit)" placeholder).
             if editing_here {
                 let mut q = truncate(&st.model_query, value_w.saturating_sub(1));
                 q.push('█');
@@ -624,40 +650,51 @@ fn editor_lines<'a>(
                 ]));
 
                 // Results dropdown: up to 8 catalogue hits, the selected row
-                // inverse-highlighted; an empty-query box shows the search hint.
+                // inverse-highlighted. The catalogue is fetched on demand for the
+                // resolved endpoint: until the cache holds it (`cache_matches`),
+                // show `searching models…`; an empty-query box shows the search
+                // hint; a fetched-empty / no-match set shows `no models — type an id`
+                // (the raw-query fallback still lets Enter commit).
                 const MAX_VIS: usize = 8;
-                if st.model_query.is_empty() {
+                let results = if cache_matches {
+                    filter_models(models_cache, &st.model_query)
+                } else {
+                    Vec::new()
+                };
+                if !cache_matches {
+                    lines.push(Line::from(Span::styled(
+                        "  searching models…",
+                        Style::default().fg(palette.dim),
+                    )));
+                } else if st.model_query.is_empty() {
                     lines.push(Line::from(Span::styled(
                         "  type to search models…",
                         Style::default().fg(palette.dim),
                     )));
+                } else if results.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  no models — type an id",
+                        Style::default().fg(palette.dim),
+                    )));
                 } else {
-                    let results = filter_models(models_cache, &st.model_query);
-                    if results.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "  (no matching models · enter uses raw text)",
-                            Style::default().fg(palette.dim),
-                        )));
-                    } else {
-                        let sel = st.model_result_sel.min(results.len() - 1);
-                        let start = if sel < MAX_VIS { 0 } else { sel + 1 - MAX_VIS };
-                        let end = (start + MAX_VIS).min(results.len());
-                        let row_w = width.saturating_sub(2).max(4);
-                        for (vi, &mi) in results[start..end].iter().enumerate() {
-                            let i = start + vi;
-                            let id = models_cache[mi].id.clone();
-                            if i == sel {
-                                let text = truncate(&format!(" {id} "), row_w);
-                                lines.push(Line::from(Span::styled(
-                                    text,
-                                    Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
-                                )));
-                            } else {
-                                lines.push(Line::from(Span::styled(
-                                    format!("  {}", truncate(&id, row_w.saturating_sub(2))),
-                                    Style::default().fg(palette.fg),
-                                )));
-                            }
+                    let sel = st.model_result_sel.min(results.len() - 1);
+                    let start = if sel < MAX_VIS { 0 } else { sel + 1 - MAX_VIS };
+                    let end = (start + MAX_VIS).min(results.len());
+                    let row_w = width.saturating_sub(2).max(4);
+                    for (vi, &mi) in results[start..end].iter().enumerate() {
+                        let i = start + vi;
+                        let id = models_cache[mi].id.clone();
+                        if i == sel {
+                            let text = truncate(&format!(" {id} "), row_w);
+                            lines.push(Line::from(Span::styled(
+                                text,
+                                Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
+                            )));
+                        } else {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {}", truncate(&id, row_w.saturating_sub(2))),
+                                Style::default().fg(palette.fg),
+                            )));
                         }
                     }
                 }
@@ -728,17 +765,24 @@ fn delete_lines<'a>(st: &'a AgentsState, palette: &Palette) -> Vec<Line<'a>> {
 
 /// Context-sensitive footer hint for the active sub-mode.
 ///
-/// `config`/`models_cache` let the Edit/Create hints reflect the provider
-/// picker, the Provider field (pick), and the Model field's OpenRouter
-/// omnisearch — all of which depend on the chosen provider.
-fn footer_hint(st: &AgentsState, config: &AppConfig, models_cache: &[ModelInfo]) -> &'static str {
+/// `config`/`settings` let the Edit/Create hints reflect the provider picker, the
+/// Provider field (pick), and the Model field's omnisearch — all of which depend on
+/// the chosen provider (or the inherited session Main endpoint).
+fn footer_hint(
+    st: &AgentsState,
+    config: &AppConfig,
+    settings: Option<&crate::model::settings::Settings>,
+) -> &'static str {
     // Provider picker owns input while open (deepest modal).
     if st.provider_picker.is_some() {
         return "↑↓ select · enter ok · esc cancel";
     }
 
     let model_field = st.field == AgentEditField::Model;
-    let model_or = model_field && st.selected_provider_is_openrouter(config, models_cache);
+    let model_or = model_field
+        && settings
+            .map(|s| st.model_field_omnisearchable(config, s))
+            .unwrap_or(false);
 
     match st.mode {
         AgentSubMode::DeleteConfirm => "y delete · n/Esc cancel",

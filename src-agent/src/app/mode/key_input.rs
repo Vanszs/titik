@@ -5,11 +5,11 @@
 //!
 //! - **Step 0 — connection:** `Endpoint` (any OpenAI-compatible base URL, not
 //!   just OpenRouter) and `API key`.
-//! - **Step 1 — model:** `Model` id. For an OpenRouter endpoint this is a LIVE
-//!   omnisearch over the cached model catalogue (`query` + `result_sel`,
-//!   filtered via [`crate::app::mode::filter_models`]); for any other endpoint it
+//! - **Step 1 — model:** `Model` id. For any non-empty endpoint this is a LIVE
+//!   omnisearch over the on-demand model catalogue (`query` + `result_sel`,
+//!   filtered via [`crate::app::mode::filter_models`]); for a blank endpoint it
 //!   stays a plain text box. The branch is keyed on
-//!   [`KeyInputForm::is_openrouter`].
+//!   [`KeyInputForm::is_omnisearchable`].
 //!
 //! Constructed via [`KeyInputForm::new`] (clean first-run defaults) or
 //! [`KeyInputForm::prefilled`] (seeded from remembered creds for the
@@ -38,15 +38,15 @@ pub struct KeyInputForm {
     pub endpoint: String,
     /// API key for the provider connection.
     pub api_key: String,
-    /// Main model id. Defaults to [`DEFAULT_MODEL`]. On step 1 with an OpenRouter
+    /// Main model id. Defaults to [`DEFAULT_MODEL`]. On step 1 with a non-empty
     /// endpoint this is the PICKED id (set from the highlighted catalogue result
     /// or the raw `query` fallback); otherwise it is typed in directly.
     pub model: String,
-    /// Step-1 OpenRouter omnisearch query (the live search box value). Unused for
-    /// a non-OpenRouter endpoint (the Model field is a plain text box there).
+    /// Step-1 omnisearch query (the live search box value). Unused for a blank
+    /// endpoint (the Model field is a plain text box there).
     pub query: String,
     /// Highlighted row in the step-1 omnisearch results list. Indexes into the
-    /// `filter_models` result vector; clamped to it. OpenRouter step-1 only.
+    /// `filter_models` result vector; clamped to it. Fetchable-endpoint step-1 only.
     pub result_sel: usize,
     /// `true` when no prior session / configured client exists.
     /// Controls Esc behaviour: if true, Esc must quit (there is no Chat view
@@ -114,11 +114,12 @@ impl KeyInputForm {
         }
     }
 
-    /// `true` when the entered endpoint is an OpenRouter URL (case-insensitive
-    /// substring match). Step 1 branches on this: OpenRouter → live catalogue
-    /// omnisearch; otherwise → plain text Model box.
-    pub fn is_openrouter(&self) -> bool {
-        self.endpoint.to_lowercase().contains("openrouter")
+    /// `true` when the entered endpoint is non-empty, so its `/models` catalogue
+    /// can be fetched and step 1 becomes a live omnisearch (works for ANY
+    /// OpenAI-compatible endpoint, not just OpenRouter). A blank endpoint → step 1
+    /// stays a plain text Model box.
+    pub fn is_omnisearchable(&self) -> bool {
+        !self.endpoint.trim().is_empty()
     }
 
     /// Advance to the next field within the current step (clamped at the last

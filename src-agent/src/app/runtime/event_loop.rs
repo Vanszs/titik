@@ -367,20 +367,28 @@ pub(super) fn run_loop(
             let mut keep = true;
             loop {
                 match wrx.try_recv() {
-                    Ok(WarmEvent::WarmCatalogue(models)) => {
-                        let n = models.len();
-                        // Always populate the cache (drives the short-send window).
+                    Ok(WarmEvent::WarmCatalogue { endpoint, models }) => {
+                        // Key the on-demand cache to the endpoint it was fetched
+                        // for; the omnisearch filters locally only while
+                        // `models_cache_endpoint` matches the active endpoint.
                         state.rest.models_cache = Some(models);
-                        if let Mode::Loading(s) = &mut state.mode {
-                            s.catalogue = WarmStatus::Done(format!("{n} models"));
+                        state.rest.models_cache_endpoint = Some(endpoint.clone());
+                        // Clear the in-flight guard for this endpoint so a later
+                        // endpoint change can fetch again.
+                        if state.rest.catalogue_fetching.as_deref() == Some(endpoint.as_str()) {
+                            state.rest.catalogue_fetching = None;
                         }
                         dirty = true;
                     }
-                    Ok(WarmEvent::WarmCatalogueFailed) => {
-                        // No cache write (it stays None → window unknown). Only the
-                        // splash step changes, and only while still Loading.
-                        if let Mode::Loading(s) = &mut state.mode {
-                            s.catalogue = WarmStatus::Failed;
+                    Ok(WarmEvent::WarmCatalogueFailed { endpoint }) => {
+                        // TERMINAL empty result for this endpoint: record an empty
+                        // catalogue keyed to it so the omnisearch degrades to manual
+                        // model-id entry and does NOT retry in a loop (the
+                        // request_catalogue no-op guard sees a matching endpoint).
+                        state.rest.models_cache = Some(Vec::new());
+                        state.rest.models_cache_endpoint = Some(endpoint.clone());
+                        if state.rest.catalogue_fetching.as_deref() == Some(endpoint.as_str()) {
+                            state.rest.catalogue_fetching = None;
                         }
                         dirty = true;
                     }
@@ -412,6 +420,58 @@ pub(super) fn run_loop(
             }
             if keep {
                 state.rest.warm_rx = Some(wrx);
+            }
+        }
+
+        // 1b-3b. Fire a DEBOUNCED, on-demand model-catalogue fetch. The model
+        //        omnisearch arms `catalogue_pending` (via `request_catalogue`) on
+        //        each keystroke / provider change, pushing `due` ~300ms forward so a
+        //        typing burst collapses into one request. Fire here — where `handle`
+        //        + `client` are in scope — once `due` passes and nothing is already
+        //        in flight. Reuse the shared `warm_rx` channel (no new channel): the
+        //        drain above folds the result into the per-endpoint cache. On
+        //        failure send `WarmCatalogueFailed { endpoint }` so the drain records
+        //        a terminal empty result (no infinite re-fetch on a dead endpoint).
+        if let Some(pending) = state.rest.catalogue_pending.as_ref() {
+            if state.rest.catalogue_fetching.is_none()
+                && std::time::Instant::now() >= pending.due
+            {
+                // Take the pending request and mark its endpoint in-flight.
+                let pending = state.rest.catalogue_pending.take().unwrap();
+                let endpoint = pending.endpoint;
+                let api_key = pending.api_key;
+                state.rest.catalogue_fetching = Some(endpoint.clone());
+                // Open a fresh warm channel for this fetch and stash its receiver.
+                // Senders aren't stored in state (only the receiver), so this is the
+                // only way to obtain one. This is safe wrt the awareness warm task:
+                // the omnisearch (the sole `request_catalogue` caller) only runs in
+                // Chat-mode modals / the first-run wizard, by which point the startup
+                // awareness task has already resolved + closed its channel — so no
+                // live awareness send can be stranded on a replaced receiver.
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                state.rest.warm_rx = Some(rx);
+                // Reuse the pinned client, or build a keyless one (the first-run
+                // wizard fetches before any client is pinned — `Conn` carries the
+                // endpoint+key, so a keyless client is enough). The fetch is just
+                // `GET {endpoint}/models`; on error send WarmCatalogueFailed so the
+                // drain records a terminal empty result (no infinite re-fetch).
+                let c = match client.as_ref() {
+                    Some(c) => Arc::clone(c),
+                    None => super::build_client(),
+                };
+                handle.spawn(async move {
+                    let conn = crate::service::openrouter::Conn {
+                        endpoint: &endpoint,
+                        api_key: &api_key,
+                    };
+                    let ev = match c.list_models(conn).await {
+                        Ok(models) => WarmEvent::WarmCatalogue { endpoint, models },
+                        Err(_) => WarmEvent::WarmCatalogueFailed { endpoint },
+                    };
+                    // A dropped receiver (app closing) makes this a no-op.
+                    let _ = tx.send(ev);
+                });
+                dirty = true;
             }
         }
 
@@ -518,8 +578,13 @@ pub(super) fn run_loop(
         //    buffered event each tick so paste / fast typing don't lag.
         // Also poll fast while the loading splash is up so its braille spinner
         // animates smoothly (the per-tick `frame`++ above needs the loop to wake
-        // at the fast cadence, not idle-sleep for 100ms between frames).
-        let timeout = if state.rest.waiting || matches!(state.mode, Mode::Loading(_)) {
+        // at the fast cadence, not idle-sleep for 100ms between frames). And while a
+        // debounced catalogue fetch is pending, so its ~300ms `due` fires promptly
+        // rather than waiting out a 100ms idle sleep (treat it like the splash).
+        let timeout = if state.rest.waiting
+            || state.rest.catalogue_pending.is_some()
+            || matches!(state.mode, Mode::Loading(_))
+        {
             Duration::from_millis(8)
         } else {
             Duration::from_millis(100)

@@ -625,28 +625,54 @@ impl AgentsState {
         self.provider_picker = None;
     }
 
-    /// Whether the Model field should use the OpenRouter omnisearch.
+    /// Resolve the `(endpoint, api_key)` the Model omnisearch should fetch its
+    /// catalogue against, or `None` when there is nothing usable to search.
     ///
-    /// Rule (the simplest correct one): when a provider is explicitly chosen
-    /// (`draft_provider_uuid` is `Some`), it's OpenRouter iff that connection's
-    /// endpoint contains `"openrouter"`. When inheriting the session provider
-    /// (`None`), fall back to "the catalogue is non-empty" — `models_cache` only
-    /// ever holds the OpenRouter catalogue, so a populated cache means the
-    /// inherited provider is the OpenRouter one driving the omnisearch.
-    pub fn selected_provider_is_openrouter(
+    /// - An explicitly-chosen provider (`draft_provider_uuid` is `Some`) → that
+    ///   connection's endpoint+key (when the uuid resolves).
+    /// - Inheriting the session provider (`None`) → the session's effective MAIN
+    ///   route's endpoint+key (so the agent's "inherit" omnisearch searches the
+    ///   same catalogue the session's chat model uses).
+    ///
+    /// A blank endpoint resolves to `None` (no catalogue to fetch → plain text id).
+    pub fn model_omnisearch_conn(
         &self,
         config: &AppConfig,
-        models_cache: &[crate::dto::openrouter::ModelInfo],
-    ) -> bool {
-        match &self.draft_provider_uuid {
-            Some(uuid) => config
-                .providers
-                .iter()
-                .find(|p| &p.uuid == uuid)
-                .map(|p| p.endpoint.to_lowercase().contains("openrouter"))
-                .unwrap_or(false),
-            None => !models_cache.is_empty(),
+        settings: &crate::model::settings::Settings,
+    ) -> Option<(String, String)> {
+        let (endpoint, api_key) = match &self.draft_provider_uuid {
+            Some(uuid) => {
+                let p = config.providers.iter().find(|p| &p.uuid == uuid)?;
+                (p.endpoint.clone(), p.api_key.clone())
+            }
+            None => {
+                // Inherit: resolve the session's Main route for its endpoint+key.
+                let r = crate::app::resolve::resolve_role(
+                    config,
+                    settings,
+                    crate::model::app_config::ModelRole::Main,
+                )?;
+                (r.endpoint.clone(), r.api_key.clone())
+            }
+        };
+        if endpoint.trim().is_empty() {
+            None
+        } else {
+            Some((endpoint, api_key))
         }
+    }
+
+    /// Whether the Model field should use the live catalogue omnisearch: `true`
+    /// when [`Self::model_omnisearch_conn`] resolves to a non-empty endpoint (the
+    /// catalogue is just `GET {endpoint}/models`, available for ANY provider). The
+    /// chosen provider's endpoint, or the inherited session Main endpoint, drives
+    /// it — not OpenRouter specifically.
+    pub fn model_field_omnisearchable(
+        &self,
+        config: &AppConfig,
+        settings: &crate::model::settings::Settings,
+    ) -> bool {
+        self.model_omnisearch_conn(config, settings).is_some()
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime

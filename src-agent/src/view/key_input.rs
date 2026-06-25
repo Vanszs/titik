@@ -5,10 +5,10 @@
 //!
 //! Steps:
 //! - **0 — connection:** `Endpoint` (any OpenAI-compatible base URL) + `API key`.
-//! - **1 — model:** `Model` id. For an OpenRouter endpoint this is a LIVE search
-//!   over the cached model catalogue (search line + gray rule + windowed results
-//!   dropdown, mirroring `settings::draw_model_modal`); for any other endpoint it
-//!   stays a plain text box. Branch is keyed on [`KeyInputForm::is_openrouter`].
+//! - **1 — model:** `Model` id. For any non-empty endpoint this is a LIVE search
+//!   over the on-demand model catalogue (search line + gray rule + windowed results
+//!   dropdown, mirroring `settings::draw_model_modal`); for a blank endpoint it
+//!   stays a plain text box. Branch is keyed on [`KeyInputForm::is_omnisearchable`].
 //!
 //! Layout: a single left-aligned block of BLOCK_W columns, horizontally centred
 //! in the frame and placed in the upper portion (≈25 % down). Every element
@@ -176,12 +176,19 @@ fn result_line(
 
 /// Render the setup wizard for `form` using the given colour `palette`.
 ///
-/// `models_cache` is the cached OpenRouter model catalogue, threaded through so
-/// step 1's live search can render results (empty slice when the catalogue
-/// hasn't been fetched yet — rendered as a dim `fetching models…` line, since a
-/// real OpenRouter catalogue is never empty). Ignored for a non-OpenRouter
-/// endpoint (the Model field is a plain text box there).
-pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], palette: &Palette) {
+/// `models_cache` is the on-demand model catalogue and `cache_endpoint` the
+/// endpoint it was fetched for (`None` = never fetched). Step 1's live search
+/// renders results only when `cache_endpoint` matches the ENTERED endpoint;
+/// otherwise it shows a dim `searching models…` (still fetching) or `no models —
+/// type an id` (fetched empty). Ignored for a blank endpoint (the Model field is a
+/// plain text box there).
+pub fn draw(
+    frame: &mut Frame,
+    form: &KeyInputForm,
+    models_cache: &[ModelInfo],
+    cache_endpoint: Option<&str>,
+    palette: &Palette,
+) {
     let area = frame.area();
 
     // ── Vertical layout ──────────────────────────────────────────────────────
@@ -299,10 +306,10 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], 
         // API key underline rule.
         render_line(frame, rule_line(rule_w, key_active, palette), row);
         // row not needed after last field
-    } else if form.is_openrouter() {
-        // Step 1 (OpenRouter): the Model field becomes a LIVE catalogue search —
-        // the query as the input value, the accent underline, and a windowed
-        // results dropdown below (mirrors `settings::draw_model_modal`).
+    } else if form.is_omnisearchable() {
+        // Step 1 (fetchable endpoint): the Model field becomes a LIVE catalogue
+        // search — the query as the input value, the accent underline, and a
+        // windowed results dropdown below (mirrors `settings::draw_model_modal`).
         //
         // Search input row: label "Model" + the live query + cursor block.
         render_line(frame, field_line("Model", &form.query, true, palette), row);
@@ -311,16 +318,15 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], 
         render_line(frame, rule_line(rule_w, true, palette), row);
         row += 1;
 
-        // Results dropdown, indented to the value column. The result set is
-        // `filter_models` for BOTH empty and non-empty queries (an empty query
-        // matches every model, in catalogue order) so the highlight + Up/Down
-        // exactly track the controller, which navigates the same vector.
+        // The catalogue is fetched ON DEMAND for the entered endpoint. Trust
+        // `models_cache` only when it was fetched for THIS endpoint; otherwise the
+        // fetch is still in flight → `searching models…`. Once it lands, an empty
+        // catalogue is terminal → `no models — type an id` (the raw-query fallback
+        // still lets Enter finish).
         let indent = LABEL_W + GAP;
-        if models_cache.is_empty() {
-            // No catalogue yet (None upstream → empty slice): the fetch spawned on
-            // the step-0→1 advance hasn't resolved. A real OpenRouter catalogue is
-            // never empty, so an empty slice unambiguously means "still fetching".
-            render_line(frame, dim_indented("fetching models\u{2026}", indent, palette), row);
+        let cache_matches = cache_endpoint == Some(form.endpoint.trim());
+        if !cache_matches {
+            render_line(frame, dim_indented("searching models\u{2026}", indent, palette), row);
         } else {
             // Show the "type to search" hint above the list while the query is empty.
             if form.query.trim().is_empty() {
@@ -329,7 +335,7 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], 
             }
             let results = filter_models(models_cache, &form.query);
             if results.is_empty() {
-                render_line(frame, dim_indented("no matching models", indent, palette), row);
+                render_line(frame, dim_indented("no models \u{2014} type an id", indent, palette), row);
             } else {
                 let sel = form.result_sel.min(results.len() - 1);
                 // Autoscroll: anchor the window so the selected row stays visible.
@@ -344,7 +350,7 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], 
             }
         }
     } else {
-        // Step 1 (non-OpenRouter): plain editable Model id with a bottom rule.
+        // Step 1 (blank endpoint): plain editable Model id with a bottom rule.
         render_line(frame, field_line("Model", &form.model, true, palette), row);
         row += 1;
         // Model underline rule (always active accent on this step).
@@ -358,7 +364,7 @@ pub fn draw(frame: &mut Frame, form: &KeyInputForm, models_cache: &[ModelInfo], 
     // Pinned to the bottom of the frame, dim, centred.
     let footer_text = if form.step == 0 {
         "tab/\u{2191}\u{2193} switch \u{00b7} enter next \u{00b7} esc cancel \u{00b7} ctrl+c quit"
-    } else if form.is_openrouter() {
+    } else if form.is_omnisearchable() {
         // Step 1 search mode: ↑↓ navigates the catalogue results.
         "\u{2191}\u{2193} pick \u{00b7} enter finish \u{00b7} esc back \u{00b7} ctrl+c quit"
     } else {

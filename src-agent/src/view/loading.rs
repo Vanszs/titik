@@ -1,11 +1,12 @@
 //! View – startup loading splash (Loading mode).
 //!
 //! A btop-style, borderless, full-frame centered splash shown while a
-//! returning-into-Chat session warms asynchronously (catalogue fetch + project
-//! awareness summary run as background tasks; see the non-blocking
-//! `runtime::warm_session` refactor). Purely presentational: the step statuses
-//! live in [`app::mode::LoadingState`], the spinner `frame` is advanced by the
-//! event loop each tick, and `Esc` (skip) is handled in
+//! returning-into-Chat session warms asynchronously (the project awareness
+//! summary runs as a background task; see the non-blocking `runtime::warm_session`
+//! refactor — the model catalogue is no longer fetched here, it loads on demand
+//! per endpoint in the omnisearch). Purely presentational: the step statuses live
+//! in [`app::mode::LoadingState`], the spinner `frame` is advanced by the event
+//! loop each tick, and `Esc` (skip) is handled in
 //! [`controller::input::handle_loading`].
 //!
 //! Layout (top → bottom), centered:
@@ -14,7 +15,6 @@
 //!                         simple-coder
 //!
 //!                  ⠙  indexing workspace
-//!                  ●  model catalogue   412 models
 //!                  ⠹  reading project docs
 //!
 //!              warming up · 1.4s   ·   esc to skip
@@ -39,8 +39,8 @@ use crate::view::theme::Palette;
 /// draw tick by the event loop so the glyph rotates.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The three step rows, in display order, with their fixed labels.
-const STEP_LABELS: [&str; 3] = ["indexing workspace", "model catalogue", "reading project docs"];
+/// The two step rows, in display order, with their fixed labels.
+const STEP_LABELS: [&str; 2] = ["indexing workspace", "reading project docs"];
 
 /// Build one centered step row: `<marker>  <label>[  <detail>]`.
 ///
@@ -96,7 +96,7 @@ pub fn draw(frame: &mut Frame, state: &LoadingState, palette: &Palette) {
             Constraint::Percentage(30), // top spacer → title lands in the upper third
             Constraint::Length(1),      // title
             Constraint::Length(1),      // gap
-            Constraint::Length(3),      // the three step rows
+            Constraint::Length(2),      // the two step rows
             Constraint::Min(1),         // flexible spacer
             Constraint::Length(1),      // footer
             Constraint::Length(1),      // bottom margin
@@ -111,14 +111,13 @@ pub fn draw(frame: &mut Frame, state: &LoadingState, palette: &Palette) {
     .alignment(Alignment::Center);
     frame.render_widget(title, chunks[1]);
 
-    // --- Step rows: a centered block of three lines ---
+    // --- Step rows: a centered block of two lines ---
     let steps: Vec<Line> = STEP_LABELS
         .iter()
         .enumerate()
         .map(|(i, label)| {
             let status = match i {
                 0 => &state.workspace,
-                1 => &state.catalogue,
                 _ => &state.awareness,
             };
             step_line(status, label, state.frame, palette)

@@ -44,12 +44,6 @@ pub enum Action {
     /// Setup wizard finished; carry the entered endpoint, api key, and model out
     /// so the runtime can build a provider-agnostic config from them.
     SaveCreds { endpoint: String, api_key: String, model: String },
-    /// Setup wizard advanced from the connection step to the model step with an
-    /// OpenRouter endpoint: prefetch the model catalogue so step 2's live search
-    /// has results. The runtime serves a fresh disk cache directly, else spawns a
-    /// network fetch on the shared `warm_rx` channel (mirroring `warm_session`).
-    /// A no-op for a non-OpenRouter endpoint (never emitted there).
-    FetchWizardCatalogue { endpoint: String, api_key: String },
     /// Esc on a credentials form that was NOT opened from the picker — return
     /// to the normal Chat view.
     CancelKeyInput,
@@ -187,15 +181,18 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
             }
         }
         Mode::KeyInput(form) => {
-            // Step 1 on an OpenRouter endpoint is the catalogue omnisearch:
-            // paste feeds the live query and resets the result highlight, exactly
-            // as a typed char does. Every other field is plain text on `model` /
-            // `endpoint` / `api_key` via `push_char`.
-            if form.step == 1 && form.is_openrouter() {
+            // Step 1 on a fetchable endpoint is the catalogue omnisearch: paste
+            // feeds the live query and resets the result highlight, exactly as a
+            // typed char does, then arms the on-demand catalogue fetch. Every other
+            // field is plain text on `model` / `endpoint` / `api_key` via `push_char`.
+            if form.step == 1 && form.is_omnisearchable() {
                 paste_single_line(text, |c| {
                     form.query.push(c);
                     form.result_sel = 0;
                 });
+                let endpoint = form.endpoint.trim().to_string();
+                let api_key = form.api_key.trim().to_string();
+                state.rest.request_catalogue(&endpoint, &api_key);
             } else {
                 paste_single_line(text, |c| form.push_char(c));
             }
@@ -208,9 +205,19 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 // Checkbox overlay — no text entry; swallow the paste.
             } else if s.model_modal.is_some() {
                 // `mm_push_char` already routes to the active model-modal field:
-                // Name → name, Model → omnisearch query (OpenRouter, resets the
-                // result highlight) or raw model id, and ignores Route/Role/buttons.
+                // Name → name, Model → omnisearch query (any provider with an
+                // endpoint, resets the result highlight) or raw model id, and
+                // ignores Route/Role/buttons.
                 paste_single_line(text, |c| s.mm_push_char(c));
+                // If that fed the Model omnisearch, prime the on-demand fetch for
+                // the edited provider's endpoint (debounced; no-op otherwise).
+                if s.mm_current_field()
+                    == Some(crate::app::mode::settings::ModelField::Model)
+                {
+                    if let Some((ep, key)) = s.mm_provider_conn() {
+                        state.rest.request_catalogue(&ep, &key);
+                    }
+                }
             } else if s.prov_modal.is_some() {
                 // Add-API-provider modal: `modal_push_char` writes to the active
                 // text field (name/endpoint/api_key) and no-ops on the buttons.
@@ -231,15 +238,15 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 // Tool picker live filter (single-line).
                 paste_single_line(text, |c| p.push_filter(c));
             } else if a.editing {
-                // Typing into a draft field. The Model field on an OpenRouter
-                // provider is an omnisearch (paste → query, reset highlight); the
-                // Body is the multiline prompt (newlines kept); every other field
-                // is single-line plain text.
-                let model_search = a.field == AgentEditField::Model
-                    && a.selected_provider_is_openrouter(
-                        &state.rest.config,
-                        state.rest.models_cache.as_deref().unwrap_or(&[]),
-                    );
+                // Typing into a draft field. The Model field on a provider with a
+                // resolvable endpoint is an omnisearch (paste → query, reset
+                // highlight); the Body is the multiline prompt (newlines kept); every
+                // other field is single-line plain text.
+                let settings = state.rest.session.as_ref().map(|s| s.settings.clone());
+                let omni_conn = settings
+                    .as_ref()
+                    .and_then(|st| a.model_omnisearch_conn(&state.rest.config, st));
+                let model_search = a.field == AgentEditField::Model && omni_conn.is_some();
                 let body = a.field == AgentEditField::Body;
                 for c in text.chars() {
                     if c == '\r' || c == '\n' {
@@ -253,6 +260,12 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                         a.model_result_sel = 0;
                     } else {
                         a.push_char(c);
+                    }
+                }
+                // Arm the on-demand fetch once after the whole paste.
+                if model_search {
+                    if let Some((ep, key)) = omni_conn.as_ref() {
+                        state.rest.request_catalogue(ep, key);
                     }
                 }
             }
@@ -502,14 +515,15 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
 /// move between fields WITHIN the current step; Enter advances (field → step →
 /// finish) and Esc walks back (step 1 → step 0 → cancel).
 ///
-/// Step 1 (model) has TWO modes, keyed on [`KeyInputForm::is_openrouter`]:
-/// - **OpenRouter** → a live omnisearch over `rest.models_cache`. Chars edit
-///   `form.query`; ↑/↓ move `form.result_sel` over `filter_models(cache, query)`;
-///   Enter picks the highlighted result into `form.model` (or, when there are no
-///   results, falls back to the raw trimmed query so manual entry never traps)
-///   and finishes. The catalogue is prefetched on the step-0→1 advance via
-///   [`Action::FetchWizardCatalogue`].
-/// - **Other endpoint** → a plain text Model box (chars edit `form.model`).
+/// Step 1 (model) has TWO modes, keyed on [`KeyInputForm::is_omnisearchable`]:
+/// - **Non-empty endpoint** → a live omnisearch over the on-demand catalogue.
+///   Chars edit `form.query` and arm `request_catalogue(endpoint, api_key)`
+///   (debounced); ↑/↓ move `form.result_sel` over `filter_models(cache, query)`
+///   (only when `models_cache_endpoint` matches the entered endpoint); Enter picks
+///   the highlighted result into `form.model` (or, when there are no results yet,
+///   falls back to the raw trimmed query so manual entry never traps) and finishes.
+///   The catalogue fetch is armed on the step-0→1 advance and on each keystroke.
+/// - **Blank endpoint** → a plain text Model box (chars edit `form.model`).
 ///
 /// Esc on step 0 has three cases:
 /// 1. `first_run = true` → no prior client exists, so Esc must quit rather than drop back to a broken Chat view.
@@ -522,13 +536,26 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
         return Action::Quit;
     }
 
-    // --- Step 1 (model) on an OpenRouter endpoint: live catalogue omnisearch ---
+    // --- Step 1 (model) on a fetchable endpoint: live catalogue omnisearch ---
     // This intercepts ALL keys for the model step so the search box + results list
     // own the input (chars → query, ↑/↓ → result_sel, Enter → pick/finish). Esc
-    // still walks back to the connection step. The non-OpenRouter model step and
+    // still walks back to the connection step. The blank-endpoint model step and
     // the whole connection step fall through to the generic handler below.
-    if form.step == 1 && form.is_openrouter() {
+    //
+    // The catalogue is fetched ON DEMAND for the entered endpoint: keystrokes call
+    // `request_catalogue(endpoint, api_key)` (debounced). The filter only trusts
+    // `models_cache` when it was fetched for THIS endpoint; otherwise results are
+    // empty (still fetching) and Enter falls back to the raw typed query.
+    if form.step == 1 && form.is_omnisearchable() {
+        let endpoint = form.endpoint.trim().to_string();
+        let api_key = form.api_key.trim().to_string();
+        let cache_matches = rest.models_cache_endpoint.as_deref() == Some(endpoint.as_str());
         let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+        let filtered: Vec<usize> = if cache_matches {
+            filter_models(cache, &form.query)
+        } else {
+            Vec::new()
+        };
         return match key.code {
             KeyCode::Esc => {
                 // Non-destructive: back to the connection step (clears the query).
@@ -541,25 +568,23 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
             }
             KeyCode::Down => {
                 // Clamp to the last filtered result (0 when there are none).
-                let n = filter_models(cache, &form.query).len();
-                form.result_sel = (form.result_sel + 1).min(n.saturating_sub(1));
+                form.result_sel = (form.result_sel + 1).min(filtered.len().saturating_sub(1));
                 Action::None
             }
             KeyCode::Enter => {
-                let results = filter_models(cache, &form.query);
-                if !results.is_empty() {
+                if !filtered.is_empty() {
                     // Pick the highlighted catalogue model.
-                    let sel = form.result_sel.min(results.len() - 1);
-                    form.model = cache[results[sel]].id.clone();
+                    let sel = form.result_sel.min(filtered.len() - 1);
+                    form.model = cache[filtered[sel]].id.clone();
                     Action::SaveCreds {
-                        endpoint: form.endpoint.trim().to_string(),
-                        api_key: form.api_key.trim().to_string(),
+                        endpoint,
+                        api_key,
                         model: form.model.clone(),
                     }
                 } else {
-                    // No results (catalogue still loading, or the query matches
-                    // nothing): fall back to the raw query as a manual model id so
-                    // the wizard never traps. Finish only when it's non-empty.
+                    // No results (catalogue still loading / empty, or the query
+                    // matches nothing): fall back to the raw query as a manual model
+                    // id so the wizard never traps. Finish only when it's non-empty.
                     let typed = form.query.trim();
                     if typed.is_empty() {
                         rest.status = "model required".into();
@@ -567,8 +592,8 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
                     } else {
                         form.model = typed.to_string();
                         Action::SaveCreds {
-                            endpoint: form.endpoint.trim().to_string(),
-                            api_key: form.api_key.trim().to_string(),
+                            endpoint,
+                            api_key,
                             model: form.model.clone(),
                         }
                     }
@@ -577,11 +602,13 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
             KeyCode::Backspace => {
                 form.query.pop();
                 form.result_sel = 0;
+                rest.request_catalogue(&endpoint, &api_key);
                 Action::None
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 form.query.push(c);
                 form.result_sel = 0; // new filter → reset the highlight
+                rest.request_catalogue(&endpoint, &api_key);
                 Action::None
             }
             _ => Action::None,
@@ -625,20 +652,18 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
                         rest.status = "api key required".into();
                         Action::None
                     } else {
-                        // Advance to the model step. For an OpenRouter endpoint,
-                        // ALSO prefetch the catalogue so step 2's live search has
-                        // results (advance first so the form is already on step 1
-                        // when the fetch resolves). Non-OpenRouter: just advance.
-                        let or = form.is_openrouter();
+                        // Advance to the model step. For a fetchable endpoint, ALSO
+                        // arm the on-demand catalogue fetch so step 2's live search
+                        // has results (advance first so the form is already on step 1
+                        // when the fetch resolves). Blank endpoint: just advance.
+                        let omni = form.is_omnisearchable();
+                        let endpoint = form.endpoint.trim().to_string();
+                        let api_key = form.api_key.trim().to_string();
                         form.advance_step();
-                        if or {
-                            Action::FetchWizardCatalogue {
-                                endpoint: form.endpoint.trim().to_string(),
-                                api_key: form.api_key.trim().to_string(),
-                            }
-                        } else {
-                            Action::None
+                        if omni {
+                            rest.request_catalogue(&endpoint, &api_key);
                         }
+                        Action::None
                     }
                 } else {
                     form.next_field();
@@ -768,12 +793,25 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
     // --- Add/edit-model modal (deepest level: intercepts ALL keys except Ctrl+C) ---
     if s.model_modal.is_some() {
         use crate::app::mode::settings::ModelField;
-        let or = s.mm_provider_is_openrouter();
+        // The Model field is now an omnisearch for ANY provider with a non-empty
+        // endpoint (the catalogue is just `GET {endpoint}/models`); OpenRouter is no
+        // longer special here. The Route field stays OpenRouter-only.
+        let omni = s.mm_provider_omnisearchable();
+        let is_or = s.mm_provider_is_openrouter();
         let cur = s.mm_current_field();
         let query = s.mm_query().to_string();
-        // Omnisearch is live only on the Model field, for an OpenRouter provider,
+        // The edited provider's endpoint+key, for the on-demand catalogue fetch.
+        let conn = s.mm_provider_conn();
+        // Only filter against `models_cache` when it was fetched for THIS provider's
+        // endpoint; otherwise the cache is stale / for another provider and the
+        // results are treated as still-pending (raw-query fallback on Enter).
+        let cache_matches = conn
+            .as_ref()
+            .map(|(ep, _)| rest.models_cache_endpoint.as_deref() == Some(ep.as_str()))
+            .unwrap_or(false);
+        // Omnisearch is live on the Model field, for an omnisearchable provider,
         // once the user has typed something.
-        let search_mode = cur == Some(ModelField::Model) && or && !query.is_empty();
+        let search_mode = cur == Some(ModelField::Model) && omni && !query.is_empty();
 
         // Selecting a model arms its provider-endpoints load: `mm_select_model`
         // sets the modal's loading flags, and we hand the chosen id back to the
@@ -781,7 +819,14 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
         let mut modal_action = Action::None;
 
         if search_mode {
+            // The matched catalogue indices, but ONLY when the cache is for this
+            // endpoint; otherwise empty (still fetching → raw-query fallback).
             let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+            let filtered: Vec<usize> = if cache_matches {
+                filter_models(cache, &query)
+            } else {
+                Vec::new()
+            };
             match key.code {
                 KeyCode::Esc => {
                     s.close_model_modal();
@@ -790,25 +835,39 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                     s.mm_result_up();
                 }
                 KeyCode::Down => {
-                    let len = filter_models(cache, &query).len();
-                    s.mm_result_down(len.saturating_sub(1));
+                    s.mm_result_down(filtered.len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
-                    let results = filter_models(cache, &query);
-                    if !results.is_empty() {
+                    if !filtered.is_empty() {
                         let sel = s
                             .model_modal
                             .as_ref()
                             .map(|m| m.result_sel)
                             .unwrap_or(0)
-                            .min(results.len() - 1);
-                        let id = cache[results[sel]].id.clone();
-                        // Set the model + arm the loading flags, then trigger the
-                        // background endpoints fetch for the chosen id. (Search
-                        // mode is OpenRouter-only, so an endpoints API always
-                        // exists for this path.)
-                        s.mm_select_model(id.clone());
-                        modal_action = Action::FetchModelEndpoints(id);
+                            .min(filtered.len() - 1);
+                        let id = cache[filtered[sel]].id.clone();
+                        if is_or {
+                            // OpenRouter: arm the loading flags + fetch upstream
+                            // providers for the chosen id.
+                            s.mm_select_model(id.clone());
+                            modal_action = Action::FetchModelEndpoints(id);
+                        } else {
+                            // Other provider: just set the id (no Route list).
+                            s.mm_set_model_simple(id);
+                        }
+                    } else {
+                        // No-trap fallback: an empty / not-yet-fetched result set
+                        // commits the raw query as a manual model id (only when
+                        // non-empty). For OpenRouter, arm the endpoints fetch too.
+                        let typed = query.trim().to_string();
+                        if !typed.is_empty() {
+                            if is_or {
+                                s.mm_select_model(typed.clone());
+                                modal_action = Action::FetchModelEndpoints(typed);
+                            } else {
+                                s.mm_set_model_simple(typed);
+                            }
+                        }
                     }
                 }
                 // Tab escapes the search and advances to the next field.
@@ -817,9 +876,18 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 }
                 KeyCode::Backspace => {
                     s.mm_backspace();
+                    // Re-request after the edit (debounced) so a shrinking query
+                    // still has the right endpoint's catalogue on the way.
+                    if let Some((ep, key)) = conn.as_ref() {
+                        rest.request_catalogue(ep, key);
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.mm_push_char(c);
+                    // On-demand fetch for the edited provider's endpoint (debounced).
+                    if let Some((ep, key)) = conn.as_ref() {
+                        rest.request_catalogue(ep, key);
+                    }
                 }
                 _ => {}
             }
@@ -904,17 +972,34 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 }
                 KeyCode::Left => {
                     s.mm_left();
+                    // Provider may have changed → request its endpoint's catalogue
+                    // (recompute the conn AFTER the swap).
+                    if let Some((ep, key)) = s.mm_provider_conn() {
+                        rest.request_catalogue(&ep, &key);
+                    }
                 }
                 KeyCode::Right => {
                     s.mm_right();
+                    if let Some((ep, key)) = s.mm_provider_conn() {
+                        rest.request_catalogue(&ep, &key);
+                    }
                 }
                 KeyCode::Enter => {
                     match cur {
                         Some(ModelField::Save) => s.save_model_modal(false),
                         Some(ModelField::SaveSession) => s.save_model_modal(true),
                         Some(ModelField::Cancel) => s.close_model_modal(),
-                        // Name / Provider / Model: advance to the next field.
-                        _ => s.mm_down(),
+                        // Name / Provider / Model: advance to the next field. When
+                        // landing on (or already on) the Model field, prime the
+                        // omnisearch catalogue for the current provider.
+                        _ => {
+                            s.mm_down();
+                            if s.mm_current_field() == Some(ModelField::Model) {
+                                if let Some((ep, key)) = s.mm_provider_conn() {
+                                    rest.request_catalogue(&ep, &key);
+                                }
+                            }
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -922,6 +1007,14 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.mm_push_char(c);
+                    // First keystroke on the Model field (empty query → field-nav
+                    // branch): kick the on-demand catalogue fetch for the edited
+                    // provider's endpoint. No-op off the Model field / blank endpoint.
+                    if cur == Some(ModelField::Model) {
+                        if let Some((ep, key)) = conn.as_ref() {
+                            rest.request_catalogue(ep, key);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1107,16 +1200,28 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 KeyCode::Down | KeyCode::Tab => {
                     s.model_down();
                 }
-                // Catalogue prefetch happens on /settings open, so '+' just opens
-                // the modal — no Action needed in Pass A.
+                // Opening the add modal: kick the on-demand catalogue fetch for the
+                // default provider so the Model omnisearch already has data when the
+                // user reaches it (debounced; no-op if the endpoint is blank).
                 KeyCode::Char('+') => {
                     s.open_model_modal_add();
+                    if let Some((ep, key)) = s.mm_provider_conn() {
+                        rest.request_catalogue(&ep, &key);
+                    }
                 }
                 KeyCode::Enter => {
                     if s.model_on_add_button() {
                         s.open_model_modal_add();
+                        if let Some((ep, key)) = s.mm_provider_conn() {
+                            rest.request_catalogue(&ep, &key);
+                        }
                     } else {
                         s.open_model_modal_edit(s.model_sel);
+                        // Prime the Model omnisearch for the edited provider's
+                        // endpoint (any provider, debounced).
+                        if let Some((ep, key)) = s.mm_provider_conn() {
+                            rest.request_catalogue(&ep, &key);
+                        }
                         // If the opened model's provider is OpenRouter and it has
                         // a model id, arm the loading flags + fetch its providers.
                         // Non-OpenRouter / empty id → no endpoints API, so this
@@ -1243,6 +1348,14 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
             }
             KeyCode::Enter => {
                 s.confirm_provider_picker();
+                // Provider changed → prime the on-demand catalogue for its endpoint
+                // (or the inherited session Main endpoint) so the Model omnisearch
+                // has data when the user reaches it.
+                if let Some(settings) = rest.session.as_ref().map(|s| s.settings.clone()) {
+                    if let Some((ep, key)) = s.model_omnisearch_conn(&rest.config, &settings) {
+                        rest.request_catalogue(&ep, &key);
+                    }
+                }
             }
             KeyCode::Esc => {
                 s.cancel_provider_picker();
@@ -1306,19 +1419,38 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
 
         // --- Edit / Create ---
         AgentSubMode::Edit | AgentSubMode::Create => {
-            // Is the Model field being edited as an OpenRouter omnisearch? (Model
-            // field + editing + the chosen provider is OpenRouter.) When so, keys
-            // drive the query + results list instead of plain text editing.
-            let model_search = s.editing
-                && s.field == AgentEditField::Model
-                && s.selected_provider_is_openrouter(
-                    &rest.config,
-                    rest.models_cache.as_deref().unwrap_or(&[]),
-                );
+            // The session settings drive the "inherit" omnisearch endpoint (the
+            // session Main route) when no provider is explicitly chosen. Snapshot it
+            // once so the omnisearch helpers can borrow it without holding `rest`.
+            let settings = rest.session.as_ref().map(|s| s.settings.clone());
+            // The endpoint+key the Model omnisearch fetches against (chosen provider,
+            // or inherited session Main); `None` when nothing resolves (→ plain text).
+            let omni_conn = settings
+                .as_ref()
+                .and_then(|st| s.model_omnisearch_conn(&rest.config, st));
+            // Is the Model field being edited as a live omnisearch? (Model field +
+            // editing + a resolvable, non-empty endpoint.) When so, keys drive the
+            // query + results list instead of plain text editing.
+            let model_search =
+                s.editing && s.field == AgentEditField::Model && omni_conn.is_some();
 
             if model_search {
-                // --- Model omnisearch over the OpenRouter catalogue ---
+                // --- Model omnisearch over the resolved endpoint's catalogue ---
+                // Only filter against `models_cache` when it holds THIS endpoint's
+                // catalogue; otherwise treat results as empty (still fetching →
+                // raw-query fallback on Enter).
+                let cache_matches = omni_conn
+                    .as_ref()
+                    .map(|(ep, _)| {
+                        rest.models_cache_endpoint.as_deref() == Some(ep.as_str())
+                    })
+                    .unwrap_or(false);
                 let cache = rest.models_cache.as_deref().unwrap_or(&[]);
+                let filtered: Vec<usize> = if cache_matches {
+                    filter_models(cache, &s.model_query)
+                } else {
+                    Vec::new()
+                };
                 match key.code {
                     // Leave search without committing (keeps the existing model).
                     KeyCode::Esc => {
@@ -1332,21 +1464,19 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                         Action::None
                     }
                     KeyCode::Down => {
-                        let n = filter_models(cache, &s.model_query).len();
                         s.model_result_sel =
-                            (s.model_result_sel + 1).min(n.saturating_sub(1));
+                            (s.model_result_sel + 1).min(filtered.len().saturating_sub(1));
                         Action::None
                     }
                     KeyCode::Enter => {
-                        let results = filter_models(cache, &s.model_query);
-                        if !results.is_empty() {
+                        if !filtered.is_empty() {
                             // Pick the highlighted catalogue model.
-                            let sel = s.model_result_sel.min(results.len() - 1);
-                            s.draft_model = cache[results[sel]].id.clone();
+                            let sel = s.model_result_sel.min(filtered.len() - 1);
+                            s.draft_model = cache[filtered[sel]].id.clone();
                         } else {
-                            // No-trap fallback: an empty result set commits the raw
-                            // query as a manual model id (only when non-empty, so a
-                            // bare Enter on an empty box just leaves the model as-is).
+                            // No-trap fallback: an empty / not-yet-fetched result set
+                            // commits the raw query as a manual model id (only when
+                            // non-empty, so a bare Enter just leaves the model as-is).
                             let typed = s.model_query.trim();
                             if !typed.is_empty() {
                                 s.draft_model = typed.to_string();
@@ -1360,11 +1490,17 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                     KeyCode::Backspace => {
                         s.model_query.pop();
                         s.model_result_sel = 0;
+                        if let Some((ep, key)) = omni_conn.as_ref() {
+                            rest.request_catalogue(ep, key);
+                        }
                         Action::None
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         s.model_query.push(c);
                         s.model_result_sel = 0; // new filter → reset the highlight
+                        if let Some((ep, key)) = omni_conn.as_ref() {
+                            rest.request_catalogue(ep, key);
+                        }
                         Action::None
                     }
                     _ => Action::None,
@@ -1430,14 +1566,18 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                             AgentEditField::Provider => {
                                 s.open_provider_picker(&rest.config.providers);
                             }
-                            // Model field on an OpenRouter provider enters the
-                            // omnisearch (editing=true with an empty query shows
-                            // the search box); every other field, plus the Model
-                            // field on a non-OpenRouter provider, is plain text.
+                            // Model field with a resolvable endpoint enters the
+                            // omnisearch (editing=true with an empty query shows the
+                            // search box) and primes its on-demand catalogue fetch;
+                            // every other field, plus the Model field on a blank/
+                            // unresolved endpoint, is plain text.
                             AgentEditField::Model => {
                                 s.model_query = String::new();
                                 s.model_result_sel = 0;
                                 s.editing = true;
+                                if let Some((ep, key)) = omni_conn.as_ref() {
+                                    rest.request_catalogue(ep, key);
+                                }
                             }
                             _ => {
                                 s.editing = true;
@@ -1568,9 +1708,6 @@ fn handle_loading(l: &mut LoadingState, key: KeyEvent) -> Action {
             // wrong if anything reads it). Workspace is included so nothing dangles.
             if matches!(l.workspace, WarmStatus::Running) {
                 l.workspace = WarmStatus::Skipped;
-            }
-            if matches!(l.catalogue, WarmStatus::Running) {
-                l.catalogue = WarmStatus::Skipped;
             }
             if matches!(l.awareness, WarmStatus::Running) {
                 l.awareness = WarmStatus::Skipped;

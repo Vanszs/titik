@@ -77,24 +77,34 @@ pub enum StreamEvent {
     },
 }
 
-/// A single event on the startup-warming channel. The non-blocking `warm_session`
-/// refactor spawns the catalogue + awareness fetches as background tasks and
-/// shows an animated [`crate::app::mode::Mode::Loading`] splash; each task sends
-/// one of these when it resolves, and the event loop folds it into both
-/// `AppStateRest` (the cache / summary — always) and the live `LoadingState`
-/// (the step marker — only while still Loading). Lives on its own channel
-/// (`AppStateRest::warm_rx`), independent of streaming, mirroring `endpoints_rx`.
+/// A single event on the warming channel. It carries two unrelated kinds of
+/// background result that share one channel (`AppStateRest::warm_rx`):
+///
+/// - the project-awareness summary, spawned by the non-blocking `warm_session`
+///   on a returning-into-Chat session (and folded into `awareness_summary`,
+///   advancing the `LoadingState` splash while still in `Mode::Loading`); and
+/// - the ON-DEMAND, PER-ENDPOINT model catalogue, spawned by the debounced
+///   omnisearch fetch in the event-loop tick. Each catalogue event carries the
+///   `endpoint` it was fetched for so the drain can key `models_cache` to it (and
+///   ignore a stale endpoint's result).
 // The shared `Warm` prefix is intentional: it reads clearly at the call/drain
 // site (`WarmEvent::WarmCatalogue`) and matches the dedicated-channel naming.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum WarmEvent {
-    /// The model catalogue fetch succeeded; carries the fetched models. Folded
-    /// into `models_cache` so the short-send threshold gate has a context window.
-    WarmCatalogue(Vec<crate::dto::openrouter::ModelInfo>),
-    /// The model catalogue fetch failed (network / non-routable Main). The cache
-    /// stays `None` (treated as "window unknown") and the step marker shows failed.
-    WarmCatalogueFailed,
+    /// The catalogue fetch for `endpoint` succeeded; carries the fetched models.
+    /// The drain sets `models_cache = Some(models)` and
+    /// `models_cache_endpoint = Some(endpoint)`, then clears the in-flight guard.
+    WarmCatalogue {
+        endpoint: String,
+        models: Vec<crate::dto::openrouter::ModelInfo>,
+    },
+    /// The catalogue fetch for `endpoint` failed (network / non-OpenAI provider).
+    /// The drain records a TERMINAL empty result for that endpoint
+    /// (`models_cache = Some(vec![])`, `models_cache_endpoint = Some(endpoint)`)
+    /// so it is NOT retried in a loop; the omnisearch degrades to manual model-id
+    /// entry. The in-flight guard is cleared.
+    WarmCatalogueFailed { endpoint: String },
     /// The project-awareness summary resolved: `Some(text)` on success, `None`
     /// when there were no docs / the call failed. Folded into `awareness_summary`.
     WarmAwareness(Option<String>),

@@ -66,13 +66,21 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Render the settings dashboard for `st` using the given colour `palette`.
 ///
-/// `models_cache` is the cached OpenRouter model catalogue, threaded through so
-/// the Models Select modal's omnisearch can render live results (empty slice
-/// when the catalogue hasn't been fetched).
+/// `models_cache` is the on-demand model catalogue and `cache_endpoint` the
+/// endpoint it was fetched for (`None` = never fetched). The Models Select modal's
+/// omnisearch renders live results only when `cache_endpoint` matches the EDITED
+/// provider's endpoint; otherwise it shows `searching models…` (still fetching) or
+/// `no models — type an id` (fetched empty).
 ///
 /// All colours flow through `palette` — no hardcoded `Color::` values except
 /// the per-accent tint resolved via [`resolve_accent`].
-pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], palette: &Palette) {
+pub fn draw(
+    frame: &mut Frame,
+    st: &SettingsState,
+    models_cache: &[ModelInfo],
+    cache_endpoint: Option<&str>,
+    palette: &Palette,
+) {
     let dark = st.theme == ThemeMode::Dark;
 
     // Outer vertical zones: header | body | footer.
@@ -376,11 +384,11 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], p
             && !st.is_providers_category()
             && !SETTING_CATEGORIES[st.cat].fields.is_empty()
             && SettingsState::is_path_list(st.current_field());
-        // Is the model modal currently in live-omnisearch mode? (Model field,
-        // OpenRouter provider, non-empty query.)
+        // Is the model modal currently in live-omnisearch mode? (Model field, a
+        // provider with a non-empty endpoint, non-empty query.)
         let cur_mf = st.mm_current_field();
         let model_search = cur_mf == Some(crate::app::mode::settings::ModelField::Model)
-            && st.mm_provider_is_openrouter()
+            && st.mm_provider_omnisearchable()
             && st.model_modal.as_ref().map(|m| !m.query.is_empty()).unwrap_or(false);
         let on_route = cur_mf == Some(crate::app::mode::settings::ModelField::Route);
         let on_role  = cur_mf == Some(crate::app::mode::settings::ModelField::Role);
@@ -509,8 +517,18 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], p
 
     // --- Add/edit-model modal overlay (rendered last, over everything) ---
     if let Some(modal) = st.model_modal.as_ref() {
-        let or = st.mm_provider_is_openrouter();
-        draw_model_modal(frame, st, modal, or, models_cache, palette, frame.area());
+        // The Model field is an omnisearch for ANY provider with an endpoint; the
+        // Route field stays OpenRouter-only.
+        let omni = st.mm_provider_omnisearchable();
+        let is_or = st.mm_provider_is_openrouter();
+        // Does the cache hold THIS provider's catalogue? (endpoint match)
+        let cache_matches = st
+            .mm_provider_conn()
+            .map(|(ep, _)| cache_endpoint == Some(ep.as_str()))
+            .unwrap_or(false);
+        draw_model_modal(
+            frame, st, modal, omni, is_or, cache_matches, models_cache, palette, frame.area(),
+        );
 
         // Role checkbox picker overlay: a modal-on-modal, drawn LAST so it floats
         // over the model modal it belongs to.
@@ -946,15 +964,23 @@ fn draw_models(
 ///
 /// Mirrors [`draw_provider_modal`] (backdrop dim + `Clear` + bordered accent
 /// box), but is taller because the Model field hosts a live omnisearch results
-/// list when the chosen provider is OpenRouter. `or` is
-/// `st.mm_provider_is_openrouter()` (passed in so the borrow isn't recomputed),
-/// and `cache` is the model catalogue used to render the results list.
+/// list whenever the chosen provider has an endpoint to search.
+///
+/// - `omni` = `st.mm_provider_omnisearchable()` — the Model field is the live
+///   omnisearch (any provider with a non-empty endpoint), not a plain text box.
+/// - `is_or` = `st.mm_provider_is_openrouter()` — gates the Route upstream-pin
+///   section (OpenRouter-only).
+/// - `cache_matches` — whether `cache` was fetched for THIS provider's endpoint.
+///   When false the results area shows `searching models…` (still fetching);
+///   when true but the filter is empty it shows `no models — type an id`.
 #[allow(clippy::too_many_arguments)]
 fn draw_model_modal(
     frame: &mut Frame,
     st: &SettingsState,
     modal: &ModelModal,
-    or: bool,
+    omni: bool,
+    is_or: bool,
+    cache_matches: bool,
     cache: &[ModelInfo],
     palette: &Palette,
     area: Rect,
@@ -1050,13 +1076,13 @@ fn draw_model_modal(
     }
 
     // Row(s): Model.
-    // OpenRouter layout:
+    // Omnisearch layout (any provider with an endpoint):
     //   1. Read-only selected model readout  (label "Model" + model_id / dim placeholder, NO cursor)
     //   2. Search input line                 (indented to value column; query text + cursor when focused)
     //   3. Gray ─ bottom rule                (dim, spans value column width)
-    //   4. Results dropdown                  (when query is non-empty)
-    //   5. Route label + selectable options  (when query is empty + a model is selected)
-    // Non-OpenRouter layout:
+    //   4. Results dropdown / state          (when query is non-empty: searching / results / no models)
+    //   5. Route label + selectable options  (OpenRouter only, when query is empty + a model is selected)
+    // Plain (blank-endpoint) layout:
     //   1. Plain editable model id           (label "Model" + model_id text + cursor when focused)
     //   2. Gray ─ bottom rule
     {
@@ -1064,7 +1090,7 @@ fn draw_model_modal(
         let lc = if active { palette.accent } else { palette.dim };
         let label = Span::styled(format!("{:<width$}", "Model", width = label_w), Style::default().fg(lc));
 
-        if or {
+        if omni {
             // --- 1. Selected model readout (read-only, no cursor ever) ---
             if modal.model_id.is_empty() {
                 lines.push(Line::from(vec![
@@ -1104,13 +1130,27 @@ fn draw_model_modal(
                 ]));
             }
 
-            // --- 4. Results dropdown (only when query is non-empty) ---
+            // --- 4. Results dropdown / fetch-state (only when query is non-empty) ---
+            // The catalogue is fetched on demand for this provider's endpoint.
+            // Until the cache holds THIS endpoint (`cache_matches`), show a dim
+            // `searching models…`. Once it does: the dropdown, or a dim
+            // `no models — type an id` when the (terminal) catalogue is empty / the
+            // query matches nothing (the raw-query fallback still lets Enter commit).
             if !modal.query.is_empty() {
                 const MAX_VIS: usize = 8;
-                let results = filter_models(cache, &modal.query);
-                if results.is_empty() {
+                let results = if cache_matches {
+                    filter_models(cache, &modal.query)
+                } else {
+                    Vec::new()
+                };
+                if !cache_matches {
                     lines.push(Line::from(Span::styled(
-                        "  (no matching models)",
+                        "  searching models\u{2026}",
+                        Style::default().fg(palette.dim),
+                    )));
+                } else if results.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  no models \u{2014} type an id",
                         Style::default().fg(palette.dim),
                     )));
                 } else {
@@ -1155,12 +1195,13 @@ fn draw_model_modal(
                 }
             }
 
-            // --- 5. Route field: label row + selectable options list (shown when
-            //        the search query is empty so it never stacks under the
-            //        results dropdown — the two are mutually exclusive). The
-            //        Route field only exists once a model is selected; until then
-            //        the same area shows loading / hint states. ---
-            if modal.query.is_empty() {
+            // --- 5. Route field: label row + selectable options list (OpenRouter
+            //        only — the upstream-pin list is OpenRouter-specific). Shown when
+            //        the search query is empty so it never stacks under the results
+            //        dropdown (the two are mutually exclusive). The Route field only
+            //        exists once a model is selected; until then the same area shows
+            //        loading / hint states. ---
+            if is_or && modal.query.is_empty() {
                 let row_w = inner.width as usize;
                 let route_active = focused(ModelField::Route);
 

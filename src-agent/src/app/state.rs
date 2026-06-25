@@ -87,6 +87,24 @@ pub struct TranscriptCache {
     pub blocks: Vec<Vec<Line<'static>>>,
 }
 
+/// A debounced, pending model-catalogue (`GET {endpoint}/models`) fetch.
+///
+/// Created/refreshed by [`AppStateRest::request_catalogue`] on each omnisearch
+/// keystroke or provider change. `due` is pushed ~300 ms into the future every
+/// time the same request is re-issued, so a burst of typing collapses into a
+/// single fetch fired once the user pauses. The event-loop tick reads `due`; when
+/// `now >= due` (and nothing is already in flight) it takes this and spawns the
+/// fetch against `endpoint`/`api_key`.
+#[derive(Debug, Clone)]
+pub struct CataloguePending {
+    /// The endpoint to fetch `/models` from.
+    pub endpoint: String,
+    /// Bearer token for that endpoint (may be empty for a keyless catalogue).
+    pub api_key: String,
+    /// Earliest instant the fetch may fire (debounce gate).
+    pub due: std::time::Instant,
+}
+
 pub struct AppStateRest {
     pub session: Option<Session>,
     /// Saved (session) before a /new or reconfigure prompt; restored on cancel.
@@ -214,24 +232,41 @@ pub struct AppStateRest {
     /// [`StreamEvent::EndpointsError`]. Drained in `run_loop` independently of
     /// streaming. `None` when no endpoints fetch is in flight.
     pub endpoints_rx: Option<UnboundedReceiver<StreamEvent>>,
-    /// Receiver for the startup-warming background tasks. Opened by the
-    /// non-blocking `runtime::warm_session` when a returning-into-Chat session has
-    /// warm work to do; the spawned tasks send [`WarmEvent`]s (catalogue result +
-    /// awareness summary) which the event loop folds into `models_cache` /
-    /// `awareness_summary` (always) and the live `LoadingState` step markers (only
-    /// while still in `Mode::Loading`). Drained in `run_loop` independently of
-    /// streaming, mirroring `endpoints_rx`. `None` when no warm work is in flight.
+    /// Receiver for warming background tasks. Carries TWO kinds of [`WarmEvent`]:
+    /// the startup project-awareness summary (opened by `runtime::warm_session` for
+    /// a returning-into-Chat session, folded into `awareness_summary` and advancing
+    /// the `LoadingState` splash), and the ON-DEMAND, per-endpoint model catalogue
+    /// (opened by the debounced omnisearch fetch in the event-loop tick, folded into
+    /// `models_cache` + `models_cache_endpoint`). Drained in `run_loop` independently
+    /// of streaming, mirroring `endpoints_rx`. `None` when nothing is in flight.
     pub warm_rx: Option<UnboundedReceiver<WarmEvent>>,
     /// Reason the tool-call classifier (TAC) flagged the currently-paused call,
     /// shown in the approval overlay so the user sees WHY approval is asked.
     /// `None` for an approval that wasn't classifier-driven. Cleared when the
     /// approval resolves.
     pub approval_reason: Option<String>,
-    /// Cached OpenRouter model catalogue (`GET /models`), fetched lazily the
-    /// first time `/effort` opens and reused on subsequent opens so the menu
-    /// doesn't refetch. `None` until the first successful fetch; a failed fetch
-    /// leaves it `None` (the picker falls back to a generic option set).
+    /// Cached model catalogue (`GET {endpoint}/models`) for ONE endpoint at a
+    /// time — the endpoint recorded in `models_cache_endpoint`. Fetched ON DEMAND
+    /// (debounced) by the model omnisearch for whichever provider is being edited,
+    /// not at boot. `Some(vec![])` is a TERMINAL "no models / fetch failed" state
+    /// for that endpoint (degrade to manual model-id entry), distinct from `None`
+    /// = "never fetched". Re-fetched when the active omnisearch endpoint differs
+    /// from `models_cache_endpoint`.
     pub models_cache: Option<Vec<crate::dto::openrouter::ModelInfo>>,
+    /// Which endpoint `models_cache` currently holds models for (`None` when the
+    /// cache has never been populated). The omnisearch only filters against
+    /// `models_cache` while this equals the active provider's endpoint; otherwise
+    /// it shows `searching models…` and (re)requests a fetch.
+    pub models_cache_endpoint: Option<String>,
+    /// A debounced catalogue fetch waiting to fire (see [`CataloguePending`]).
+    /// Set/refreshed by [`AppStateRest::request_catalogue`]; consumed by the
+    /// event-loop tick once `due` passes. `None` when no fetch is pending.
+    pub catalogue_pending: Option<CataloguePending>,
+    /// The endpoint of a catalogue fetch currently IN FLIGHT (in-flight guard so
+    /// the same endpoint isn't fetched twice concurrently). Set when the tick
+    /// spawns the fetch; cleared by the `warm_rx` drain when the result lands.
+    /// `None` when nothing is being fetched.
+    pub catalogue_fetching: Option<String>,
     /// Start instant of the `/compact` animation. `Some` only while a compaction
     /// is in flight (set in `Command::Compact`, cleared once the result is
     /// applied). The renderer uses it to draw the spinner + elapsed + indeterminate
@@ -340,6 +375,9 @@ impl AppStateRest {
             warm_rx: None,
             approval_reason: None,
             models_cache: None,
+            models_cache_endpoint: None,
+            catalogue_pending: None,
+            catalogue_fetching: None,
             compact_anim_start: None,
             compact_apply_at: None,
             compact_pending: None,
@@ -582,6 +620,39 @@ impl AppStateRest {
         self.last_key = Some(key.to_string());
         self.last_model = Some(model.to_string());
         self.last_provider = Some(provider.to_string());
+    }
+
+    /// Request the model catalogue for `endpoint` (debounced).
+    ///
+    /// The model omnisearch calls this on every query keystroke / provider change
+    /// / field focus for whatever provider is being edited. It is cheap and
+    /// idempotent:
+    /// - empty `endpoint` → no-op (nothing to fetch against);
+    /// - the cache already holds this endpoint (`models_cache_endpoint` matches,
+    ///   including the terminal empty-result state) → no-op (filter locally);
+    /// - a fetch for this endpoint is already in flight → no-op (don't double-fire);
+    /// - otherwise (re)arm a pending fetch ~300 ms out. Calling it again on the
+    ///   next keystroke pushes `due` forward, collapsing a typing burst into one
+    ///   request fired only once the user pauses.
+    ///
+    /// The event-loop tick fires the pending fetch once `due` passes; the result
+    /// lands via the `warm_rx` drain, which sets `models_cache` +
+    /// `models_cache_endpoint` and clears `catalogue_fetching`.
+    pub fn request_catalogue(&mut self, endpoint: &str, api_key: &str) {
+        if endpoint.is_empty() {
+            return;
+        }
+        if self.models_cache_endpoint.as_deref() == Some(endpoint) {
+            return; // already have this endpoint's catalogue (or terminal empty)
+        }
+        if self.catalogue_fetching.as_deref() == Some(endpoint) {
+            return; // already fetching this endpoint
+        }
+        self.catalogue_pending = Some(CataloguePending {
+            endpoint: endpoint.to_string(),
+            api_key: api_key.to_string(),
+            due: std::time::Instant::now() + std::time::Duration::from_millis(300),
+        });
     }
 
     /// Show an error toast (red box) for ~6 seconds.

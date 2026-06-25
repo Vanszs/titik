@@ -34,7 +34,7 @@ use crate::app::resolve::resolve_role;
 use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::model::app_config::ModelRole;
-use crate::model::{app_config::AppConfig, catalogue, settings::Settings, store};
+use crate::model::{app_config::AppConfig, settings::Settings, store};
 use crate::service::openrouter::OpenRouterClient;
 use crate::service::WarmEvent;
 
@@ -67,23 +67,24 @@ pub(super) fn reconcile_session_lock(state: &mut AppState) {
 
 /// Warm a newly-activated session to match a cold terminal launch: kick off a
 /// background reindex of its workspace and (best-effort) compute the project
-/// awareness summary + prefetch the model catalogue. Safe to call whenever a
-/// session becomes the active one (startup, /new, picker-select, creds-confirm).
-/// No-op if no session.
+/// awareness summary. Safe to call whenever a session becomes the active one
+/// (startup, /new, picker-select, creds-confirm). No-op if no session.
 ///
-/// NON-BLOCKING: the network work (catalogue + awareness) used to run via
-/// `handle.block_on` on the UI thread BEFORE the event loop started, so a slow
-/// network froze the app on a black screen. It is now SPAWNED as background tasks
-/// (mirroring the endpoints fetch), and — when there is warm work to do — this
-/// switches the app into [`Mode::Loading`], an animated splash the event loop
-/// renders while the tasks run. Each task sends a [`WarmEvent`] on `warm_rx`,
-/// drained in `run_loop` to populate the cache/summary and advance the splash;
-/// once the catalogue + awareness steps are terminal the loop enters Chat. This
-/// function returns immediately (it only spawns), so startup never blocks.
+/// NON-BLOCKING: the awareness network call used to run via `handle.block_on` on
+/// the UI thread BEFORE the event loop started, so a slow network froze the app on
+/// a black screen. It is now SPAWNED as a background task (mirroring the endpoints
+/// fetch), and — when there is awareness work to do — this switches the app into
+/// [`Mode::Loading`], an animated splash the event loop renders while the task
+/// runs. The task sends a [`WarmEvent::WarmAwareness`] on `warm_rx`, drained in
+/// `run_loop` to populate the summary and advance the splash; once the awareness
+/// step is terminal the loop enters Chat. This function returns immediately (it
+/// only spawns), so startup never blocks.
 ///
-/// When there is NO warm work (no client, or the catalogue is already cached AND
-/// awareness is disabled), the mode is left as-is (Chat) so the no-work case
-/// behaves exactly as before — no splash flash.
+/// The model catalogue is NO LONGER fetched here: it loads ON DEMAND, per
+/// endpoint, the first time a model omnisearch needs it (see
+/// `AppStateRest::request_catalogue` + the debounced tick in `event_loop`). So
+/// when awareness is disabled or unroutable, there is no warm work and the mode is
+/// left as-is (Chat) — no splash flash.
 pub(super) fn warm_session(
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
@@ -96,7 +97,7 @@ pub(super) fn warm_session(
     reconcile_session_lock(state);
     // Snapshot what we need, dropping the session borrow before mutating
     // `state.mode` / `state.rest`. `config` is cloned so the role resolution
-    // below doesn't borrow `state` across the spawns.
+    // below doesn't borrow `state` across the spawn.
     let (workdir, settings, workdirs) = match state.rest.session.as_ref() {
         Some(s) => (s.workdir(), s.settings.clone(), s.workdirs()),
         None => return,
@@ -106,21 +107,11 @@ pub(super) fn warm_session(
     // independent of whether we show the loading splash.
     crate::tool::dircache::reindex(workdirs, state.rest.dir_cache.clone());
 
-    // Decide the warm work. The catalogue is wanted only when not already cached;
-    // awareness only when the setting is on. Both need a client AND a routable
-    // resolved route (an Anthropic-typed provider can't be dispatched by the
-    // OpenAI-compatible client — native Anthropic is deferred). "wanted but not
-    // routable" becomes a Skipped step (no task spawned) rather than a hang.
-    let want_catalogue = state.rest.models_cache.is_none();
+    // Decide the warm work. Awareness runs only when the setting is on. It needs a
+    // client AND a routable resolved route (an Anthropic-typed provider can't be
+    // dispatched by the OpenAI-compatible client — native Anthropic is deferred).
+    // "wanted but not routable" becomes a Skipped step (no task spawned).
     let want_awareness = settings.awareness_enabled;
-    // Resolve up front so we know routability before building the LoadingState.
-    let main_route = client.as_ref().and_then(|_| {
-        if want_catalogue {
-            resolve_role(&config, &settings, ModelRole::Main).filter(|r| r.is_routable())
-        } else {
-            None
-        }
-    });
     let aware_route = client.as_ref().and_then(|_| {
         if want_awareness {
             resolve_role(&config, &settings, ModelRole::Awareness).filter(|r| r.is_routable())
@@ -129,130 +120,24 @@ pub(super) fn warm_session(
         }
     });
 
-    // Check the disk cache before deciding whether to spawn a network task.
-    // This is a synchronous local-file read — fine on the startup path.
-    // Three outcomes for the catalogue:
-    //   - `Some((models, fresh))` where `fresh` is true  → use cached, no network task
-    //   - `Some((models, fresh))` where `fresh` is false → use cached immediately,
-    //                                                       still spawn a background refresh
-    //   - `None`                                          → no cache; spawn fetch as before
-    enum CatalogueDecision {
-        /// Already loaded from disk (may still spawn a background refresh if stale).
-        FromDisk { models: Vec<crate::dto::openrouter::ModelInfo>, is_fresh: bool },
-        /// Need a network fetch (no usable cache).
-        FetchNeeded,
-        /// Not needed or unroutable — no action.
-        Skip,
-    }
-    let catalogue_decision = if want_catalogue {
-        if let Some(route) = main_route.as_ref() {
-            let endpoint = route.endpoint.clone();
-            match catalogue::load(&endpoint) {
-                Some((models, age)) => {
-                    let fresh = catalogue::is_fresh(age);
-                    CatalogueDecision::FromDisk { models, is_fresh: fresh }
-                }
-                None => CatalogueDecision::FetchNeeded,
-            }
-        } else {
-            // Wanted but unroutable → skip (no network, no disk load possible).
-            CatalogueDecision::Skip
-        }
-    } else {
-        CatalogueDecision::Skip
-    };
-
-    // For fresh-from-disk, populate the in-memory cache RIGHT NOW (synchronously)
-    // so the cache is available before the splash even starts.
-    let catalogue_prefilled = match &catalogue_decision {
-        CatalogueDecision::FromDisk { models, .. } => {
-            let n = models.len();
-            state.rest.models_cache = Some(models.clone());
-            Some(n)
-        }
-        _ => None,
-    };
-
-    // Determine whether we need to spawn a catalogue network task.
-    // - FetchNeeded: spawn a full fetch task.
-    // - FromDisk { is_fresh: false }: spawn a background refresh (stale cache).
-    // - FromDisk { is_fresh: true } or Skip: no network task.
-    let need_catalogue_task = matches!(
-        &catalogue_decision,
-        CatalogueDecision::FetchNeeded
-            | CatalogueDecision::FromDisk { is_fresh: false, .. }
-    );
-
-    // Is there any actual network warm work to run? (A spawnable catalogue or
-    // awareness task.) If not — no client, catalogue cached (fresh), awareness
-    // disabled or unroutable — do NOT enter the loading splash; leave the mode
-    // as-is so this path behaves exactly as before for the no-work case.
-    let has_network_work = (need_catalogue_task && main_route.is_some()) || aware_route.is_some();
-    if !has_network_work && catalogue_prefilled.is_none() {
-        // Nothing to do at all.
-        return;
-    }
-    if !has_network_work && catalogue_prefilled.is_some() {
-        // Loaded fresh from disk, awareness not needed — skip the splash entirely.
+    // No awareness task to spawn → no splash; leave the mode as-is (Chat) so the
+    // no-work case behaves exactly as before (no splash flash).
+    if aware_route.is_none() {
         return;
     }
 
-    // Build the per-step status for the splash.
-    // When data was loaded from disk (fresh or stale), the catalogue step starts
-    // as Done immediately — the user already has data and we just refresh in
-    // the background. Otherwise Running (network fetch pending) or Skipped.
-    let catalogue_status = if let Some(n) = catalogue_prefilled {
-        // Loaded from disk: already terminal — Done with a "(cached)" note.
-        WarmStatus::Done(format!("{n} models (cached)"))
-    } else if need_catalogue_task && main_route.is_some() {
-        WarmStatus::Running
-    } else if want_catalogue {
-        WarmStatus::Skipped // wanted but no routable Main route
-    } else {
-        WarmStatus::Pending // already cached → nothing to do
-    };
-    let awareness = if aware_route.is_some() {
-        WarmStatus::Running
-    } else if want_awareness {
-        WarmStatus::Skipped // enabled but no routable Awareness route
-    } else {
-        WarmStatus::Pending // awareness disabled
-    };
     state.mode = Mode::Loading(LoadingState {
         started: std::time::Instant::now(),
         frame: 0,
         workspace: WarmStatus::Running,
-        catalogue: catalogue_status,
-        awareness,
+        awareness: WarmStatus::Running,
     });
 
-    // One channel for both warm tasks; the receiver lives in state and is drained
-    // in run_loop. Dropping it (e.g. app close) makes the sends no-ops, same
-    // contract as the streaming / endpoints channels.
+    // One channel for the warm task; the receiver lives in state and is drained in
+    // run_loop. Dropping it (e.g. app close) makes the sends no-ops, same contract
+    // as the streaming / endpoints channels.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     state.rest.warm_rx = Some(rx);
-
-    // Catalogue task: fetch the model catalogue (fresh fetch or background
-    // refresh). On success, save to disk AND send WarmCatalogue so the in-memory
-    // cache is updated. Move the owned route in; never borrows `state`.
-    if need_catalogue_task {
-        if let (Some(c), Some(route)) = (client.as_ref(), main_route) {
-            let c = Arc::clone(c);
-            let tx = tx.clone();
-            let endpoint = route.endpoint.clone();
-            handle.spawn(async move {
-                let ev = match c.list_models(route.conn()).await {
-                    Ok(models) => {
-                        // Persist the fresh catalogue to disk (best-effort).
-                        catalogue::save(&endpoint, &models);
-                        WarmEvent::WarmCatalogue(models)
-                    }
-                    Err(_) => WarmEvent::WarmCatalogueFailed,
-                };
-                let _ = tx.send(ev);
-            });
-        }
-    }
 
     // Awareness task: read the depth-1 docs + summarize on the resolved Awareness
     // route. Move the owned route + the cloned settings/workdir in; `summarize`
@@ -260,7 +145,6 @@ pub(super) fn warm_session(
     // appropriate terminal step.
     if let (Some(c), Some(route)) = (client.as_ref(), aware_route) {
         let c = Arc::clone(c);
-        let tx = tx.clone();
         handle.spawn(async move {
             let summary = crate::app::awareness::summarize(
                 &c,
@@ -274,10 +158,6 @@ pub(super) fn warm_session(
             let _ = tx.send(WarmEvent::WarmAwareness(summary));
         });
     }
-    // Drop the original sender so the channel closes once both task clones finish
-    // (the drain treats a closed channel as "no more events"). Tasks that weren't
-    // spawned simply never held a clone.
-    drop(tx);
 }
 
 /// Build a fresh per-session client.

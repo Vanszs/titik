@@ -786,12 +786,39 @@ impl SettingsState {
     /// `true` when the modal's selected provider is an OpenRouter endpoint
     /// (its [`ProviderDraft::endpoint`], lowercased, contains `"openrouter"`).
     /// `false` when no modal is open or the provider index is out of range.
+    ///
+    /// This now gates ONLY the Route field (the upstream-pin list is an
+    /// OpenRouter-only feature). The MODEL field's omnisearch is gated by
+    /// [`Self::mm_provider_omnisearchable`] instead — the catalogue is just
+    /// `GET {endpoint}/models`, available for ANY non-empty endpoint.
     pub fn mm_provider_is_openrouter(&self) -> bool {
         self.model_modal
             .as_ref()
             .and_then(|m| self.providers.get(m.provider_idx))
             .map(|p| p.endpoint.to_lowercase().contains("openrouter"))
             .unwrap_or(false)
+    }
+
+    /// `true` when the modal's selected provider has a non-empty endpoint, so its
+    /// `/models` catalogue can be fetched and the Model field becomes a live
+    /// omnisearch. `false` when no modal is open, the index is out of range, or the
+    /// provider's endpoint is blank (then the Model field is a plain text box).
+    pub fn mm_provider_omnisearchable(&self) -> bool {
+        self.model_modal
+            .as_ref()
+            .and_then(|m| self.providers.get(m.provider_idx))
+            .map(|p| !p.endpoint.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// The edited provider's `(endpoint, api_key)` for the on-demand catalogue
+    /// fetch, or `None` when no modal is open / the provider index is out of range.
+    /// The input handler hands these to `AppStateRest::request_catalogue`.
+    pub fn mm_provider_conn(&self) -> Option<(String, String)> {
+        self.model_modal
+            .as_ref()
+            .and_then(|m| self.providers.get(m.provider_idx))
+            .map(|p| (p.endpoint.clone(), p.api_key.clone()))
     }
 
     /// `true` when the modal's selected provider can serve the per-model
@@ -1066,10 +1093,10 @@ impl SettingsState {
     }
 
     /// Append `c` to the active model-modal text field: Name → name; Model → the
-    /// omnisearch query when the provider is OpenRouter, else the raw model id.
-    /// The Route/Role/button fields ignore typed chars.
+    /// omnisearch query when the provider has a (non-empty) endpoint to search,
+    /// else the raw model id. The Route/Role/button fields ignore typed chars.
     pub fn mm_push_char(&mut self, c: char) {
-        let or = self.mm_provider_is_openrouter();
+        let or = self.mm_provider_omnisearchable();
         match self.mm_current_field() {
             Some(ModelField::Name) => {
                 if let Some(m) = self.model_modal.as_mut() {
@@ -1093,7 +1120,7 @@ impl SettingsState {
     /// Delete the last char of the active model-modal text field (mirrors
     /// [`Self::mm_push_char`]).
     pub fn mm_backspace(&mut self) {
-        let or = self.mm_provider_is_openrouter();
+        let or = self.mm_provider_omnisearchable();
         match self.mm_current_field() {
             Some(ModelField::Name) => {
                 if let Some(m) = self.model_modal.as_mut() {
@@ -1134,6 +1161,22 @@ impl SettingsState {
             m.endpoints = None;
             m.endpoints_loading = true;
             m.endpoints_for = Some(model_id);
+        }
+    }
+
+    /// Commit a chosen `model_id` from the omnisearch WITHOUT arming the
+    /// provider-endpoints machinery. Used when the edited provider is NOT
+    /// OpenRouter: those providers have no upstream-route list (the Route field is
+    /// hidden), so the endpoints flags must stay untouched rather than leaving a
+    /// hidden "loading routes…" state stuck on. Clears the query/route, same as
+    /// [`Self::mm_select_model`] minus the `endpoints*` writes.
+    pub fn mm_set_model_simple(&mut self, model_id: String) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.model_id = model_id;
+            m.query.clear();
+            m.result_sel = 0;
+            m.route = None;
+            m.route_sel = 0;
         }
     }
 

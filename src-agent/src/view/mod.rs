@@ -35,26 +35,25 @@ use crate::app::state::AppState;
 /// colour decisions flow through a single source of truth.
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let palette = theme::palette(&state.rest.config);
+    // The catalogue is now per-endpoint and fetched on demand: pass BOTH the
+    // cached models and the endpoint they were fetched for, so each omnisearch view
+    // can tell "this is my provider's catalogue" (filter locally) from "still
+    // fetching / stale" (show `searching models…`) and "fetched but empty"
+    // (`no models — type an id`).
+    let cache = state.rest.models_cache.as_deref().unwrap_or(&[]);
+    let cache_endpoint = state.rest.models_cache_endpoint.as_deref();
     match &state.mode {
         Mode::Chat => chat::draw(frame, &state.rest, &palette),
-        Mode::KeyInput(form) => key_input::draw(
-            frame,
-            form,
-            state.rest.models_cache.as_deref().unwrap_or(&[]),
-            &palette,
-        ),
+        Mode::KeyInput(form) => key_input::draw(frame, form, cache, cache_endpoint, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
-        Mode::Settings(s) => settings::draw(
-            frame,
-            s,
-            state.rest.models_cache.as_deref().unwrap_or(&[]),
-            &palette,
-        ),
+        Mode::Settings(s) => settings::draw(frame, s, cache, cache_endpoint, &palette),
         Mode::Agents(a) => agents::draw(
             frame,
             a,
             &state.rest.config,
-            state.rest.models_cache.as_deref().unwrap_or(&[]),
+            state.rest.session.as_ref().map(|s| &s.settings),
+            cache,
+            cache_endpoint,
             &palette,
         ),
         Mode::Effort(e) => effort::draw(frame, e, &palette),

@@ -10,7 +10,7 @@ use crate::app::state::AppState;
 use crate::config::DEFAULT_MODEL;
 use crate::controller::command::Command;
 use crate::dto::chat::{ChatMessage, Role};
-use crate::model::{catalogue, store};
+use crate::model::store;
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 
 use super::stream::abort_current;
@@ -206,14 +206,16 @@ pub(super) fn apply_slash(
         }
 
         Command::Effort => {
-            // Needs an active session + client (the menu is per-model and a fetch
-            // uses the client). Blocked while a request is in flight, mirroring
-            // the /settings + /compact guards.
+            // Needs an active session + client (the menu is per-model and the
+            // catalogue fetch uses the client). Blocked while a request is in flight,
+            // mirroring the /settings + /compact guards.
             if state.rest.waiting {
                 state.rest.status = "busy — wait for response".into();
                 return Ok(());
             }
-            let (Some(c), Some(settings)) = (
+            // `_c` only gates "is there a usable client?"; the catalogue is now
+            // fetched on demand by the debounced tick, not here.
+            let (Some(_c), Some(settings)) = (
                 client.as_ref(),
                 state.rest.session.as_ref().map(|s| s.settings.clone()),
             ) else {
@@ -221,44 +223,35 @@ pub(super) fn apply_slash(
                 return Ok(());
             };
             let model = settings.model.clone();
-            // Resolve the MAIN role for the catalogue fetch (the catalogue is keyed
-            // to the chat endpoint). Snapshot the route into an owned local BEFORE
-            // the `block_on` + cache write so neither borrows `state.rest`.
+            // Resolve the MAIN role (the effort menu is per the chat model, served
+            // by the Main endpoint). Snapshot the route into an owned local so it
+            // doesn't borrow `state.rest` across the mutation below.
             let main = crate::app::resolve::resolve_role(
                 &state.rest.config,
                 &settings,
                 crate::model::app_config::ModelRole::Main,
             );
 
-            // Fetch the model catalogue once and cache it. A network failure
-            // leaves the cache `None`, which the option-build step below treats
-            // as "capabilities unknown" and falls back to a generic menu.
-            // Try the disk cache first; only hit the network when absent or stale.
-            if state.rest.models_cache.is_none() {
-                if let Some(r) = main.as_ref() {
-                    // Check disk cache before network (best-effort, sync read).
-                    let disk = catalogue::load(&r.endpoint);
-                    match disk {
-                        Some((models, age)) if catalogue::is_fresh(age) => {
-                            // Fresh on disk — use it, skip the network call.
-                            state.rest.models_cache = Some(models);
-                        }
-                        other => {
-                            // Stale or absent: try the network.
-                            if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
-                                catalogue::save(&r.endpoint, &models);
-                                state.rest.models_cache = Some(models);
-                            } else if let Some((models, _)) = other {
-                                // Network failed but we have stale data — use it.
-                                state.rest.models_cache = Some(models);
-                            }
-                        }
-                    }
-                }
+            // The catalogue is fetched ON DEMAND now (no boot/disk cache, no
+            // block_on). Arm a debounced fetch for the Main endpoint so a SUBSEQUENT
+            // `/effort` open has capabilities; this open uses whatever `models_cache`
+            // already holds FOR THE MAIN ENDPOINT, else falls back to the generic
+            // menu. `request_catalogue` no-ops when the cache already covers it.
+            if let Some(r) = main.as_ref() {
+                state.rest.request_catalogue(&r.endpoint, &r.api_key);
             }
+            // Only trust `models_cache` when it was fetched for the Main endpoint;
+            // a cache for some OTHER provider's endpoint must not drive THIS model's
+            // capability menu.
+            let cache_for_main = main
+                .as_ref()
+                .map(|r| state.rest.models_cache_endpoint.as_deref() == Some(r.endpoint.as_str()))
+                .unwrap_or(false);
 
             // Build the option list + capability note from the (cached) catalogue.
-            let (options, note) = if let Some(models) = state.rest.models_cache.as_ref() {
+            let (options, note) = if let Some(models) =
+                state.rest.models_cache.as_ref().filter(|_| cache_for_main)
+            {
                 let caps = crate::service::openrouter::effort_caps(models, &model);
                 match build_effort_options(&caps) {
                     Some(opts) => {
@@ -319,44 +312,11 @@ pub(super) fn apply_slash(
                 state.rest.status = "busy — wait for response".into();
                 return Ok(());
             }
-            // Warm the model catalogue so the Models Select omnisearch has data
-            // (best-effort; a network failure leaves the cache None and the modal
-            // simply shows no results). Mirrors the /effort prefetch. Resolved
-            // against the MAIN role (the catalogue is keyed to the chat endpoint).
-            // Must run before the immutable `session` borrow below, as it mutates
-            // rest. Snapshot the Main route into an owned local first so neither the
-            // `block_on` nor the cache write borrows `state.rest`.
-            if state.rest.models_cache.is_none() {
-                if let Some(c) = client.as_ref() {
-                    let main = state.rest.session.as_ref().and_then(|s| {
-                        crate::app::resolve::resolve_role(
-                            &state.rest.config,
-                            &s.settings,
-                            crate::model::app_config::ModelRole::Main,
-                        )
-                    });
-                    if let Some(r) = main.as_ref() {
-                        // Check disk cache before network (best-effort, sync read).
-                        let disk = catalogue::load(&r.endpoint);
-                        match disk {
-                            Some((models, age)) if catalogue::is_fresh(age) => {
-                                // Fresh on disk — use it, skip the network call.
-                                state.rest.models_cache = Some(models);
-                            }
-                            other => {
-                                // Stale or absent: try the network.
-                                if let Ok(models) = handle.block_on(c.list_models(r.conn())) {
-                                    catalogue::save(&r.endpoint, &models);
-                                    state.rest.models_cache = Some(models);
-                                } else if let Some((models, _)) = other {
-                                    // Network failed but we have stale data — use it.
-                                    state.rest.models_cache = Some(models);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // No catalogue prefetch here anymore: the Models Select modal's
+            // omnisearch fetches the EDITED provider's `/models` on demand
+            // (debounced) the first time it opens / a key is typed — see
+            // `controller::input::handle_settings`. A boot prefetch keyed to the
+            // Main endpoint was wrong for editing a model on a DIFFERENT provider.
             let Some(session) = state.rest.session.as_ref() else {
                 state.rest.status = "no active session".into();
                 return Ok(());
