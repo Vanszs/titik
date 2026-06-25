@@ -106,13 +106,31 @@ pub(super) fn apply_slash(
             state.rest.compact_anim_start = Some(std::time::Instant::now());
             state.rest.compact_apply_at = None;
             state.rest.compact_pending = None;
+            // Resolve the COMPACTOR role (falls back to Main — compaction rides the
+            // main route today) into an owned `Resolved` BEFORE the spawn, so the
+            // moved-into-task value carries no borrow of `state.rest`. Compactor
+            // always resolves (Main legacy fallback), but guard defensively.
+            let route = state.rest.session.as_ref().and_then(|s| {
+                crate::app::resolve::resolve_role(
+                    &state.rest.config,
+                    &s.settings,
+                    crate::model::app_config::ModelRole::Compactor,
+                )
+            });
             // Fresh channel for this request; the receiver lives in state so an
             // interrupt/new just drops it and the task's result is ignored.
             let (tx, rx) = mpsc::unbounded_channel();
             state.rest.active_rx = Some(rx);
             let c = Arc::clone(client.as_ref().unwrap());
             let jh = handle.spawn(async move {
-                let event = match c.complete(req).await {
+                // Compaction sends on the resolved Compactor connection (endpoint +
+                // key) with its model id + upstream-route slug; no effort (the
+                // summary is mechanical).
+                let result = match route {
+                    Some(r) => c.complete(r.conn(), &r.model_id, r.provider(), req).await,
+                    None => Err(anyhow::anyhow!("no active session")),
+                };
+                let event = match result {
                     Ok(s) => StreamEvent::Compacted {
                         summary: s,
                         kept_tail,
@@ -165,7 +183,7 @@ pub(super) fn apply_slash(
                     false, // not from picker
                 ));
             } else {
-                *client = Some(super::build_client(&sess));
+                *client = Some(super::build_client());
                 let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
                 // Fresh session → totals are 0; calling is harmless and keeps the

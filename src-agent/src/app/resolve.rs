@@ -60,10 +60,9 @@ pub struct Resolved {
     #[allow(dead_code)]
     pub api_type: ApiType,
     pub route: Option<String>,
-    // Consumed only by the MAIN streaming path, which still reads the client's
-    // baked `self.effort` this stage (the chat path is refactored next stage).
-    // Non-empty only for the Main role; every other role resolves it to "".
-    #[allow(dead_code)]
+    // Consumed by the MAIN streaming path (passed as the `effort` param of
+    // `stream_complete`). Non-empty only for the Main role; every other role
+    // resolves it to "".
     pub effort: String,
 }
 

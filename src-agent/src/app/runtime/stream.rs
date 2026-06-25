@@ -661,17 +661,34 @@ pub(super) fn start_stream_task(
         (sess.path.clone(), sess.settings.clone(), user_intent, aware)
     });
 
+    // Resolve the MAIN role for the actual send: its connection (endpoint + key),
+    // model id, upstream-route slug, and effort. EFFORT ISOLATION: effort flows
+    // ONLY here, into the streaming path. Resolved BEFORE the spawn into an owned
+    // `Resolved` so the moved-into-task value carries no borrow of `state.rest`.
+    // Main always resolves (legacy fallback), but keep it `Option` and treat a
+    // `None` as "no session" below.
+    let main = state.rest.session.as_ref().and_then(|sess| {
+        crate::app::resolve::resolve_role(
+            &state.rest.config,
+            &sess.settings,
+            crate::model::app_config::ModelRole::Main,
+        )
+    });
+
     // 1. Window: the model's context-window size in tokens, from the cached
-    //    catalogue. 128k is a safe fallback (the min-window policy is 100k+).
-    let window = reshape
+    //    catalogue. WINDOW-SIZING FIX: size against the RESOLVED Main model id
+    //    (what we actually send), NOT the legacy `settings.model` — a per-session
+    //    or config Main override must size the short-send window correctly. 128k is
+    //    a safe fallback (the min-window policy is 100k+).
+    let window = main
         .as_ref()
-        .and_then(|(_, settings, _, _)| {
+        .and_then(|m| {
             state
                 .rest
                 .models_cache
                 .as_deref()
                 .and_then(|models| {
-                    crate::service::openrouter::context_length_for(models, &settings.model)
+                    crate::service::openrouter::context_length_for(models, &m.model_id)
                 })
         })
         .unwrap_or(128_000);
@@ -744,7 +761,15 @@ pub(super) fn start_stream_task(
             }
             None => history,
         };
-        let _ = c.stream_complete(history, tx).await;
+        // Send on the resolved MAIN route: its connection (endpoint + key), model
+        // id, upstream-route slug, and effort. The owned `Resolved` was moved into
+        // this task; borrow it for the call. A `None` (no session) can't reach here
+        // — the client only exists when Main resolves — but guard defensively.
+        if let Some(m) = main {
+            let _ = c
+                .stream_complete(m.conn(), &m.model_id, m.provider(), &m.effort, history, tx)
+                .await;
+        }
     });
     state.rest.current_task = Some(jh.abort_handle());
 }

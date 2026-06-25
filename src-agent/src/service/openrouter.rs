@@ -21,15 +21,15 @@ use crate::dto::openrouter::{
 };
 use crate::service::StreamEvent;
 
-/// A resolved provider connection for a single secondary-model request: the
-/// `endpoint` (base URL) + `api_key` that used to be baked onto the client.
+/// A resolved provider connection for a single request: the `endpoint` (base
+/// URL) + `api_key` that used to be baked onto the client.
 ///
 /// A cheap borrow (two `&str`, `Copy`), built fresh at the call site from the
-/// role's resolved route. The interactive chat (`stream_complete`) and `/compact`
-/// (`complete`) still read the baked `self.base_url`/`self.api_key`; every other
-/// request method takes its endpoint+key through this value instead, so a
-/// secondary role on a DIFFERENT provider/key Just Works with no client rebuild
-/// (auth + URL are already pure string interpolation on a header-less client).
+/// role's resolved route. EVERY request method — the interactive chat
+/// (`stream_complete`) and `/compact` (`complete`) included — takes its
+/// endpoint+key through this value, so a role on a DIFFERENT provider/key Just
+/// Works with no client rebuild (auth + URL are already pure string
+/// interpolation on a header-less client; nothing is baked onto `self`).
 #[derive(Clone, Copy, Debug)]
 pub struct Conn<'a> {
     /// Base URL, e.g. `https://openrouter.ai/api/v1`. Was `self.base_url`.
@@ -38,17 +38,15 @@ pub struct Conn<'a> {
     pub api_key: &'a str,
 }
 
+/// A keyless, per-session HTTP holder. Owns ONLY the shared `reqwest::Client`
+/// (header-less; internally Arc'd, safe to share across all roles) and the
+/// per-session `plan_word`. Connection, model, provider-route, and effort are
+/// resolved per-role at each call site and threaded in as parameters — nothing
+/// credential- or model-specific is baked onto the client, so it never needs
+/// rebuilding when those change (only at session boundaries, for a fresh
+/// `plan_word`).
 pub struct OpenRouterClient {
     http: reqwest::Client,
-    api_key: String,
-    base_url: String,
-    model: String,
-    provider: String,
-    /// Reasoning/thinking effort for the interactive chat path. Free-form token
-    /// (`""`/`"default"` = model default, `"off"`/`"none"` = thinking off, or an
-    /// effort level like `"low"`/`"high"`); mapped to the request `reasoning`
-    /// object by [`reasoning_config`]. Only [`Self::stream_complete`] applies it.
-    effort: String,
     /// Whimsical plan lead-in word, chosen ONCE per client (= per session) in
     /// the constructor. [`Self::stream_complete`] injects this SAME word into the
     /// system message every request instead of rolling a fresh one each time —
@@ -213,31 +211,26 @@ fn clean_error(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
+impl Default for OpenRouterClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenRouterClient {
-    pub fn new(
-        api_key: String,
-        base_url: String,
-        model: String,
-        provider: String,
-        effort: String,
-    ) -> Self {
+    /// Build a fresh, keyless client. Takes no creds/model/provider/effort — those
+    /// are resolved per-role and passed into each request method. Re-rolls the
+    /// session's `plan_word`, so call this once per session activation (build /
+    /// `/new` / picker-select / creds-confirm / cancel paths) and NOT on a mid-
+    /// session cred/effort change (which would needlessly bust the cache-stable
+    /// plan word).
+    pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key,
-            base_url,
-            model,
-            provider,
-            effort,
             // Pick the plan lead-in ONCE here so every request in this session
             // injects the same word → the cached system prefix stays byte-stable.
             plan_word: crate::resources::wanderer_word(),
         }
-    }
-
-    /// Build a provider-routing directive from this client's stored provider
-    /// slug. Thin wrapper over [`provider_routing_for`] for the session model.
-    fn provider_routing(&self) -> Option<crate::dto::openrouter::ProviderRouting> {
-        provider_routing_for(&self.provider)
     }
 
     /// The whimsical plan lead-in word chosen once per client (= per session) in
@@ -261,6 +254,10 @@ impl OpenRouterClient {
     /// `Ok(())`. The caller (a spawned task) discards the return value.
     pub async fn stream_complete(
         &self,
+        conn: Conn<'_>,
+        model: &str,
+        provider: &str,
+        effort: &str,
         messages: Vec<ChatMessage>,
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
@@ -269,7 +266,7 @@ impl OpenRouterClient {
         // ahead of the `CACHE_SPLIT_MARK` boundary, so it stays inside the cached
         // (byte-stable) head. `to_wire` splits the System content on that mark and
         // puts the cache breakpoint on the head only.
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", conn.endpoint);
         // Expose the built-in tool set to the model. Each tool maps to an
         // OpenAI/OpenRouter `function` definition (name + description + raw
         // JSON-Schema parameters).
@@ -285,17 +282,17 @@ impl OpenRouterClient {
             })
             .collect();
         let body = ChatRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             // Wrap into wire messages: the system message gets the single prompt-
             // caching breakpoint; everything else serialises as a plain string.
             messages: to_wire(messages),
             stream: true,
-            provider: self.provider_routing(),
+            provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },
             tools: Some(tools),
-            // Interactive chat is the only path that thinks; map the session's
-            // effort token to a `reasoning` directive (None = model default).
-            reasoning: reasoning_config(&self.effort),
+            // Interactive chat is the only path that thinks; map the resolved
+            // role's effort token to a `reasoning` directive (None = model default).
+            reasoning: reasoning_config(effort),
             // Free-form text reply; structured output is classifier-only.
             response_format: None,
             // Generous runaway cap for the interactive path.
@@ -305,7 +302,7 @@ impl OpenRouterClient {
         let resp = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)
@@ -461,13 +458,23 @@ impl OpenRouterClient {
     }
 
     /// Non-stream completion (used by /compact). Returns assistant content.
-    pub async fn complete(&self, messages: Vec<ChatMessage>) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
+    ///
+    /// Takes its connection + model + provider-route per call (the Compactor role
+    /// resolves to Main today), reusing this client's http; `provider` "" =
+    /// default routing.
+    pub async fn complete(
+        &self,
+        conn: Conn<'_>,
+        model: &str,
+        provider: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<String> {
+        let url = format!("{}/chat/completions", conn.endpoint);
         let body = ChatRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             messages: to_wire(messages),
             stream: false,
-            provider: self.provider_routing(),
+            provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },
             // /compact summarisation uses no tools.
             tools: None,
@@ -482,7 +489,7 @@ impl OpenRouterClient {
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", conn.api_key))
             .header("HTTP-Referer", HTTP_REFERER)
             .header("X-Title", APP_TITLE)
             .json(&body)

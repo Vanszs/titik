@@ -260,8 +260,31 @@ pub(super) fn apply_action(
                 sess.settings.provider = provider.clone();
                 let _ = sess.save();
             }
+            // Idempotent migration seed: if the global catalogue has no providers
+            // yet, synthesize an OpenRouter ProviderConn from the just-entered key
+            // plus a Main-role ModelEntry from the model. No-op once configured (or
+            // when the key is empty). Persist config.json on a successful seed so
+            // the new role-resolution path engages from here on.
+            if let Some(sess) = state.rest.session.as_ref() {
+                if state.rest.config.seed_from_settings(&sess.settings) {
+                    if let Err(e) = state.rest.config.save() {
+                        state.rest.status = format!("config save failed: {e}");
+                    }
+                }
+            }
             state.rest.remember_creds(&api_key, &model, &provider);
-            *client = state.rest.session.as_ref().map(build_client);
+            // KEYLESS client → no creds baked in; just (re)build for a fresh
+            // plan_word at this session boundary. Resolve gates whether there's a
+            // usable Main route (non-empty key) so we don't pin a no-creds client.
+            *client = state.rest.session.as_ref().and_then(|sess| {
+                crate::app::resolve::resolve_role(
+                    &state.rest.config,
+                    &sess.settings,
+                    crate::model::app_config::ModelRole::Main,
+                )
+                .filter(|r| !r.api_key.is_empty())
+                .map(|_| build_client())
+            });
             // Warm the confirmed session: reindex its workspace and compute the
             // awareness summary so a creds-confirmed session is fully primed like
             // a cold boot.
@@ -277,19 +300,30 @@ pub(super) fn apply_action(
         }
 
         Action::CancelKeyInput => {
+            // KEYLESS client → build for a fresh plan_word at this session boundary;
+            // gate on whether the restored session's MAIN role resolves to a usable
+            // route (non-empty key), preserving the no-client-no-send invariant.
+            let usable = |state: &AppState, settings: &crate::model::settings::Settings| {
+                crate::app::resolve::resolve_role(
+                    &state.rest.config,
+                    settings,
+                    crate::model::app_config::ModelRole::Main,
+                )
+                .is_some_and(|r| !r.api_key.is_empty())
+            };
             if let Some(prev) = state.rest.prev_session.take() {
-                *client = if prev.settings.api_key.is_empty() {
-                    None
+                *client = if usable(state, &prev.settings) {
+                    Some(build_client())
                 } else {
-                    Some(build_client(&prev))
+                    None
                 };
                 state.rest.session = Some(prev);
-            } else if let Some(sess) = state.rest.session.as_ref() {
+            } else if let Some(settings) = state.rest.session.as_ref().map(|s| s.settings.clone()) {
                 // Defensive: no stashed prev; rebuild from current session.
-                *client = if sess.settings.api_key.is_empty() {
-                    None
+                *client = if usable(state, &settings) {
+                    Some(build_client())
                 } else {
-                    Some(build_client(sess))
+                    None
                 };
             }
             // Restoring prev_session here bypasses warm_session, so reconcile the
@@ -359,7 +393,9 @@ pub(super) fn apply_action(
                 state
                     .rest
                     .remember_creds(&sess.settings.api_key, &sess.settings.model, &sess.settings.provider);
-                *client = Some(build_client(&sess));
+                // KEYLESS client → fresh plan_word at this session boundary. This
+                // branch already gated on a non-empty key above, so build directly.
+                *client = Some(build_client());
                 let sess_path = sess.path.clone();
                 state.rest.session = Some(sess);
                 // Warm the selected session: reindex its workspace and compute
@@ -424,16 +460,10 @@ pub(super) fn apply_action(
                 model_drafts,
             )) = drafts
             {
-                // Detect whether the OpenRouter-relevant creds changed so we only
-                // rebuild the client when necessary.
-                let creds_changed = match state.rest.session.as_ref() {
-                    Some(s) => {
-                        s.settings.api_key != api_key
-                            || s.settings.model != model
-                            || s.settings.provider != provider
-                    }
-                    None => false,
-                };
+                // No client rebuild is keyed off creds/model/provider changes
+                // anymore: the client is KEYLESS and every request resolves its
+                // connection/model/effort per-call via `resolve_role`, so the
+                // existing Arc keeps serving (and keeps its cache-stable plan_word).
                 // a) Apply the text drafts to the session settings. The
                 //    awareness settings ride along here too; they don't affect
                 //    the chat client (the awareness call uses `complete_with`
@@ -574,18 +604,20 @@ pub(super) fn apply_action(
                         }
                     }
                 }
-                // e) Rebuild the OpenRouter client if the creds changed.
-                if creds_changed {
-                    *client = state.rest.session.as_ref().map(build_client);
-                }
+                // e) No client rebuild: creds/model/provider are read per-call via
+                //    `resolve_role`, so the existing keyless Arc serves the new
+                //    settings on the next request. (This also keeps the cache-stable
+                //    plan_word intact across a settings save.)
             }
             state.mode = Mode::Chat;
         }
 
         Action::SaveEffort(choice) => {
-            // Store the chosen effort ("default" → empty = model default),
-            // persist, then REBUILD the client so the new `reasoning` directive
-            // is applied to the next request (effort is baked into the client).
+            // Store the chosen effort ("default" → empty = model default) and
+            // persist. No client rebuild: effort is now resolved per-call (it flows
+            // only into the streaming path via the Main route's `effort`), so the
+            // existing keyless client applies the new directive on the next request
+            // WITHOUT busting its cache-stable plan_word.
             let effort = if choice == "default" { String::new() } else { choice };
             if let Some(sess) = state.rest.session.as_mut() {
                 sess.settings.effort = effort.clone();
@@ -593,7 +625,6 @@ pub(super) fn apply_action(
                     state.rest.status = format!("error: {e}");
                 }
             }
-            *client = state.rest.session.as_ref().map(build_client);
             let label = if effort.is_empty() { "default" } else { &effort };
             state.rest.status = format!("effort: {label}");
             state.mode = Mode::Chat;

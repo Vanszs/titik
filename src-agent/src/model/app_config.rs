@@ -163,6 +163,53 @@ impl AppConfig {
         self.providers.iter().position(|p| p.uuid == uuid)
     }
 
+    /// Idempotent migration seed: synthesize the global provider/model catalogue
+    /// from the legacy per-session `settings.*` fields the first time it's empty.
+    ///
+    /// Guard (returns `false`, no mutation): the catalogue is already configured
+    /// (`providers` OR `models` non-empty), or there's nothing to seed from
+    /// (`settings.api_key` empty — a fresh install with no key yet). Otherwise
+    /// synthesizes ONE OpenRouter [`ProviderConn`] (endpoint [`DEFAULT_BASE_URL`],
+    /// [`ApiType::OpenAiCompatible`], `api_key` from `settings.api_key`) plus a
+    /// Main-role [`ModelEntry`] (`model_id` from `settings.model`, referencing the
+    /// new provider's uuid, `route` from `settings.provider` when non-empty), and
+    /// returns `true` so the caller persists `config.json`.
+    ///
+    /// The old `settings.*` fields are left untouched (downgrade-safe); the
+    /// resolver's legacy fallback keeps working until this seed runs, after which
+    /// the role-resolution path engages. Safe to call repeatedly — the guard makes
+    /// every call after the first a no-op.
+    pub fn seed_from_settings(&mut self, settings: &crate::model::settings::Settings) -> bool {
+        if !self.providers.is_empty() || !self.models.is_empty() {
+            return false; // already configured
+        }
+        if settings.api_key.is_empty() {
+            return false; // nothing to seed from (fresh install, no key)
+        }
+        let provider_uuid = new_uuid();
+        self.providers.push(ProviderConn {
+            uuid: provider_uuid.clone(),
+            name: "OpenRouter".to_string(),
+            api_type: ApiType::OpenAiCompatible,
+            endpoint: crate::config::DEFAULT_BASE_URL.to_string(),
+            api_key: settings.api_key.clone(),
+        });
+        self.models.push(ModelEntry {
+            uuid: new_uuid(),
+            name: "Main".to_string(),
+            model_id: settings.model.clone(),
+            provider_uuid,
+            // Empty provider slug = OpenRouter default routing → no `route` pin.
+            route: if settings.provider.is_empty() {
+                None
+            } else {
+                Some(settings.provider.clone())
+            },
+            role: Some(ModelRole::Main),
+        });
+        true
+    }
+
     /// Serialise (pretty-printed) to `~/.simple-coder/config.json`.
     ///
     /// Called by the `/settings` dashboard when the user saves theme/accent

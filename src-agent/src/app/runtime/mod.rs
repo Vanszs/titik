@@ -32,9 +32,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
 use crate::app::resolve::resolve_role;
 use crate::app::state::AppState;
-use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
+use crate::config::DEFAULT_MODEL;
 use crate::model::app_config::ModelRole;
-use crate::model::{app_config::AppConfig, session::Session, settings::Settings, store};
+use crate::model::{app_config::AppConfig, settings::Settings, store};
 use crate::service::openrouter::OpenRouterClient;
 
 use terminal::TerminalGuard;
@@ -121,15 +121,16 @@ pub(super) fn warm_session(
     }
 }
 
-/// Build a client from a session's settings.
-pub(super) fn build_client(s: &Session) -> Arc<OpenRouterClient> {
-    Arc::new(OpenRouterClient::new(
-        s.settings.api_key.clone(),
-        DEFAULT_BASE_URL.to_string(),
-        s.settings.model.clone(),
-        s.settings.provider.clone(),
-        s.settings.effort.clone(),
-    ))
+/// Build a fresh per-session client.
+///
+/// The client is now KEYLESS — it carries no creds/model/provider/effort, only
+/// `http` + a fresh `plan_word`. So this is needed ONLY at session boundaries
+/// (startup, `/new`, picker-select, creds-confirm, cancel paths) to re-roll the
+/// cache-stable `plan_word`; it must NOT be called on a mid-session cred/effort
+/// change, since those are read per-call via `resolve_role`. The `&Session`
+/// param is gone — building doesn't depend on session state anymore.
+pub(super) fn build_client() -> Arc<OpenRouterClient> {
+    Arc::new(OpenRouterClient::new())
 }
 
 /// Best-effort prefill of (api_key, model, provider) from the most-recently-modified
@@ -238,13 +239,21 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     terminal.clear()?;
 
     // If startup opened a session straight into chat (returning user), build its
-    // client now; otherwise it's built when the user confirms credentials.
+    // client now; otherwise it's built when the user confirms credentials. The
+    // None-gate is the "is there a usable session/key?" signal the whole runtime
+    // relies on. Because the key now lives in config/settings (read per-call), the
+    // condition is whether the MAIN role resolves to a usable route (a route with a
+    // non-empty api_key) — NOT the old `!settings.api_key.is_empty()`. The client
+    // itself is keyless; the gate just preserves the no-client-no-send invariant.
     let mut client: Option<Arc<OpenRouterClient>> = state
         .rest
         .session
         .as_ref()
-        .filter(|s| !s.settings.api_key.is_empty())
-        .map(build_client);
+        .filter(|s| {
+            resolve_role(&state.rest.config, &s.settings, ModelRole::Main)
+                .is_some_and(|r| !r.api_key.is_empty())
+        })
+        .map(|_| build_client());
 
     // Warm the session (reindex workspace + compute awareness summary) so a
     // cold launch is fully primed before the first keystroke. Picker / first-run
