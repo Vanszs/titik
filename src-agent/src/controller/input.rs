@@ -152,47 +152,89 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
     }
 }
 
-/// Insert pasted text into the active input. In Chat the text is inserted
-/// verbatim (newlines kept → multiline input, never a submit); single-line
-/// fields strip newlines. `\r` is always dropped (paste may use CRLF).
+/// Feed `text` into a SINGLE-LINE field through `sink`, one char at a time,
+/// dropping every `\r`/`\n` (and bare CR from CRLF) so a multi-line clipboard
+/// can never corrupt a one-line field. Mirrors a normal `Char` keystroke per
+/// surviving char, which is the only way to reuse each field's existing
+/// active-target resolution (`push_char` step/field logic, `mm_push_char`
+/// query-vs-id routing, …).
+fn paste_single_line(text: &str, mut sink: impl FnMut(char)) {
+    for c in text.chars() {
+        if c != '\r' && c != '\n' {
+            sink(c);
+        }
+    }
+}
+
+/// Insert pasted text into the active input of the current mode/sub-mode,
+/// mirroring how a `Char(c)` keystroke is routed there (same deepest-modal
+/// priority), but inserting the WHOLE pasted string at once.
+///
+/// Multiline fields (the Chat input, the agent prompt Body) keep newlines
+/// verbatim; every single-line field (endpoints, keys, names, search queries,
+/// filters) strips `\n`/`\r` so a multi-line clipboard can't corrupt it.
+/// Contexts with no text field (the role/provider pickers, the session/effort
+/// pickers, the loading splash) ignore the paste.
 pub fn handle_paste(state: &mut AppState, text: &str) {
     match &mut state.mode {
         Mode::Chat => {
+            // Multiline verbatim: '\n' is kept (newline in the input, never a
+            // submit); only the bare CR of a CRLF pair is dropped.
             for c in text.chars() {
                 if c != '\r' {
-                    state.rest.push_char(c); // '\n' kept → newline in the input
+                    state.rest.push_char(c);
                 }
             }
         }
         Mode::KeyInput(form) => {
-            for c in text.chars() {
-                if c != '\r' && c != '\n' {
-                    form.push_char(c);
-                }
+            // Step 1 on an OpenRouter endpoint is the catalogue omnisearch:
+            // paste feeds the live query and resets the result highlight, exactly
+            // as a typed char does. Every other field is plain text on `model` /
+            // `endpoint` / `api_key` via `push_char`.
+            if form.step == 1 && form.is_openrouter() {
+                paste_single_line(text, |c| {
+                    form.query.push(c);
+                    form.result_sel = 0;
+                });
+            } else {
+                paste_single_line(text, |c| form.push_char(c));
             }
         }
         Mode::Settings(s) => {
-            // Route a paste into the active picker query first, else the text field.
-            if s.picker.is_some() {
-                for c in text.chars() {
-                    if c != '\r' && c != '\n' {
-                        s.picker_push_char(c);
-                    }
-                }
+            // Deepest-modal priority, mirroring `handle_settings`:
+            //   role picker (no text field) > model modal > provider modal >
+            //   FS path picker > plain text field.
+            if s.mm_role_picker_open() {
+                // Checkbox overlay — no text entry; swallow the paste.
+            } else if s.model_modal.is_some() {
+                // `mm_push_char` already routes to the active model-modal field:
+                // Name → name, Model → omnisearch query (OpenRouter, resets the
+                // result highlight) or raw model id, and ignores Route/Role/buttons.
+                paste_single_line(text, |c| s.mm_push_char(c));
+            } else if s.prov_modal.is_some() {
+                // Add-API-provider modal: `modal_push_char` writes to the active
+                // text field (name/endpoint/api_key) and no-ops on the buttons.
+                paste_single_line(text, |c| s.modal_push_char(c));
+            } else if s.picker.is_some() {
+                paste_single_line(text, |c| s.picker_push_char(c));
             } else if s.editing {
-                for c in text.chars() {
-                    if c != '\r' && c != '\n' {
-                        s.push_char(c);
-                    }
-                }
+                paste_single_line(text, |c| s.push_char(c));
             }
         }
         Mode::Agents(a) => {
-            // Only meaningful while typing into a draft field; newlines collapse
-            // to spaces except in the multiline body. The Model field on an
-            // OpenRouter provider is an omnisearch, so paste feeds its query.
-            if a.editing {
-                use crate::app::mode::AgentEditField;
+            use crate::app::mode::AgentEditField;
+            // Deepest-modal priority, mirroring `handle_agents`:
+            //   provider picker (no text field) > tool picker (filter) > draft field.
+            if a.provider_picker.is_some() {
+                // Single-select list — no text entry; swallow the paste.
+            } else if let Some(p) = a.tool_picker.as_mut() {
+                // Tool picker live filter (single-line).
+                paste_single_line(text, |c| p.push_filter(c));
+            } else if a.editing {
+                // Typing into a draft field. The Model field on an OpenRouter
+                // provider is an omnisearch (paste → query, reset highlight); the
+                // Body is the multiline prompt (newlines kept); every other field
+                // is single-line plain text.
                 let model_search = a.field == AgentEditField::Model
                     && a.selected_provider_is_openrouter(
                         &state.rest.config,
@@ -215,9 +257,15 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 }
             }
         }
-        // No text entry in the session/effort pickers or the loading splash —
-        // paste is a no-op.
-        Mode::SessionPicker(_) | Mode::Effort(_) | Mode::Loading(_) => {}
+        Mode::SessionPicker(p) => {
+            // The `--resume` picker has a live search field: paste feeds the
+            // query and re-runs the filter, exactly as a typed char does.
+            paste_single_line(text, |c| p.query.push(c));
+            p.refilter();
+        }
+        // No text entry on the effort picker or the loading splash — paste is a
+        // no-op.
+        Mode::Effort(_) | Mode::Loading(_) => {}
     }
 }
 
