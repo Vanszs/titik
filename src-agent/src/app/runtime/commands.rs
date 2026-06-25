@@ -13,7 +13,7 @@ use crate::dto::chat::{ChatMessage, Role};
 use crate::model::store;
 use crate::service::{openrouter::OpenRouterClient, StreamEvent};
 
-use super::stream::{abort_current, build_tool_ctx};
+use super::stream::abort_current;
 
 /// Generic effort menu used when the model catalogue can't be fetched (network
 /// failure). Covers the common tokens so the user can still set something; the
@@ -399,45 +399,10 @@ pub(super) fn apply_slash(
                 return Ok(());
             }
 
-            // Snapshot inputs before borrowing state mutably below.
-            let ctx = build_tool_ctx(state);
-            let (session_dir, config, settings, awareness, memory_md) = {
-                let sess = state.rest.session.as_ref().unwrap();
-                let session_dir = sess.path.clone();
-                let config = state.rest.config.clone();
-                let settings = sess.settings.clone();
-                let awareness = state
-                    .rest
-                    .awareness_summary
-                    .clone()
-                    .unwrap_or_default();
-                // Read MEMORY.md from the session memory dir if present.
-                let memory_md = std::fs::read_to_string(session_dir.join("memory").join("MEMORY.md"))
-                    .unwrap_or_default();
-                (session_dir, config, settings, awareness, memory_md)
-            };
-
-            let registry = crate::model::agent_def::AgentRegistry::load(Some(&session_dir));
-            let id = state.rest.next_subagent_id;
-            let client_arc = std::sync::Arc::clone(client.as_ref().unwrap());
-
-            match crate::app::subagent::spawn_subagent(
-                &client_arc,
-                handle,
-                &registry,
-                &config,
-                &settings,
-                ctx,
-                &awareness,
-                &memory_md,
-                id,
-                &agent_name,
-                &task_text,
-            ) {
-                Some(sub) => {
-                    state.rest.next_subagent_id += 1;
-                    state.rest.subagents.push(sub);
-                    state.rest.subagents_open = true;
+            // Spawn via the shared helper (same path the `task` tool uses) so the
+            // ctx/registry/awareness/memory inputs + bookkeeping never diverge.
+            match super::stream::spawn_task(state, client, handle, &agent_name, &task_text) {
+                Some(id) => {
                     state
                         .rest
                         .set_toast_info(format!("started sub-agent #{id} ({agent_name})"));

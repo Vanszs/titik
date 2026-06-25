@@ -303,6 +303,42 @@ pub(super) fn process_tools(
         .unwrap_or_default();
     while state.rest.tool_idx < state.rest.pending_tool_calls.len() {
         let call = state.rest.pending_tool_calls[state.rest.tool_idx].clone();
+        // Intercept the model-callable `task` tool BEFORE the generic
+        // classify/dispatch path: spawn a background sub-agent and return
+        // immediately (never classify it as risky, never await it). Either branch
+        // pushes EXACTLY ONE tool result for this call id and advances `tool_idx`,
+        // so the turn's per-call bookkeeping stays in lockstep with the generic
+        // path and the model receives a valid result for every requested call.
+        if call.function.name == "task" {
+            let sanitized =
+                crate::dto::chat::sanitize_tool_arguments(&call.function.arguments);
+            let args: serde_json::Value =
+                serde_json::from_str(&sanitized).unwrap_or_else(|_| serde_json::json!({}));
+            let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let result = if agent.is_empty() || prompt.is_empty() {
+                "error: task requires non-empty 'agent' and 'prompt'".to_string()
+            } else {
+                let agent = agent.to_string();
+                let prompt = prompt.to_string();
+                match spawn_task(state, client, handle, &agent, &prompt) {
+                    Some(id) => {
+                        // Truncate the prompt (char-boundary safe) for the result line.
+                        let short: String = prompt.chars().take(80).collect();
+                        let short = if prompt.chars().count() > 80 {
+                            format!("{short}…")
+                        } else {
+                            short
+                        };
+                        format!("started sub-agent #{id} ({agent}): {short}")
+                    }
+                    None => format!("error: unknown agent '{agent}'"),
+                }
+            };
+            state.rest.tool_results.push((call.id.clone(), result));
+            state.rest.tool_idx += 1;
+            continue;
+        }
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.
@@ -474,6 +510,64 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
         dir_cache: state.rest.dir_cache.clone(),
         memory_dir,
     }
+}
+
+/// Spawn a background sub-agent for `agent_name` running `task_text`, wiring it
+/// into app state. Shared by the `/task` slash command and the model-callable
+/// `task` tool so both build the EXACT same `ToolCtx` / registry / awareness /
+/// memory inputs and advance the same bookkeeping.
+///
+/// On success: increments `next_subagent_id`, pushes the [`crate::app::subagent::SubAgent`]
+/// into `state.rest.subagents`, sets `subagents_open = true`, and returns
+/// `Some(id)` (the id assigned to the spawned sub-agent). Returns `None` when
+/// there is no client/session or the named agent doesn't exist — the caller
+/// surfaces that as it sees fit. Does NOT await the sub-agent.
+pub(crate) fn spawn_task(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+    agent_name: &str,
+    task_text: &str,
+) -> Option<usize> {
+    if client.is_none() || state.rest.session.is_none() {
+        return None;
+    }
+    // Snapshot inputs before borrowing state mutably below — identical to the
+    // `/task` command's construction so the two paths can never diverge.
+    let ctx = build_tool_ctx(state);
+    let (session_dir, config, settings, awareness, memory_md) = {
+        let sess = state.rest.session.as_ref().unwrap();
+        let session_dir = sess.path.clone();
+        let config = state.rest.config.clone();
+        let settings = sess.settings.clone();
+        let awareness = state.rest.awareness_summary.clone().unwrap_or_default();
+        let memory_md =
+            std::fs::read_to_string(session_dir.join("memory").join("MEMORY.md"))
+                .unwrap_or_default();
+        (session_dir, config, settings, awareness, memory_md)
+    };
+
+    let registry = crate::model::agent_def::AgentRegistry::load(Some(&session_dir));
+    let id = state.rest.next_subagent_id;
+    let client_arc = Arc::clone(client.as_ref().unwrap());
+
+    let sub = crate::app::subagent::spawn_subagent(
+        &client_arc,
+        handle,
+        &registry,
+        &config,
+        &settings,
+        ctx,
+        &awareness,
+        &memory_md,
+        id,
+        agent_name,
+        task_text,
+    )?;
+    state.rest.next_subagent_id += 1;
+    state.rest.subagents.push(sub);
+    state.rest.subagents_open = true;
+    Some(id)
 }
 
 /// Run a single tool call against the session workspace and return its result

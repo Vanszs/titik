@@ -22,6 +22,7 @@ pub mod memory;
 pub mod pong;
 pub mod search;
 pub mod shell;
+pub mod task;
 
 pub use dircache::DirCache;
 
@@ -78,6 +79,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(dircache::DirCacheUpdate),
         Box::new(pong::Pong),
         Box::new(memory::Remember),
+        Box::new(task::Task),
     ]
 }
 
