@@ -1,16 +1,42 @@
-/// Transient state for the credentials input form.
+//! Transient state for the first-run setup WIZARD (KeyInput mode).
+//!
+//! A 2-step, provider-agnostic flow that captures a real provider connection and
+//! a Main model, then writes them to `config.json` (see `Action::SaveCreds`):
+//!
+//! - **Step 0 — connection:** `Endpoint` (any OpenAI-compatible base URL, not
+//!   just OpenRouter) and `API key`.
+//! - **Step 1 — model:** `Model` id. PLAIN TEXT this pass — a later pass adds
+//!   OpenRouter omnisearch, branching on [`KeyInputForm::is_openrouter`].
+//!
+//! Constructed via [`KeyInputForm::new`] (clean first-run defaults) or
+//! [`KeyInputForm::prefilled`] (seeded from remembered creds for the
+//! `/settings`-style re-entry and `--resume` picker paths). Fields are edited in
+//! place via `push_char` / `backspace` against whichever field is active; the
+//! controller reads `step` + `field` to know what is focused, and drives
+//! `advance_step` / `back_step` for the step transitions.
+
+use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
+
+/// In-progress state of the first-run setup wizard.
 ///
-/// Created with [`KeyInputForm::prefilled`]; fields are edited in place via
-/// `push_char` / `backspace`; the controller reads `field` to know which
-/// entry is active. Three fields in order: api_key (0), model (1), provider (2).
-#[derive(Debug, Clone, Default)]
+/// `step` selects the wizard page (0 = connection, 1 = model) and `field`
+/// selects the active input within that page. The string fields hold the live
+/// values; `first_run` / `from_picker` only steer Esc behaviour (see
+/// [`controller::input::handle_key_input`]).
+#[derive(Debug, Clone)]
 pub struct KeyInputForm {
-    pub api_key: String,
-    pub model: String,
-    /// OpenRouter provider slug for strict-pin routing (optional, may be empty).
-    pub provider: String,
-    /// Active field index: `0` = api_key, `1` = model, `2` = provider.
+    /// Wizard page: `0` = connection (endpoint + key), `1` = model.
+    pub step: usize,
+    /// Active field within the current step. Step 0: `0` = endpoint, `1` = key.
+    /// Step 1: `0` = model.
     pub field: usize,
+    /// Provider base URL (any OpenAI-compatible endpoint). Defaults to
+    /// [`DEFAULT_BASE_URL`].
+    pub endpoint: String,
+    /// API key for the provider connection.
+    pub api_key: String,
+    /// Main model id. Defaults to [`DEFAULT_MODEL`]; PLAIN TEXT this pass.
+    pub model: String,
     /// `true` when no prior session / configured client exists.
     /// Controls Esc behaviour: if true, Esc must quit (there is no Chat view
     /// to return to).
@@ -20,66 +46,138 @@ pub struct KeyInputForm {
     pub from_picker: bool,
 }
 
+impl Default for KeyInputForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyInputForm {
-    /// Construct a form pre-populated with existing credentials.
+    /// Fresh first-run wizard: step 0 / field 0, endpoint = [`DEFAULT_BASE_URL`],
+    /// empty key, model = [`DEFAULT_MODEL`]. Esc quits (`first_run = true`).
+    pub fn new() -> Self {
+        Self {
+            step: 0,
+            field: 0,
+            endpoint: DEFAULT_BASE_URL.to_string(),
+            api_key: String::new(),
+            model: DEFAULT_MODEL.to_string(),
+            first_run: true,
+            from_picker: false,
+        }
+    }
+
+    /// Construct a wizard pre-populated with existing credentials, starting on
+    /// step 0 / field 0. The endpoint defaults to [`DEFAULT_BASE_URL`] (the
+    /// legacy/remembered creds carry no endpoint — that path was always
+    /// OpenRouter); an empty `model` falls back to [`DEFAULT_MODEL`].
     ///
     /// - `first_run = true`:   Esc quits (no usable Chat fallback).
     /// - `from_picker = true`: Esc returns to the session picker.
-    /// - `provider`:           OpenRouter provider slug (may be empty for default routing).
-    pub fn prefilled(
-        api_key: String,
-        model: String,
-        provider: String,
-        first_run: bool,
-        from_picker: bool,
-    ) -> Self {
+    pub fn prefilled(api_key: String, model: String, first_run: bool, from_picker: bool) -> Self {
         Self {
-            api_key,
-            model,
-            provider,
+            step: 0,
             field: 0,
+            endpoint: DEFAULT_BASE_URL.to_string(),
+            api_key,
+            model: if model.is_empty() {
+                DEFAULT_MODEL.to_string()
+            } else {
+                model
+            },
             first_run,
             from_picker,
         }
     }
 
-    /// Advance to the next field (clamps at the last field, index 2).
+    /// Number of fields on the current step (step 0 has 2, step 1 has 1).
+    fn field_count(&self) -> usize {
+        if self.step == 0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// `true` when the entered endpoint is an OpenRouter URL (case-insensitive
+    /// substring match). The next pass branches on this to enable model
+    /// omnisearch; computed now so the wiring is in place.
+    #[allow(dead_code)] // consumed by the next pass (step-2 OpenRouter omnisearch)
+    pub fn is_openrouter(&self) -> bool {
+        self.endpoint.to_lowercase().contains("openrouter")
+    }
+
+    /// Advance to the next field within the current step (clamped at the last
+    /// field of the step).
     pub fn next_field(&mut self) {
-        if self.field < 2 {
+        if self.field + 1 < self.field_count() {
             self.field += 1;
         }
     }
 
-    /// Move to the previous field (clamps at zero).
+    /// Move to the previous field within the current step (clamps at zero).
     pub fn prev_field(&mut self) {
         if self.field > 0 {
             self.field -= 1;
         }
     }
 
+    /// `true` when the cursor is on the last field of the current step. Used by
+    /// the controller to decide whether Enter advances the cursor or the step.
+    pub fn is_last_field(&self) -> bool {
+        self.field + 1 == self.field_count()
+    }
+
     /// Append a character to whichever field is currently active.
     pub fn push_char(&mut self, c: char) {
-        match self.field {
-            0 => self.api_key.push(c),
-            1 => self.model.push(c),
-            _ => self.provider.push(c),
+        match (self.step, self.field) {
+            (0, 0) => self.endpoint.push(c),
+            (0, _) => self.api_key.push(c),
+            // Step 1 only has the model field.
+            (_, _) => self.model.push(c),
         }
     }
 
     /// Delete the last character from the active field.
     pub fn backspace(&mut self) {
-        match self.field {
-            0 => { self.api_key.pop(); }
-            1 => { self.model.pop(); }
-            _ => { self.provider.pop(); }
+        match (self.step, self.field) {
+            (0, 0) => {
+                self.endpoint.pop();
+            }
+            (0, _) => {
+                self.api_key.pop();
+            }
+            (_, _) => {
+                self.model.pop();
+            }
         };
     }
 
-    /// Returns `true` when the cursor is on the last field (provider, index 2).
-    ///
-    /// Used by the controller to decide whether Enter should advance the
-    /// cursor or submit the form.
-    pub fn is_last(&self) -> bool {
-        self.field == 2
+    /// Move from the connection step (0) to the model step (1), resetting the
+    /// field cursor to the first field of the new step. No-op past step 1.
+    pub fn advance_step(&mut self) {
+        if self.step == 0 {
+            self.step = 1;
+            self.field = 0;
+        }
+    }
+
+    /// Move back from the model step (1) to the connection step (0). Returns the
+    /// field cursor to the last field of step 0 (the API key) so the user lands
+    /// where they left off. No-op at step 0.
+    pub fn back_step(&mut self) {
+        if self.step == 1 {
+            self.step = 0;
+            // Step 0's last field (API key) — where the user advanced from.
+            self.field = 1;
+        }
+    }
+
+    /// Minimal completion gate: on the model step with a non-empty model AND a
+    /// non-empty key entered back on step 0. The controller already blocks the
+    /// step-0→1 advance on an empty key, so reaching step 1 implies a key was
+    /// given; this re-checks it for a single authoritative "can finish" answer.
+    pub fn can_finish(&self) -> bool {
+        self.step == 1 && !self.model.trim().is_empty() && !self.api_key.trim().is_empty()
     }
 }

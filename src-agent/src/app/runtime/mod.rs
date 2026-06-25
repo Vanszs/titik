@@ -354,7 +354,6 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
                     st.mode = Mode::KeyInput(KeyInputForm::prefilled(
                         lk.clone().unwrap_or_default(),
                         lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-                        lp.clone().unwrap_or_default(),
                         true,
                         false,
                     ));
@@ -367,7 +366,6 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
             AppState::new(Mode::KeyInput(KeyInputForm::prefilled(
                 lk.clone().unwrap_or_default(),
                 lm.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-                lp.clone().unwrap_or_default(),
                 true,  // first_run
                 false, // from_picker
             )))

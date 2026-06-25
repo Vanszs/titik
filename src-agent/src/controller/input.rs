@@ -41,8 +41,9 @@ pub enum Action {
     /// `"denied by user"` back as its result and resume the machine.
     DenyTool,
     // --- KeyInput actions ---
-    /// Credentials form confirmed; carry the api key, model, and provider out.
-    SaveCreds { api_key: String, model: String, provider: String },
+    /// Setup wizard finished; carry the entered endpoint, api key, and model out
+    /// so the runtime can build a provider-agnostic config from them.
+    SaveCreds { endpoint: String, api_key: String, model: String },
     /// Esc on a credentials form that was NOT opened from the picker — return
     /// to the normal Chat view.
     CancelKeyInput,
@@ -432,9 +433,13 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
     }
 }
 
-/// Handle a key press while the credentials form is active.
+/// Handle a key press while the first-run setup wizard is active.
 ///
-/// Esc routing has three cases:
+/// Two steps: step 0 = connection (endpoint + key), step 1 = model. Tab / ↑ / ↓
+/// move between fields WITHIN the current step; Enter advances (field → step →
+/// finish) and Esc walks back (step 1 → step 0 → cancel).
+///
+/// Esc on step 0 has three cases:
 /// 1. `first_run = true` → no prior client exists, so Esc must quit rather than drop back to a broken Chat view.
 /// 2. `from_picker = true` → form was opened from the `--resume` session picker, so Esc returns there (`CancelKeyInputToPicker`).
 /// 3. Otherwise → Esc cancels back to the existing Chat view.
@@ -445,7 +450,11 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
 
     match key.code {
         KeyCode::Esc => {
-            if form.first_run {
+            if form.step == 1 {
+                // Model step: step back to the connection step (non-destructive).
+                form.back_step();
+                Action::None
+            } else if form.first_run {
                 // No usable session exists yet — quitting is safer than an
                 // unconfigured Chat screen.
                 Action::Quit
@@ -457,6 +466,7 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
                 Action::CancelKeyInput
             }
         }
+        // Field navigation stays WITHIN the current step.
         KeyCode::Tab | KeyCode::Down => {
             form.next_field();
             Action::None
@@ -466,20 +476,34 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
             Action::None
         }
         KeyCode::Enter => {
-            if form.is_last() {
-                if form.api_key.trim().is_empty() {
-                    rest.status = "api key required".into();
-                    Action::None
-                } else {
-                    Action::SaveCreds {
-                        api_key: form.api_key.trim().to_string(),
-                        model: form.model.trim().to_string(),
-                        provider: form.provider.trim().to_string(),
+            if form.step == 0 {
+                // Connection step: advance to the model step only from the last
+                // field (API key) with a non-empty key; otherwise move to the
+                // next field.
+                if form.is_last_field() {
+                    if form.api_key.trim().is_empty() {
+                        rest.status = "api key required".into();
+                        Action::None
+                    } else {
+                        form.advance_step();
+                        Action::None
                     }
+                } else {
+                    form.next_field();
+                    Action::None
                 }
             } else {
-                form.next_field();
-                Action::None
+                // Model step: finish if the model is non-empty.
+                if form.can_finish() {
+                    Action::SaveCreds {
+                        endpoint: form.endpoint.trim().to_string(),
+                        api_key: form.api_key.trim().to_string(),
+                        model: form.model.trim().to_string(),
+                    }
+                } else {
+                    rest.status = "model required".into();
+                    Action::None
+                }
             }
         }
         KeyCode::Backspace => {

@@ -178,7 +178,6 @@ pub(super) fn apply_slash(
                 state.mode = Mode::KeyInput(KeyInputForm::prefilled(
                     String::new(),
                     DEFAULT_MODEL.to_string(),
-                    String::new(),
                     false, // Esc -> CancelKeyInput restores prev_session
                     false, // not from picker
                 ));

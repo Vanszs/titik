@@ -192,6 +192,11 @@ impl AppConfig {
     /// resolver's legacy fallback keeps working until this seed runs, after which
     /// the role-resolution path engages. Safe to call repeatedly — the guard makes
     /// every call after the first a no-op.
+    ///
+    /// Retained for the legacy/migration path: the first-run wizard now writes the
+    /// catalogue directly from the entered endpoint, so the wizard no longer calls
+    /// this — but it stays as the seed-from-`settings.*` migration entry point.
+    #[allow(dead_code)] // legacy/migration seed; wizard writes config directly now
     pub fn seed_from_settings(&mut self, settings: &crate::model::settings::Settings) -> bool {
         if !self.providers.is_empty() || !self.models.is_empty() {
             return false; // already configured
