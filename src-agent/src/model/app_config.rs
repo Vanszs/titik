@@ -70,8 +70,10 @@ impl ApiType {
     }
 }
 
-/// Runtime role slot a model is assigned to. Exclusive (1:1 role→model) by
-/// convention; persisted in lowercase (`"main"`, `"awareness"`, …).
+/// Runtime role slot a model can be assigned to. Each role is GLOBALLY exclusive
+/// (a given role is held by at most ONE model), but a single model may carry
+/// SEVERAL roles (e.g. Main + Awareness + Compactor). Persisted in lowercase
+/// (`"main"`, `"awareness"`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelRole {
@@ -101,11 +103,18 @@ pub struct ProviderConn {
 }
 
 /// One model entry in the global catalogue. References its serving provider by
-/// `provider_uuid`. `route` pins an OpenRouter upstream provider name; `role`
-/// assigns the runtime slot (`None` = unassigned).
+/// `provider_uuid`. `route` pins an OpenRouter upstream provider name; `roles`
+/// lists the runtime slots this model holds (a model may hold several; each role
+/// is globally unique, held by at most one model).
+///
+/// Back-compat: an older config wrote a single `role: Option<ModelRole>`. That
+/// field is still READ (hidden, never re-serialized) so old entries migrate;
+/// always go through [`Self::effective_roles`] to fold the legacy field into the
+/// new list. On save we write `roles` and leave `role` `None`, so the legacy key
+/// stops being emitted once a config is re-saved.
 ///
 /// Every field carries `#[serde(default)]`; `uuid` defaults to a freshly minted
-/// v4 and the two `Option` fields are omitted from the JSON when `None`.
+/// v4 and `route` is omitted from the JSON when `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     #[serde(default = "new_uuid")]
@@ -118,8 +127,31 @@ pub struct ModelEntry {
     pub provider_uuid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime roles this model holds. Empty = unassigned. Serialized as-is.
+    #[serde(default)]
+    pub roles: Vec<ModelRole>,
+    /// LEGACY single-role field: READ-ONLY back-compat. Deserialized from old
+    /// configs but never written back (`skip_serializing`), so it silently
+    /// migrates into `roles` via [`Self::effective_roles`].
+    #[serde(default, skip_serializing)]
     pub role: Option<ModelRole>,
+}
+
+impl ModelEntry {
+    /// The roles this entry effectively holds, folding in the legacy single-role
+    /// field for back-compat: if `roles` is non-empty it wins; otherwise the
+    /// legacy `role` (when `Some`) is promoted to a one-element list; otherwise
+    /// empty. Every roles READ (resolver + load mapping) goes through this so a
+    /// pre-multi-role config behaves identically until it's re-saved.
+    pub fn effective_roles(&self) -> Vec<ModelRole> {
+        if !self.roles.is_empty() {
+            self.roles.clone()
+        } else if let Some(r) = self.role {
+            vec![r]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Global user-facing configuration (theme + accent + provider/model catalogue).
@@ -223,7 +255,8 @@ impl AppConfig {
             } else {
                 Some(settings.provider.clone())
             },
-            role: Some(ModelRole::Main),
+            roles: vec![ModelRole::Main],
+            role: None,
         });
         true
     }

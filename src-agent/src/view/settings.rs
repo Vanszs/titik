@@ -383,13 +383,16 @@ pub fn draw(frame: &mut Frame, st: &SettingsState, models_cache: &[ModelInfo], p
             && st.mm_provider_is_openrouter()
             && st.model_modal.as_ref().map(|m| !m.query.is_empty()).unwrap_or(false);
         let on_route = cur_mf == Some(crate::app::mode::settings::ModelField::Route);
+        let on_role  = cur_mf == Some(crate::app::mode::settings::ModelField::Role);
         let hint = if st.model_modal.is_some() {
             if model_search {
                 "↑↓ result · enter pick · tab next · esc cancel"
             } else if on_route {
                 "↑↓ provider/move · enter pin + next · esc cancel"
+            } else if on_role {
+                "←→ role · space toggle · enter next · esc cancel"
             } else {
-                "↑↓ field · ←→ provider/role · enter select · esc cancel"
+                "↑↓ field · ←→ provider · enter select · esc cancel"
             }
         } else if st.prov_modal.is_some() {
             "↑↓ field · ←→ move/type · enter select · esc cancel"
@@ -760,9 +763,17 @@ fn draw_models(
             m.name.clone()
         };
         let name_str  = truncate(&name_str, col_name_w as usize);
-        let role_str  = m.role
-            .map(|r: ModelRole| r.label().to_string())
-            .unwrap_or_else(|| "\u{2014}".to_string());
+        // A model may hold several roles → comma-join their labels (truncated to
+        // the column width); an em-dash when it holds none.
+        let role_str  = if m.roles.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            m.roles
+                .iter()
+                .map(|r: &ModelRole| r.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let role_str  = truncate(&role_str, col_role_w as usize);
         let model_str = if m.model_id.is_empty() {
             "\u{2014}".to_string()
@@ -1197,7 +1208,11 @@ fn draw_model_modal(
         }
     }
 
-    // Row: Role toggle (edit mode only).
+    // Row: Role chip multi-select (edit mode only). The four roles render as a
+    // horizontal chip row: an ASSIGNED role (in `modal.roles`) is accent and
+    // bracket-wrapped (`[main]`); an UNASSIGNED one is dim and space-wrapped
+    // (` main `). When the Role field is focused, the chip at `role_cursor` gets
+    // the inverse highlight so the cursor is visible.
     if modal.is_edit() {
         let active  = focused(ModelField::Role);
         let lc      = if active { palette.accent } else { palette.dim };
@@ -1205,15 +1220,26 @@ fn draw_model_modal(
             format!("{:<width$}", "Role", width = label_w),
             Style::default().fg(lc),
         );
-        let role_label = modal.role
-            .map(|r: ModelRole| r.label())
-            .unwrap_or("unassigned");
-        let toggle_text = format!("\u{2039} {} \u{203a}", role_label);
-        let tc = if active { palette.accent } else { palette.dim };
-        lines.push(Line::from(vec![
-            label,
-            Span::styled(toggle_text, Style::default().fg(tc)),
-        ]));
+        let mut spans: Vec<Span> = vec![label];
+        for (i, role) in ModelRole::ALL.iter().enumerate() {
+            let assigned = modal.roles.contains(role);
+            let chip = if assigned {
+                format!("[{}]", role.label())
+            } else {
+                format!(" {} ", role.label())
+            };
+            let style = if active && i == modal.role_cursor {
+                // Cursor chip: inverse highlight (visible regardless of assignment).
+                Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
+            } else if assigned {
+                Style::default().fg(palette.accent)
+            } else {
+                Style::default().fg(palette.dim)
+            };
+            spans.push(Span::styled(chip, style));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
     }
 
     // Blank line before the buttons.

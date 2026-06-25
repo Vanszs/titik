@@ -15,9 +15,10 @@ pub use state::SettingsState;
 /// inherent `impl` blocks below (label/short_label/full_label/toggle/ALL) attach
 /// the UI-only helpers to these re-exported in-crate types.
 ///
-/// `ModelRole`: role slot a model is assigned to in the agent runtime. Roles are
-/// exclusive (1:1 role→model): assigning a role steals it from any other model
-/// that currently holds it. `None` means unassigned.
+/// `ModelRole`: role slot a model is assigned to in the agent runtime. A model
+/// may hold SEVERAL roles, but each role is globally exclusive — assigning a role
+/// to one model steals it from any other model that currently holds it. An empty
+/// role list means unassigned.
 ///
 /// `ApiType`: the wire protocol type of an API provider endpoint.
 pub use crate::model::app_config::{ApiType, ModelRole};
@@ -151,8 +152,9 @@ pub struct ModelDraft {
     pub model_id: String,
     /// Index into [`SettingsState::providers`] — which API provider serves it.
     pub provider_idx: usize,
-    /// Role slot assigned to this model; `None` = unassigned.
-    pub role: Option<ModelRole>,
+    /// Role slots assigned to this model; empty = unassigned. A model may hold
+    /// several roles (each role is globally unique across models).
+    pub roles: Vec<ModelRole>,
     /// Pinned upstream provider for OpenRouter routing: the chosen endpoint's
     /// provider name. `None` = Auto (let OpenRouter route). Only meaningful for
     /// OpenRouter-served models; ignored for other providers.
@@ -194,8 +196,12 @@ pub struct ModelModal {
     pub model_id: String,
     /// Active field index (see layout comment above).
     pub field: usize,
-    /// Draft role assignment; `None` = unassigned.  Only editable in EDIT mode.
-    pub role: Option<ModelRole>,
+    /// Draft role assignments; empty = unassigned. A model may hold several
+    /// roles. Only editable in EDIT mode, via the Role chip multi-select.
+    pub roles: Vec<ModelRole>,
+    /// Which role chip the multi-select cursor sits on (`0..ModelRole::ALL.len()`).
+    /// Used by the Role field to highlight + toggle the focused chip.
+    pub role_cursor: usize,
     /// Model omnisearch query (used when provider is OpenRouter and the Model
     /// field is focused).
     pub query: String,
@@ -232,7 +238,8 @@ impl ModelModal {
             provider_idx,
             model_id: String::new(),
             field: 0,
-            role: None,
+            roles: Vec::new(),
+            role_cursor: 0,
             query: String::new(),
             result_sel: 0,
             route: None,

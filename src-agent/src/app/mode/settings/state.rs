@@ -152,7 +152,8 @@ impl SettingsState {
             name: m.name.clone(),
             model_id: m.model_id.clone(),
             provider_idx: config.provider_index_by_uuid(&m.provider_uuid).unwrap_or(0),
-            role: m.role,
+            // Fold the legacy single-role field into the multi-role list on load.
+            roles: m.effective_roles(),
             route: m.route.clone(),
             session_only,
         };
@@ -708,7 +709,8 @@ impl SettingsState {
                 provider_idx: m.provider_idx,
                 model_id: m.model_id.clone(),
                 field: 0,
-                role: m.role,
+                roles: m.roles.clone(),
+                role_cursor: 0,
                 query: String::new(),
                 result_sel: 0,
                 // Carry the stored route forward. `route_sel` starts at 0 and is
@@ -734,8 +736,10 @@ impl SettingsState {
     /// this session only) and `false` for plain "Save" (global scope). Persistence
     /// is stubbed — the flag is stored in-memory only.
     ///
-    /// Role-steal: when the saved role is `Some(r)`, every OTHER model that
-    /// currently holds `r` is set to unassigned before the target is written.
+    /// Role-steal (per role): a model may hold several roles, but each role is
+    /// globally unique. For EACH role the target now holds, that role is removed
+    /// from every OTHER model before the target's full role set is written, so no
+    /// two models ever share a role.
     pub fn save_model_modal(&mut self, session_only: bool) {
         if let Some(m) = self.model_modal.take() {
             let draft = ModelDraft {
@@ -749,7 +753,7 @@ impl SettingsState {
                 name: m.name.trim().to_string(),
                 model_id: m.model_id.trim().to_string(),
                 provider_idx: m.provider_idx,
-                role: m.role,
+                roles: m.roles.clone(),
                 route: m.route.clone(),
                 session_only,
             };
@@ -758,12 +762,12 @@ impl SettingsState {
                 Some(i) if i < self.models.len() => i,
                 _ => self.models.len(), // will be the pushed index
             };
-            // Role-steal: clear the role from any other model that already holds it.
-            if let Some(r) = draft.role {
-                for (i, other) in self.models.iter_mut().enumerate() {
-                    if i != target_idx && other.role == Some(r) {
-                        other.role = None;
-                    }
+            // Per-role steal: drop each role the target now holds from every OTHER
+            // model so each role stays on at most one model (the target keeps all
+            // of its own roles).
+            for (i, other) in self.models.iter_mut().enumerate() {
+                if i != target_idx {
+                    other.roles.retain(|r| !draft.roles.contains(r));
                 }
             }
             match m.editing_idx {
@@ -866,9 +870,12 @@ impl SettingsState {
     /// Move left in the model modal, dispatching on the focused field:
     /// - Provider → cycle provider backward (wrapping, resets search), then
     ///   re-clamp `field` since the Route field may appear/disappear.
-    /// - Role     → cycle role backward.
     /// - Save/SaveSession/Cancel → step left within the button group, clamping at Save.
     /// - everything else (Name/Model/Route) → no-op.
+    ///
+    /// The Role field is NOT handled here: it's a chip multi-select whose ←→ move
+    /// the chip cursor ([`Self::mm_role_left`]/[`Self::mm_role_right`]), driven
+    /// directly from the input layer.
     pub fn mm_left(&mut self) {
         let n = self.providers.len();
         match self.mm_current_field() {
@@ -881,22 +888,6 @@ impl SettingsState {
                     }
                 }
                 self.mm_clamp_field();
-            }
-            Some(ModelField::Role) => {
-                if let Some(m) = self.model_modal.as_mut() {
-                    // None → Compactor → Safeguard → Awareness → Main → None
-                    m.role = match m.role {
-                        None => Some(ModelRole::ALL[ModelRole::ALL.len() - 1]),
-                        Some(r) => {
-                            let pos = ModelRole::ALL.iter().position(|x| *x == r).unwrap_or(0);
-                            if pos == 0 {
-                                None
-                            } else {
-                                Some(ModelRole::ALL[pos - 1])
-                            }
-                        }
-                    };
-                }
             }
             // Button group: Save → SaveSession → Cancel; Left steps backward, clamping at Save.
             Some(ModelField::SaveSession) => {
@@ -915,9 +906,10 @@ impl SettingsState {
     /// Move right in the model modal, dispatching on the focused field:
     /// - Provider → cycle provider forward (wrapping, resets search), then
     ///   re-clamp `field` since the Route field may appear/disappear.
-    /// - Role     → cycle role forward.
     /// - Save/SaveSession/Cancel → step right within the button group, clamping at Cancel.
     /// - everything else (Name/Model/Route) → no-op.
+    ///
+    /// The Role field is NOT handled here — see [`Self::mm_left`].
     pub fn mm_right(&mut self) {
         let n = self.providers.len();
         match self.mm_current_field() {
@@ -930,23 +922,6 @@ impl SettingsState {
                     }
                 }
                 self.mm_clamp_field();
-            }
-            Some(ModelField::Role) => {
-                if let Some(m) = self.model_modal.as_mut() {
-                    // None → Main → Awareness → Safeguard → Compactor → None
-                    m.role = match m.role {
-                        None => Some(ModelRole::ALL[0]),
-                        Some(r) => {
-                            let pos = ModelRole::ALL.iter().position(|x| *x == r).unwrap_or(0);
-                            let next = pos + 1;
-                            if next >= ModelRole::ALL.len() {
-                                None
-                            } else {
-                                Some(ModelRole::ALL[next])
-                            }
-                        }
-                    };
-                }
             }
             // Button group: Save → SaveSession → Cancel; Right steps forward, clamping at Cancel.
             Some(ModelField::Save) => {
@@ -978,6 +953,39 @@ impl SettingsState {
         if let Some(m) = self.model_modal.as_mut() {
             if m.field > max {
                 m.field = max;
+            }
+        }
+    }
+
+    // --- Role chip multi-select (EDIT-mode Role field) ---
+
+    /// Move the role-chip cursor left over `0..ModelRole::ALL.len()` (clamps at
+    /// 0). Drives which chip the Role field highlights/toggles.
+    pub fn mm_role_left(&mut self) {
+        if let Some(m) = self.model_modal.as_mut() {
+            m.role_cursor = m.role_cursor.saturating_sub(1);
+        }
+    }
+
+    /// Move the role-chip cursor right over `0..ModelRole::ALL.len()` (clamps at
+    /// the last chip).
+    pub fn mm_role_right(&mut self) {
+        let max = ModelRole::ALL.len().saturating_sub(1);
+        if let Some(m) = self.model_modal.as_mut() {
+            m.role_cursor = (m.role_cursor + 1).min(max);
+        }
+    }
+
+    /// Toggle membership of the focused chip's role (`ModelRole::ALL[role_cursor]`)
+    /// in the modal's `roles`: add when absent, remove when present. The global
+    /// per-role steal runs later, on save.
+    pub fn mm_role_toggle(&mut self) {
+        if let Some(m) = self.model_modal.as_mut() {
+            let role = ModelRole::ALL[m.role_cursor.min(ModelRole::ALL.len() - 1)];
+            if let Some(pos) = m.roles.iter().position(|r| *r == role) {
+                m.roles.remove(pos);
+            } else {
+                m.roles.push(role);
             }
         }
     }

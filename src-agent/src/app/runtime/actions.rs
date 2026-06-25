@@ -291,7 +291,10 @@ pub(super) fn apply_action(
                     provider_uuid,
                     // Omnisearch routing is a later pass; no upstream pin here.
                     route: None,
-                    role: Some(ModelRole::Main),
+                    // First-run only ever assigns Main (unchanged behavior); the
+                    // legacy single-role field is left None so it isn't written.
+                    roles: vec![ModelRole::Main],
+                    role: None,
                 });
                 if let Err(e) = state.rest.config.save() {
                     state.rest.status = format!("config save failed: {e}");
@@ -555,7 +558,10 @@ pub(super) fn apply_action(
                         .map(|p| p.uuid.clone())
                         .unwrap_or_default(),
                     route: d.route.clone(),
-                    role: d.role,
+                    // Persist the multi-role list; leave the legacy single-role
+                    // field None so it stops being serialized (migration on save).
+                    roles: d.roles.clone(),
+                    role: None,
                 };
                 // Global catalogue: session_only == false. Session override layer:
                 // session_only == true (persisted to settings.json, never config).

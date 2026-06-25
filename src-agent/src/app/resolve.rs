@@ -180,12 +180,14 @@ fn legacy_fallback(settings: &Settings, role: ModelRole) -> Option<Resolved> {
 /// `Some`.
 pub fn resolve_role(config: &AppConfig, settings: &Settings, role: ModelRole) -> Option<Resolved> {
     // 1. Pick the assigned model: per-session overrides first, then the global
-    //    catalogue. (`role` is Copy; both finds compare against `Some(role)`.)
+    //    catalogue. A model may hold several roles, so match on whether its
+    //    effective role set CONTAINS `role` (this also folds the legacy
+    //    single-role field in via `effective_roles`).
     let assigned = settings
         .session_models
         .iter()
-        .find(|e| e.role == Some(role))
-        .or_else(|| config.models.iter().find(|e| e.role == Some(role)));
+        .find(|e| e.effective_roles().contains(&role))
+        .or_else(|| config.models.iter().find(|e| e.effective_roles().contains(&role)));
 
     // 2. If a model is assigned AND its provider resolves, that route wins —
     //    including an explicitly-assigned Awareness model (explicit assignment is

@@ -692,8 +692,37 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                 }
                 _ => {}
             }
+        } else if cur == Some(ModelField::Role) {
+            // Role field: a chip multi-select. ←→ move the chip cursor; Space
+            // toggles the focused role on/off (the global per-role steal happens
+            // on save). Enter advances to the next field; Up leaves upward,
+            // Down/Tab leave downward (same non-trap nav as other fields).
+            match key.code {
+                KeyCode::Esc => {
+                    s.close_model_modal();
+                }
+                KeyCode::Left => {
+                    s.mm_role_left();
+                }
+                KeyCode::Right => {
+                    s.mm_role_right();
+                }
+                KeyCode::Char(' ') => {
+                    s.mm_role_toggle();
+                }
+                KeyCode::Enter => {
+                    s.mm_down();
+                }
+                KeyCode::Up => {
+                    s.mm_up();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    s.mm_down();
+                }
+                _ => {}
+            }
         } else {
-            // Field navigation (Name / Provider / Model-as-text / [Role] / Save / Cancel).
+            // Field navigation (Name / Provider / Model-as-text / Save / Cancel).
             match key.code {
                 KeyCode::Esc => {
                     s.close_model_modal();
@@ -715,7 +744,7 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
                         Some(ModelField::Save) => s.save_model_modal(false),
                         Some(ModelField::SaveSession) => s.save_model_modal(true),
                         Some(ModelField::Cancel) => s.close_model_modal(),
-                        // Name / Provider / Model / Role: advance to the next field.
+                        // Name / Provider / Model: advance to the next field.
                         _ => s.mm_down(),
                     }
                 }
