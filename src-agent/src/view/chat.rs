@@ -114,7 +114,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         Some(s) => (s.name.as_str(), if resolved_model.is_empty() { s.settings.model.as_str() } else { resolved_model }),
         None => (APP_TITLE, DEFAULT_MODEL),
     };
-    let header_line = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled("simple-coder · ", Style::default().fg(palette.dim)),
         Span::styled(name, Style::default().fg(palette.accent)),
         Span::styled(" [", Style::default().fg(palette.dim)),
@@ -122,7 +122,21 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         Span::styled("]", Style::default().fg(palette.dim)),
         Span::styled(" · ", Style::default().fg(palette.dim)),
         Span::styled(rest.agent_mode.label(), Style::default().fg(palette.accent)),
-    ]);
+    ];
+    // Sub-agent hint: when any exist, a small dim `▸ N sub-agents` (N = running
+    // count) so the user knows the `$` panel has something to show.
+    if !rest.subagents.is_empty() {
+        let running = rest
+            .subagents
+            .iter()
+            .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
+            .count();
+        header_spans.push(Span::styled(
+            format!("  ▸ {running} sub-agents"),
+            Style::default().fg(palette.dim),
+        ));
+    }
+    let header_line = Line::from(header_spans);
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim))
@@ -657,6 +671,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
             ("Ctrl+R", "resend the last message"),
             ("Esc", "interrupt while busy, else quit"),
             ("Up/Down/wheel", "scroll the transcript"),
+            ("$", "open the sub-agents panel — Ctrl+X kills the selected"),
         ];
         for (k, v) in keys {
             rows.push(Line::from(vec![
@@ -680,6 +695,111 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(rows), inner);
+    }
+
+    // --- Sub-agents panel --- opened with `$`. A bordered popup above the input
+    // (same rect math as the help overlay), split into a narrow left list of
+    // active sub-agents (RIGHT border, like the settings sidebar) and a wide right
+    // pane showing the selected one's live progress. Modal: keys are routed to the
+    // sub-agent handler in the input controller. Ctrl+X kills the selection.
+    if rest.subagents_open {
+        // Box sizing: up to ~12 rows, clamped to the space above the input.
+        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let h = 12u16.min(avail.max(3));
+        let y = chunks[2].y.saturating_sub(h);
+        let rect = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+
+        let block = Block::bordered()
+            .border_style(Style::default().fg(palette.dim))
+            .title(Span::styled(" sub-agents ", Style::default().fg(palette.dim)));
+        let inner = block.inner(rect);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+
+        if inner.width == 0 || inner.height == 0 {
+            // Nothing fits — the bordered box itself is the whole signal.
+        } else if rest.subagents.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "(no active sub-agents)",
+                    Style::default().fg(palette.dim),
+                ))
+                .style(Style::default()),
+                inner.inner(Margin { horizontal: 1, vertical: 0 }),
+            );
+        } else {
+            // Two-pane split: a ~24-col left list (RIGHT border divider, like the
+            // settings sidebar) + a wide right progress pane.
+            const LIST_W: u16 = 24;
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(LIST_W), Constraint::Min(0)])
+                .split(inner);
+
+            // LEFT: one row per sub-agent — "#id name tag" + truncated label. The
+            // row at `subagent_sel` gets the sel_fg/sel_bg highlight.
+            let list_block = Block::new()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(palette.dim));
+            let list_inner = list_block.inner(cols[0]);
+            frame.render_widget(list_block, cols[0]);
+
+            let sel = rest.subagent_sel.min(rest.subagents.len().saturating_sub(1));
+            let list_w = list_inner.width as usize;
+            let list_lines: Vec<Line> = rest
+                .subagents
+                .iter()
+                .enumerate()
+                .map(|(i, sa)| {
+                    let tag = subagent_tag(&sa.status);
+                    let head = format!("#{} {} {}", sa.id, sa.agent_name, tag);
+                    let label = truncate_chars(&sa.label, list_w.saturating_sub(head.chars().count() + 1).max(1));
+                    let text = format!("{head} {label}");
+                    if i == sel {
+                        Line::from(Span::styled(
+                            format!("{:<width$}", truncate_chars(&text, list_w), width = list_w),
+                            Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
+                        ))
+                    } else {
+                        Line::from(vec![
+                            Span::styled(format!("#{} ", sa.id), Style::default().fg(palette.accent)),
+                            Span::styled(
+                                truncate_chars(
+                                    &format!("{} {} {}", sa.agent_name, tag, sa.label),
+                                    list_w.saturating_sub(2 + sa.id.to_string().chars().count()).max(1),
+                                ),
+                                Style::default().fg(palette.fg),
+                            ),
+                        ])
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(list_lines), list_inner);
+
+            // RIGHT: the selected sub-agent's status line + the trailing transcript
+            // lines that fit. Inset 1 col on the left so it doesn't hug the divider.
+            let right = cols[1].inner(Margin { horizontal: 1, vertical: 0 });
+            if right.width > 0 && right.height > 0 {
+                let sa = &rest.subagents[sel];
+                let mut rows: Vec<Line> = Vec::new();
+                rows.push(Line::from(Span::styled(
+                    subagent_status_line(&sa.status),
+                    Style::default().fg(palette.accent),
+                )));
+                // Last transcript lines that fit (after the status row).
+                let budget = (right.height as usize).saturating_sub(1);
+                if budget > 0 {
+                    let start = sa.transcript.len().saturating_sub(budget);
+                    for line in &sa.transcript[start..] {
+                        rows.push(Line::from(Span::styled(
+                            truncate_chars(line, right.width as usize),
+                            Style::default().fg(palette.dim),
+                        )));
+                    }
+                }
+                frame.render_widget(Paragraph::new(rows), right);
+            }
+        }
     }
 
     // --- Toast --- transient box pinned to the top of the transcript. `Error`
@@ -858,6 +978,28 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(rows), inner);
+    }
+}
+
+/// Short status tag/glyph for a sub-agent, shown in the panel's left list.
+fn subagent_tag(status: &crate::app::subagent::SubAgentStatus) -> &'static str {
+    use crate::app::subagent::SubAgentStatus;
+    match status {
+        SubAgentStatus::Running => "running",
+        SubAgentStatus::Done(_) => "done",
+        SubAgentStatus::Killed => "killed",
+        SubAgentStatus::Error(_) => "error",
+    }
+}
+
+/// Status line for a sub-agent, shown at the top of the panel's right pane.
+fn subagent_status_line(status: &crate::app::subagent::SubAgentStatus) -> String {
+    use crate::app::subagent::SubAgentStatus;
+    match status {
+        SubAgentStatus::Running => "running…".to_string(),
+        SubAgentStatus::Done(answer) => format!("done · {}", truncate_chars(answer, 60)),
+        SubAgentStatus::Killed => "killed".to_string(),
+        SubAgentStatus::Error(e) => format!("error · {}", truncate_chars(e, 60)),
     }
 }
 

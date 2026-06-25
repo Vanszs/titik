@@ -314,6 +314,35 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         return Action::None;
     }
 
+    // The sub-agents panel is modal: Up/Down move the selection, Ctrl+X kills the
+    // selected one (abrupt abort), Esc or any other key closes it. Mirrors the
+    // help-overlay modal handling above.
+    if rest.subagents_open {
+        let count = rest.subagents.len();
+        if is_ctrl(&key, 'x') {
+            if let Some(sa) = rest.subagents.get_mut(rest.subagent_sel) {
+                sa.abort.abort();
+                sa.status = crate::app::subagent::SubAgentStatus::Killed;
+            }
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Up => {
+                rest.subagent_sel = rest.subagent_sel.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if count > 0 {
+                    rest.subagent_sel = (rest.subagent_sel + 1).min(count - 1);
+                }
+            }
+            // Esc or any non-nav key closes the panel.
+            _ => {
+                rest.subagents_open = false;
+            }
+        }
+        return Action::None;
+    }
+
     // Tool-approval modal: while a risky call is paused, only y/n/Esc matter.
     // `y` approves (run it), `n`/Esc deny (feed "denied by user"); every other
     // key is swallowed so the prompt stays up and input can't leak underneath.
@@ -499,6 +528,18 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         KeyCode::BackTab => {
             rest.agent_mode = rest.agent_mode.toggled();
             rest.status = format!("mode: {}", rest.agent_mode.label());
+            Action::None
+        }
+        // `$` on an EMPTY input opens the sub-agents panel instead of being typed
+        // (mirrors the `/` and `@` palette triggers). With any input present it's
+        // a normal character.
+        KeyCode::Char('$')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) && rest.input.is_empty() =>
+        {
+            rest.subagents_open = true;
+            rest.subagent_sel = rest
+                .subagent_sel
+                .min(rest.subagents.len().saturating_sub(1));
             Action::None
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
