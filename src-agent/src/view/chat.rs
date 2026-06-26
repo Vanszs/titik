@@ -400,6 +400,46 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
             lines.extend(render_block(logical, "● ", palette.fg, wrap_w, true));
         }
 
+        // Sub-agent inline indicator: one animated line per RUNNING sub-agent,
+        // appended at the bottom of the transcript so it sits just above the input
+        // box and has full width. Uses the same time-driven braille spinner as the
+        // compact animation (80ms/frame cadence). Only rendered while at least one
+        // sub-agent is Running; disappears automatically when all finish.
+        const SA_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let running_agents: Vec<&crate::app::subagent::SubAgent> = rest
+            .subagents
+            .iter()
+            .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
+            .collect();
+        if !running_agents.is_empty() {
+            let elapsed_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let frame_idx = (elapsed_ms / 80) as usize;
+            let glyph = SA_SPINNER[frame_idx % SA_SPINNER.len()];
+            if !first {
+                lines.push(Line::from(""));
+            }
+            for sa in &running_agents {
+                // Last meaningful transcript line as the "current action"; fall
+                // back to "starting…" when the transcript is still empty.
+                let action = sa
+                    .transcript
+                    .last()
+                    .map(|s| s.as_str())
+                    .unwrap_or("starting…");
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(glyph.to_string(), Style::default().fg(palette.accent)),
+                    Span::styled(
+                        format!(" {} · {}", sa.agent_name, action),
+                        Style::default().fg(palette.dim),
+                    ),
+                ]));
+            }
+        }
+
         // Scroll model: follow pins to the bottom (auto-scrolls as content grows);
         // otherwise show the stored offset, clamped. Publish max_scroll so the key/
         // mouse handlers can clamp + detect bottom.
@@ -502,74 +542,25 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     // fold. Idle (`ready`) and the `approve …? [y/n]` prompt render statically — a
     // single plain dim span, no comet, no timer.
     //
-    // When there are RUNNING sub-agents, an animated braille spinner with a
-    // "press $ to view" hint is appended to (or replaces) the status line so the
-    // user always knows an agent is alive. The spinner frame is time-driven
-    // (matching the compact animation cadence) so it advances on every redraw
-    // without a stored counter.
-    const SA_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let running_count = rest
-        .subagents
-        .iter()
-        .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
-        .count();
+    // Sub-agent progress is now rendered INLINE in the transcript (see above),
+    // so the status line is uncluttered and always has room for the token readout.
     let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
-    let status_line: Line<'static> = if running_count > 0 && rest.work_since.is_none() {
-        // No main-agent shimmer: the whole status line becomes the sub-agent hint.
-        let elapsed_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let frame_idx = (elapsed_ms / 80) as usize;
-        let glyph = SA_SPINNER[frame_idx % SA_SPINNER.len()];
-        let label: String = if running_count == 1 {
-            let name = rest
-                .subagents
-                .iter()
-                .find(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
-                .map(|s| s.agent_name.as_str())
-                .unwrap_or("agent");
-            format!("{glyph} {name} working — press $ to view")
-        } else {
-            format!("{glyph} {running_count} sub-agents working — press $ to view")
-        };
-        Line::from(vec![
-            Span::styled(glyph.to_string(), Style::default().fg(palette.accent)),
-            Span::styled(label[glyph.len()..].to_string(), Style::default().fg(palette.dim)),
-        ])
-    } else {
-        match rest.work_since {
-            Some(since) => {
-                let elapsed_ms = since.elapsed().as_millis();
-                let mut spans = comet_spans(&rest.status, elapsed_ms, palette);
-                // Dim elapsed counter, e.g. `thinking · 3s`. Whole seconds so it ticks
-                // calmly (the comet supplies the fast motion).
-                spans.push(Span::styled(
-                    format!(" · {}s", elapsed_ms / 1000),
-                    Style::default().fg(palette.dim),
-                ));
-                // When sub-agents are also running alongside main-agent work, append
-                // a brief animated spinner hint so the user knows $ has activity.
-                if running_count > 0 {
-                    let elapsed_ms2 = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let frame_idx = (elapsed_ms2 / 80) as usize;
-                    let glyph = SA_SPINNER[frame_idx % SA_SPINNER.len()];
-                    spans.push(Span::styled(
-                        format!("   {glyph} {running_count} sub-agent{} ($)",
-                            if running_count == 1 { "" } else { "s" }),
-                        Style::default().fg(palette.dim),
-                    ));
-                }
-                Line::from(spans)
-            }
-            None => Line::from(Span::styled(
-                rest.status.clone(),
+    let status_line: Line<'static> = match rest.work_since {
+        Some(since) => {
+            let elapsed_ms = since.elapsed().as_millis();
+            let mut spans = comet_spans(&rest.status, elapsed_ms, palette);
+            // Dim elapsed counter, e.g. `thinking · 3s`. Whole seconds so it ticks
+            // calmly (the comet supplies the fast motion).
+            spans.push(Span::styled(
+                format!(" · {}s", elapsed_ms / 1000),
                 Style::default().fg(palette.dim),
-            )),
+            ));
+            Line::from(spans)
         }
+        None => Line::from(Span::styled(
+            rest.status.clone(),
+            Style::default().fg(palette.dim),
+        )),
     };
     let readout = if rest.tokens_in > 0 || rest.tokens_out > 0 || rest.cost > 0.0 {
         // Show the cached-prompt-token count right after the input arrow when the
