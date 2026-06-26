@@ -41,6 +41,9 @@ pub use event::AgentEvent;
 #[allow(unused_imports)]
 pub use spawn::spawn_subagent;
 
+// `PendingSubagent` is referenced from `AppStateRest` and both spawn paths the
+// moment the queue is wired in, so it is a live part of the public surface.
+
 /// Hard cap on the number of sub-agents that may run CONCURRENTLY. Both spawn
 /// paths (the model-callable `task` tool and the `/task` slash command) refuse
 /// to launch a new sub-agent while this many are already in [`SubAgentStatus::Running`],
@@ -95,5 +98,31 @@ pub struct SubAgent {
     /// this sub-agent, if any. `Some(call_id)` means the sub-agent was spawned
     /// by the model via the `task` tool; `None` means it was spawned by the
     /// user's `/task` slash command.
+    pub tool_call_id: Option<String>,
+}
+
+/// A delegation that has been ACCEPTED but not yet started because all
+/// [`MAX_SUBAGENTS`] slots are occupied. It waits at the back of
+/// [`AppStateRest::pending_subagents`](crate::app::state::AppStateRest::pending_subagents)
+/// and is started (popped from the FRONT) by `try_start_pending` the moment a
+/// running sub-agent terminates and frees a slot.
+///
+/// Its `id` is allocated from `next_subagent_id` at ENQUEUE time so the `$`
+/// panel can show a stable id for the queued row, and the spawned [`SubAgent`]
+/// inherits that exact id when it finally starts. For a model-callable `task`
+/// delegation (`tool_call_id == Some`) the call id is ALSO recorded in
+/// `pending_subagent_calls` at enqueue time, so a parked main turn waits for the
+/// queued delegation just as it waits for a running one — its result fills when
+/// the queued agent eventually runs and finishes.
+#[derive(Debug, Clone)]
+pub struct PendingSubagent {
+    /// Stable id pre-allocated at enqueue time; the spawned [`SubAgent`] takes it.
+    pub id: usize,
+    /// The agent definition's name to run (resolved at spawn time, not now).
+    pub agent_name: String,
+    /// The task prompt to seed the sub-agent with.
+    pub prompt: String,
+    /// The `task`-tool call id this delegation answers, if any (`None` for a
+    /// `/task` slash-command enqueue, which never parks the main turn).
     pub tool_call_id: Option<String>,
 }

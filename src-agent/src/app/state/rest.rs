@@ -228,6 +228,15 @@ pub struct AppStateRest {
     /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
     #[allow(dead_code)]
     pub next_subagent_id: usize,
+    /// FIFO queue of delegations accepted while all [`crate::app::subagent::MAX_SUBAGENTS`]
+    /// slots were busy. Unlimited length: over-cap delegations ENQUEUE here instead
+    /// of being refused. `try_start_pending` (in the event-loop sub-agent drain)
+    /// pops the FRONT and spawns it whenever a running sub-agent terminates and a
+    /// slot frees, so at most `MAX_SUBAGENTS` ever run at once. Each entry's id is
+    /// pre-allocated from `next_subagent_id` at enqueue time (stable `$`-panel row);
+    /// a `task`-tool entry's call id is also held in `pending_subagent_calls` so the
+    /// parked main turn waits for the queued delegation too.
+    pub pending_subagents: std::collections::VecDeque<crate::app::subagent::PendingSubagent>,
     /// Tool-call ids of in-flight `task`-tool delegations whose result the main
     /// agent is still waiting for. The model-callable `task` tool DEFERS its tool
     /// result (mirroring the `awaiting_approval` park): `process_tools` pushes the
@@ -318,6 +327,7 @@ impl AppStateRest {
             subagents_open: false,
             subagent_sel: 0,
             next_subagent_id: 0,
+            pending_subagents: std::collections::VecDeque::new(),
             pending_subagent_calls: Vec::new(),
             awaiting_subagents: false,
         }

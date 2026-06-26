@@ -106,23 +106,30 @@ pub(crate) fn process_tools(
                     call.id.clone(),
                     "error: task requires non-empty 'agent' and 'prompt'".to_string(),
                 ));
-            } else if super::spawn::running_subagents(state) >= crate::app::subagent::MAX_SUBAGENTS {
-                // Concurrency cap hit: do NOT spawn. Answer the call now with an
-                // error so the conversation stays API-valid and the main agent sees
-                // it must wait for a running sub-agent to finish before delegating
-                // again (rather than parking forever on an un-spawned delegation).
-                state.rest.tool_results.push((
-                    call.id.clone(),
-                    "error: sub-agent limit reached (5 running). Wait for one to finish before delegating again.".to_string(),
-                ));
             } else {
                 let agent = agent.to_string();
                 let prompt = prompt.to_string();
-                match super::spawn::spawn_task(state, client, handle, &agent, &prompt, Some(call.id.clone())) {
-                    // Spawned: DEFER the result. The drain fills it on terminal.
-                    Some(_) => state.rest.pending_subagent_calls.push(call.id.clone()),
-                    // Nothing spawned → answer the call now so it isn't left dangling.
-                    None => state
+                // Spawn now if a slot is free, else ENQUEUE (unlimited pending; at
+                // most MAX_SUBAGENTS run at once). In BOTH the spawned and queued
+                // cases DEFER the result by recording the call id in
+                // `pending_subagent_calls`, so the parked round waits for the
+                // delegation whether it runs now or later — its result fills when
+                // the agent (eventually) finishes.
+                match super::spawn::spawn_or_queue(
+                    state,
+                    client,
+                    handle,
+                    &agent,
+                    &prompt,
+                    Some(call.id.clone()),
+                ) {
+                    super::spawn::SpawnOutcome::Spawned(_)
+                    | super::spawn::SpawnOutcome::Queued(_) => {
+                        state.rest.pending_subagent_calls.push(call.id.clone())
+                    }
+                    // Nothing started or queued (no client/session or unknown
+                    // agent) → answer the call now so it isn't left dangling.
+                    super::spawn::SpawnOutcome::Failed => state
                         .rest
                         .tool_results
                         .push((call.id.clone(), format!("error: unknown agent '{agent}'"))),

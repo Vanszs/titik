@@ -113,6 +113,14 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
         // and is dropped (no chat fold, no re-stream).
         state.rest.pending_subagent_calls.clear();
         state.rest.awaiting_subagents = false;
+        // Also drop any QUEUED `task`-tool delegations that belonged to this
+        // killed turn (their call ids were just cleared above, so they'd never
+        // resume anything). User-initiated `/task` queue entries (tool_call_id
+        // == None) are turn-independent and stay queued.
+        state
+            .rest
+            .pending_subagents
+            .retain(|p| p.tool_call_id.is_none());
         // Take any captured usage unconditionally so a partial turn's
         // usage can't leak into the next response.
         let usage = state.rest.pending_usage.take();

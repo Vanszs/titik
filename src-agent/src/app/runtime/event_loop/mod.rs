@@ -546,6 +546,19 @@ pub(super) fn run_loop(
             // unaffected. The list only ever grows here, so `subagent_sel` (always
             // < len once set) can never fall out of range — no clamp needed.
 
+            // --- start queued delegations into any freed slots ---
+            // A terminal handle above may have freed a slot. Start as many pending
+            // sub-agents (FRONT-first) as now fit. Done BEFORE the resume gate
+            // below: a queued task-tool delegation keeps its call id in
+            // `pending_subagent_calls` across the queued→running transition, and an
+            // unstartable entry delivers its error result + drops its id HERE — so
+            // the `pending_subagent_calls.is_empty()` test sees the settled set and
+            // can't resume a round that still has a queued delegation outstanding.
+            if !state.rest.pending_subagents.is_empty() {
+                super::stream::try_start_pending(state, client, handle);
+                dirty = true;
+            }
+
             // --- resume a round parked on deferred task-tool delegations ---
             // Once every pending delegation has filled its result (above), unpark
             // the tool round: `finish_tool_round` flushes ALL collected `tool_results`

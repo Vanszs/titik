@@ -32,25 +32,26 @@ pub(super) fn handle_task(
         state.rest.status = "usage: /task <agent> <task>".into();
         return Ok(());
     }
-    // Concurrency cap: refuse a new spawn while the max are already running
-    // (terminated sub-agents are pruned each tick, freeing slots). Surface a
-    // toast + status and bail without spawning, mirroring the `task` tool.
-    if super::super::stream::running_subagents(state) >= crate::app::subagent::MAX_SUBAGENTS {
-        state.rest.set_toast("sub-agent limit reached (5 running)".into());
-        state.rest.status = "sub-agent limit reached (5 running)".into();
-        return Ok(());
-    }
-
-    // Spawn via the shared helper (same path the `task` tool uses) so the
-    // ctx/registry/awareness/memory inputs + bookkeeping never diverge.
-    match super::super::stream::spawn_task(state, client, handle, &agent_name, &task_text, None) {
-        Some(id) => {
+    // Spawn now if a slot is free, else ENQUEUE (unlimited pending; at most
+    // MAX_SUBAGENTS run at once). The `/task` path never parks the main turn
+    // (tool_call_id == None), so it just reports started vs queued. Uses the
+    // shared `spawn_or_queue` helper so the ctx/registry/awareness/memory inputs
+    // + bookkeeping never diverge from the `task` tool.
+    match super::super::stream::spawn_or_queue(state, client, handle, &agent_name, &task_text, None)
+    {
+        super::super::stream::SpawnOutcome::Spawned(id) => {
             state
                 .rest
                 .set_toast_info(format!("started sub-agent #{id} ({agent_name})"));
             state.rest.status = format!("started sub-agent #{id} ({agent_name})");
         }
-        None => {
+        super::super::stream::SpawnOutcome::Queued(id) => {
+            state
+                .rest
+                .set_toast_info(format!("queued sub-agent #{id} ({agent_name})"));
+            state.rest.status = format!("queued sub-agent #{id} ({agent_name})");
+        }
+        super::super::stream::SpawnOutcome::Failed => {
             state.rest.status = format!("unknown agent: {agent_name}");
         }
     }

@@ -64,7 +64,7 @@ pub(super) fn render_subagents_panel(
 
     if inner.width == 0 || inner.height == 0 {
         // Nothing fits — the bordered box itself is the whole signal.
-    } else if rest.subagents.is_empty() {
+    } else if rest.subagents.is_empty() && rest.pending_subagents.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "(no active sub-agents)",
@@ -92,7 +92,7 @@ pub(super) fn render_subagents_panel(
 
         let sel = rest.subagent_sel.min(rest.subagents.len().saturating_sub(1));
         let list_w = list_inner.width as usize;
-        let list_lines: Vec<Line> = rest
+        let mut list_lines: Vec<Line> = rest
             .subagents
             .iter()
             .enumerate()
@@ -120,12 +120,40 @@ pub(super) fn render_subagents_panel(
                 }
             })
             .collect();
+        // QUEUED delegations (not yet running) listed AFTER the live/done rows,
+        // tagged "pending" and rendered fully dim so they read as not-yet-active.
+        // They are not selectable here (no messages yet) — S3 owns that; for now
+        // they only show the id + agent + truncated prompt.
+        for p in &rest.pending_subagents {
+            let body = format!("{} pending {}", p.agent_name, p.prompt);
+            list_lines.push(Line::from(vec![
+                Span::styled(format!("#{} ", p.id), Style::default().fg(palette.dim)),
+                Span::styled(
+                    truncate_chars(
+                        &body,
+                        list_w.saturating_sub(2 + p.id.to_string().chars().count()).max(1),
+                    ),
+                    Style::default().fg(palette.dim),
+                ),
+            ]));
+        }
         frame.render_widget(Paragraph::new(list_lines), list_inner);
 
         // RIGHT: the selected sub-agent's status line + the trailing transcript
         // lines that fit. Inset 1 col on the left so it doesn't hug the divider.
+        // When ONLY pending entries exist (no spawned sub-agent yet) there is
+        // nothing to select, so show a neutral note instead of indexing an empty
+        // list.
         let right = cols[1].inner(Margin { horizontal: 1, vertical: 0 });
-        if right.width > 0 && right.height > 0 {
+        if right.width > 0 && right.height > 0 && rest.subagents.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "(sub-agents queued — waiting for a free slot)",
+                    Style::default().fg(palette.dim),
+                )),
+                right,
+            );
+        } else if right.width > 0 && right.height > 0 {
             let sa = &rest.subagents[sel];
             let mut rows: Vec<Line> = Vec::new();
             rows.push(Line::from(Span::styled(

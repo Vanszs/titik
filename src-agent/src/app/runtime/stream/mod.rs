@@ -9,7 +9,9 @@ pub(super) use turn::{finish_stream, advance_turn};
 pub(super) use tools::{process_tools, run_tool};
 pub(super) use run::{abort_current, start_stream_task};
 pub(crate) use tools::resume_after_subagents;
-pub(crate) use spawn::{running_subagents, spawn_task};
+pub(crate) use spawn::{spawn_or_queue, try_start_pending, SpawnOutcome};
+#[allow(unused_imports)]
+pub(crate) use spawn::spawn_task;
 
 /// Hard cap on tool-call rounds within a single user turn. Once exceeded the
 /// turn is stopped so a misbehaving model can't loop indefinitely.
