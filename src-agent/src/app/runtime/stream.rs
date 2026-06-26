@@ -305,15 +305,15 @@ pub(super) fn process_tools(
         let call = state.rest.pending_tool_calls[state.rest.tool_idx].clone();
         // Intercept the model-callable `task` tool BEFORE the generic
         // classify/dispatch path: spawn a background sub-agent (never classify it
-        // as risky, never await it inline). NON-BLOCKING: a SUCCESSFUL spawn pushes
-        // an IMMEDIATE ack tool result here ("started sub-agent #N …") so the round
-        // completes right away and the user can keep chatting while the sub-agent
-        // runs. When that sub-agent finishes, the event-loop drain enqueues its full
-        // report onto `subagent_nudges` to nudge the main agent later — the result
-        // is NOT awaited inline. A parse error / unknown agent spawns nothing, so it
-        // still pushes an IMMEDIATE error result for that call id (keeping the
-        // conversation API-valid). Either way `tool_idx` advances so the remaining
-        // calls in the round still process.
+        // as risky, never await it inline). UNLIKE the generic path, a SUCCESSFUL
+        // spawn does NOT push a tool result here — instead it DEFERS, recording the
+        // call id in `pending_subagent_calls` so the round parks (below) and the
+        // event-loop drain delivers the sub-agent's FULL report as the tool result
+        // once it finishes. The main agent then reacts to the real report rather
+        // than a fire-and-forget "started" line. A parse error / unknown agent
+        // spawns nothing, so it still pushes an IMMEDIATE error result for that call
+        // id (keeping the conversation API-valid). Either way `tool_idx` advances so
+        // the remaining calls in the round still process.
         if call.function.name == "task" {
             let sanitized =
                 crate::dto::chat::sanitize_tool_arguments(&call.function.arguments);
@@ -330,15 +330,8 @@ pub(super) fn process_tools(
                 let agent = agent.to_string();
                 let prompt = prompt.to_string();
                 match spawn_task(state, client, handle, &agent, &prompt, Some(call.id.clone())) {
-                    // Spawned: ack immediately so the round finishes now. The drain
-                    // queues the finished report as a nudge once the sub-agent ends.
-                    Some(id) => state.rest.tool_results.push((
-                        call.id.clone(),
-                        format!(
-                            "started sub-agent #{id} ({agent}). Running in the \
-                             background; it will report back when done."
-                        ),
-                    )),
+                    // Spawned: DEFER the result. The drain fills it on terminal.
+                    Some(_) => state.rest.pending_subagent_calls.push(call.id.clone()),
                     // Nothing spawned → answer the call now so it isn't left dangling.
                     None => state
                         .rest
@@ -435,10 +428,39 @@ pub(super) fn process_tools(
         state.rest.tool_results.push((call.id.clone(), result));
         state.rest.tool_idx += 1;
     }
-    // Every call in the round resolved inline (the `task` tool now acks immediately
-    // rather than parking), so the round is complete — finish it normally. A
-    // delegated sub-agent's finished report is delivered LATER as a nudge by the
-    // event-loop drain, never as a parked tool result.
+    // PARK on deferred `task`-tool delegations. If any sub-agent spawned this round
+    // is still awaiting its result, DON'T finish the round yet — the conversation
+    // would have dangling tool_call ids. Mark the round parked and return; the
+    // event-loop sub-agent drain fills each pending result into `tool_results` as
+    // its sub-agent terminates, and once `pending_subagent_calls` empties it calls
+    // `resume_after_subagents` (which runs `finish_tool_round`). `waiting` stays
+    // true and `awaiting_approval` stays false, so the comet keeps shimmering.
+    if !state.rest.pending_subagent_calls.is_empty() {
+        state.rest.awaiting_subagents = true;
+        let n = state.rest.pending_subagent_calls.len();
+        state.rest.status = if n == 1 {
+            "delegating… (1 sub-agent)".into()
+        } else {
+            format!("delegating… ({n} sub-agents)")
+        };
+        return;
+    }
+    finish_tool_round(state, client, handle);
+}
+
+/// Resume a tool round that was PARKED on deferred `task`-tool delegations.
+///
+/// Called from the event-loop sub-agent drain once every id in
+/// `pending_subagent_calls` has had its result delivered into `tool_results`. By
+/// then `tool_results` holds one entry per call in the round (non-task calls were
+/// answered inline in [`process_tools`]; task calls were filled by the drain), so
+/// finishing the round flushes them all into the conversation and re-streams —
+/// the main agent now sees every delegated report as a tool result and reacts.
+pub(crate) fn resume_after_subagents(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
     finish_tool_round(state, client, handle);
 }
 
