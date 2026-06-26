@@ -180,9 +180,13 @@ pub fn shortsend_router_prompt() -> &'static str {
 /// Assemble the full system prompt string for the OpenRouter `system` field.
 ///
 /// Structure: `prompt + "\n\n" + personality [+ "\n\n# Project Instructions\n" + agents]
-/// [+ "\n\n# Memory\n" + memory]`.
-/// Both optional sections are omitted when their argument is `None` or blank.
-pub fn build_system_prompt(memory: Option<&str>, agents: Option<&str>) -> String {
+/// [+ "\n\n# Memory\n" + memory] [+ <tools>] [+ "\n\n# Sub-agents\n" + subagents]`.
+/// All optional sections are omitted when their argument is `None` or blank.
+pub fn build_system_prompt(
+    memory: Option<&str>,
+    agents: Option<&str>,
+    subagents: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str(system_prompt());
     s.push_str("\n\n");
@@ -208,6 +212,19 @@ pub fn build_system_prompt(memory: Option<&str>, agents: Option<&str>) -> String
     if !tools.is_empty() {
         s.push_str("\n\n");
         s.push_str(tools);
+    }
+    if let Some(sa) = subagents {
+        let sa = sa.trim();
+        if !sa.is_empty() {
+            s.push_str("\n\n# Sub-agents\n");
+            s.push_str(
+                "You can delegate self-contained work to these specialist sub-agents with the \
+                 `task` tool. Each runs autonomously to completion and returns a full report \
+                 you must read and react to. The `agent` argument must be one of the names \
+                 below:\n",
+            );
+            s.push_str(sa);
+        }
     }
     s
 }

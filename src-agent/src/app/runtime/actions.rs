@@ -881,6 +881,10 @@ fn apply_agent_create(state: &mut AppState) {
                     a.cancel();
                 }
             }
+            // Rebuild the system prompt so the sub-agent roster reflects the new agent.
+            if let Some(sess) = state.rest.session.as_mut() {
+                sess.rebuild_system();
+            }
             state.rest.status = format!("agent created: {}", def.name);
         }
         Err(e) => {
@@ -931,6 +935,10 @@ fn apply_agent_save(state: &mut AppState) {
                     a.cancel();
                 }
             }
+            // Rebuild the system prompt so the sub-agent roster reflects the change.
+            if let Some(sess) = state.rest.session.as_mut() {
+                sess.rebuild_system();
+            }
             state.rest.status = format!("agent updated: {}", def.name);
         }
         Err(e) => {
@@ -979,6 +987,10 @@ fn apply_agent_delete(state: &mut AppState) {
                     a.reload(sess);
                     a.cancel();
                 }
+            }
+            // Rebuild the system prompt so the sub-agent roster reflects the deletion.
+            if let Some(sess) = state.rest.session.as_mut() {
+                sess.rebuild_system();
             }
             state.rest.status = format!("agent deleted: {name}");
         }

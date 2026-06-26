@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crate::dto::chat::ChatMessage;
+use crate::model::agent_def::AgentRegistry;
 use crate::model::conversation::Conversation;
 use crate::model::memory::{load_agents, load_memory};
 use crate::model::settings::Settings;
@@ -179,7 +180,8 @@ impl Session {
 
     /// Rebuild the system prompt and push it into the conversation.
     ///
-    /// Called on session load and after the user edits `MEMORY.md` at runtime.
+    /// Called on session load and after the user edits `MEMORY.md` at runtime,
+    /// and after agent create/edit/delete so the sub-agent roster stays live.
     /// Reads the session's `memory/MEMORY.md` (via `load_memory`), passes the
     /// result to `resources::build_system_prompt` which stitches together the
     /// embedded base prompt and the optional memory section, then calls
@@ -187,7 +189,37 @@ impl Session {
     pub fn rebuild_system(&mut self) {
         let mem = load_memory(&self.path);
         let agents = load_agents(&self.workdir());
-        let sys = resources::build_system_prompt(mem.as_deref(), agents.as_deref());
+
+        // Build the sub-agent roster from the AgentRegistry (visible agents only).
+        let registry = AgentRegistry::load(Some(&self.path));
+        let visible = registry.list(true); // exclude_hidden = true
+        let roster: String = visible
+            .iter()
+            .map(|a| {
+                // Condense the description to a single line (take first line).
+                let desc = a
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                format!("- {}: {}", a.name, desc)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let subagents = if roster.is_empty() {
+            None
+        } else {
+            Some(roster)
+        };
+
+        let sys = resources::build_system_prompt(
+            mem.as_deref(),
+            agents.as_deref(),
+            subagents.as_deref(),
+        );
         self.conversation.set_system(sys);
     }
 }

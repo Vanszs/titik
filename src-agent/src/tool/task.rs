@@ -17,10 +17,11 @@ impl Tool for Task {
     fn name(&self) -> &'static str { "task" }
 
     fn description(&self) -> &'static str {
-        "Delegate a self-contained task to a named sub-agent that runs in the \
-         background. Returns immediately once the sub-agent has started, so your \
-         current turn continues without waiting. Use this to fan out independent \
-         work (exploration, research, mechanical edits) to a specialist agent."
+        "Delegate a self-contained task to a named specialist sub-agent. The \
+         sub-agent runs autonomously to completion; its FULL report is returned \
+         as this tool's result for you to read and react to. Use it to offload \
+         exploration, research, or mechanical edits. The `agent` must be one of \
+         the sub-agents listed in your system prompt."
     }
 
     fn parameters(&self) -> Value {
@@ -29,7 +30,7 @@ impl Tool for Task {
             "properties": {
                 "agent": {
                     "type": "string",
-                    "description": "Name of the sub-agent to run the task."
+                    "description": "Name of the sub-agent to delegate to (must be one listed under # Sub-agents in your system prompt)."
                 },
                 "prompt": {
                     "type": "string",
