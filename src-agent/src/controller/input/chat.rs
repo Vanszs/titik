@@ -172,14 +172,14 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
-                    rest.status = crate::app::runtime::commands::internet::internet_status(new_mode);
+                    rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(new_mode));
                 }
                 Err(e) => {
-                    rest.status = format!("error saving settings: {e}");
+                    rest.set_toast(format!("error saving settings: {e}"));
                 }
             }
         } else {
-            rest.status = "no active session".into();
+            rest.set_toast("no active session".to_string());
         }
         return Action::None;
     }
