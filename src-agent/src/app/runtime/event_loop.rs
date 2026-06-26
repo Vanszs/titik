@@ -19,7 +19,7 @@ use crate::service::{openrouter::OpenRouterClient, StreamEvent, WarmEvent};
 use crate::view;
 
 use super::actions::apply_action;
-use super::stream::{advance_turn, finish_stream, start_stream_task};
+use super::stream::{advance_turn, finish_stream};
 use super::Term;
 
 /// Leave the alternate screen + disable mouse capture, then print the full
@@ -677,73 +677,6 @@ pub(super) fn run_loop(
                     state.rest.subagent_sel = 0;
                 }
             }
-        }
-
-        // 1b-3d. Deliver queued sub-agent nudges to the MAIN agent (the "react after
-        //         response" step). A delegated `task`-tool sub-agent that finished
-        //         pushed its full report onto `subagent_nudges` (above / on an earlier
-        //         tick). We inject those reports as ONE synthetic user turn and kick a
-        //         fresh stream so the main agent reacts and reports back to the user.
-        //
-        //         IDLE GATE — deliver only when it is safe to start a brand-new turn,
-        //         i.e. the SAME conditions a user `Submit` requires:
-        //           - in `Mode::Chat` (never while a settings/agents/picker/loading
-        //             modal is up — those aren't a chat turn; wait until back in Chat),
-        //           - no active stream (`active_rx` is None),
-        //           - not paused on a y/n approval,
-        //           - no in-flight tool round (`pending_tool_calls` empty),
-        //           - not otherwise working (`waiting` is false).
-        //         While the main agent is mid-response any of these is true, so the
-        //         nudges simply stay queued until the next idle tick — that IS the
-        //         "after the in-flight response" behaviour. Multiple finishers that
-        //         landed meanwhile are DRAINED together into a single reaction turn.
-        //
-        //         Like the `Submit` path, delivery also needs a live session AND a
-        //         pinned client; with either missing we leave the nudges queued (a
-        //         later tick, once both exist, delivers them).
-        let main_idle = matches!(state.mode, Mode::Chat)
-            && state.rest.active_rx.is_none()
-            && !state.rest.awaiting_approval
-            && state.rest.pending_tool_calls.is_empty()
-            && !state.rest.waiting;
-        if main_idle
-            && !state.rest.subagent_nudges.is_empty()
-            && state.rest.session.is_some()
-            && client.is_some()
-        {
-            // Drain ALL queued reports and join them into one injected user turn.
-            let reports: Vec<String> = state.rest.subagent_nudges.drain(..).collect();
-            let injected = format!(
-                "[sub-agent results — react to these and update me]\n\n{}",
-                reports.join("\n\n---\n\n")
-            );
-            // Mirror the `Submit` path: log + push the synthetic user turn, persist,
-            // then take the history for the stream. A save failure surfaces on the
-            // status line but does not abort delivery (the turn is already queued).
-            let history = {
-                let sess = state.rest.session.as_mut().unwrap();
-                let _ = crate::model::msglog::append(&sess.path, Role::User, &injected, None);
-                sess.conversation.push_user(injected);
-                if let Err(e) = sess.save() {
-                    state.rest.status = format!("error: {e}");
-                }
-                state.rest.session.as_ref().unwrap().conversation.history()
-            };
-            // Same fresh-turn bookkeeping a user `Submit` sets: reset scroll, arm the
-            // stream buffer, raise `waiting`, and clear the agentic-loop machine so no
-            // stale tool round / approval state carries over.
-            state.rest.reset_scroll();
-            state.rest.begin_stream();
-            state.rest.waiting = true;
-            state.rest.agent_steps = 0;
-            state.rest.pending_tool_calls.clear();
-            state.rest.awaiting_approval = false;
-            state.rest.approval_reason = None;
-            state.rest.tool_idx = 0;
-            state.rest.tool_results.clear();
-            state.rest.status = "thinking".into();
-            start_stream_task(history, state, client, handle);
-            dirty = true;
         }
 
         // 1b-4. Loading splash: workspace step, transition, and animation. While in
