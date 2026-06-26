@@ -34,7 +34,8 @@ impl SettingsState {
             | SettingField::AwarenessProvider
             | SettingField::ClassifierEnabled
             | SettingField::ShortSendEnabled
-            | SettingField::SlidingCache => None,
+            | SettingField::SlidingCache
+            | SettingField::InternetMode => None,
         }
     }
 

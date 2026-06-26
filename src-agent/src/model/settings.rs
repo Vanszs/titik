@@ -108,6 +108,20 @@ impl Default for Compaction {
     }
 }
 
+/// Controls which internet-access tier is active for this session.
+///
+/// `Simple` (the default) limits the agent to a lightweight DDG text search
+/// executed in-process (low overhead, no subprocess). `Full` enables the
+/// opt-in scrapion researcher (a Firefox-backed subprocess), which costs
+/// more tokens and spawns an external process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InternetMode {
+    #[default]
+    Simple,
+    Full,
+}
+
 /// Per-session user-configurable settings.
 ///
 /// Deserialized from (and serialized to) `<session_dir>/settings.json`.
@@ -206,6 +220,11 @@ pub struct Settings {
     /// (e.g. Anthropic). When false (the default), no such adaptation is attempted.
     #[serde(default = "default_sliding_cache")]
     pub sliding_cache: bool,
+    /// Internet-access tier for this session. `Simple` (default) uses a
+    /// lightweight in-process DDG text search. `Full` enables the opt-in
+    /// scrapion researcher (Firefox subprocess, higher token usage).
+    #[serde(default = "default_internet_mode")]
+    pub internet_mode: InternetMode,
     /// Per-session override layer for the global model catalogue: models the user
     /// saved for THIS session only (the `/settings` "Save session" path). They are
     /// never written to the global `config.json`; they live here so they survive a
@@ -267,6 +286,10 @@ fn default_sliding_cache() -> bool {
     false
 }
 
+fn default_internet_mode() -> InternetMode {
+    InternetMode::Simple
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -288,6 +311,7 @@ impl Default for Settings {
             short_send_enabled: default_short_send_enabled(),
             short_send_tail_n: default_short_send_tail_n(),
             sliding_cache: default_sliding_cache(),
+            internet_mode: InternetMode::Simple,
             session_models: Vec::new(),
         }
     }

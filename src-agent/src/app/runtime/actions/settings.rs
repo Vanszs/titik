@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::model::app_config::{ModelEntry, ProviderConn};
+use crate::model::settings::InternetMode;
 use crate::model::store;
 use crate::service::openrouter::OpenRouterClient;
 
@@ -35,6 +36,7 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             s.allowed_folders.clone(),
             s.short_send_enabled,
             s.sliding_cache,
+            s.internet_mode,
             s.providers.clone(),
             s.models.clone(),
         )),
@@ -58,6 +60,7 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         allowed_folders,
         short_send_enabled,
         sliding_cache,
+        internet_mode,
         provider_drafts,
         model_drafts,
     )) = drafts
@@ -165,6 +168,9 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             // Sliding-cache toggle: no client rebuild needed; a later
             // wave's summarization logic reads this flag per-send.
             sess.settings.sliding_cache = sliding_cache;
+            // Internet-mode toggle: no client rebuild needed; the tool
+            // dispatch layer reads this flag per-request.
+            sess.settings.internet_mode = internet_mode;
             // Session-only models live in the per-session override layer,
             // never in the global config. Persisted via sess.save() below.
             sess.settings.session_models = session_model_entries;
@@ -213,6 +219,12 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    `resolve_role`, so the existing keyless Arc serves the new
         //    settings on the next request. (This also keeps the cache-stable
         //    plan_word intact across a settings save.)
+        // f) Transient status hint when switching internet mode.
+        if internet_mode == InternetMode::Full {
+            state.rest.status = "internet: full — higher token usage".to_string();
+        } else {
+            state.rest.status = "internet: simple".to_string();
+        }
     }
     state.mode = Mode::Chat;
     Ok(())
