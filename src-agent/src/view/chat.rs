@@ -52,7 +52,7 @@ use ratatui::{
     Frame,
 };
 use crate::app::state::AppStateRest;
-use crate::config::{APP_TITLE, DEFAULT_MODEL};
+use crate::config::DEFAULT_MODEL;
 use crate::controller::command;
 use crate::dto::chat::Role;
 use crate::view::theme::Palette;
@@ -92,49 +92,63 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     };
     let input_h = (input_rows as u16) + 2; // + top & bottom borders
 
-    // Layout: header (text + bottom rule) | transcript | input (top+bottom
-    // rules) | status. Header/input get thin dim borders so the screen reads
-    // as structured, not boxed; the transcript itself stays flat.
+    // Layout: header (text + bottom rule) | transcript | model name row |
+    // input (top+bottom rules) | status. Header/input get thin dim borders so
+    // the screen reads as structured, not boxed; the transcript stays flat.
+    // The model-name row is a single dim right-aligned line sitting directly
+    // above the input's top border (no extra gap — it reads as a label for it).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),       // header line + bottom border
             Constraint::Min(1),          // transcript
+            Constraint::Length(1),       // model name (right-aligned, dim)
             Constraint::Length(input_h), // top border + input row(s) + bottom border
             Constraint::Length(1),       // status bar
         ])
         .split(frame.area());
 
-    // --- Header --- `simple-coder · {name} [{model}]`, dim bottom border.
-    // `resolved_model` is the concrete model id that stream.rs will actually use
-    // (resolved through session overrides + the global catalogue by view::draw),
-    // so the header and the request always agree. Fall back to DEFAULT_MODEL
-    // when the session is absent.
-    let (name, model): (&str, &str) = match rest.session.as_ref() {
-        Some(s) => (s.name.as_str(), if resolved_model.is_empty() { s.settings.model.as_str() } else { resolved_model }),
-        None => (APP_TITLE, DEFAULT_MODEL),
+    // --- Header --- "simple-coder" (dim, left) + mode indicator (FIXED colour,
+    // right). Session name and model have moved: the model sits in the model-name
+    // row just above the input; the session name is a tab on the input's top border.
+    // Mode colours are fixed regardless of theme: Normal = green, Auto = yellow.
+    let (mode_icon, mode_label, mode_color) = match rest.agent_mode {
+        crate::app::state::AgentMode::Normal => ("●", "normal", Color::Rgb(80, 220, 80)),
+        crate::app::state::AgentMode::Auto   => ("»", "auto",   Color::Rgb(255, 210, 60)),
     };
-    let mut header_spans = vec![
-        Span::styled("simple-coder · ", Style::default().fg(palette.dim)),
-        Span::styled(name, Style::default().fg(palette.accent)),
-        Span::styled(" [", Style::default().fg(palette.dim)),
-        Span::styled(model, Style::default().fg(palette.dim)),
-        Span::styled("]", Style::default().fg(palette.dim)),
-        Span::styled(" · ", Style::default().fg(palette.dim)),
-        Span::styled(rest.agent_mode.label(), Style::default().fg(palette.accent)),
-    ];
-    // Sub-agent hint: when any exist, a small dim `▸ N sub-agents` (N = running
-    // count) so the user knows the `$` panel has something to show.
-    if !rest.subagents.is_empty() {
+    // Sub-agent count hint (dim, right of mode label), built first so we know its
+    // width before computing the right-align gap.
+    let subagent_hint: Option<String> = if !rest.subagents.is_empty() {
         let running = rest
             .subagents
             .iter()
             .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
             .count();
-        header_spans.push(Span::styled(
-            format!("  ▸ {running} sub-agents"),
-            Style::default().fg(palette.dim),
-        ));
+        Some(format!("  ▸ {running} sub-agents"))
+    } else {
+        None
+    };
+    // Build the right-side text ("● normal" or "» auto" + optional hint) so we can
+    // measure it and pad the gap between brand and mode.
+    let mode_str = format!("{mode_icon} {mode_label}");
+    let hint_str = subagent_hint.as_deref().unwrap_or("");
+    let right_str = format!("{mode_str}{hint_str}");
+    // header_inner width = frame width minus 2 (border) minus 4 (horizontal padding 2+2)
+    let header_inner_w = frame.area().width.saturating_sub(2 + 4) as usize;
+    let brand = "simple-coder";
+    // Gap = available width minus brand chars minus right side chars; floor at 1 space.
+    let gap = header_inner_w
+        .saturating_sub(brand.chars().count() + right_str.chars().count())
+        .max(1);
+    let mut header_spans = vec![
+        Span::styled(brand, Style::default().fg(palette.dim)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(mode_icon, Style::default().fg(mode_color)),
+        Span::raw(" "),
+        Span::styled(mode_label, Style::default().fg(mode_color)),
+    ];
+    if let Some(hint) = &subagent_hint {
+        header_spans.push(Span::styled(hint.clone(), Style::default().fg(palette.dim)));
     }
     let header_line = Line::from(header_spans);
     let header_block = Block::new()
@@ -144,6 +158,26 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     let header_inner = header_block.inner(chunks[0]);
     frame.render_widget(header_block, chunks[0]);
     frame.render_widget(Paragraph::new(header_line), header_inner);
+
+    // --- Model name row --- right-aligned, dim, sits directly above the input
+    // top border so it reads as a label for it. Truncated to the inner width
+    // (2-col padding each side) when the model string is absurdly long.
+    {
+        let row_inner_w = chunks[2].width.saturating_sub(4) as usize; // 2+2 padding
+        let display_model = if resolved_model.is_empty() {
+            match rest.session.as_ref() {
+                Some(s) => s.settings.model.as_str(),
+                None    => DEFAULT_MODEL,
+            }
+        } else {
+            resolved_model
+        };
+        let model_label = truncate_chars(display_model, row_inner_w);
+        let model_row = Paragraph::new(Span::styled(model_label, Style::default().fg(palette.dim)))
+            .alignment(Alignment::Right);
+        let model_area = chunks[2].inner(Margin { horizontal: 2, vertical: 0 });
+        frame.render_widget(model_row, model_area);
+    }
 
     // --- Transcript ---
     // Padded, flat. Each message is a block: a coloured bullet (★ user / ● ai)
@@ -451,16 +485,33 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         frame.render_widget(messages, body);
     } // cache borrow ends
 
-    // --- Input box / compaction animation --- dim top + bottom borders. While a
-    // `/compact` is in flight we replace the input contents with an animated
+    // --- Input box / compaction animation --- dim top + bottom borders. The top
+    // border carries the session name as a right-aligned tab "┤ {name} ├" styled
+    // in palette.accent so it reads as a tab label without boxing the whole widget.
+    // While a `/compact` is in flight we replace the input contents with an animated
     // indicator (spinner + elapsed + indeterminate sweep) so the wait is legible;
     // otherwise the normal `[$] {input}` editor is drawn.
-    let input_block = Block::new()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(palette.dim))
-        .padding(Padding::horizontal(2));
-    let input_inner = input_block.inner(chunks[2]);
-    frame.render_widget(input_block, chunks[2]);
+    let session_tab: Option<Span<'static>> = rest.session.as_ref().map(|s| {
+        Span::styled(
+            format!(" {} ", s.name.clone()),
+            Style::default().fg(palette.accent),
+        )
+    });
+    let input_block = if let Some(tab) = session_tab {
+        Block::new()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(palette.dim))
+            .title(tab)
+            .title_alignment(Alignment::Right)
+            .padding(Padding::horizontal(2))
+    } else {
+        Block::new()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(palette.dim))
+            .padding(Padding::horizontal(2))
+    };
+    let input_inner = input_block.inner(chunks[3]);
+    frame.render_widget(input_block, chunks[3]);
     if let Some(start) = rest.compact_anim_start {
         render_compact_anim(frame, input_inner, start, palette);
     } else {
@@ -544,7 +595,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     //
     // Sub-agent progress is now rendered INLINE in the transcript (see above),
     // so the status line is uncluttered and always has room for the token readout.
-    let status_area = chunks[3].inner(Margin { horizontal: 2, vertical: 0 });
+    let status_area = chunks[4].inner(Margin { horizontal: 2, vertical: 0 });
     let status_line: Line<'static> = match rest.work_since {
         Some(since) => {
             let elapsed_ms = since.elapsed().as_millis();
@@ -631,10 +682,10 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
 
         // Size the box to the list (+2 for borders), clamped to the space
         // between the header rule and the input, and anchor it just above input.
-        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let avail = chunks[3].y.saturating_sub(chunks[1].y);
         let h = ((rows.len() as u16) + 2).min(avail.max(3));
-        let y = chunks[2].y.saturating_sub(h);
-        let popup = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+        let y = chunks[3].y.saturating_sub(h);
+        let popup = Rect { x: chunks[3].x, y, width: chunks[3].width, height: h };
 
         let block = Block::bordered()
             .border_style(Style::default().fg(palette.dim))
@@ -675,10 +726,10 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
                 } else {
                     " files ".to_string()
                 };
-                let avail = chunks[2].y.saturating_sub(chunks[1].y);
+                let avail = chunks[3].y.saturating_sub(chunks[1].y);
                 let h = ((rows.len() as u16) + 2).min(avail.max(3));
-                let y = chunks[2].y.saturating_sub(h);
-                let popup = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+                let y = chunks[3].y.saturating_sub(h);
+                let popup = Rect { x: chunks[3].x, y, width: chunks[3].width, height: h };
                 let block = Block::bordered()
                     .border_style(Style::default().fg(palette.dim))
                     .title(Span::styled(title, Style::default().fg(palette.dim)))
@@ -725,10 +776,10 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
 
         // Anchor just above the input, full input width, growing upward —
         // identical placement to the slash-command palette.
-        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let avail = chunks[3].y.saturating_sub(chunks[1].y);
         let h = ((rows.len() as u16) + 2).min(avail.max(3));
-        let y = chunks[2].y.saturating_sub(h);
-        let rect = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+        let y = chunks[3].y.saturating_sub(h);
+        let rect = Rect { x: chunks[3].x, y, width: chunks[3].width, height: h };
 
         let block = Block::bordered()
             .border_style(Style::default().fg(palette.dim))
@@ -747,10 +798,10 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     // sub-agent handler in the input controller. Ctrl+X kills the selection.
     if rest.subagents_open {
         // Box sizing: up to ~12 rows, clamped to the space above the input.
-        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let avail = chunks[3].y.saturating_sub(chunks[1].y);
         let h = 12u16.min(avail.max(3));
-        let y = chunks[2].y.saturating_sub(h);
-        let rect = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+        let y = chunks[3].y.saturating_sub(h);
+        let rect = Rect { x: chunks[3].x, y, width: chunks[3].width, height: h };
 
         let block = Block::bordered()
             .border_style(Style::default().fg(palette.dim))
@@ -909,7 +960,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
             }
             let v: serde_json::Value =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
-            let inner_w = (chunks[2].width as usize)
+            let inner_w = (chunks[3].width as usize)
                 .saturating_sub(2 /*borders*/ + 2 /*padding*/ + 3 /*indent*/)
                 .max(8);
             match name {
@@ -1008,10 +1059,10 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
 
         // Anchor just above the input, full input width, growing upward —
         // identical placement to the slash-command / help boxes.
-        let avail = chunks[2].y.saturating_sub(chunks[1].y);
+        let avail = chunks[3].y.saturating_sub(chunks[1].y);
         let h = ((rows.len() as u16) + 2).min(avail.max(3));
-        let y = chunks[2].y.saturating_sub(h);
-        let rect = Rect { x: chunks[2].x, y, width: chunks[2].width, height: h };
+        let y = chunks[3].y.saturating_sub(h);
+        let rect = Rect { x: chunks[3].x, y, width: chunks[3].width, height: h };
 
         let block = Block::bordered()
             .border_style(Style::default().fg(warn))
