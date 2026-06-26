@@ -146,6 +146,8 @@ pub(super) fn render_help(
         ("Enter", "send message / run command"),
         ("Tab", "complete the selected command"),
         ("Ctrl+R", "resend the last message"),
+        ("Ctrl+E", "toggle internet mode (simple / full)"),
+        ("/internet", "set internet mode: simple | full"),
         ("Esc", "interrupt while busy"),
         ("/quit", "exit the app"),
         ("Up/Down/wheel", "scroll the transcript"),

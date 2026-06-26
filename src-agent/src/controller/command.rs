@@ -8,7 +8,9 @@
 //! Supported commands: `/compact`, `/new`, `/mode`, `/effort`,
 //! `/rename [session] <name>`, `/settings` (alias `/config`),
 //! `/resume` (alias `/sessions`), `/task <agent> <task>`,
-//! `/help`, `/quit` (aliases: `/q`, `/exit`).
+//! `/internet [simple|full]`, `/help`, `/quit` (aliases: `/q`, `/exit`).
+
+use crate::model::settings::InternetMode;
 
 /// User-facing slash commands shown in the `/` palette, in display order.
 /// (name, one-line description). Source of truth for the palette UI.
@@ -17,6 +19,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Open the session picker to switch sessions"),
     ("/mode", "Toggle Normal/Auto tool approval"),
     ("/effort", "Set model reasoning/thinking effort"),
+    ("/internet", "Toggle internet mode (simple | full)"),
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/agents", "Create, modify, or delete agent definitions"),
     ("/task", "Run an agent on a task in the background"),
@@ -66,6 +69,8 @@ pub enum Command {
     Agents,
     /// Run a named agent on a task in the background. Holds `<agent> <task>`.
     Task(String),
+    /// Toggle or set internet mode. `None` = toggle; `Some(mode)` = set explicitly.
+    Internet(Option<InternetMode>),
     /// Open the session picker to switch to a different session (alias: `/sessions`).
     Resume,
     /// Dump the conversation to the normal terminal for native copy/paste.
@@ -107,6 +112,14 @@ pub fn parse(line: &str) -> Command {
         "settings" | "config" => Command::Settings,
         "agents" | "agent" => Command::Agents,
         "task" => Command::Task(rest.to_string()),
+        "internet" => {
+            let target = match rest.to_lowercase().trim() {
+                "full" => Some(InternetMode::Full),
+                "simple" => Some(InternetMode::Simple),
+                _ => None, // empty or anything else → toggle
+            };
+            Command::Internet(target)
+        }
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,

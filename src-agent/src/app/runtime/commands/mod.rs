@@ -10,6 +10,7 @@ use crate::service::openrouter::OpenRouterClient;
 
 mod compact;
 mod effort;
+mod internet;
 mod misc;
 mod new_session;
 mod task;
@@ -35,6 +36,7 @@ pub(super) fn apply_slash(
         Command::Help => misc::handle_help(state)?,
         Command::Quit => misc::handle_quit(state)?,
         Command::Task(args) => task::handle_task(args, state, client, handle)?,
+        Command::Internet(target) => internet::handle_internet(target, state)?,
         Command::Unknown(s) => {
             state.rest.status = format!("unknown command: /{s}");
         }
