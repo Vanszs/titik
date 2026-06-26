@@ -7,7 +7,12 @@ license = "Apache-2.0"
 [dependencies]
 ratatui = "0.30.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+dom_smoothie = "0.18.0"
+fast_html2md = "0.0.62"
+scraper = "0.27.0"
+url = "2"
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.9"

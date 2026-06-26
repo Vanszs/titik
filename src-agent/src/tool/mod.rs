@@ -18,6 +18,7 @@ use serde_json::Value;
 
 pub mod dircache;
 pub mod fs;
+pub mod internet;
 pub mod memory;
 pub mod pong;
 pub mod search;
@@ -80,6 +81,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(pong::Pong),
         Box::new(memory::Remember),
         Box::new(task::Task),
+        Box::new(internet::WebFetch),
+        Box::new(internet::WebSearch),
     ]
 }
 
