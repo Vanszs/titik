@@ -1,149 +1,45 @@
-//! Block-aware Markdown renderer for the chat transcript.
+//! The [`Renderer`] struct and its full event-driven implementation.
 //!
-//! Replaces `tui-markdown`, which flattens everything into a borderless `Text`
-//! and therefore cannot preserve code indentation, draw boxes, or align tables.
-//! Here we parse with `pulldown-cmark` and walk the event stream while keeping a
-//! small inline-style stack and a notion of the *current block*. Each block is
-//! laid out to a fixed column width and emitted as fully-formed **visual lines**
-//! (`Vec<Span<'static>>`) — already wrapped, boxed, padded, and aligned — so the
-//! caller only prepends a bullet/indent and never re-wraps. That contract is
-//! what keeps the chat view's follow-scroll math exact: emitted line count ==
-//! on-screen line count.
-//!
-//! Code blocks are the priority feature: every fenced/indented block is drawn as
-//! a full box with a language label and syntax highlighting (via `syntect` using
-//! the pure-Rust fancy-regex engine, no Oniguruma), preserving whitespace and
-//! hard-splitting over-long lines rather than word-wrapping. GFM tables are
-//! collected in full, column widths fitted to the available width, and rendered
-//! with box-drawing borders honouring per-column alignment. Prose, headings,
-//! lists, block quotes, and thematic breaks word-wrap with inline styles intact.
-//!
-//! All colours are tuned for a dark background (the app default); `syntect`'s
-//! own background is dropped so highlighted code blends with the terminal.
+//! Constructed by `super::render()`, fed one `pulldown_cmark::Event` at a time,
+//! and consumed by `finish()` which returns the completed visual-line buffer.
 
-use std::sync::OnceLock;
-
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Tag, TagEnd};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 use crate::view::theme::Palette;
 
-// --- syntect singletons (loaded once, on first markdown render with code) ----
-
-static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<Theme> = OnceLock::new();
-
-/// Bundled syntax definitions (newline-terminated variants so `LinesWithEndings`
-/// feeds `highlight_line` correctly). Loaded once and shared for the process.
-fn syntaxes() -> &'static SyntaxSet {
-    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-/// Bundled dark theme for code highlighting. `base16-ocean.dark` reads well on
-/// the app's default dark background; only the foreground is used.
-fn theme() -> &'static Theme {
-    THEME.get_or_init(|| ThemeSet::load_defaults().themes["base16-ocean.dark"].clone())
-}
-
-/// Map a `syntect` style to a ratatui [`Style`], keeping only the foreground RGB
-/// so the terminal background shows through (code boxes are not filled).
-fn syntect_fg(s: syntect::highlighting::Style) -> Style {
-    Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b))
-}
-
-// --- public API --------------------------------------------------------------
-
-/// Render `md` into final visual lines laid out to exactly `width` columns.
-///
-/// Each inner `Vec<Span>` is one on-screen line (already wrapped/boxed/aligned).
-/// The caller prepends a bullet/indent and must NOT re-wrap. All spans own their
-/// text (`'static`). Top-level blocks are separated by a single blank line.
-pub fn render(md: &str, palette: &Palette, width: usize) -> Vec<Vec<Span<'static>>> {
-    let width = width.max(1);
-
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(md, opts);
-
-    let mut r = Renderer::new(palette, width);
-    for ev in parser {
-        r.event(ev);
-    }
-    r.finish()
-}
-
-// --- inline style stack ------------------------------------------------------
-
-/// One pushed inline context. `Link` carries the destination so we can append
-/// ` (url)` when the link closes. (Inline `code` arrives as a standalone
-/// `Event::Code`, not a Start/End pair, so it isn't represented here.)
-#[derive(Clone)]
-enum Inline {
-    Bold,
-    Italic,
-    Strike,
-    Link(String),
-}
-
-// --- table buffering ---------------------------------------------------------
-
-/// A table accumulated until its `End` so column widths can be fitted before any
-/// row is drawn. Cells are styled inline spans; `head` is rendered bold.
-struct TableBuf {
-    aligns: Vec<Alignment>,
-    head: Vec<Vec<Span<'static>>>,
-    rows: Vec<Vec<Vec<Span<'static>>>>,
-    in_head: bool,
-    cur_row: Vec<Vec<Span<'static>>>,
-}
+use super::helpers::{coalesce, fit_cell, shrink_widths, syntaxes, syntect_fg, theme, wrap_spans};
+use super::parse::{Block, Inline, TableBuf};
 
 // --- the renderer ------------------------------------------------------------
 
-/// What kind of block we're currently inside. The renderer accumulates inline
-/// content into `cur` and flushes it on the matching `End`.
-enum Block {
-    None,
-    Paragraph,
-    Heading(HeadingLevel),
-    /// Buffered raw code text + detected language token.
-    Code { lang: String, text: String },
-    /// Block-quote: buffered like a paragraph but prefixed per visual line.
-    Quote,
-    /// A list item: inline text accumulates in `cur` after a leading marker span.
-    ListItem,
-    Table(TableBuf),
-}
-
-struct Renderer<'p> {
-    palette: &'p Palette,
-    width: usize,
-    out: Vec<Vec<Span<'static>>>,
+pub(super) struct Renderer<'p> {
+    pub(super) palette: &'p Palette,
+    pub(super) width: usize,
+    pub(super) out: Vec<Vec<Span<'static>>>,
     /// Inline spans accumulated for the current text block (paragraph/heading/
     /// quote/table cell).
-    cur: Vec<Span<'static>>,
-    stack: Vec<Inline>,
-    block: Block,
+    pub(super) cur: Vec<Span<'static>>,
+    pub(super) stack: Vec<Inline>,
+    pub(super) block: Block,
     /// List marker stack: `Some(n)` = ordered (next number), `None` = unordered.
     /// Depth = `lists.len()`.
-    lists: Vec<Option<u64>>,
+    pub(super) lists: Vec<Option<u64>>,
     /// Block-quote nesting depth. While `> 0`, paragraphs inside the quote do not
     /// start/flush their own block — the quote owns the buffered inline content.
-    in_quote: u32,
+    pub(super) in_quote: u32,
     /// True once at least one block has been emitted (drives blank separators).
-    started: bool,
+    pub(super) started: bool,
     /// True once the current top-level list has emitted its leading separator, so
     /// items within one list stay tight (no blank line between them).
-    list_sep_done: bool,
+    pub(super) list_sep_done: bool,
 }
 
 impl<'p> Renderer<'p> {
-    fn new(palette: &'p Palette, width: usize) -> Self {
+    pub(super) fn new(palette: &'p Palette, width: usize) -> Self {
         Renderer {
             palette,
             width,
@@ -190,7 +86,7 @@ impl<'p> Renderer<'p> {
         self.cur.push(Span::styled(t.to_string(), self.cur_style()));
     }
 
-    fn event(&mut self, ev: Event<'_>) {
+    pub(super) fn event(&mut self, ev: Event<'_>) {
         match ev {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
@@ -718,7 +614,7 @@ impl<'p> Renderer<'p> {
     /// Flush any block left open by a malformed / truncated document, dispatching
     /// to the matching block flusher so a half-finished heading/quote/code/table
     /// still renders correctly (each flusher reads `self.block` + `self.cur`).
-    fn finish(mut self) -> Vec<Vec<Span<'static>>> {
+    pub(super) fn finish(mut self) -> Vec<Vec<Span<'static>>> {
         match &self.block {
             Block::Heading(_) => self.flush_heading(),
             Block::Code { .. } => self.flush_code(),
@@ -730,211 +626,4 @@ impl<'p> Renderer<'p> {
         }
         self.out
     }
-}
-
-// --- helpers -----------------------------------------------------------------
-
-/// Coalesce a run of `(char, Style)` into owned spans, merging adjacent chars
-/// that share a style. Used to rebuild code-row spans after char-level chunking.
-fn coalesce(run: &[(char, Style)]) -> Vec<Span<'static>> {
-    let mut line: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut cur: Option<Style> = None;
-    for &(ch, style) in run {
-        match cur {
-            Some(s) if s == style => buf.push(ch),
-            _ => {
-                if let Some(s) = cur {
-                    line.push(Span::styled(std::mem::take(&mut buf), s));
-                }
-                buf.push(ch);
-                cur = Some(style);
-            }
-        }
-    }
-    if let Some(s) = cur {
-        line.push(Span::styled(buf, s));
-    }
-    line
-}
-
-/// Truncate a cell's inline spans to `w` chars (appending `…` when it overflows)
-/// and pad to `w` honouring `align`. Header cells are forced bold.
-fn fit_cell(
-    cell: &[Span<'static>],
-    w: usize,
-    align: Alignment,
-    bold: bool,
-    palette: &Palette,
-) -> Vec<Span<'static>> {
-    let _ = palette;
-    // Flatten to (char, style), truncate with an ellipsis if needed.
-    let mut chars: Vec<(char, Style)> = Vec::new();
-    for s in cell {
-        let st = if bold { s.style.add_modifier(Modifier::BOLD) } else { s.style };
-        for ch in s.content.chars() {
-            chars.push((ch, st));
-        }
-    }
-    let len = chars.len();
-    if len > w {
-        if w == 0 {
-            chars.clear();
-        } else {
-            chars.truncate(w.saturating_sub(1));
-            let st = chars.last().map(|c| c.1).unwrap_or_default();
-            chars.push(('…', st));
-        }
-    }
-    let content_len = chars.len();
-    let pad = w.saturating_sub(content_len);
-    let (lpad, rpad) = match align {
-        Alignment::Right => (pad, 0),
-        Alignment::Center => (pad / 2, pad - pad / 2),
-        _ => (0, pad),
-    };
-    let mut out: Vec<Span<'static>> = Vec::new();
-    if lpad > 0 {
-        out.push(Span::raw(" ".repeat(lpad)));
-    }
-    out.extend(coalesce(&chars));
-    if rpad > 0 {
-        out.push(Span::raw(" ".repeat(rpad)));
-    }
-    out
-}
-
-/// Shrink `widths` so their sum equals `target`, taking from the widest columns
-/// first and never reducing a column below 1.
-fn shrink_widths(widths: &mut [usize], target: usize) {
-    let ncols = widths.len();
-    if ncols == 0 {
-        return;
-    }
-    // Start from a floor of 1 per column; distribute the remaining budget
-    // proportionally to each column's natural width.
-    let total: usize = widths.iter().sum();
-    if total == 0 || target <= ncols {
-        widths.fill(1);
-        return;
-    }
-    let spare = target - ncols; // budget above the 1-per-col floor
-    let mut scaled: Vec<usize> = widths
-        .iter()
-        .map(|&w| 1 + (w.saturating_sub(1) * spare) / (total.saturating_sub(ncols)).max(1))
-        .collect();
-    // Fix rounding drift so the sum lands exactly on `target`.
-    let mut sum: usize = scaled.iter().sum();
-    while sum > target {
-        // Trim the currently-widest column.
-        if let Some((idx, _)) = scaled
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w > 1)
-            .max_by_key(|(_, &w)| w)
-        {
-            scaled[idx] -= 1;
-            sum -= 1;
-        } else {
-            break;
-        }
-    }
-    while sum < target {
-        // Pad the currently-narrowest column up toward its natural width.
-        if let Some((idx, _)) = scaled
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, &w)| w)
-        {
-            scaled[idx] += 1;
-            sum += 1;
-        } else {
-            break;
-        }
-    }
-    widths.copy_from_slice(&scaled);
-}
-
-/// Word-wrap one logical line of styled `spans` to `width` columns, preserving
-/// each span's [`Style`]. Returns visual lines (each a `Vec<Span>`). Counting is
-/// in `char`s. Runs of non-whitespace are kept whole when they fit; words longer
-/// than `width` are hard-split; `width` is clamped to `>= 1`. Embedded `\n`
-/// chars force a hard break (soft/hard markdown breaks arrive as `\n`).
-/// Consecutive same-style chars are coalesced back into one owned `Span` per run.
-///
-/// Shared by the chat view (`render_block`) and this module; `pub(crate)` so
-/// there is a single implementation.
-pub(crate) fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
-    let width = width.max(1);
-
-    // Flatten the styled spans into a single (char, style) sequence so wrapping
-    // can break anywhere while remembering each char's style.
-    let mut chars: Vec<(char, Style)> = Vec::new();
-    for span in spans {
-        for ch in span.content.chars() {
-            chars.push((ch, span.style));
-        }
-    }
-
-    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut line: Vec<(char, Style)> = Vec::new(); // chars committed to current visual line
-    let mut word: Vec<(char, Style)> = Vec::new(); // current run of non-whitespace
-    let mut line_len = 0usize;
-
-    // Place the buffered `word` onto the current line, wrapping/splitting as
-    // needed. A too-long word is hard-split across lines; otherwise it goes on
-    // this line if it fits or starts a fresh one.
-    let place_word = |out: &mut Vec<Vec<Span<'static>>>,
-                      line: &mut Vec<(char, Style)>,
-                      line_len: &mut usize,
-                      word: &mut Vec<(char, Style)>| {
-        if word.is_empty() {
-            return;
-        }
-        let wlen = word.len();
-        if wlen > width {
-            if *line_len > 0 {
-                out.push(coalesce(line));
-                line.clear();
-                *line_len = 0;
-            }
-            let mut start = 0usize;
-            while word.len() - start > width {
-                out.push(coalesce(&word[start..start + width]));
-                start += width;
-            }
-            line.extend_from_slice(&word[start..]);
-            *line_len = word.len() - start;
-        } else if *line_len == 0 {
-            line.extend_from_slice(word);
-            *line_len = wlen;
-        } else if *line_len + 1 + wlen <= width {
-            line.push((' ', Style::default()));
-            line.extend_from_slice(word);
-            *line_len += 1 + wlen;
-        } else {
-            out.push(coalesce(line));
-            line.clear();
-            line.extend_from_slice(word);
-            *line_len = wlen;
-        }
-        word.clear();
-    };
-
-    for &(ch, style) in &chars {
-        if ch == '\n' {
-            place_word(&mut out, &mut line, &mut line_len, &mut word);
-            out.push(coalesce(&line));
-            line.clear();
-            line_len = 0;
-        } else if ch.is_whitespace() {
-            place_word(&mut out, &mut line, &mut line_len, &mut word);
-        } else {
-            word.push((ch, style));
-        }
-    }
-    place_word(&mut out, &mut line, &mut line_len, &mut word);
-    out.push(coalesce(&line));
-
-    out
 }
