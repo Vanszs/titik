@@ -53,3 +53,7 @@ pub const APP_TITLE: &str = "koma";
 /// Name of the hidden directory created in the user's home folder to store
 /// session files and configuration.
 pub const APP_DIR_NAME: &str = ".koma";
+
+/// Hard cap on a single tool result's size, in characters. ~100k tokens at
+/// ~4 chars/token. Tool outputs are not truncated below this.
+pub const MAX_TOOL_OUTPUT_CHARS: usize = 400_000;

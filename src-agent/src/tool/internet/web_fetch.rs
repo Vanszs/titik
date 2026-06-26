@@ -26,7 +26,7 @@ const SCRAPION_TIMEOUT_SECS: u64 = 150;
 
 /// Per-result content cap (characters) for the browser-fetched content handed
 /// back to the model.
-const SCRAPION_MAX_CHARS: usize = 16_000;
+const SCRAPION_MAX_CHARS: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
 
 /// Fetch a web page and return its main content as markdown.
 pub struct WebFetch;
@@ -78,8 +78,8 @@ impl Tool for WebFetch {
 }
 
 /// The simple-tier raw-HTTP fetch: blocking GET (off the tokio thread) →
-/// readability → markdown, capped at ~20 000 chars. Unchanged behaviour from
-/// the original `web_fetch`.
+/// readability → markdown, capped at [`crate::config::MAX_TOOL_OUTPUT_CHARS`].
+/// Unchanged behaviour from the original `web_fetch`.
 fn raw_http_fetch(url: &str) -> Result<String> {
     let (status, body) = match http_get_blocking(url, Duration::from_secs(30)) {
         Ok(v) => v,
@@ -100,8 +100,8 @@ fn raw_http_fetch(url: &str) -> Result<String> {
     // Convert HTML to markdown.
     let markdown = html2md::rewrite_html(&readable_html, false);
 
-    // Trim and cap at ~20 000 chars.
-    const MAX_CHARS: usize = 20_000;
+    // Trim and cap at MAX_CHARS.
+    const MAX_CHARS: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
     let trimmed = markdown.trim();
     let (content, truncated) = if trimmed.chars().count() > MAX_CHARS {
         let cut: String = trimmed.chars().take(MAX_CHARS).collect();
@@ -112,7 +112,7 @@ fn raw_http_fetch(url: &str) -> Result<String> {
 
     let mut out = format!("source: {url}\n\n{content}");
     if truncated {
-        out.push_str("\n\n... (content truncated at 20000 chars)");
+        out.push_str(&format!("\n\n... (content truncated at {MAX_CHARS} chars)"));
     }
     Ok(out)
 }

@@ -24,7 +24,7 @@ impl Tool for Read {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max lines to read (default 2000, capped at 2000)."
+                    "description": "Max lines to read (default 20000, capped at 20000)."
                 }
             },
             "required": ["path"]
@@ -42,8 +42,8 @@ impl Tool for Read {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading file '{rel}'"))?;
 
-        const MAX_LINES: usize = 2000;
-        const MAX_BYTES: usize = 50 * 1024;
+        const MAX_LINES: usize = 20_000;
+        const MAX_BYTES: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
 
         // Parse optional offset/limit; clamp limit to the hard cap.
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
