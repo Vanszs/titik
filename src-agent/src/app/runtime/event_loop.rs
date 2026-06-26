@@ -494,6 +494,14 @@ pub(super) fn run_loop(
                 }
             }
 
+            // Deferred `task`-tool results to deliver into the PARKED tool round
+            // (call_id, result_text), accumulated across every sub-agent this tick
+            // and applied after the loop. A sub-agent that reaches a terminal state
+            // and still has its call id in `pending_subagent_calls` fills its result
+            // here (the FULL report on Done, an error/killed note otherwise) so the
+            // parked round can resume with no dangling tool_call ids.
+            let mut deferred_results: Vec<(String, String)> = Vec::new();
+
             for i in 0..state.rest.subagents.len() {
                 // --- collect phase: drain rx into a local vec ---
                 let mut disconnected = false;
@@ -522,19 +530,13 @@ pub(super) fn run_loop(
                     }
                 }
 
-                if events.is_empty() {
-                    continue;
-                }
-                dirty = true;
-
                 // --- apply phase: fold events onto the sub-agent ---
-                // done_fold carries (id, agent_name, result, tool_call_id) for the
-                // session fold below. tool_call_id distinguishes the two paths:
-                //   None     => /task command — fold full report into chat.
-                //   Some(..) => model task tool — record in transcript only (R2
-                //               will wire the deferred result back to the model).
-                let mut done_fold: Option<(usize, String, String, Option<String>)> = None;
-                {
+                // done_fold carries (id, agent_name, result) for the /task chat fold
+                // below; only set on a Done event for a `/task` sub-agent
+                // (tool_call_id == None). The task-tool path delivers its result via
+                // `deferred_results` (computed from the settled status below), not here.
+                if !events.is_empty() {
+                    dirty = true;
                     let sa = &mut state.rest.subagents[i];
                     for ev in events {
                         match ev {
@@ -576,15 +578,7 @@ pub(super) fn run_loop(
                             }
                             AgentEvent::Done(s) => {
                                 sa.transcript.push(format!("done: {}", trunc(&s, 200)));
-                                sa.status = SubAgentStatus::Done(s.clone());
-                                // Capture for the session fold (happens exactly once
-                                // per Done event; Done is terminal so this fires once).
-                                done_fold = Some((
-                                    sa.id,
-                                    sa.agent_name.clone(),
-                                    s,
-                                    sa.tool_call_id.clone(),
-                                ));
+                                sa.status = SubAgentStatus::Done(s);
                             }
                             AgentEvent::Error(e) => {
                                 sa.transcript.push(format!("error: {e}"));
@@ -594,33 +588,78 @@ pub(super) fn run_loop(
                     }
                 }
 
-                // --- session fold: inject a reference turn for Done ---
-                // Only the /task path (tool_call_id == None) folds into chat; the
-                // task-tool path records in transcript only (R2 will deliver the
-                // deferred result back to the waiting model turn).
-                if let Some((sa_id, sa_name, result, call_id)) = done_fold {
-                    if call_id.is_none() {
-                        // /task command path: inject the FULL, untruncated report as
-                        // an assistant turn so the main session retains a complete
-                        // record of the result.
-                        if let Some(sess) = state.rest.session.as_mut() {
-                            let note =
-                                format!("[sub-agent #{sa_id} {sa_name}] finished: {result}");
-                            // Log to sqlite (no usage/cost for a sub-agent fold).
-                            let _ = crate::model::msglog::append(
-                                &sess.path,
-                                crate::dto::chat::Role::Assistant,
-                                &note,
-                                None,
-                            );
-                            // Append as a display-only assistant turn (no reasoning block).
-                            sess.conversation.push_assistant(note, None);
-                            let _ = sess.save();
+                // --- terminal delivery / fold ---
+                // Inspect the SETTLED status + origin once events are folded, capturing
+                // owned values up front so the immutable borrow of `subagents[i]` is
+                // released before any `state.rest.session` mutation below. Runs every
+                // tick (even when no events arrived, so a disconnect-only Killed is
+                // still delivered). The "still in pending_subagent_calls" guard makes a
+                // task-tool delivery happen EXACTLY ONCE (the id is removed after the
+                // loop, so later ticks skip it).
+                //
+                // `chat_fold` carries the /task chat-fold note; `defer` carries the
+                // (call_id, result) for the task-tool deferred delivery. At most one
+                // is Some (the two origins are mutually exclusive on tool_call_id).
+                let (chat_fold, defer): (Option<String>, Option<(String, String)>) = {
+                    let sa = &state.rest.subagents[i];
+                    match (&sa.tool_call_id, &sa.status) {
+                        // task-tool path: deliver the deferred result back to the model.
+                        (Some(call_id), status)
+                            if state.rest.pending_subagent_calls.contains(call_id) =>
+                        {
+                            let result = match status {
+                                // Deliver the FULL, untruncated report.
+                                SubAgentStatus::Done(s) => Some(s.clone()),
+                                SubAgentStatus::Error(e) => Some(format!("sub-agent error: {e}")),
+                                // Killed (user Ctrl+X / task died) — fill so the round
+                                // can't hang waiting on a result that will never come.
+                                SubAgentStatus::Killed => Some("[sub-agent killed]".to_string()),
+                                // Still running: nothing to deliver this tick.
+                                SubAgentStatus::Running => None,
+                            };
+                            (None, result.map(|r| (call_id.clone(), r)))
                         }
+                        // /task command path (tool_call_id == None): on Done, build the
+                        // FULL, untruncated report note (injected as an assistant turn
+                        // below). Done is terminal and the agent is pruned this tick, so
+                        // it fires once.
+                        (None, SubAgentStatus::Done(result)) => (
+                            Some(format!(
+                                "[sub-agent #{} {}] finished: {result}",
+                                sa.id, sa.agent_name
+                            )),
+                            None,
+                        ),
+                        _ => (None, None),
                     }
-                    // task-tool path (call_id == Some): transcript already has the
-                    // "done: …" line; no chat injection here — R2 handles delivery.
+                };
+                if let Some(note) = chat_fold {
+                    // /task command path: append the full report as a display-only
+                    // assistant turn so the main session retains a complete record.
+                    if let Some(sess) = state.rest.session.as_mut() {
+                        // Log to sqlite (no usage/cost for a sub-agent fold).
+                        let _ = crate::model::msglog::append(
+                            &sess.path,
+                            crate::dto::chat::Role::Assistant,
+                            &note,
+                            None,
+                        );
+                        sess.conversation.push_assistant(note, None);
+                        let _ = sess.save();
+                    }
                 }
+                if let Some(pair) = defer {
+                    deferred_results.push(pair);
+                }
+            }
+
+            // Deliver every terminal task-tool result into the parked round's
+            // `tool_results` and drop its id from `pending_subagent_calls`. Done
+            // AFTER the loop so the per-agent borrow above stays immutable.
+            for (call_id, result) in deferred_results {
+                state.rest.pending_subagent_calls.retain(|c| c != &call_id);
+                state.rest.tool_results.push((call_id, result));
+                dirty = true;
             }
 
             // --- prune terminated sub-agents ---
@@ -640,6 +679,18 @@ pub(super) fn run_loop(
                 } else if after_len == 0 {
                     state.rest.subagent_sel = 0;
                 }
+            }
+
+            // --- resume a round parked on deferred task-tool delegations ---
+            // Once every pending delegation has filled its result (above), unpark
+            // the tool round: `finish_tool_round` flushes ALL collected `tool_results`
+            // into the conversation and re-streams, so the MAIN AGENT now reacts to
+            // each delegated report. Clearing `awaiting_subagents` drops the parked
+            // status; `waiting` stays true through the re-stream.
+            if state.rest.awaiting_subagents && state.rest.pending_subagent_calls.is_empty() {
+                state.rest.awaiting_subagents = false;
+                super::stream::resume_after_subagents(state, client, handle);
+                dirty = true;
             }
         }
 
