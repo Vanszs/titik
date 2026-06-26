@@ -231,22 +231,16 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         Mode::Agents(a) => {
             use crate::app::mode::AgentEditField;
             // Deepest-modal priority, mirroring `handle_agents`:
-            //   provider picker (no text field) > tool picker (filter) > draft field.
-            if a.provider_picker.is_some() {
+            //   model picker (no text field) > tool picker (filter) > draft field.
+            if a.model_picker.is_some() {
                 // Single-select list — no text entry; swallow the paste.
             } else if let Some(p) = a.tool_picker.as_mut() {
                 // Tool picker live filter (single-line).
                 paste_single_line(text, |c| p.push_filter(c));
             } else if a.editing {
-                // Typing into a draft field. The Model field on a provider with a
-                // resolvable endpoint is an omnisearch (paste → query, reset
-                // highlight); the Body is the multiline prompt (newlines kept); every
-                // other field is single-line plain text.
-                let settings = state.rest.session.as_ref().map(|s| s.settings.clone());
-                let omni_conn = settings
-                    .as_ref()
-                    .and_then(|st| a.model_omnisearch_conn(&state.rest.config, st));
-                let model_search = a.field == AgentEditField::Model && omni_conn.is_some();
+                // Typing into a draft field. The Body is the multiline prompt
+                // (newlines kept); every other text field is single-line plain text.
+                // (The Model field is a picker, never an edited text field.)
                 let body = a.field == AgentEditField::Body;
                 for c in text.chars() {
                     if c == '\r' || c == '\n' {
@@ -255,18 +249,7 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                         }
                         continue;
                     }
-                    if model_search {
-                        a.model_query.push(c);
-                        a.model_result_sel = 0;
-                    } else {
-                        a.push_char(c);
-                    }
-                }
-                // Arm the on-demand fetch once after the whole paste.
-                if model_search {
-                    if let Some((ep, key)) = omni_conn.as_ref() {
-                        state.rest.request_catalogue(ep, key);
-                    }
+                    a.push_char(c);
                 }
             }
         }
@@ -1364,42 +1347,34 @@ fn handle_settings(s: &mut SettingsState, rest: &mut AppStateRest, key: KeyEvent
 ///    `n` starts Create; `d` deletes the selected file-backed agent; Esc closes
 ///    the dashboard (`Action::CloseAgents`).
 fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
-    use crate::app::mode::{filter_models, AgentEditField, AgentSubMode};
+    use crate::app::mode::{AgentEditField, AgentSubMode};
     use crate::model::agent_def::AgentSource;
 
     if is_ctrl(&key, 'c') {
         return Action::Quit;
     }
 
-    // --- Provider picker overlay (DEEPEST priority: intercepts ALL keys) ---
-    // Single-select pick-one list: ↑/↓ navigate, Enter commits the cursor's
-    // provider into the draft, Esc discards. Sits above the tool picker (both are
-    // mutually exclusive, but only one can ever be open at a time).
-    if s.provider_picker.is_some() {
+    // --- Model picker overlay (DEEPEST priority: intercepts ALL keys) ---
+    // Single-select pick-one list over the registered models: ↑/↓ navigate, Enter
+    // commits the cursor's model uuid into the draft, Esc discards. Sits above the
+    // tool picker (both are mutually exclusive — only one is ever open at a time).
+    if s.model_picker.is_some() {
         match key.code {
             KeyCode::Up => {
-                if let Some(p) = s.provider_picker.as_mut() {
+                if let Some(p) = s.model_picker.as_mut() {
                     p.up();
                 }
             }
             KeyCode::Down => {
-                if let Some(p) = s.provider_picker.as_mut() {
+                if let Some(p) = s.model_picker.as_mut() {
                     p.down();
                 }
             }
             KeyCode::Enter => {
-                s.confirm_provider_picker();
-                // Provider changed → prime the on-demand catalogue for its endpoint
-                // (or the inherited session Main endpoint) so the Model omnisearch
-                // has data when the user reaches it.
-                if let Some(settings) = rest.session.as_ref().map(|s| s.settings.clone()) {
-                    if let Some((ep, key)) = s.model_omnisearch_conn(&rest.config, &settings) {
-                        rest.request_catalogue(&ep, &key);
-                    }
-                }
+                s.confirm_model_picker();
             }
             KeyCode::Esc => {
-                s.cancel_provider_picker();
+                s.cancel_model_picker();
             }
             _ => {}
         }
@@ -1460,95 +1435,8 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
 
         // --- Edit / Create ---
         AgentSubMode::Edit | AgentSubMode::Create => {
-            // The session settings drive the "inherit" omnisearch endpoint (the
-            // session Main route) when no provider is explicitly chosen. Snapshot it
-            // once so the omnisearch helpers can borrow it without holding `rest`.
-            let settings = rest.session.as_ref().map(|s| s.settings.clone());
-            // The endpoint+key the Model omnisearch fetches against (chosen provider,
-            // or inherited session Main); `None` when nothing resolves (→ plain text).
-            let omni_conn = settings
-                .as_ref()
-                .and_then(|st| s.model_omnisearch_conn(&rest.config, st));
-            // Is the Model field being edited as a live omnisearch? (Model field +
-            // editing + a resolvable, non-empty endpoint.) When so, keys drive the
-            // query + results list instead of plain text editing.
-            let model_search =
-                s.editing && s.field == AgentEditField::Model && omni_conn.is_some();
-
-            if model_search {
-                // --- Model omnisearch over the resolved endpoint's catalogue ---
-                // Only filter against `models_cache` when it holds THIS endpoint's
-                // catalogue; otherwise treat results as empty (still fetching →
-                // raw-query fallback on Enter).
-                let cache_matches = omni_conn
-                    .as_ref()
-                    .map(|(ep, _)| {
-                        rest.models_cache_endpoint.as_deref() == Some(ep.as_str())
-                    })
-                    .unwrap_or(false);
-                let cache = rest.models_cache.as_deref().unwrap_or(&[]);
-                let filtered: Vec<usize> = if cache_matches {
-                    filter_models(cache, &s.model_query)
-                } else {
-                    Vec::new()
-                };
-                match key.code {
-                    // Leave search without committing (keeps the existing model).
-                    KeyCode::Esc => {
-                        s.editing = false;
-                        s.model_query = String::new();
-                        s.model_result_sel = 0;
-                        Action::None
-                    }
-                    KeyCode::Up => {
-                        s.model_result_sel = s.model_result_sel.saturating_sub(1);
-                        Action::None
-                    }
-                    KeyCode::Down => {
-                        s.model_result_sel =
-                            (s.model_result_sel + 1).min(filtered.len().saturating_sub(1));
-                        Action::None
-                    }
-                    KeyCode::Enter => {
-                        if !filtered.is_empty() {
-                            // Pick the highlighted catalogue model.
-                            let sel = s.model_result_sel.min(filtered.len() - 1);
-                            s.draft_model = cache[filtered[sel]].id.clone();
-                        } else {
-                            // No-trap fallback: an empty / not-yet-fetched result set
-                            // commits the raw query as a manual model id (only when
-                            // non-empty, so a bare Enter just leaves the model as-is).
-                            let typed = s.model_query.trim();
-                            if !typed.is_empty() {
-                                s.draft_model = typed.to_string();
-                            }
-                        }
-                        s.editing = false;
-                        s.model_query = String::new();
-                        s.model_result_sel = 0;
-                        Action::None
-                    }
-                    KeyCode::Backspace => {
-                        s.model_query.pop();
-                        s.model_result_sel = 0;
-                        if let Some((ep, key)) = omni_conn.as_ref() {
-                            rest.request_catalogue(ep, key);
-                        }
-                        Action::None
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        s.model_query.push(c);
-                        s.model_result_sel = 0; // new filter → reset the highlight
-                        if let Some((ep, key)) = omni_conn.as_ref() {
-                            rest.request_catalogue(ep, key);
-                        }
-                        Action::None
-                    }
-                    _ => Action::None,
-                }
-            } else if s.editing {
-                // Typing into the highlighted draft field (plain text fields,
-                // incl. the Model field for a non-OpenRouter provider).
+            if s.editing {
+                // Typing into the highlighted draft field (plain text fields).
                 // Ctrl+J always inserts a body newline (reliable multiline key).
                 if is_ctrl(&key, 'j') {
                     s.newline();
@@ -1599,27 +1487,22 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                     }
                     KeyCode::Enter => {
                         match s.field {
-                            // Tools field uses the picker overlay, not inline editing.
+                            // Tools field uses the multi-select picker overlay.
                             AgentEditField::Tools => {
                                 s.open_tool_picker();
                             }
-                            // Provider field uses the single-select provider picker.
-                            AgentEditField::Provider => {
-                                s.open_provider_picker(&rest.config.providers);
-                            }
-                            // Model field with a resolvable endpoint enters the
-                            // omnisearch (editing=true with an empty query shows the
-                            // search box) and primes its on-demand catalogue fetch;
-                            // every other field, plus the Model field on a blank/
-                            // unresolved endpoint, is plain text.
+                            // Model field uses the single-select picker over the
+                            // registered models (inherit-or-registered); it falls
+                            // back to a no-op when there are no settings to read the
+                            // session models from.
                             AgentEditField::Model => {
-                                s.model_query = String::new();
-                                s.model_result_sel = 0;
-                                s.editing = true;
-                                if let Some((ep, key)) = omni_conn.as_ref() {
-                                    rest.request_catalogue(ep, key);
+                                if let Some(settings) =
+                                    rest.session.as_ref().map(|sess| sess.settings.clone())
+                                {
+                                    s.open_model_picker(&rest.config, &settings);
                                 }
                             }
+                            // Every other field is a plain text box.
                             _ => {
                                 s.editing = true;
                             }

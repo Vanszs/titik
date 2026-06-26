@@ -24,8 +24,9 @@
 use std::path::PathBuf;
 
 use crate::model::agent_def::{load_registry, AgentDef, AgentSource};
-use crate::model::app_config::{AppConfig, ProviderConn};
+use crate::model::app_config::{AppConfig, ModelEntry};
 use crate::model::session::Session;
+use crate::model::settings::Settings;
 use crate::tool::all_tools;
 
 /// Tool names excluded from the picker (internal / infra tools).
@@ -160,40 +161,66 @@ impl ToolPickerState {
     }
 }
 
-/// State for the single-select API-provider picker overlay.
+/// Resolve a [`ModelEntry`]'s provider connection to a human-readable name for
+/// the model picker / browse rows: the provider's `name` (falling back to its
+/// `endpoint`) looked up in `config.providers` by the entry's `provider_uuid`,
+/// or `"?"` when the connection is missing/blank.
+fn entry_provider_name(config: &AppConfig, entry: &ModelEntry) -> String {
+    match config.providers.iter().find(|p| p.uuid == entry.provider_uuid) {
+        Some(p) if !p.name.trim().is_empty() => p.name.clone(),
+        Some(p) if !p.endpoint.trim().is_empty() => p.endpoint.clone(),
+        _ => "?".to_string(),
+    }
+}
+
+/// One-line label for a registered model in the picker / browse row:
+/// `"name — model_id @ <provider name>"`.
+fn entry_label(config: &AppConfig, entry: &ModelEntry) -> String {
+    format!(
+        "{} — {} @ {}",
+        entry.name,
+        entry.model_id,
+        entry_provider_name(config, entry)
+    )
+}
+
+/// State for the single-select MODEL picker overlay.
 ///
-/// Opened from the Edit/Create form when the user presses Enter on the Provider
-/// field. Unlike the multi-select tool picker this is a pick-ONE list: the
-/// option set is `[ (None, "inherit session"), (Some(uuid), name)… ]`, and the
-/// cursor row is the chosen value. Closed by Enter (confirm → write the cursor's
-/// uuid into `draft_provider_uuid`) or Esc (cancel → discard).
+/// Opened from the Edit/Create form when the user presses Enter on the Model
+/// field. It is a pick-ONE list over the REGISTERED models (the same entries
+/// edited in `/settings` → Models): row 0 is the `None` "(inherit main)"
+/// sentinel, then every [`ModelEntry`] from `settings.session_models` followed
+/// by the global `config.models`. The cursor row is the chosen value. Closed by
+/// Enter (confirm → write the cursor's uuid into `draft_model_uuid`) or Esc
+/// (cancel → discard). Mirrors the tool picker's modal flow.
 #[derive(Debug, Clone)]
-pub struct ProviderPickerState {
-    /// One row per choice: `(uuid_or_none, display_name)`. The first row is
-    /// always the `None` "inherit session" sentinel; the rest are the configured
-    /// provider connections in catalogue order.
+pub struct ModelPickerState {
+    /// One row per choice: `(model_uuid_or_none, display_label)`. Row 0 is always
+    /// the `None` "(inherit main)" sentinel; the rest are registered model entries
+    /// (session overrides first, then the global catalogue) in order.
     pub options: Vec<(Option<String>, String)>,
     /// Highlighted row, in `0..options.len()`.
     pub cursor: usize,
 }
 
-impl ProviderPickerState {
-    /// Build the option list from the configured providers, placing the cursor on
-    /// the row matching `current` (the agent's current `provider_uuid`).
+impl ModelPickerState {
+    /// Build the option list from the registered models, placing the cursor on the
+    /// row matching `current` (the agent's current `model_uuid`).
     ///
-    /// Row 0 is the `None` "inherit session" sentinel; rows `1..=N` are the
-    /// providers in order. The cursor lands on the row whose uuid equals
-    /// `current` (or row 0 when `current` is `None` or no longer exists).
-    pub fn from_providers(providers: &[ProviderConn], current: &Option<String>) -> Self {
+    /// Row 0 is the `None` "(inherit main)" sentinel; the remaining rows are the
+    /// session model overrides (`settings.session_models`) followed by the global
+    /// catalogue (`config.models`), each labelled `"name — model_id @ provider"`.
+    /// The cursor lands on the row whose uuid equals `current` (or row 0 when
+    /// `current` is `None` or no longer matches a registered entry).
+    pub fn from_models(config: &AppConfig, settings: &Settings, current: &Option<String>) -> Self {
         let mut options: Vec<(Option<String>, String)> =
-            vec![(None, "inherit session".to_string())];
-        for p in providers {
-            let name = if p.name.trim().is_empty() {
-                p.endpoint.clone()
-            } else {
-                p.name.clone()
-            };
-            options.push((Some(p.uuid.clone()), name));
+            vec![(None, "(inherit main)".to_string())];
+        for entry in settings
+            .session_models
+            .iter()
+            .chain(config.models.iter())
+        {
+            options.push((Some(entry.uuid.clone()), entry_label(config, entry)));
         }
         let cursor = match current {
             Some(uuid) => options
@@ -217,8 +244,8 @@ impl ProviderPickerState {
         }
     }
 
-    /// The uuid at the cursor: `None` for the "inherit session" row, else the
-    /// chosen provider's uuid.
+    /// The model uuid at the cursor: `None` for the "(inherit main)" row, else the
+    /// chosen registered model's uuid.
     pub fn selected(&self) -> Option<String> {
         self.options
             .get(self.cursor)
@@ -272,10 +299,9 @@ pub enum AgentEditField {
     Name,
     /// Required user-facing description (frontmatter `description`).
     Description,
-    /// OpenRouter model slug; empty = inherit the session model.
+    /// Registered model the agent runs on; `(inherit main)` when unset. Opens a
+    /// single-select picker over the models registered in `/settings`.
     Model,
-    /// OpenRouter provider slug; empty = default routing.
-    Provider,
     /// Comma/space separated tool allow-list (frontmatter `tools`).
     Tools,
     /// The markdown body = the agent system prompt.
@@ -289,7 +315,6 @@ impl AgentEditField {
             AgentEditField::Name => "name",
             AgentEditField::Description => "description",
             AgentEditField::Model => "model",
-            AgentEditField::Provider => "provider",
             AgentEditField::Tools => "tools",
             AgentEditField::Body => "prompt",
         }
@@ -300,7 +325,6 @@ impl AgentEditField {
 const EDIT_FIELDS: &[AgentEditField] = &[
     AgentEditField::Description,
     AgentEditField::Model,
-    AgentEditField::Provider,
     AgentEditField::Tools,
     AgentEditField::Body,
 ];
@@ -310,7 +334,6 @@ const CREATE_FIELDS: &[AgentEditField] = &[
     AgentEditField::Name,
     AgentEditField::Description,
     AgentEditField::Model,
-    AgentEditField::Provider,
     AgentEditField::Tools,
     AgentEditField::Body,
 ];
@@ -344,20 +367,14 @@ pub struct AgentsState {
     pub draft_name: String,
     /// Draft: description.
     pub draft_description: String,
-    /// Draft: model slug (empty = inherit). Edited via omnisearch when the
-    /// selected provider is OpenRouter, else as plain text.
-    pub draft_model: String,
-    /// Draft: LEGACY provider routing slug (empty = default). Kept only so old
-    /// agent files round-trip; the editor's Provider field drives
-    /// `draft_provider_uuid` instead.
-    pub draft_provider: String,
-    /// Draft: chosen API provider connection uuid (`None` = inherit session).
-    /// This is what the editor's Provider field selects, via the provider picker.
-    pub draft_provider_uuid: Option<String>,
-    /// Live omnisearch query for the Model field (OpenRouter providers only).
-    pub model_query: String,
-    /// Highlighted row in the Model omnisearch results list.
-    pub model_result_sel: usize,
+    /// Draft: uuid of the REGISTERED model this agent runs on (`None` = inherit
+    /// the Main role). Selected via the single-select model picker; on save it
+    /// becomes [`AgentDef::model_uuid`].
+    pub draft_model_uuid: Option<String>,
+    /// Read-only legacy hint: an old agent file's free-text `model` slug, kept
+    /// only so the Model row can SHOW it when the file predates `model_uuid`. It is
+    /// never written back (the editor only ever writes `model_uuid`).
+    pub draft_model_legacy: Option<String>,
     /// Draft: tool allow-list, raw comma/space separated text.
     pub draft_tools: String,
     /// Draft: markdown body / system prompt.
@@ -369,10 +386,10 @@ pub struct AgentsState {
     /// All key input is routed to the picker; the form underneath is frozen
     /// until the picker is confirmed (Enter) or cancelled (Esc).
     pub tool_picker: Option<ToolPickerState>,
-    /// When `Some`, the single-select API-provider picker overlay is active
-    /// (opened from the Provider field). Like `tool_picker` it owns all key
-    /// input while open; the deepest modal in the agents editor.
-    pub provider_picker: Option<ProviderPickerState>,
+    /// When `Some`, the single-select MODEL picker overlay is active (opened from
+    /// the Model field). Like `tool_picker` it owns all key input while open; the
+    /// deepest modal in the agents editor.
+    pub model_picker: Option<ModelPickerState>,
 }
 
 impl AgentsState {
@@ -390,16 +407,13 @@ impl AgentsState {
             create_scope: AgentScope::Session,
             draft_name: String::new(),
             draft_description: String::new(),
-            draft_model: String::new(),
-            draft_provider: String::new(),
-            draft_provider_uuid: None,
-            model_query: String::new(),
-            model_result_sel: 0,
+            draft_model_uuid: None,
+            draft_model_legacy: None,
             draft_tools: String::new(),
             draft_body: String::new(),
             session_dir: session.path.clone(),
             tool_picker: None,
-            provider_picker: None,
+            model_picker: None,
         }
     }
 
@@ -460,27 +474,34 @@ impl AgentsState {
         }
     }
 
-    /// Mutable handle to the draft buffer for the highlighted field.
+    /// Mutable handle to the draft buffer for the highlighted TEXT field.
+    ///
+    /// The Model field is a picker (never typed into), so it has no text buffer:
+    /// the input handler opens the model picker on Enter instead of setting
+    /// `editing`, so `draft_mut` is never called while it is highlighted.
     fn draft_mut(&mut self) -> &mut String {
         match self.field {
             AgentEditField::Name => &mut self.draft_name,
             AgentEditField::Description => &mut self.draft_description,
-            AgentEditField::Model => &mut self.draft_model,
-            AgentEditField::Provider => &mut self.draft_provider,
             AgentEditField::Tools => &mut self.draft_tools,
             AgentEditField::Body => &mut self.draft_body,
+            // Model is a picker, not a text field; it never enters text-edit mode.
+            AgentEditField::Model => unreachable!("model field is edited via the picker"),
         }
     }
 
-    /// Immutable handle to the draft buffer for `f` (view-side reads).
+    /// Immutable handle to the draft buffer for text field `f` (view-side reads).
+    ///
+    /// The Model field is a picker with no text buffer; the view renders it from
+    /// `draft_model_uuid` directly, so it is not requested here.
     pub fn draft(&self, f: AgentEditField) -> &str {
         match f {
             AgentEditField::Name => &self.draft_name,
             AgentEditField::Description => &self.draft_description,
-            AgentEditField::Model => &self.draft_model,
-            AgentEditField::Provider => &self.draft_provider,
             AgentEditField::Tools => &self.draft_tools,
             AgentEditField::Body => &self.draft_body,
+            // Model is a picker, not a text field; the view reads its uuid instead.
+            AgentEditField::Model => "",
         }
     }
 
@@ -520,11 +541,14 @@ impl AgentsState {
         };
         self.draft_name = a.name.clone();
         self.draft_description = a.description.clone();
-        self.draft_model = a.model.clone().unwrap_or_default();
-        self.draft_provider = a.provider.clone().unwrap_or_default();
-        self.draft_provider_uuid = a.provider_uuid.clone();
-        self.model_query = String::new();
-        self.model_result_sel = 0;
+        self.draft_model_uuid = a.model_uuid.clone();
+        // Legacy hint only when the file predates `model_uuid` (no registered
+        // model chosen, but an old free-text `model` slug is present).
+        self.draft_model_legacy = if a.model_uuid.is_none() {
+            a.model.clone().filter(|m| !m.trim().is_empty())
+        } else {
+            None
+        };
         self.draft_tools = a.tools.join(", ");
         self.draft_body = a.prompt.clone();
         self.mode = AgentSubMode::Edit;
@@ -537,11 +561,8 @@ impl AgentsState {
     pub fn enter_create(&mut self) {
         self.draft_name = String::new();
         self.draft_description = String::new();
-        self.draft_model = String::new();
-        self.draft_provider = String::new();
-        self.draft_provider_uuid = None;
-        self.model_query = String::new();
-        self.model_result_sel = 0;
+        self.draft_model_uuid = None;
+        self.draft_model_legacy = None;
         self.draft_tools = String::new();
         self.draft_body = TEMPLATE_BODY.to_string();
         self.create_scope = AgentScope::Session;
@@ -573,7 +594,7 @@ impl AgentsState {
         self.in_detail = false;
         self.field = AgentEditField::Description;
         self.tool_picker = None;
-        self.provider_picker = None;
+        self.model_picker = None;
     }
 
     // --- Tool picker overlay ---
@@ -597,82 +618,31 @@ impl AgentsState {
         self.tool_picker = None;
     }
 
-    // --- Provider picker overlay ---
+    // --- Model picker overlay ---
 
-    /// Open the single-select API-provider picker, seeding the cursor from the
-    /// current `draft_provider_uuid`.
-    pub fn open_provider_picker(&mut self, providers: &[ProviderConn]) {
-        self.provider_picker = Some(ProviderPickerState::from_providers(
-            providers,
-            &self.draft_provider_uuid,
+    /// Open the single-select model picker over the registered models, seeding the
+    /// cursor from the current `draft_model_uuid`.
+    pub fn open_model_picker(&mut self, config: &AppConfig, settings: &Settings) {
+        self.model_picker = Some(ModelPickerState::from_models(
+            config,
+            settings,
+            &self.draft_model_uuid,
         ));
     }
 
-    /// Confirm the picker: write the cursor's choice into `draft_provider_uuid`
-    /// and close the overlay. The provider changed, so the Model omnisearch state
-    /// is reset (its OpenRouter-ness — hence the catalogue it searches — depends
-    /// on the chosen provider).
-    pub fn confirm_provider_picker(&mut self) {
-        if let Some(p) = self.provider_picker.take() {
-            self.draft_provider_uuid = p.selected();
-            self.model_query = String::new();
-            self.model_result_sel = 0;
+    /// Confirm the picker: write the cursor's choice into `draft_model_uuid` and
+    /// close the overlay. Choosing a registered model clears the legacy hint (the
+    /// agent now resolves through `model_uuid`, so the old slug is no longer shown).
+    pub fn confirm_model_picker(&mut self) {
+        if let Some(p) = self.model_picker.take() {
+            self.draft_model_uuid = p.selected();
+            self.draft_model_legacy = None;
         }
     }
 
-    /// Cancel the picker without modifying `draft_provider_uuid`.
-    pub fn cancel_provider_picker(&mut self) {
-        self.provider_picker = None;
-    }
-
-    /// Resolve the `(endpoint, api_key)` the Model omnisearch should fetch its
-    /// catalogue against, or `None` when there is nothing usable to search.
-    ///
-    /// - An explicitly-chosen provider (`draft_provider_uuid` is `Some`) → that
-    ///   connection's endpoint+key (when the uuid resolves).
-    /// - Inheriting the session provider (`None`) → the session's effective MAIN
-    ///   route's endpoint+key (so the agent's "inherit" omnisearch searches the
-    ///   same catalogue the session's chat model uses).
-    ///
-    /// A blank endpoint resolves to `None` (no catalogue to fetch → plain text id).
-    pub fn model_omnisearch_conn(
-        &self,
-        config: &AppConfig,
-        settings: &crate::model::settings::Settings,
-    ) -> Option<(String, String)> {
-        let (endpoint, api_key) = match &self.draft_provider_uuid {
-            Some(uuid) => {
-                let p = config.providers.iter().find(|p| &p.uuid == uuid)?;
-                (p.endpoint.clone(), p.api_key.clone())
-            }
-            None => {
-                // Inherit: resolve the session's Main route for its endpoint+key.
-                let r = crate::app::resolve::resolve_role(
-                    config,
-                    settings,
-                    crate::model::app_config::ModelRole::Main,
-                )?;
-                (r.endpoint.clone(), r.api_key.clone())
-            }
-        };
-        if endpoint.trim().is_empty() {
-            None
-        } else {
-            Some((endpoint, api_key))
-        }
-    }
-
-    /// Whether the Model field should use the live catalogue omnisearch: `true`
-    /// when [`Self::model_omnisearch_conn`] resolves to a non-empty endpoint (the
-    /// catalogue is just `GET {endpoint}/models`, available for ANY provider). The
-    /// chosen provider's endpoint, or the inherited session Main endpoint, drives
-    /// it — not OpenRouter specifically.
-    pub fn model_field_omnisearchable(
-        &self,
-        config: &AppConfig,
-        settings: &crate::model::settings::Settings,
-    ) -> bool {
-        self.model_omnisearch_conn(config, settings).is_some()
+    /// Cancel the picker without modifying `draft_model_uuid`.
+    pub fn cancel_model_picker(&mut self) {
+        self.model_picker = None;
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime
@@ -697,22 +667,13 @@ impl AgentsState {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
-        let opt = |s: &str| {
-            let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        };
         AgentDef {
             name,
             description: self.draft_description.trim().to_string(),
-            model: opt(&self.draft_model),
-            // Legacy routing slug: written through from any back-compat draft.
-            provider: opt(&self.draft_provider),
-            // The chosen API provider connection (None = inherit session).
-            provider_uuid: self.draft_provider_uuid.clone(),
+            // The chosen registered model (None = inherit Main). The editor no
+            // longer writes the legacy `model` / `provider` / `provider_uuid`
+            // fields — they stay at their `None` default for new/edited agents.
+            model_uuid: self.draft_model_uuid.clone(),
             tools,
             prompt: self.draft_body.clone(),
             ..AgentDef::default()

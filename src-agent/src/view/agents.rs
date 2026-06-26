@@ -15,7 +15,7 @@
 //! ─────────────────────────────────────────────────────────
 //! │ explore  built-in │  name         my-agent
 //! │ general  built-in │  description  Does the thing
-//! │ my-agent session  │  model        (inherit)
+//! │ my-agent session  │  model        (inherit main)
 //!                     │  prompt       You are a focused subagent…
 //!
 //!  ↑/↓ pick · →/Enter edit · n new · d delete · Esc close
@@ -32,10 +32,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::mode::agents::{source_label, ProviderPickerState, ToolPickerState};
-use crate::app::mode::{filter_models, AgentEditField, AgentSubMode, AgentsState};
-use crate::dto::openrouter::ModelInfo;
+use crate::app::mode::agents::{source_label, ModelPickerState, ToolPickerState};
+use crate::app::mode::{AgentEditField, AgentSubMode, AgentsState};
 use crate::model::app_config::AppConfig;
+use crate::model::settings::Settings;
 use crate::view::theme::Palette;
 
 /// List (sidebar) column width in terminal columns (includes the RIGHT border).
@@ -57,21 +57,18 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Render the agents dashboard for `st` using the given colour `palette`.
 ///
-/// `config` supplies the API provider catalogue (to resolve a `provider_uuid` to
-/// its display name), `settings` the active session's settings (to resolve the
-/// "inherit" omnisearch endpoint — the session Main route), `models_cache` the
-/// on-demand model catalogue, and `cache_endpoint` the endpoint it was fetched for
-/// (so the Model omnisearch can tell "this is my endpoint's catalogue" from "still
-/// fetching"). All are threaded down to the detail/editor rows.
+/// `config` supplies the registered-model catalogue + API providers (to resolve a
+/// chosen model entry to its `name @ provider` label), and `settings` the active
+/// session's settings (whose `session_models` are the per-session registered
+/// models, listed first in the model picker). Both are threaded down to the
+/// detail/editor rows and the model picker.
 ///
 /// All colours flow through `palette` — no hardcoded `Color::` values.
 pub fn draw(
     frame: &mut Frame,
     st: &AgentsState,
     config: &AppConfig,
-    settings: Option<&crate::model::settings::Settings>,
-    models_cache: &[ModelInfo],
-    cache_endpoint: Option<&str>,
+    settings: Option<&Settings>,
     palette: &Palette,
 ) {
     // Outer vertical zones: header | body | footer.
@@ -105,14 +102,14 @@ pub fn draw(
         .split(outer[1]);
 
     draw_list(frame, st, palette, body_cols[0]);
-    draw_detail(frame, st, config, settings, models_cache, cache_endpoint, palette, body_cols[1]);
+    draw_detail(frame, st, config, settings, palette, body_cols[1]);
 
     // --- Footer ---
     // Full-width inverse status bar: background fills the entire footer line
     // edge to edge; text is left-padded by 1 space so it doesn't touch the edge.
     let footer_rect = outer[2];
     if footer_rect.width > 0 {
-        let hint = footer_hint(st, config, settings);
+        let hint = footer_hint(st);
         let bar_style = Style::default()
             .fg(palette.sel_fg)
             .bg(palette.sel_bg)
@@ -131,25 +128,46 @@ pub fn draw(
         draw_tool_picker(frame, picker, palette, frame.area());
     }
 
-    // --- Provider picker overlay (rendered last; only one modal open at a time) ---
-    if let Some(picker) = &st.provider_picker {
-        draw_provider_picker(frame, picker, palette, frame.area());
+    // --- Model picker overlay (rendered last; only one modal open at a time) ---
+    if let Some(picker) = &st.model_picker {
+        draw_model_picker(frame, picker, palette, frame.area());
     }
 }
 
-/// Resolve a `provider_uuid` to a human-readable display name for the editor /
-/// browse rows: `None` → "inherit session"; a known uuid → its provider name
-/// (falling back to the endpoint, or the raw uuid if the connection is gone);
-/// an unknown uuid → a short "(unknown provider)" note so a dangling reference
-/// is visible rather than silently blank.
-fn provider_display_name(config: &AppConfig, provider_uuid: &Option<String>) -> String {
-    match provider_uuid {
-        None => "inherit session".to_string(),
-        Some(uuid) => match config.providers.iter().find(|p| &p.uuid == uuid) {
-            Some(p) if !p.name.trim().is_empty() => p.name.clone(),
-            Some(p) if !p.endpoint.trim().is_empty() => p.endpoint.clone(),
-            Some(_) => uuid.clone(),
-            None => "(unknown provider)".to_string(),
+/// The display label for the agent's chosen registered model in a detail/browse
+/// row: the entry's `name @ provider` when `model_uuid` resolves to a registered
+/// model, an `(unknown model)` note when the uuid dangles, or `(inherit main)`
+/// (with a legacy hint appended when an old file still carries a free-text
+/// `model` slug). Returns `(text, is_chosen)` so the caller can dim "inherit".
+fn model_display(
+    config: &AppConfig,
+    settings: Option<&Settings>,
+    model_uuid: &Option<String>,
+    legacy: &Option<String>,
+) -> (String, bool) {
+    match model_uuid {
+        Some(uuid) => {
+            let entry = settings
+                .and_then(|s| s.session_models.iter().find(|e| &e.uuid == uuid))
+                .or_else(|| config.models.iter().find(|e| &e.uuid == uuid));
+            match entry {
+                Some(e) => {
+                    let provider = match config.providers.iter().find(|p| p.uuid == e.provider_uuid)
+                    {
+                        Some(p) if !p.name.trim().is_empty() => p.name.clone(),
+                        Some(p) if !p.endpoint.trim().is_empty() => p.endpoint.clone(),
+                        _ => "?".to_string(),
+                    };
+                    (format!("{} @ {}", e.name, provider), true)
+                }
+                None => ("(unknown model)".to_string(), true),
+            }
+        }
+        None => match legacy {
+            Some(m) if !m.trim().is_empty() => {
+                (format!("(inherit main)  was: {m}"), false)
+            }
+            _ => ("(inherit main)".to_string(), false),
         },
     }
 }
@@ -293,24 +311,26 @@ fn draw_tool_picker(
     );
 }
 
-/// Render the single-select API-provider picker overlay as a bordered modal.
+/// Render the single-select MODEL picker overlay as a bordered modal.
 ///
 /// Mirrors [`draw_tool_picker`] (dimmed backdrop + `Clear` + accent bordered
 /// box + footer hint) but it is a PICK-ONE list, so there are no checkboxes and
 /// no filter line: each option is a plain row, the cursor row carries the
 /// inverse highlight, and a `›` accent marker flags the cursor for clarity.
+/// Row 0 is `(inherit main)`; the rest are registered models labelled
+/// `name — model_id @ provider`.
 ///
 /// ```text
-/// ┌─ api provider ──────────────────┐
-/// │ › inherit session               │
-/// │   OpenRouter                    │
-/// │   Local llama                   │
-/// │ ↑↓ select · enter ok · esc …    │
-/// └─────────────────────────────────┘
+/// ┌─ model ───────────────────────────────────┐
+/// │ › (inherit main)                          │
+/// │   fast — openai/gpt-4o-mini @ OpenRouter   │
+/// │   local — llama3 @ Local llama            │
+/// │ ↑↓ select · enter ok · esc cancel         │
+/// └───────────────────────────────────────────┘
 /// ```
-fn draw_provider_picker(
+fn draw_model_picker(
     frame: &mut Frame,
-    picker: &ProviderPickerState,
+    picker: &ModelPickerState,
     palette: &Palette,
     area: Rect,
 ) {
@@ -318,7 +338,8 @@ fn draw_provider_picker(
     let opt_rows = picker.options.len().clamp(1, 10) as u16;
     let content_h = opt_rows + 2;
     let total_h = content_h + 2;
-    let popup_w = 40_u16.min(area.width.saturating_sub(2));
+    // Model labels are longer than provider names; give the modal more room.
+    let popup_w = 56_u16.min(area.width.saturating_sub(2));
     let popup = centered_rect(area, popup_w, total_h);
 
     // Dim the backdrop (fg dim + bg reset, like the settings modals so a stacked
@@ -337,7 +358,7 @@ fn draw_provider_picker(
 
     let modal_block = Block::bordered()
         .border_style(Style::default().fg(palette.accent))
-        .title(Span::styled(" api provider ", Style::default().fg(palette.accent)));
+        .title(Span::styled(" model ", Style::default().fg(palette.accent)));
     let inner = modal_block.inner(popup);
 
     frame.render_widget(Clear, popup);
@@ -358,14 +379,18 @@ fn draw_provider_picker(
         .iter()
         .enumerate()
         .map(|(i, (_, name))| {
-            let label = format!("{} {}", if i == cursor { "›" } else { " " }, name);
+            let marker = if i == cursor { "›" } else { " " };
             if i == cursor {
+                let label = truncate(&format!("{marker} {name}"), body_w as usize);
                 Line::from(Span::styled(
                     format!("{:<width$}", label, width = body_w as usize),
                     Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
                 ))
             } else {
-                Line::from(Span::styled(label, Style::default().fg(palette.fg)))
+                Line::from(Span::styled(
+                    truncate(&format!("{marker} {name}"), body_w as usize),
+                    Style::default().fg(palette.fg),
+                ))
             }
         })
         .collect();
@@ -442,29 +467,20 @@ fn draw_list(
 }
 
 /// Render the DETAIL pane based on the active sub-mode.
-#[allow(clippy::too_many_arguments)]
 fn draw_detail(
     frame: &mut Frame,
     st: &AgentsState,
     config: &AppConfig,
-    settings: Option<&crate::model::settings::Settings>,
-    models_cache: &[ModelInfo],
-    cache_endpoint: Option<&str>,
+    settings: Option<&Settings>,
     palette: &Palette,
     area: ratatui::layout::Rect,
 ) {
     let inner = area.inner(Margin { horizontal: 2, vertical: 1 });
     let lines = match st.mode {
-        AgentSubMode::Browse => browse_lines(st, config, palette, inner.width as usize),
-        AgentSubMode::Edit | AgentSubMode::Create => editor_lines(
-            st,
-            config,
-            settings,
-            models_cache,
-            cache_endpoint,
-            palette,
-            inner.width as usize,
-        ),
+        AgentSubMode::Browse => browse_lines(st, config, settings, palette, inner.width as usize),
+        AgentSubMode::Edit | AgentSubMode::Create => {
+            editor_lines(st, config, settings, palette, inner.width as usize)
+        }
         AgentSubMode::DeleteConfirm => delete_lines(st, palette),
     };
     frame.render_widget(Paragraph::new(lines), inner);
@@ -474,6 +490,7 @@ fn draw_detail(
 fn browse_lines<'a>(
     st: &'a AgentsState,
     config: &AppConfig,
+    settings: Option<&Settings>,
     palette: &Palette,
     width: usize,
 ) -> Vec<Line<'a>> {
@@ -500,20 +517,13 @@ fn browse_lines<'a>(
         truncate(&a.description, value_w),
         palette.fg,
     ));
+    // Model is the chosen REGISTERED model (resolved to `name @ provider`); None =
+    // inherit the Main role, shown dim (with a legacy slug hint for old files).
+    let (model_text, model_chosen) = model_display(config, settings, &a.model_uuid, &a.model);
     lines.push(row(
         "model",
-        match &a.model {
-            Some(m) => truncate(m, value_w),
-            None => "(inherit)".to_string(),
-        },
-        if a.model.is_some() { palette.fg } else { palette.dim },
-    ));
-    // Provider is the chosen API provider connection (resolved to its name);
-    // None = inherit the session provider, shown dim.
-    lines.push(row(
-        "provider",
-        truncate(&provider_display_name(config, &a.provider_uuid), value_w),
-        if a.provider_uuid.is_some() { palette.fg } else { palette.dim },
+        truncate(&model_text, value_w),
+        if model_chosen { palette.fg } else { palette.dim },
     ));
     let tools = if a.tools.is_empty() {
         "(read-only default)".to_string()
@@ -543,29 +553,15 @@ fn browse_lines<'a>(
 }
 
 /// Detail rows for Edit / Create: one labelled draft field per row.
-#[allow(clippy::too_many_arguments)]
 fn editor_lines<'a>(
     st: &'a AgentsState,
     config: &AppConfig,
-    settings: Option<&crate::model::settings::Settings>,
-    models_cache: &[ModelInfo],
-    cache_endpoint: Option<&str>,
+    settings: Option<&Settings>,
     palette: &Palette,
     width: usize,
 ) -> Vec<Line<'a>> {
     let value_w = width.saturating_sub(16).max(4);
     let mut lines = Vec::new();
-    // The endpoint+key the Model omnisearch fetches against (chosen provider, or
-    // inherited session Main); `None` → the Model field is a plain text box.
-    let omni_conn = settings.and_then(|st_settings| st.model_omnisearch_conn(config, st_settings));
-    // Whether the Model field is a live omnisearch (drives both the Model row
-    // rendering and whether Enter opens a search vs. plain edit).
-    let model_omni = omni_conn.is_some();
-    // Does the cache hold THIS endpoint's catalogue? (still fetching otherwise)
-    let cache_matches = omni_conn
-        .as_ref()
-        .map(|(ep, _)| cache_endpoint == Some(ep.as_str()))
-        .unwrap_or(false);
 
     // Create shows the chosen scope on its own (non-editing) top row.
     if st.mode == AgentSubMode::Create {
@@ -619,98 +615,22 @@ fn editor_lines<'a>(
             continue;
         }
 
-        if f == AgentEditField::Provider {
-            // Provider is a SELECTION (resolved name), not free text. Enter opens
-            // the picker; the row just shows the current choice. None → dim
-            // "inherit session"; a chosen provider → its name in fg.
-            let chosen = st.draft_provider_uuid.is_some();
-            let name = provider_display_name(config, &st.draft_provider_uuid);
+        if f == AgentEditField::Model {
+            // Model is a SELECTION over the registered models, not free text.
+            // Enter opens the picker; the row shows the current choice resolved to
+            // `name @ provider` (or a dim "(inherit main)").
+            let (text, chosen) =
+                model_display(config, settings, &st.draft_model_uuid, &st.draft_model_legacy);
             let color = if chosen { palette.fg } else { palette.dim };
-            let mut row = vec![marker, label, Span::styled(truncate(&name, value_w), Style::default().fg(color))];
+            let mut row = vec![
+                marker,
+                label,
+                Span::styled(truncate(&text, value_w), Style::default().fg(color)),
+            ];
             if selected {
                 row.push(Span::styled("  enter pick", Style::default().fg(palette.dim)));
             }
             lines.push(Line::from(row));
-            continue;
-        }
-
-        if f == AgentEditField::Model && model_omni {
-            // Live catalogue omnisearch (any provider with an endpoint). While
-            // searching this field, the row hosts a live query box and a results
-            // dropdown beneath it; otherwise it shows the committed model id (or an
-            // "(inherit)" placeholder).
-            if editing_here {
-                let mut q = truncate(&st.model_query, value_w.saturating_sub(1));
-                q.push('█');
-                let qcolor = if st.model_query.is_empty() { palette.dim } else { palette.fg };
-                lines.push(Line::from(vec![
-                    marker,
-                    label,
-                    Span::styled(q, Style::default().fg(qcolor)),
-                ]));
-
-                // Results dropdown: up to 8 catalogue hits, the selected row
-                // inverse-highlighted. The catalogue is fetched on demand for the
-                // resolved endpoint: until the cache holds it (`cache_matches`),
-                // show `searching models…`; an empty-query box shows the search
-                // hint; a fetched-empty / no-match set shows `no models — type an id`
-                // (the raw-query fallback still lets Enter commit).
-                const MAX_VIS: usize = 8;
-                let results = if cache_matches {
-                    filter_models(models_cache, &st.model_query)
-                } else {
-                    Vec::new()
-                };
-                if !cache_matches {
-                    lines.push(Line::from(Span::styled(
-                        "  searching models…",
-                        Style::default().fg(palette.dim),
-                    )));
-                } else if st.model_query.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  type to search models…",
-                        Style::default().fg(palette.dim),
-                    )));
-                } else if results.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  no models — type an id",
-                        Style::default().fg(palette.dim),
-                    )));
-                } else {
-                    let sel = st.model_result_sel.min(results.len() - 1);
-                    let start = if sel < MAX_VIS { 0 } else { sel + 1 - MAX_VIS };
-                    let end = (start + MAX_VIS).min(results.len());
-                    let row_w = width.saturating_sub(2).max(4);
-                    for (vi, &mi) in results[start..end].iter().enumerate() {
-                        let i = start + vi;
-                        let id = models_cache[mi].id.clone();
-                        if i == sel {
-                            let text = truncate(&format!(" {id} "), row_w);
-                            lines.push(Line::from(Span::styled(
-                                text,
-                                Style::default().fg(palette.sel_fg).bg(palette.sel_bg),
-                            )));
-                        } else {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {}", truncate(&id, row_w.saturating_sub(2))),
-                                Style::default().fg(palette.fg),
-                            )));
-                        }
-                    }
-                }
-            } else {
-                // Not searching: show the committed model id (or inherit hint).
-                let (shown, color) = if st.draft_model.is_empty() {
-                    ("(inherit)".to_string(), palette.dim)
-                } else {
-                    (truncate(&st.draft_model, value_w), palette.fg)
-                };
-                let mut row = vec![marker, label, Span::styled(shown, Style::default().fg(color))];
-                if selected {
-                    row.push(Span::styled("  enter search", Style::default().fg(palette.dim)));
-                }
-                lines.push(Line::from(row));
-            }
             continue;
         }
 
@@ -720,10 +640,8 @@ fn editor_lines<'a>(
             let ph = match f {
                 AgentEditField::Name => "(required)",
                 AgentEditField::Description => "(required)",
-                AgentEditField::Model => "(inherit)",
-                AgentEditField::Provider => "(default)",
                 AgentEditField::Tools => "(read-only default)",
-                AgentEditField::Body => "",
+                AgentEditField::Model | AgentEditField::Body => "",
             };
             (ph.to_string(), palette.dim)
         } else {
@@ -764,39 +682,19 @@ fn delete_lines<'a>(st: &'a AgentsState, palette: &Palette) -> Vec<Line<'a>> {
 }
 
 /// Context-sensitive footer hint for the active sub-mode.
-///
-/// `config`/`settings` let the Edit/Create hints reflect the provider picker, the
-/// Provider field (pick), and the Model field's omnisearch — all of which depend on
-/// the chosen provider (or the inherited session Main endpoint).
-fn footer_hint(
-    st: &AgentsState,
-    config: &AppConfig,
-    settings: Option<&crate::model::settings::Settings>,
-) -> &'static str {
-    // Provider picker owns input while open (deepest modal).
-    if st.provider_picker.is_some() {
+fn footer_hint(st: &AgentsState) -> &'static str {
+    // Model picker owns input while open (deepest modal).
+    if st.model_picker.is_some() {
         return "↑↓ select · enter ok · esc cancel";
     }
-
-    let model_field = st.field == AgentEditField::Model;
-    let model_or = model_field
-        && settings
-            .map(|s| st.model_field_omnisearchable(config, s))
-            .unwrap_or(false);
 
     match st.mode {
         AgentSubMode::DeleteConfirm => "y delete · n/Esc cancel",
         AgentSubMode::Create | AgentSubMode::Edit => {
             if st.editing {
-                if model_or {
-                    "type to search · ↑↓ pick · enter ok · esc cancel"
-                } else {
-                    "type to edit · Ctrl+J newline (prompt) · Enter/Esc done"
-                }
-            } else if st.field == AgentEditField::Provider {
-                "enter pick provider · ↑/↓ field · esc cancel"
-            } else if model_or {
-                "enter search model · ↑/↓ field · esc cancel"
+                "type to edit · Ctrl+J newline (prompt) · Enter/Esc done"
+            } else if st.field == AgentEditField::Model {
+                "enter pick model · ↑/↓ field · esc cancel"
             } else if st.mode == AgentSubMode::Create {
                 // Keep the scope-toggle affordance for Create's field nav.
                 "↑/↓ field · ←/→ scope · Enter edit · s create · Esc cancel"
