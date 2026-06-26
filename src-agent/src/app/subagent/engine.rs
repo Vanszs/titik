@@ -56,6 +56,28 @@ fn tool_is_risky(name: &str) -> bool {
     matches!(name, "write" | "delete" | "edit" | "bash")
 }
 
+/// Returns `true` when `text` looks like interstitial narration rather than a
+/// finished report — e.g. "Let me read a few more files:" — so the engine can
+/// nudge the model to keep going instead of accepting the half-thought as done.
+///
+/// Criteria (any one is enough):
+/// - trimmed text is empty
+/// - trimmed text ends with `:`  (classic "Let me read…:" cliffhanger)
+/// - trimmed text is shorter than 40 chars  (too short to be a real report)
+/// - trimmed text starts with a known procrastination phrase (case-insensitive)
+fn is_stall(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.ends_with(':') || t.len() < 40 {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    let stall_prefixes = [
+        "let me", "i'll", "i will", "let's", "now i", "next,", "next i",
+        "first,",
+    ];
+    stall_prefixes.iter().any(|p| lower.starts_with(p))
+}
+
 /// One drained stream result: the assistant text, any requested tool calls, and
 /// a fatal error if the stream failed.
 #[derive(Default)]
@@ -100,6 +122,8 @@ pub async fn run_agent_loop(
     // The most-recent assistant text, surfaced as the final answer if the loop
     // runs out of steps before the model gives a no-tool reply.
     let mut last_text = String::new();
+    // Count how many consecutive stall nudges have been issued so far.
+    let mut nudges: usize = 0;
 
     for step in 0..max_steps {
         emit(&tx, AgentEvent::Step(step));
@@ -123,7 +147,23 @@ pub async fn run_agent_loop(
         //    when present so the tool results can answer them). Reasoning is
         //    display-only and not tracked by the sub-agent, so `None`.
         if tool_calls.is_empty() {
-            // 3. No tools → the model gave its final answer; the run is done.
+            // 3. No tools → check whether this looks like an interstitial stall
+            //    ("Let me read a few more files:" with no actual tool call) rather
+            //    than a genuine final answer.  If so, nudge the model to continue
+            //    instead of accepting the half-thought as a report.
+            if nudges < 2 && is_stall(&assistant_text) {
+                convo.push_assistant(assistant_text, None);
+                convo.push_user(
+                    "Continue now: call the tools you need to finish the task, \
+                     then write your COMPLETE final report. \
+                     Do not stop with a 'let me...' line."
+                        .to_string(),
+                );
+                nudges += 1;
+                // Do not emit Done; loop for another step.
+                continue;
+            }
+            // Genuine final answer (or nudge budget exhausted).
             convo.push_assistant(assistant_text.clone(), None);
             emit(&tx, AgentEvent::Done(assistant_text));
             return;
