@@ -171,6 +171,10 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             // Internet-mode toggle: no client rebuild needed; the tool
             // dispatch layer reads this flag per-request.
             sess.settings.internet_mode = internet_mode;
+            // But DO refresh the system-prompt roster so `researcher`
+            // appears/disappears immediately on a mid-session mode change
+            // (rebuild reads in-memory settings; nothing else here rebuilds).
+            sess.rebuild_system();
             // Session-only models live in the per-session override layer,
             // never in the global config. Persisted via sess.save() below.
             sess.settings.session_models = session_model_entries;

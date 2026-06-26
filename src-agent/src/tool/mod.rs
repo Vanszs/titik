@@ -7,9 +7,11 @@
 //! tool can never touch anything outside the workspace.
 //!
 //! The trait, the registry, the tool structs, and [`resolve`] are driven by the
-//! agentic loop: `service::openrouter::stream_complete` advertises every tool to
-//! the model, and `app::runtime::stream::run_tool` dispatches the model's
-//! requested calls back through [`Tool::run`].
+//! agentic loop: `service::openrouter::stream_complete` advertises a caller-chosen
+//! subset of the tool set to the model (the main loop uses [`main_tool_names`],
+//! which hides agent-only tools; each sub-agent advertises only its allow-list),
+//! and `app::runtime::stream::run_tool` dispatches the model's requested calls
+//! back through [`Tool::run`].
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -83,7 +85,26 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(task::Task),
         Box::new(internet::WebFetch),
         Box::new(internet::WebSearch),
+        Box::new(internet::Research),
     ]
+}
+
+/// Tools that are NEVER advertised to the main chat model. They are reachable
+/// only by sub-agents whose allow-list names them (the sub-agent caller
+/// advertises its own `tools`, not [`main_tool_names`]). `research` is heavy
+/// (spawns a real browser) and is intentionally reserved for the `researcher`
+/// sub-agent so the main model delegates rather than driving it directly.
+const INTERNAL_ONLY: &[&str] = &["research"];
+
+/// Tool names advertised to the MAIN chat model (everything except agent-only
+/// tools). Used by the interactive loop's `stream_complete` call so the main
+/// model never sees [`INTERNAL_ONLY`] tools.
+pub fn main_tool_names() -> Vec<String> {
+    all_tools()
+        .iter()
+        .map(|t| t.name().to_string())
+        .filter(|n| !INTERNAL_ONLY.contains(&n.as_str()))
+        .collect()
 }
 
 /// Resolve a path (optionally with `[N]` workspace-index prefix) and enforce

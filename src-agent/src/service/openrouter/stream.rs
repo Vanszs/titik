@@ -25,6 +25,7 @@ impl OpenRouterClient {
     ///
     /// Never panics: every failure emits [`StreamEvent::Error`] and returns
     /// `Ok(())`. The caller (a spawned task) discards the return value.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_complete(
         &self,
         conn: Conn<'_>,
@@ -32,6 +33,7 @@ impl OpenRouterClient {
         provider: &str,
         effort: &str,
         messages: Vec<ChatMessage>,
+        advertise: &[String],
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
         // The plan-word steer is now injected into the System message upstream in
@@ -40,11 +42,15 @@ impl OpenRouterClient {
         // (byte-stable) head. `to_wire` splits the System content on that mark and
         // puts the cache breakpoint on the head only.
         let url = format!("{}/chat/completions", conn.endpoint);
-        // Expose the built-in tool set to the model. Each tool maps to an
-        // OpenAI/OpenRouter `function` definition (name + description + raw
-        // JSON-Schema parameters).
+        // Expose the requested subset of the built-in tool set to the model. The
+        // caller passes the exact tool names to advertise (`advertise`): the main
+        // chat loop hides agent-only tools (e.g. `research`) via
+        // `crate::tool::main_tool_names`, and each sub-agent advertises only its
+        // effective allow-list. Each retained tool maps to an OpenAI/OpenRouter
+        // `function` definition (name + description + raw JSON-Schema parameters).
         let tools: Vec<ToolDef> = crate::tool::all_tools()
             .iter()
+            .filter(|t| advertise.iter().any(|n| n == t.name()))
             .map(|t| ToolDef {
                 kind: "function".into(),
                 function: ToolFunctionDef {

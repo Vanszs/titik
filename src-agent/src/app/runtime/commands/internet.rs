@@ -25,6 +25,9 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
     };
 
     sess.settings.internet_mode = new_mode;
+    // Refresh the system-prompt roster so `researcher` appears/disappears
+    // immediately on this mid-session flip (rebuild reads in-memory settings).
+    sess.rebuild_system();
 
     if let Err(e) = sess.save() {
         state.rest.status = format!("error saving settings: {e}");

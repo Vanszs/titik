@@ -167,6 +167,9 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 InternetMode::Full => InternetMode::Simple,
             };
             sess.settings.internet_mode = new_mode;
+            // Refresh the system-prompt roster so `researcher` appears/disappears
+            // immediately on this mid-session flip (rebuild reads in-memory settings).
+            sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
                     rest.status = if new_mode == InternetMode::Full {
