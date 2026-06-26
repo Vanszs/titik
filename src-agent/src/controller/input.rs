@@ -1389,11 +1389,11 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
     // line, Backspace/Delete remove, and Esc COMMITS the text back into the draft
     // and closes (returning to the field list). Everything else is swallowed.
     if let Some(ed) = s.prompt_editor.as_mut() {
-        // F2 or Ctrl+G: one-shot prompt GENERATION (Main model). Fires BEFORE the normal
+        // Ctrl+G: one-shot prompt GENERATION (Main model). Fires BEFORE the normal
         // editor keys so it isn't shadowed by a printable-char insert. While a
         // generation is already in flight it is SWALLOWED (no double-spawn) — the
         // drain swaps the buffer in when the single call returns.
-        if matches!(key.code, KeyCode::F(2)) || is_ctrl(&key, 'g') {
+        if is_ctrl(&key, 'g') {
             if rest.prompt_generating {
                 return Action::None;
             }
