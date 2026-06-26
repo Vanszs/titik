@@ -78,4 +78,9 @@ pub struct SubAgent {
     pub rx: UnboundedReceiver<AgentEvent>,
     /// Human-readable transcript lines accumulated from the event stream.
     pub transcript: Vec<String>,
+    /// The tool-call id from the model's `task` tool invocation that spawned
+    /// this sub-agent, if any. `Some(call_id)` means the sub-agent was spawned
+    /// by the model via the `task` tool; `None` means it was spawned by the
+    /// user's `/task` slash command.
+    pub tool_call_id: Option<String>,
 }

@@ -73,6 +73,7 @@ pub fn spawn_subagent(
     id: usize,
     agent_name: &str,
     task: &str,
+    tool_call_id: Option<String>,
 ) -> Option<SubAgent> {
     // Look the agent up; a missing name is a no-op for the caller.
     let agent = registry.get(agent_name)?;
@@ -115,5 +116,6 @@ pub fn spawn_subagent(
         abort: jh.abort_handle(),
         rx,
         transcript: Vec::new(),
+        tool_call_id,
     })
 }

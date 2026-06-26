@@ -321,7 +321,7 @@ pub(super) fn process_tools(
             } else {
                 let agent = agent.to_string();
                 let prompt = prompt.to_string();
-                match spawn_task(state, client, handle, &agent, &prompt) {
+                match spawn_task(state, client, handle, &agent, &prompt, Some(call.id.clone())) {
                     Some(id) => {
                         // Truncate the prompt (char-boundary safe) for the result line.
                         let short: String = prompt.chars().take(80).collect();
@@ -528,6 +528,7 @@ pub(crate) fn spawn_task(
     handle: &tokio::runtime::Handle,
     agent_name: &str,
     task_text: &str,
+    tool_call_id: Option<String>,
 ) -> Option<usize> {
     if client.is_none() || state.rest.session.is_none() {
         return None;
@@ -563,6 +564,7 @@ pub(crate) fn spawn_task(
         id,
         agent_name,
         task_text,
+        tool_call_id,
     )?;
     state.rest.next_subagent_id += 1;
     state.rest.subagents.push(sub);

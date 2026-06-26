@@ -401,7 +401,7 @@ pub(super) fn apply_slash(
 
             // Spawn via the shared helper (same path the `task` tool uses) so the
             // ctx/registry/awareness/memory inputs + bookkeeping never diverge.
-            match super::stream::spawn_task(state, client, handle, &agent_name, &task_text) {
+            match super::stream::spawn_task(state, client, handle, &agent_name, &task_text, None) {
                 Some(id) => {
                     state
                         .rest

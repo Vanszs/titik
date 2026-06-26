@@ -528,8 +528,12 @@ pub(super) fn run_loop(
                 dirty = true;
 
                 // --- apply phase: fold events onto the sub-agent ---
-                // done_fold carries (id, agent_name, result) for the session fold below.
-                let mut done_fold: Option<(usize, String, String)> = None;
+                // done_fold carries (id, agent_name, result, tool_call_id) for the
+                // session fold below. tool_call_id distinguishes the two paths:
+                //   None     => /task command — fold full report into chat.
+                //   Some(..) => model task tool — record in transcript only (R2
+                //               will wire the deferred result back to the model).
+                let mut done_fold: Option<(usize, String, String, Option<String>)> = None;
                 {
                     let sa = &mut state.rest.subagents[i];
                     for ev in events {
@@ -575,7 +579,12 @@ pub(super) fn run_loop(
                                 sa.status = SubAgentStatus::Done(s.clone());
                                 // Capture for the session fold (happens exactly once
                                 // per Done event; Done is terminal so this fires once).
-                                done_fold = Some((sa.id, sa.agent_name.clone(), s));
+                                done_fold = Some((
+                                    sa.id,
+                                    sa.agent_name.clone(),
+                                    s,
+                                    sa.tool_call_id.clone(),
+                                ));
                             }
                             AgentEvent::Error(e) => {
                                 sa.transcript.push(format!("error: {e}"));
@@ -586,25 +595,50 @@ pub(super) fn run_loop(
                 }
 
                 // --- session fold: inject a reference turn for Done ---
-                // Appended as an assistant turn (matches how compaction summaries
-                // are injected) so the main session retains a record of the result.
-                if let Some((sa_id, sa_name, result)) = done_fold {
-                    if let Some(sess) = state.rest.session.as_mut() {
-                        let note = trunc(
-                            &format!("[sub-agent #{sa_id} {sa_name}] finished: {result}"),
-                            400,
-                        );
-                        // Log to sqlite (no usage/cost for a sub-agent fold).
-                        let _ = crate::model::msglog::append(
-                            &sess.path,
-                            crate::dto::chat::Role::Assistant,
-                            &note,
-                            None,
-                        );
-                        // Append as a display-only assistant turn (no reasoning block).
-                        sess.conversation.push_assistant(note, None);
-                        let _ = sess.save();
+                // Only the /task path (tool_call_id == None) folds into chat; the
+                // task-tool path records in transcript only (R2 will deliver the
+                // deferred result back to the waiting model turn).
+                if let Some((sa_id, sa_name, result, call_id)) = done_fold {
+                    if call_id.is_none() {
+                        // /task command path: inject the FULL, untruncated report as
+                        // an assistant turn so the main session retains a complete
+                        // record of the result.
+                        if let Some(sess) = state.rest.session.as_mut() {
+                            let note =
+                                format!("[sub-agent #{sa_id} {sa_name}] finished: {result}");
+                            // Log to sqlite (no usage/cost for a sub-agent fold).
+                            let _ = crate::model::msglog::append(
+                                &sess.path,
+                                crate::dto::chat::Role::Assistant,
+                                &note,
+                                None,
+                            );
+                            // Append as a display-only assistant turn (no reasoning block).
+                            sess.conversation.push_assistant(note, None);
+                            let _ = sess.save();
+                        }
                     }
+                    // task-tool path (call_id == Some): transcript already has the
+                    // "done: …" line; no chat injection here — R2 handles delivery.
+                }
+            }
+
+            // --- prune terminated sub-agents ---
+            // After draining all handles for this tick, remove any that have
+            // reached a terminal state (Done, Error, or Killed). The $ panel
+            // remains open; we clamp subagent_sel to the new length so the
+            // cursor never points past the end.
+            let before_len = state.rest.subagents.len();
+            state.rest.subagents.retain(|sa| {
+                matches!(sa.status, SubAgentStatus::Running)
+            });
+            let after_len = state.rest.subagents.len();
+            if after_len < before_len {
+                // Clamp selection cursor to valid range.
+                if state.rest.subagent_sel >= after_len && after_len > 0 {
+                    state.rest.subagent_sel = after_len - 1;
+                } else if after_len == 0 {
+                    state.rest.subagent_sel = 0;
                 }
             }
         }
