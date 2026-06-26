@@ -45,7 +45,9 @@ pub use spawn::spawn_subagent;
 /// paths (the model-callable `task` tool and the `/task` slash command) refuse
 /// to launch a new sub-agent while this many are already in [`SubAgentStatus::Running`],
 /// so a misbehaving main agent can't fan out an unbounded swarm. Terminated
-/// sub-agents are pruned each tick, freeing slots as they finish.
+/// sub-agents are NOT pruned — they stay in the list as session history — but
+/// they no longer count toward the cap once they leave `Running`, so a finished
+/// agent frees its slot.
 pub const MAX_SUBAGENTS: usize = 5;
 
 /// Lifecycle state of a [`SubAgent`], folded from its [`AgentEvent`] stream by
@@ -85,6 +87,10 @@ pub struct SubAgent {
     pub rx: UnboundedReceiver<AgentEvent>,
     /// Human-readable transcript lines accumulated from the event stream.
     pub transcript: Vec<String>,
+    /// The sub-agent's structured conversation, replaced wholesale on each
+    /// [`AgentEvent::Snapshot`]. Drives the full-screen history viewer; empty
+    /// until the first turn is committed.
+    pub messages: Vec<crate::dto::chat::ChatMessage>,
     /// The tool-call id from the model's `task` tool invocation that spawned
     /// this sub-agent, if any. `Some(call_id)` means the sub-agent was spawned
     /// by the model via the `task` tool; `None` means it was spawned by the

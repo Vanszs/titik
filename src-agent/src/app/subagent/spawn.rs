@@ -116,6 +116,7 @@ pub fn spawn_subagent(
         abort: jh.abort_handle(),
         rx,
         transcript: Vec::new(),
+        messages: Vec::new(),
         tool_call_id,
     })
 }

@@ -160,11 +160,15 @@ pub async fn run_agent_loop(
                         .to_string(),
                 );
                 nudges += 1;
+                // Turn committed (assistant + nudge): snapshot the history.
+                emit(&tx, AgentEvent::Snapshot(convo.messages().to_vec()));
                 // Do not emit Done; loop for another step.
                 continue;
             }
             // Genuine final answer (or nudge budget exhausted).
             convo.push_assistant(assistant_text.clone(), None);
+            // Final turn committed: snapshot the full history before finishing.
+            emit(&tx, AgentEvent::Snapshot(convo.messages().to_vec()));
             emit(&tx, AgentEvent::Done(assistant_text));
             return;
         }
@@ -228,6 +232,9 @@ pub async fn run_agent_loop(
             );
             convo.push_tool(call.id.clone(), result);
         }
+        // Turn committed (assistant + every tool result): snapshot the history
+        // so the UI sees this step's tool round.
+        emit(&tx, AgentEvent::Snapshot(convo.messages().to_vec()));
         // Loop: the next step re-streams with the tool results in `convo`.
     }
 

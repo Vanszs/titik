@@ -440,6 +440,11 @@ pub(super) fn run_loop(
                             AgentEvent::Step(n) => {
                                 sa.transcript.push(format!("— step {n} —"));
                             }
+                            AgentEvent::Snapshot(m) => {
+                                // Replace the structured history wholesale; drives
+                                // the full-screen sub-agent viewer.
+                                sa.messages = m;
+                            }
                             AgentEvent::ToolStarted { name, args } => {
                                 sa.transcript.push(format!("→ {name} {}", trunc(&args, 120)));
                             }
@@ -533,24 +538,13 @@ pub(super) fn run_loop(
                 dirty = true;
             }
 
-            // --- prune terminated sub-agents ---
-            // After draining all handles for this tick, remove any that have
-            // reached a terminal state (Done, Error, or Killed). The $ panel
-            // remains open; we clamp subagent_sel to the new length so the
-            // cursor never points past the end.
-            let before_len = state.rest.subagents.len();
-            state.rest.subagents.retain(|sa| {
-                matches!(sa.status, SubAgentStatus::Running)
-            });
-            let after_len = state.rest.subagents.len();
-            if after_len < before_len {
-                // Clamp selection cursor to valid range.
-                if state.rest.subagent_sel >= after_len && after_len > 0 {
-                    state.rest.subagent_sel = after_len - 1;
-                } else if after_len == 0 {
-                    state.rest.subagent_sel = 0;
-                }
-            }
+            // --- keep terminated sub-agents as session history ---
+            // Terminated agents (Done, Error, Killed) are NOT pruned: the $ panel
+            // is a session history, so every sub-agent that ran stays in the list
+            // with its final status + structured `messages` for later viewing.
+            // `running_subagents()` still counts only `Running`, so the cap is
+            // unaffected. The list only ever grows here, so `subagent_sel` (always
+            // < len once set) can never fall out of range — no clamp needed.
 
             // --- resume a round parked on deferred task-tool delegations ---
             // Once every pending delegation has filled its result (above), unpark

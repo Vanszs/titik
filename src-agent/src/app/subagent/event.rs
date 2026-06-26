@@ -31,6 +31,11 @@ pub enum AgentEvent {
     /// The loop entered step `usize` (0-based), i.e. it is about to make the
     /// `usize`-th model call.
     Step(usize),
+    /// A full snapshot of the sub-agent's structured conversation after a turn
+    /// was committed. Emitted once per turn (and right before `Done`) so the UI
+    /// always holds the sub-agent's complete structured history for later
+    /// viewing. Bounded by `max_steps`, so cloning per turn is cheap.
+    Snapshot(Vec<crate::dto::chat::ChatMessage>),
     /// The loop finished cleanly; `String` is the final assistant answer (or a
     /// "(stopped: …)" note when the step budget was exhausted).
     Done(String),
