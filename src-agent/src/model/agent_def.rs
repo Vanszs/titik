@@ -74,6 +74,14 @@ pub struct AgentDef {
     /// User-facing description (when to use this agent; shown in menus). Required.
     pub description: String,
 
+    /// UUID of a registered [`crate::model::app_config::ModelEntry`] this agent
+    /// runs on. When `Some`, the resolver looks up the entry in `session_models`
+    /// first, then the global `config.models`, and dispatches via that entry's
+    /// provider connection. `None` = inherit the Main role (legacy fallback).
+    /// Takes precedence over the legacy `model` / `provider_uuid` fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_uuid: Option<String>,
+
     /// OpenRouter model slug (e.g. `"openai/gpt-oss-20b"`), or `None` to inherit
     /// the session model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +154,7 @@ impl Default for AgentDef {
         Self {
             name: String::new(),
             description: String::new(),
+            model_uuid: None,
             model: None,
             provider: None,
             provider_uuid: None,
@@ -201,6 +210,9 @@ impl AgentDef {
         // Required.
         fm.insert(key("description"), sval(&self.description));
 
+        if let Some(model_uuid) = &self.model_uuid {
+            fm.insert(key("model_uuid"), sval(model_uuid));
+        }
         if let Some(model) = &self.model {
             fm.insert(key("model"), sval(model));
         }

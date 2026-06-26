@@ -95,6 +95,21 @@ impl Resolved {
     }
 }
 
+/// Find a registered [`ModelEntry`] by `uuid`, checking `settings.session_models`
+/// first (per-session overrides win), then the global `config.models`. Returns
+/// `None` when no entry with that uuid exists in either catalogue.
+fn find_model_entry<'a>(
+    config: &'a AppConfig,
+    settings: &'a Settings,
+    uuid: &str,
+) -> Option<&'a ModelEntry> {
+    settings
+        .session_models
+        .iter()
+        .find(|e| e.uuid == uuid)
+        .or_else(|| config.models.iter().find(|e| e.uuid == uuid))
+}
+
 /// Build a [`Resolved`] from an assigned [`ModelEntry`] by resolving its provider
 /// against `config.providers`. Returns `None` when the entry's `provider_uuid`
 /// does not match any known provider (a dangling reference) — the caller treats
@@ -245,7 +260,19 @@ pub fn resolve_agent(config: &AppConfig, settings: &Settings, agent: &AgentDef) 
         r
     };
 
-    // 1. Explicit model + resolvable provider connection → dispatch there.
+    // 1a. Registered model uuid → look up the ModelEntry and resolve via from_entry.
+    //     A uuid that no longer exists (deleted entry) falls through gracefully.
+    if let Some(uuid) = agent.model_uuid.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Some(entry) = find_model_entry(config, settings, uuid) {
+            if let Some(resolved) = from_entry(config, settings, entry, ModelRole::Main) {
+                return Some(with_effort(resolved));
+            }
+            // Entry found but its provider is dangling → fall through to legacy.
+        }
+        // uuid present but no matching entry (deleted) → fall through.
+    }
+
+    // 1b. Legacy explicit model + resolvable provider connection → dispatch there.
     if let Some(model_id) = agent.model.as_deref().filter(|m| !m.trim().is_empty()) {
         if let Some(uuid) = agent.provider_uuid.as_deref().filter(|u| !u.trim().is_empty()) {
             if let Some(provider) = config.providers.iter().find(|p| p.uuid == uuid) {
