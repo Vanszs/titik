@@ -30,4 +30,26 @@ impl AppStateRest {
         self.follow = true;
         self.scroll = 0;
     }
+
+    /// Scroll the full-screen sub-agent viewer up by `n` lines.
+    ///
+    /// Seeds from the current bottom (`last_max_scroll`, published by the viewer
+    /// renderer) the first time the user scrolls up from a follow position, so the
+    /// view doesn't jump to the top. Clamped at 0. While the viewed agent is still
+    /// `Running` the renderer auto-follows the bottom and ignores this offset, so
+    /// scrolling up takes visible effect once the agent stops.
+    pub fn agent_viewer_scroll_up(&mut self, n: u16) {
+        let max = self.last_max_scroll.get();
+        if self.agent_viewer_scroll > max {
+            self.agent_viewer_scroll = max;
+        }
+        self.agent_viewer_scroll = self.agent_viewer_scroll.saturating_sub(n);
+    }
+
+    /// Scroll the full-screen sub-agent viewer down by `n` lines, clamped to the
+    /// last-published max so it can't scroll past the final line.
+    pub fn agent_viewer_scroll_down(&mut self, n: u16) {
+        let max = self.last_max_scroll.get();
+        self.agent_viewer_scroll = self.agent_viewer_scroll.saturating_add(n).min(max);
+    }
 }

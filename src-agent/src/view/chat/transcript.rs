@@ -69,107 +69,10 @@ pub(super) fn render_transcript(
         }
         let start = cache.blocks.len();
         for msg in committed.iter().skip(start) {
-            let block = match msg.role {
-                Role::User => render_block(
-                    vec![vec![Span::styled(
-                        msg.content.to_string(),
-                        Style::default().fg(palette.accent),
-                    )]],
-                    "★ ",
-                    palette.accent,
-                    wrap_w,
-                    true,
-                ),
-                Role::Assistant => {
-                    // Markdown body only. The per-tool-call lines are NOT cached
-                    // here: their leading glyph flips ⚙→✓ when the matching tool
-                    // result arrives (a later round), so they're rendered fresh at
-                    // frame assembly against `completed_tool_ids`. Caching them
-                    // would freeze a stuck gear forever.
-                    //
-                    // If the message contains wanderer lead-in lines (`Word: ...`),
-                    // the entire block up to and including the LAST such line is
-                    // rendered dim+italic (the "thinking" block); the remainder is
-                    // rendered as markdown.
-                    let (thinking_block, response_body) = split_thinking(&msg.content);
-                    let thinking_style = Style::default()
-                        .fg(palette.dim)
-                        .add_modifier(Modifier::ITALIC);
-                    let bar_style = Style::default().fg(palette.dim);
-                    let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
-                    // Native reasoning channel (the model's streamed `reasoning`,
-                    // captured separately from `content`). Rendered first, dim +
-                    // italic, each line prefixed with the blockquote bar so the
-                    // whole thinking block reads as quoted text. Display-only — it
-                    // never re-enters the conversation or disk (`#[serde(skip)]`).
-                    if let Some(reasoning) = msg.reasoning.as_deref() {
-                        if !reasoning.is_empty() {
-                            for line in reasoning.lines() {
-                                push_thinking_line(
-                                    &mut logical,
-                                    line,
-                                    thinking_style,
-                                    bar_style,
-                                    wrap_w,
-                                );
-                            }
-                        }
-                    }
-                    if let Some(thinking) = thinking_block {
-                        // Render each line of the thinking block dim+italic with the
-                        // blockquote bar; wrapping + blank-line rows are handled by
-                        // `push_thinking_line` so the bar survives every wrap.
-                        for line in thinking.lines() {
-                            push_thinking_line(
-                                &mut logical,
-                                line,
-                                thinking_style,
-                                bar_style,
-                                wrap_w,
-                            );
-                        }
-                    }
-                    // Blank line between the (barred) thinking block and the answer
-                    // so the quote→answer transition is clear. Only when there IS a
-                    // thinking block AND an answer to separate.
-                    if !logical.is_empty() && !response_body.is_empty() {
-                        logical.push(vec![]);
-                    }
-                    if !response_body.is_empty() {
-                        logical.extend(crate::view::markdown::render(response_body, palette, wrap_w));
-                    }
-                    // Tool-call lines deliberately omitted here — rendered fresh at
-                    // assembly so the ⚙→✓ completion glyph stays live (see above).
-                    render_block(logical, "● ", palette.fg, wrap_w, false)
-                }
-                Role::Tool => {
-                    // Harness-internal tool results (the silent "plan first"
-                    // nudge) carry a hide-marker: fed to the model, never shown.
-                    // Cache an EMPTY block (not `continue`) so the cache stays
-                    // index-aligned with `committed`; empty blocks are skipped
-                    // entirely during frame assembly (no block, no separator).
-                    if msg.content.starts_with(crate::dto::chat::PLAN_NUDGE_MARK) {
-                        cache.blocks.push(Vec::new());
-                        continue;
-                    }
-                    // Compact dim block: just the first line of the tool output,
-                    // truncated. Tool results are not markdown-rendered. The `↳`
-                    // enter-arrow is dropped in favour of a plain dim indent so the
-                    // line reads as a sub-item under its now-checked (`✓`) call —
-                    // the finished turn renders as a checklist.
-                    let first = msg.content.lines().next().unwrap_or("");
-                    let first = truncate_chars(first, 80);
-                    render_block(
-                        vec![vec![Span::styled(first, Style::default().fg(palette.dim))]],
-                        "    ",
-                        palette.dim,
-                        wrap_w,
-                        false,
-                    )
-                }
-                Role::System => continue,
-            };
-            cache.blocks.push(block);
+            // One block per message, index-aligned with `committed`. A hidden
+            // harness tool result yields an EMPTY block (skipped at assembly), so
+            // the cache never falls out of step with the message list.
+            cache.blocks.push(render_message_block(msg, palette, wrap_w));
         }
 
         // Assemble the frame: cached blocks (with blank separators) + the live
@@ -191,38 +94,7 @@ pub(super) fn render_transcript(
             let has_body = !block.is_empty();
             let tool_lines: Vec<Line<'static>> = committed
                 .get(i)
-                .filter(|m| m.role == Role::Assistant)
-                .and_then(|m| m.tool_calls.as_ref())
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .enumerate()
-                        .map(|(ci, call)| {
-                            let args = truncate_chars(&call.function.arguments, 60);
-                            let done = completed_tool_ids.contains(call.id.as_str());
-                            let (glyph, glyph_style) = if done {
-                                ("✓ ", Style::default().fg(palette.accent))
-                            } else {
-                                ("⚙ ", Style::default().fg(palette.dim))
-                            };
-                            // First line of a body-less block carries the bullet;
-                            // every other tool line hangs under it with a 2-col indent.
-                            let prefix = if !has_body && ci == 0 {
-                                Span::styled("● ", Style::default().fg(palette.fg))
-                            } else {
-                                Span::raw("  ")
-                            };
-                            Line::from(vec![
-                                prefix,
-                                Span::styled(glyph, glyph_style),
-                                Span::styled(
-                                    format!("{}({})", call.function.name, args),
-                                    Style::default().fg(palette.dim),
-                                ),
-                            ])
-                        })
-                        .collect()
-                })
+                .map(|m| render_tool_lines(m, &completed_tool_ids, has_body, palette))
                 .unwrap_or_default();
 
             // Empty blocks (hidden harness messages) with no tool lines leave no
@@ -327,4 +199,188 @@ pub(super) fn render_transcript(
         let messages = Paragraph::new(lines).scroll((top, 0));
         frame.render_widget(messages, body);
     } // cache borrow ends
+}
+
+/// Build ONE message's visual block (the body, sans the fresh tool-call lines).
+///
+/// This is the per-message renderer the main transcript caches AND the
+/// full-screen sub-agent viewer reuses, so both paths render identical markdown,
+/// reasoning/thinking blocks, and compact tool-result rows.
+///
+/// - `User`     → `★` accent bullet, plain text.
+/// - `Assistant`→ `●` bullet; native reasoning + wanderer "thinking" prefix
+///   rendered dim+italic with the blockquote bar, then the body as markdown. The
+///   per-tool-call lines are NOT included here — they carry a live ⚙→✓ glyph and
+///   are appended fresh by [`render_tool_lines`] at assembly time.
+/// - `Tool`     → compact dim one-liner (first line, truncated); a hidden harness
+///   nudge yields an EMPTY block (no visual trace).
+/// - `System`   → EMPTY block (never shown).
+///
+/// An empty `Vec` means "no visual block"; callers skip it (and its separator).
+pub(super) fn render_message_block(
+    msg: &crate::dto::chat::ChatMessage,
+    palette: &Palette,
+    wrap_w: usize,
+) -> Vec<Line<'static>> {
+    match msg.role {
+        Role::User => render_block(
+            vec![vec![Span::styled(
+                msg.content.to_string(),
+                Style::default().fg(palette.accent),
+            )]],
+            "★ ",
+            palette.accent,
+            wrap_w,
+            true,
+        ),
+        Role::Assistant => {
+            // If the message contains wanderer lead-in lines (`Word: ...`), the
+            // entire block up to and including the LAST such line is rendered
+            // dim+italic (the "thinking" block); the remainder is markdown.
+            let (thinking_block, response_body) = split_thinking(&msg.content);
+            let thinking_style = Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::ITALIC);
+            let bar_style = Style::default().fg(palette.dim);
+            let mut logical: Vec<Vec<Span<'static>>> = Vec::new();
+            // Native reasoning channel (the model's streamed `reasoning`, captured
+            // separately from `content`). Rendered first, dim + italic, each line
+            // prefixed with the blockquote bar so the whole thinking block reads as
+            // quoted text. Display-only — it never re-enters the conversation or disk.
+            if let Some(reasoning) = msg.reasoning.as_deref() {
+                if !reasoning.is_empty() {
+                    for line in reasoning.lines() {
+                        push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+                    }
+                }
+            }
+            if let Some(thinking) = thinking_block {
+                for line in thinking.lines() {
+                    push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+                }
+            }
+            // Blank line between the (barred) thinking block and the answer so the
+            // quote→answer transition is clear. Only when there IS both.
+            if !logical.is_empty() && !response_body.is_empty() {
+                logical.push(vec![]);
+            }
+            if !response_body.is_empty() {
+                logical.extend(crate::view::markdown::render(response_body, palette, wrap_w));
+            }
+            render_block(logical, "● ", palette.fg, wrap_w, false)
+        }
+        Role::Tool => {
+            // Harness-internal tool results (the silent "plan first" nudge) carry a
+            // hide-marker: fed to the model, never shown → EMPTY block.
+            if msg.content.starts_with(crate::dto::chat::PLAN_NUDGE_MARK) {
+                return Vec::new();
+            }
+            // Compact dim block: just the first line of the tool output, truncated.
+            // Tool results are not markdown-rendered; a plain dim indent reads as a
+            // sub-item under its now-checked (`✓`) call (the finished turn as a list).
+            let first = msg.content.lines().next().unwrap_or("");
+            let first = truncate_chars(first, 80);
+            render_block(
+                vec![vec![Span::styled(first, Style::default().fg(palette.dim))]],
+                "    ",
+                palette.dim,
+                wrap_w,
+                false,
+            )
+        }
+        Role::System => Vec::new(),
+    }
+}
+
+/// The fresh per-tool-call lines for an Assistant turn that requested calls.
+///
+/// Rendered fresh (never cached) so the leading glyph flips `⚙`→`✓` the moment
+/// the matching tool result lands (a later round): a finished call (its id in
+/// `completed`) gets an accent `✓ `; an in-flight one keeps the dim `⚙ `. Lines
+/// hang under the `●` bullet with a 2-col indent, EXCEPT when the assistant body
+/// is empty (`has_body == false`) — then the first tool line takes the `● ` bullet
+/// so a pure tool-call turn isn't a bullet-less orphan. A non-Assistant message
+/// or one with no tool calls yields no lines.
+pub(super) fn render_tool_lines(
+    msg: &crate::dto::chat::ChatMessage,
+    completed: &std::collections::HashSet<&str>,
+    has_body: bool,
+    palette: &Palette,
+) -> Vec<Line<'static>> {
+    if msg.role != Role::Assistant {
+        return Vec::new();
+    }
+    let Some(calls) = msg.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .enumerate()
+        .map(|(ci, call)| {
+            let args = truncate_chars(&call.function.arguments, 60);
+            let done = completed.contains(call.id.as_str());
+            let (glyph, glyph_style) = if done {
+                ("✓ ", Style::default().fg(palette.accent))
+            } else {
+                ("⚙ ", Style::default().fg(palette.dim))
+            };
+            let prefix = if !has_body && ci == 0 {
+                Span::styled("● ", Style::default().fg(palette.fg))
+            } else {
+                Span::raw("  ")
+            };
+            Line::from(vec![
+                prefix,
+                Span::styled(glyph, glyph_style),
+                Span::styled(
+                    format!("{}({})", call.function.name, args),
+                    Style::default().fg(palette.dim),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// Assemble a full transcript from a flat `&[ChatMessage]` slice into styled
+/// visual lines, EXACTLY like the main chat (markdown bodies, reasoning/thinking
+/// blocks, blank separators, and live ⚙/✓ tool-call lines).
+///
+/// Used by the full-screen sub-agent viewer, which renders a sub-agent's
+/// structured `messages` view-only. Unlike the main transcript this does NOT
+/// cache (the viewer is opened occasionally, not every frame), but it reuses the
+/// very same per-message renderer + tool-line builder, so the output is identical
+/// to the main chat. System messages are skipped; hidden harness tool nudges
+/// leave no trace.
+pub(super) fn assemble_messages(
+    messages: &[crate::dto::chat::ChatMessage],
+    palette: &Palette,
+    wrap_w: usize,
+) -> Vec<Line<'static>> {
+    // Which tool calls have COMPLETED: a `tool`-role result message whose
+    // `tool_call_id` points back at the call. Built from the same slice so the
+    // glyph state matches what the sub-agent actually did.
+    let completed: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for msg in messages {
+        let block = render_message_block(msg, palette, wrap_w);
+        let has_body = !block.is_empty();
+        let tool_lines = render_tool_lines(msg, &completed, has_body, palette);
+        // Empty block with no tool lines (system / hidden harness) → no trace.
+        if block.is_empty() && tool_lines.is_empty() {
+            continue;
+        }
+        if !first {
+            lines.push(Line::from(""));
+        }
+        first = false;
+        lines.extend(block);
+        lines.extend(tool_lines);
+    }
+    lines
 }

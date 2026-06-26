@@ -61,9 +61,25 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         return Action::None;
     }
 
-    // The sub-agents panel is modal: Up/Down move the selection, Ctrl+X kills the
-    // selected one (abrupt abort), Esc or any other key closes it. Mirrors the
-    // help-overlay modal handling above.
+    // The full-screen sub-agent VIEWER is the most modal surface: while it's open
+    // every key routes to it. Up/Down/PgUp scroll; Esc closes it back to the still-
+    // open `$` panel; everything else is swallowed so nothing leaks underneath.
+    if rest.agent_viewer.is_some() {
+        match key.code {
+            KeyCode::Up => rest.agent_viewer_scroll_up(1),
+            KeyCode::Down => rest.agent_viewer_scroll_down(1),
+            KeyCode::PageUp => rest.agent_viewer_scroll_up(10),
+            KeyCode::PageDown => rest.agent_viewer_scroll_down(10),
+            KeyCode::Esc => rest.agent_viewer = None, // back to the `$` panel
+            _ => {}
+        }
+        return Action::None;
+    }
+
+    // The sub-agents panel is modal: Up/Down move the selection, Enter opens the
+    // full-screen viewer for a spawned row, Ctrl+X kills the selected one (abrupt
+    // abort), Esc or any other key closes it. Mirrors the help-overlay modal
+    // handling above.
     if rest.subagents_open {
         let count = rest.subagents.len();
         if is_ctrl(&key, 'x') {
@@ -80,6 +96,20 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             KeyCode::Down => {
                 if count > 0 {
                     rest.subagent_sel = (rest.subagent_sel + 1).min(count - 1);
+                }
+            }
+            // Enter opens the full-screen viewer for the selected SPAWNED sub-agent
+            // (any of running/done/killed/error — it has structured `messages`).
+            // The `$` panel only ever selects spawned rows (`subagent_sel` indexes
+            // `subagents`); queued/PENDING delegations aren't selectable here, so a
+            // valid selection is always a spawned agent. An empty list (nothing
+            // spawned yet, only pending) just shows a status note.
+            KeyCode::Enter => {
+                if rest.subagent_sel < count {
+                    rest.agent_viewer = Some(rest.subagent_sel);
+                    rest.agent_viewer_scroll = 0; // reset; renderer follows while Running
+                } else {
+                    rest.status = "sub-agent queued — not started yet".into();
                 }
             }
             // Esc or any non-nav key closes the panel.

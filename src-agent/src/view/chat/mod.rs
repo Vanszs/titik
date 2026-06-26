@@ -70,6 +70,15 @@ use crate::view::theme::Palette;
 /// buffer. The header has a dim bottom border + padding; the input has dim
 /// top + bottom borders + padding; the transcript is flat.
 pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palette: &Palette) {
+    // --- Full-screen sub-agent viewer ---
+    // When the `$`-panel viewer is open, it OWNS the whole frame (like the nano
+    // prompt editor): short-circuit the normal chat draw and render only the
+    // selected sub-agent's conversation, view-only.
+    if let Some(idx) = rest.agent_viewer {
+        subagents::render_agent_viewer(frame, rest, idx, palette);
+        return;
+    }
+
     // --- Input height ---
     // The input box grows to fit its wrapped content (capped). Compute the row
     // count BEFORE the layout split so the layout can reserve the right height.

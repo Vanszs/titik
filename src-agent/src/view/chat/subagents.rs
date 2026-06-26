@@ -11,6 +11,7 @@ use ratatui::{
 use crate::app::state::AppStateRest;
 use crate::view::theme::Palette;
 use super::helpers::truncate_chars;
+use super::transcript::assemble_messages;
 
 /// Short status tag/glyph for a sub-agent, shown in the panel's left list.
 pub(super) fn subagent_tag(status: &crate::app::subagent::SubAgentStatus) -> &'static str {
@@ -174,4 +175,103 @@ pub(super) fn render_subagents_panel(
             frame.render_widget(Paragraph::new(rows), right);
         }
     }
+}
+
+/// Render the FULL-SCREEN sub-agent viewer over the whole frame (opened with
+/// Enter on a spawned `$`-panel row). Short-circuits the normal chat draw, like
+/// the nano prompt editor.
+///
+/// Layout (minimalist, matching the app's header convention):
+///
+/// ```text
+///  sub-agent #3 explore (running…)
+/// ─────────────────────────────────────────  ← dim BOTTOM rule
+///   ★ find the auth middleware                ← the sub-agent's conversation,
+///   ● I located it in src/mw/auth.rs …          rendered EXACTLY like the main
+///   …                                           chat (markdown, tool lines, …)
+///
+///  up/down scroll · Esc back                  ← dim footer
+/// ```
+///
+/// The body reuses the main-chat transcript renderer ([`assemble_messages`]), so
+/// the sub-agent view looks identical to the main chat. While the agent is
+/// `Running` the view auto-follows the bottom so live progress shows; once it
+/// stops, Up/Down/PgUp scroll freely (clamped to the content). The renderer stays
+/// pure: it derives the top line from `agent_viewer_scroll` + the Running follow,
+/// and publishes the max scroll into the shared `last_max_scroll` cell (reused
+/// here since the viewer and the main transcript are never drawn together) so the
+/// key handler can clamp + detect bottom.
+pub(super) fn render_agent_viewer(
+    frame: &mut Frame,
+    rest: &AppStateRest,
+    idx: usize,
+    palette: &Palette,
+) {
+    let area = frame.area();
+    let Some(sa) = rest.subagents.get(idx) else {
+        return; // index went stale — nothing to show (handler resets next key).
+    };
+
+    // Header (title + BOTTOM rule) | body | footer.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // title line + BOTTOM border
+            Constraint::Min(0),    // transcript body
+            Constraint::Length(1), // footer hint
+        ])
+        .split(area);
+
+    // --- Header: "sub-agent #id name (status)" (dim) with a BOTTOM rule. ---
+    let header_block = Block::new()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(palette.dim));
+    let header_inner = header_block.inner(outer[0]);
+    frame.render_widget(header_block, outer[0]);
+    let title = format!(
+        "sub-agent #{} {} ({})",
+        sa.id,
+        sa.agent_name,
+        subagent_tag(&sa.status),
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(title, Style::default().fg(palette.dim))),
+        header_inner.inner(Margin { horizontal: 2, vertical: 0 }),
+    );
+
+    // --- Footer hint (dim). ---
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "up/down scroll \u{b7} Esc back",
+            Style::default().fg(palette.dim),
+        )),
+        outer[2].inner(Margin { horizontal: 2, vertical: 0 }),
+    );
+
+    // --- Body: same 2-col horizontal margin + wrap width as the main chat, so
+    // the reused renderer wraps identically. ---
+    let body = outer[1].inner(Margin { horizontal: 2, vertical: 0 });
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let wrap_w = (body.width as usize).saturating_sub(2).max(1);
+
+    // Render the sub-agent's structured conversation through the SHARED main-chat
+    // transcript path (markdown bodies, reasoning/thinking blocks, ⚙/✓ tool lines).
+    let lines = assemble_messages(&sa.messages, palette, wrap_w);
+
+    // Scroll model: while the agent is RUNNING auto-follow the bottom so live
+    // progress shows; otherwise honour the stored offset, clamped. Publish the max
+    // so the key handler can clamp + detect bottom (same cell-publish pattern the
+    // main transcript uses for `last_max_scroll`).
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(body.height);
+    rest.last_max_scroll.set(max_scroll);
+    let running = matches!(sa.status, crate::app::subagent::SubAgentStatus::Running);
+    let top = if running {
+        max_scroll
+    } else {
+        rest.agent_viewer_scroll.min(max_scroll)
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((top, 0)), body);
 }

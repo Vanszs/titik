@@ -225,6 +225,16 @@ pub struct AppStateRest {
     /// Selected row in the sub-agent list (index into `subagents`).
     #[allow(dead_code)]
     pub subagent_sel: usize,
+    /// When `Some(i)`, the full-screen sub-agent VIEWER is open showing
+    /// `subagents[i]`'s structured conversation (rendered exactly like the main
+    /// chat, view-only). `None` = not viewing. Opened with Enter on a spawned row
+    /// in the `$` panel; Esc closes it back to the panel. Short-circuits the
+    /// normal chat draw while set (mirrors the full-screen prompt editor).
+    pub agent_viewer: Option<usize>,
+    /// Scroll offset (top visual line) for the sub-agent viewer. Auto-follows the
+    /// bottom while the viewed agent is `Running` so live progress shows; Up/Down/
+    /// PgUp pause the follow. Reset to 0 when the viewer opens.
+    pub agent_viewer_scroll: u16,
     /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
     #[allow(dead_code)]
     pub next_subagent_id: usize,
@@ -326,6 +336,8 @@ impl AppStateRest {
             subagents: Vec::new(),
             subagents_open: false,
             subagent_sel: 0,
+            agent_viewer: None,
+            agent_viewer_scroll: 0,
             next_subagent_id: 0,
             pending_subagents: std::collections::VecDeque::new(),
             pending_subagent_calls: Vec::new(),
