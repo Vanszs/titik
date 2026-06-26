@@ -116,40 +116,23 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
         crate::app::state::AgentMode::Normal => ("●", "normal", Color::Rgb(80, 220, 80)),
         crate::app::state::AgentMode::Auto   => ("»", "auto",   Color::Rgb(255, 210, 60)),
     };
-    // Sub-agent count hint (dim, right of mode label), built first so we know its
-    // width before computing the right-align gap.
-    let subagent_hint: Option<String> = if !rest.subagents.is_empty() {
-        let running = rest
-            .subagents
-            .iter()
-            .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
-            .count();
-        Some(format!("  ▸ {running} sub-agents"))
-    } else {
-        None
-    };
-    // Build the right-side text ("● normal" or "» auto" + optional hint) so we can
+    // Build the right-side text ("● normal" or "» auto") so we can
     // measure it and pad the gap between brand and mode.
     let mode_str = format!("{mode_icon} {mode_label}");
-    let hint_str = subagent_hint.as_deref().unwrap_or("");
-    let right_str = format!("{mode_str}{hint_str}");
     // header_inner width = frame width minus 2 (border) minus 4 (horizontal padding 2+2)
     let header_inner_w = frame.area().width.saturating_sub(2 + 4) as usize;
     let brand = "simple-coder";
-    // Gap = available width minus brand chars minus right side chars; floor at 1 space.
+    // Gap = available width minus brand chars minus mode string chars; floor at 1 space.
     let gap = header_inner_w
-        .saturating_sub(brand.chars().count() + right_str.chars().count())
+        .saturating_sub(brand.chars().count() + mode_str.chars().count())
         .max(1);
-    let mut header_spans = vec![
+    let header_spans = vec![
         Span::styled(brand, Style::default().fg(palette.dim)),
         Span::raw(" ".repeat(gap)),
         Span::styled(mode_icon, Style::default().fg(mode_color)),
         Span::raw(" "),
         Span::styled(mode_label, Style::default().fg(mode_color)),
     ];
-    if let Some(hint) = &subagent_hint {
-        header_spans.push(Span::styled(hint.clone(), Style::default().fg(palette.dim)));
-    }
     let header_line = Line::from(header_spans);
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
