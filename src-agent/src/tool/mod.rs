@@ -41,6 +41,10 @@ pub struct ToolCtx {
     /// The active session's memory directory (`<session_dir>/memory`), where
     /// `MEMORY.md` lives. `None` when no session is active.
     pub memory_dir: Option<PathBuf>,
+    /// The session's active internet tier. `web_fetch` reads this to decide
+    /// between the simple raw-HTTP path and the Full browser backend (scrapion);
+    /// defaults to `Simple` when no session is available.
+    pub internet_mode: crate::model::settings::InternetMode,
 }
 
 /// Parse a `[N]` workspace-index prefix from the start of a path string.
@@ -85,25 +89,26 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(task::Task),
         Box::new(internet::WebFetch),
         Box::new(internet::WebSearch),
-        Box::new(internet::Research),
     ]
 }
 
-/// Tools that are NEVER advertised to the main chat model. They are reachable
-/// only by sub-agents whose allow-list names them (the sub-agent caller
-/// advertises its own `tools`, not [`main_tool_names`]). `research` is heavy
-/// (spawns a real browser) and is intentionally reserved for the `researcher`
-/// sub-agent so the main model delegates rather than driving it directly.
-const INTERNAL_ONLY: &[&str] = &["research"];
+/// Tools that are NEVER advertised to the main chat model — reachable only by
+/// sub-agents whose allow-list names them (the sub-agent caller advertises its
+/// own `tools`, not [`main_tool_names`]). Currently empty: every built-in tool is
+/// offered to the main model. The mechanism is kept because per-sub-agent tool
+/// scoping still relies on the [`main_tool_names`] / `advertise` split, so a
+/// future internal-only tool only needs to be listed here.
+const INTERNAL_ONLY: &[&str] = &[];
 
-/// Tools that MUST run off the UI/event-loop thread. They do blocking network
-/// I/O (`reqwest::blocking` via [`internet::http_get_blocking`]), so running them
-/// inline in `process_tools` — which executes on the main event-loop thread —
-/// would freeze the TUI for the whole HTTP round-trip (no redraw, no input).
-/// `process_tools` intercepts any call whose name is in this list and runs it on
-/// a plain `std::thread`, parking the tool round until the result lands (the same
-/// defer machinery the `task` tool uses for sub-agents). `research` is absent: it
-/// is already deferred via the sub-agent (`researcher`) path, never run inline.
+/// Tools that MUST run off the UI/event-loop thread. They do blocking I/O —
+/// `web_search` and the simple-tier `web_fetch` do a blocking `reqwest` GET (via
+/// [`internet::http_get_blocking`]); in Full mode `web_fetch` instead drives a
+/// scrapion subprocess — so running them inline in `process_tools` (which
+/// executes on the main event-loop thread) would freeze the TUI for the whole
+/// round-trip (no redraw, no input). `process_tools` intercepts any call whose
+/// name is in this list and runs it on a plain `std::thread`, parking the tool
+/// round until the result lands (the same defer machinery the `task` tool uses
+/// for sub-agents).
 pub const ASYNC_TOOLS: &[&str] = &["web_fetch", "web_search"];
 
 /// Tool names advertised to the MAIN chat model (everything except agent-only

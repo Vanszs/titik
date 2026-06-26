@@ -5,6 +5,25 @@ use anyhow::Result;
 use crate::app::state::AppState;
 use crate::model::settings::InternetMode;
 
+/// Status line for a just-applied internet `mode`.
+///
+/// Shared by the three places that flip `internet_mode` (`/internet`, Ctrl+E,
+/// and the settings save) so the messaging never drifts:
+/// - `Full` but the full-mode env is NOT installed → tell the user nothing
+///   actually changed and how to provision it (the browser backend is inert
+///   until installed; `web_fetch` silently stays on raw HTTP otherwise).
+/// - `Full` and installed → the higher-token-usage note (exact em-dash kept).
+/// - `Simple` → the plain note.
+pub(crate) fn internet_status(mode: InternetMode) -> String {
+    match mode {
+        InternetMode::Full if !crate::internet::is_installed() => {
+            "internet: full needs `koma --internet-fullmode-install`".to_string()
+        }
+        InternetMode::Full => "internet: full \u{2014} higher token usage".to_string(),
+        InternetMode::Simple => "internet: simple".to_string(),
+    }
+}
+
 /// Handle the `/internet [simple|full]` command.
 ///
 /// `target` is `None` to toggle, or `Some(mode)` to set explicitly.
@@ -25,8 +44,8 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
     };
 
     sess.settings.internet_mode = new_mode;
-    // Refresh the system-prompt roster so `researcher` appears/disappears
-    // immediately on this mid-session flip (rebuild reads in-memory settings).
+    // Refresh the system-prompt roster so any mode-gated agents stay in sync on
+    // this mid-session flip (rebuild reads in-memory settings; harmless + cheap).
     sess.rebuild_system();
 
     if let Err(e) = sess.save() {
@@ -34,11 +53,7 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
         return Ok(());
     }
 
-    state.rest.status = if new_mode == InternetMode::Full {
-        "internet: full \u{2014} higher token usage".to_string()
-    } else {
-        "internet: simple".to_string()
-    };
+    state.rest.status = internet_status(new_mode);
 
     Ok(())
 }

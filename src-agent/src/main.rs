@@ -8,8 +8,8 @@
 //!
 //! | Flag | Action |
 //! |---|---|
-//! | `--install-internet [--force]` | provision Python research env then exit |
-//! | `--uninstall-internet`         | remove Python research env then exit |
+//! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
+//! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
 //!
 //! Data flow overview:
 //! ```text
@@ -33,15 +33,15 @@ mod view;
 
 fn main() -> anyhow::Result<()> {
     // Migrate legacy config dir (~/.simple-coder -> ~/.koma) before anything
-    // reads base_dir(), so every entry path (TUI, --install-internet, --resume)
-    // sees the migrated directory.
+    // reads base_dir(), so every entry path (TUI, --internet-fullmode-install,
+    // --resume) sees the migrated directory.
     model::store::migrate_legacy_dir();
 
     let opts = cli::parse(std::env::args());
 
     // --- short-circuit: provisioner modes (no TUI) ---
 
-    if opts.install_internet {
+    if opts.internet_fullmode_install {
         return match internet::install(opts.force) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
         };
     }
 
-    if opts.uninstall_internet {
+    if opts.internet_fullmode_uninstall {
         return match internet::uninstall() {
             Ok(()) => Ok(()),
             Err(e) => {

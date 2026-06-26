@@ -167,16 +167,12 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 InternetMode::Full => InternetMode::Simple,
             };
             sess.settings.internet_mode = new_mode;
-            // Refresh the system-prompt roster so `researcher` appears/disappears
-            // immediately on this mid-session flip (rebuild reads in-memory settings).
+            // Refresh the system-prompt roster so any mode-gated agents stay in
+            // sync on this mid-session flip (rebuild reads in-memory settings).
             sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
-                    rest.status = if new_mode == InternetMode::Full {
-                        "internet: full \u{2014} higher token usage".to_string()
-                    } else {
-                        "internet: simple".to_string()
-                    };
+                    rest.status = crate::app::runtime::commands::internet::internet_status(new_mode);
                 }
                 Err(e) => {
                     rest.status = format!("error saving settings: {e}");

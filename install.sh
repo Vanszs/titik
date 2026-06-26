@@ -123,8 +123,8 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$WITH_RESEARCH" = "1" ]; then
     echo ""
-    echo "Provisioning internet/research environment (downloads ~80MB Firefox)..."
-    "$INSTALL_DIR/koma" --install-internet
+    echo "Provisioning full internet mode environment (downloads ~80MB Firefox)..."
+    "$INSTALL_DIR/koma" --internet-fullmode-install
 fi
 
 # ---------------------------------------------------------------------------
@@ -134,8 +134,8 @@ echo ""
 echo "koma installed to $INSTALL_DIR/koma"
 echo ""
 echo "  Run 'koma' to start."
-echo "  Re-run this installer with --with-research (or run 'koma --install-internet')"
-echo "  inside koma) to enable full internet / research mode."
+echo "  Re-run this installer with --with-research (or run"
+echo "  'koma --internet-fullmode-install') to enable full internet mode."
 echo ""
 
 # Warn if install dir may not be on PATH

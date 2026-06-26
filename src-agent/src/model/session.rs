@@ -258,18 +258,8 @@ impl Session {
         // Build the sub-agent roster from the AgentRegistry (visible agents only).
         let registry = AgentRegistry::load(Some(&self.path));
         let visible = registry.list(true); // exclude_hidden = true
-        // The `researcher` agent drives the heavy `research` tool (a Firefox-backed
-        // subprocess), so it is only offered to the main model when the full
-        // internet tier is BOTH selected (`internet_mode == Full`) AND provisioned.
-        // In Simple mode or when uninstalled it is omitted from the roster, so the
-        // main model never delegates to it (web_search/web_fetch stay available in
-        // both modes via `main_tool_names`). All other agents are unaffected.
-        let researcher_enabled = self.settings.internet_mode
-            == crate::model::settings::InternetMode::Full
-            && crate::internet::is_installed();
         let roster: String = visible
             .iter()
-            .filter(|a| researcher_enabled || a.name != "researcher")
             .map(|a| {
                 // Condense the description to a single line (take first line).
                 let desc = a

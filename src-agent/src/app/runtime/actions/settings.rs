@@ -8,7 +8,6 @@ use anyhow::Result;
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::model::app_config::{ModelEntry, ProviderConn};
-use crate::model::settings::InternetMode;
 use crate::model::store;
 use crate::service::openrouter::OpenRouterClient;
 
@@ -171,9 +170,9 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             // Internet-mode toggle: no client rebuild needed; the tool
             // dispatch layer reads this flag per-request.
             sess.settings.internet_mode = internet_mode;
-            // But DO refresh the system-prompt roster so `researcher`
-            // appears/disappears immediately on a mid-session mode change
-            // (rebuild reads in-memory settings; nothing else here rebuilds).
+            // But DO refresh the system-prompt roster so any mode-gated agents
+            // stay in sync on a mid-session mode change (rebuild reads in-memory
+            // settings; nothing else here rebuilds).
             sess.rebuild_system();
             // Session-only models live in the per-session override layer,
             // never in the global config. Persisted via sess.save() below.
@@ -223,12 +222,11 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    `resolve_role`, so the existing keyless Arc serves the new
         //    settings on the next request. (This also keeps the cache-stable
         //    plan_word intact across a settings save.)
-        // f) Transient status hint when switching internet mode.
-        if internet_mode == InternetMode::Full {
-            state.rest.status = "internet: full — higher token usage".to_string();
-        } else {
-            state.rest.status = "internet: simple".to_string();
-        }
+        // f) Transient status hint when switching internet mode (shared helper
+        //    so the Full-needs-install / token-usage / simple lines match the
+        //    `/internet` and Ctrl+E paths exactly).
+        state.rest.status =
+            crate::app::runtime::commands::internet::internet_status(internet_mode);
     }
     state.mode = Mode::Chat;
     Ok(())

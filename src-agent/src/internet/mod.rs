@@ -1,9 +1,10 @@
-//! Internet research provisioner — "full" tier installer.
+//! Internet full-mode provisioner — "full" tier installer.
 //!
-//! The "full" internet tier delegates deep research to a vendored Python
-//! package (`scrapion_agent`) that drives a headless Firefox via Playwright.
-//! That package lives in `src-internet/` (sibling of this crate) and is
-//! embedded verbatim into the binary at compile time via [`include_dir!`].
+//! The "full" internet tier upgrades the `web_fetch` tool to a browser backend:
+//! a vendored Python package (`scrapion_agent`) that drives a Firefox via
+//! Playwright (renders JS, beats Cloudflare). That package lives in
+//! `src-internet/` (sibling of this crate) and is embedded verbatim into the
+//! binary at compile time via [`include_dir!`].
 //!
 //! # Public surface
 //!
@@ -106,7 +107,7 @@ pub fn install(force: bool) -> Result<()> {
 
     if !py3_ok {
         return Err(anyhow!(
-            "python3 not found — install Python 3.8+ and re-run `koma --install-internet`"
+            "python3 not found — install Python 3.8+ and re-run `koma --internet-fullmode-install`"
         ));
     }
 

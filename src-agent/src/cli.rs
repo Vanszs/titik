@@ -1,10 +1,10 @@
 //! CLI argument parsing.
 //!
 //! Flags:
-//! - `--resume`            — open the session picker on startup instead of a new chat.
-//! - `--install-internet`  — provision the Python research environment and exit.
-//! - `--uninstall-internet`— remove the Python research environment and exit.
-//! - `--force`             — modifier for `--install-internet`: force a reinstall
+//! - `--resume`                    — open the session picker on startup instead of a new chat.
+//! - `--internet-fullmode-install` — provision the Python full-mode (browser) environment and exit.
+//! - `--internet-fullmode-uninstall` — remove the Python full-mode environment and exit.
+//! - `--force`                     — modifier for `--internet-fullmode-install`: force a reinstall
 //!   even when the environment is already present.
 //!
 //! `parse` accepts anything that yields `String` items so it can be called
@@ -15,11 +15,11 @@
 pub struct Opts {
     /// When `true`, show the session picker on startup (`--resume` flag).
     pub resume: bool,
-    /// When `true`, provision the Python internet-research environment then exit.
-    pub install_internet: bool,
-    /// When `true`, remove the Python internet-research environment then exit.
-    pub uninstall_internet: bool,
-    /// Modifier for `--install-internet`: overwrite an existing install.
+    /// When `true`, provision the Python full-mode (browser) environment then exit.
+    pub internet_fullmode_install: bool,
+    /// When `true`, remove the Python full-mode (browser) environment then exit.
+    pub internet_fullmode_uninstall: bool,
+    /// Modifier for `--internet-fullmode-install`: overwrite an existing install.
     pub force: bool,
 }
 
@@ -31,11 +31,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
     let mut opts = Opts::default();
     for arg in args {
         match arg.as_str() {
-            "--resume"             => opts.resume = true,
-            "--install-internet"   => opts.install_internet = true,
-            "--uninstall-internet" => opts.uninstall_internet = true,
-            "--force"              => opts.force = true,
-            _                      => {}
+            "--resume"                       => opts.resume = true,
+            "--internet-fullmode-install"    => opts.internet_fullmode_install = true,
+            "--internet-fullmode-uninstall"  => opts.internet_fullmode_uninstall = true,
+            "--force"                        => opts.force = true,
+            _                                => {}
         }
     }
     opts

@@ -11,11 +11,9 @@
 //! returned via an `mpsc::channel` with `recv_timeout` — exactly the same pattern
 //! used by `shell::Bash`.
 
-mod research;
 mod web_fetch;
 mod web_search;
 
-pub use research::Research;
 pub use web_fetch::WebFetch;
 pub use web_search::WebSearch;
 

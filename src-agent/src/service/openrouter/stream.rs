@@ -44,9 +44,9 @@ impl OpenRouterClient {
         let url = format!("{}/chat/completions", conn.endpoint);
         // Expose the requested subset of the built-in tool set to the model. The
         // caller passes the exact tool names to advertise (`advertise`): the main
-        // chat loop hides agent-only tools (e.g. `research`) via
-        // `crate::tool::main_tool_names`, and each sub-agent advertises only its
-        // effective allow-list. Each retained tool maps to an OpenAI/OpenRouter
+        // chat loop advertises `crate::tool::main_tool_names` (everything not in
+        // `INTERNAL_ONLY`, currently empty), and each sub-agent advertises only
+        // its effective allow-list. Each retained tool maps to an OpenAI/OpenRouter
         // `function` definition (name + description + raw JSON-Schema parameters).
         let tools: Vec<ToolDef> = crate::tool::all_tools()
             .iter()

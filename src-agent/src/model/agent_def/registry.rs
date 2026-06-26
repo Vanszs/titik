@@ -73,15 +73,6 @@ pub(crate) fn builtin_agents() -> Vec<AgentDef> {
                 tools(&["read", "grep", "glob", "dir_list", "edit", "write", "bash"]),
             )
         },
-        AgentDef {
-            steps: Some(10),
-            ..AgentDef::builtin(
-                "researcher",
-                "Internet research agent: searches, visits, and synthesizes web sources into a report",
-                include_str!("../../../../src-misc/agent-researcher-prompt.txt"),
-                tools(&["web_search", "web_fetch", "research"]),
-            )
-        },
     ]
 }
 
