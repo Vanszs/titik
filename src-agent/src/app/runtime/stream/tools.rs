@@ -138,6 +138,40 @@ pub(crate) fn process_tools(
             state.rest.tool_idx += 1;
             continue;
         }
+        // Intercept ASYNC tools (web_fetch / web_search) BEFORE the generic
+        // classify/dispatch path. They do blocking HTTP, and `process_tools` runs
+        // on the main UI/event-loop thread, so running them inline would freeze the
+        // TUI for the whole network round-trip. Instead DEFER (mirroring `task`):
+        // run `execute_tool` on a plain background thread and record the call id in
+        // `pending_tool_tasks` so the round parks (below) until the event-loop drain
+        // delivers the result. These tools are read-only and auto-run, so there is
+        // no approval/classifier step to skip — like `task`, they never reach it.
+        if crate::tool::ASYNC_TOOLS.contains(&call.function.name.as_str()) {
+            // Lazily create the result channel once per session, then reuse it.
+            if state.rest.tool_task_tx.is_none() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                state.rest.tool_task_tx = Some(tx);
+                state.rest.tool_task_rx = Some(rx);
+            }
+            let ctx = super::spawn::build_tool_ctx(state);
+            let call_cloned = call.clone();
+            let id = call.id.clone();
+            let tx = state.rest.tool_task_tx.as_ref().unwrap().clone();
+            state.rest.status = format!("running {}", call.function.name);
+            // Run on a PLAIN std::thread (NOT a tokio task): the tool's internal
+            // `reqwest::blocking` work would panic inside a tokio runtime context,
+            // so the worker must have none. `ToolCtx` is Send + 'static (PathBuf /
+            // Vec / Arc / Option fields, no borrows) so it moves in cleanly, and the
+            // UnboundedSender is Send so it can fire from this off-runtime thread.
+            // This keeps the UI/event-loop thread free to redraw + take input.
+            std::thread::spawn(move || {
+                let result = crate::tool::execute_tool(&ctx, &call_cloned);
+                let _ = tx.send((id, result));
+            });
+            state.rest.pending_tool_tasks.push(call.id.clone());
+            state.rest.tool_idx += 1;
+            continue;
+        }
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.
@@ -224,21 +258,35 @@ pub(crate) fn process_tools(
         state.rest.tool_results.push((call.id.clone(), result));
         state.rest.tool_idx += 1;
     }
-    // PARK on deferred `task`-tool delegations. If any sub-agent spawned this round
-    // is still awaiting its result, DON'T finish the round yet — the conversation
-    // would have dangling tool_call ids. Mark the round parked and return; the
-    // event-loop sub-agent drain fills each pending result into `tool_results` as
-    // its sub-agent terminates, and once `pending_subagent_calls` empties it calls
-    // `resume_after_subagents` (which runs `finish_tool_round`). `waiting` stays
+    // PARK on deferred work of EITHER lane: `task`-tool sub-agent delegations
+    // (`pending_subagent_calls`) and/or async tool tasks (`pending_tool_tasks`,
+    // e.g. web_fetch/web_search running off-thread). If anything is still in
+    // flight, DON'T finish the round — the conversation would have dangling
+    // tool_call ids. Mark the round parked and return; the event-loop drains fill
+    // each pending result into `tool_results` as it lands, and once BOTH pending
+    // lists empty the unified resume gate runs `finish_tool_round`. `waiting` stays
     // true and `awaiting_approval` stays false, so the comet keeps shimmering.
-    if !state.rest.pending_subagent_calls.is_empty() {
-        state.rest.awaiting_subagents = true;
-        let n = state.rest.pending_subagent_calls.len();
-        state.rest.status = if n == 1 {
-            "delegating… (1 sub-agent)".into()
+    let has_subagents = !state.rest.pending_subagent_calls.is_empty();
+    let has_tool_tasks = !state.rest.pending_tool_tasks.is_empty();
+    if has_subagents || has_tool_tasks {
+        if has_subagents {
+            state.rest.awaiting_subagents = true;
+        }
+        if has_tool_tasks {
+            state.rest.awaiting_tool_tasks = true;
+        }
+        // Status: prefer the delegation message when sub-agents are pending (its
+        // existing wording is unchanged); otherwise show the fetch is in flight.
+        if has_subagents {
+            let n = state.rest.pending_subagent_calls.len();
+            state.rest.status = if n == 1 {
+                "delegating… (1 sub-agent)".into()
+            } else {
+                format!("delegating… ({n} sub-agents)")
+            };
         } else {
-            format!("delegating… ({n} sub-agents)")
-        };
+            state.rest.status = "fetching…".into();
+        }
         return;
     }
     finish_tool_round(state, client, handle);

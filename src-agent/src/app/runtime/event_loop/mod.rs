@@ -559,14 +559,37 @@ pub(super) fn run_loop(
                 dirty = true;
             }
 
-            // --- resume a round parked on deferred task-tool delegations ---
-            // Once every pending delegation has filled its result (above), unpark
-            // the tool round: `finish_tool_round` flushes ALL collected `tool_results`
-            // into the conversation and re-streams, so the MAIN AGENT now reacts to
-            // each delegated report. Clearing `awaiting_subagents` drops the parked
-            // status; `waiting` stays true through the re-stream.
-            if state.rest.awaiting_subagents && state.rest.pending_subagent_calls.is_empty() {
+            // --- drain async tool-task results (web_fetch / web_search) ---
+            // Async tools run on a plain std::thread (spawned in `process_tools`)
+            // and send their `(call_id, result)` back over `tool_task_rx`. Fold
+            // each into the PARKED round's `tool_results` and drop its id from
+            // `pending_tool_tasks`, exactly mirroring the sub-agent deferral — so
+            // the unified resume gate below sees the settled set. Done within this
+            // same block (before the gate) so both lanes' results are in place when
+            // emptiness is tested.
+            if let Some(rx) = state.rest.tool_task_rx.as_mut() {
+                while let Ok((id, result)) = rx.try_recv() {
+                    state.rest.pending_tool_tasks.retain(|c| c != &id);
+                    state.rest.tool_results.push((id, result));
+                    dirty = true;
+                }
+            }
+
+            // --- resume a round parked on deferred work (BOTH lanes) ---
+            // Unpark only when EVERY deferred id — sub-agent delegations AND async
+            // tool tasks — has filled its result (above). `finish_tool_round` then
+            // flushes ALL collected `tool_results` into the conversation and
+            // re-streams, so the MAIN AGENT reacts to each report. Clearing both
+            // awaiting flags drops the parked status; `waiting` stays true through
+            // the re-stream. Gating on both lists means a mixed round (sync tools +
+            // async tools + task delegations) waits for the last pending id of
+            // either kind before resuming — no dangling tool_call ids.
+            if (state.rest.awaiting_subagents || state.rest.awaiting_tool_tasks)
+                && state.rest.pending_subagent_calls.is_empty()
+                && state.rest.pending_tool_tasks.is_empty()
+            {
                 state.rest.awaiting_subagents = false;
+                state.rest.awaiting_tool_tasks = false;
                 super::stream::resume_after_subagents(state, client, handle);
                 dirty = true;
             }

@@ -96,6 +96,16 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
 /// sub-agent so the main model delegates rather than driving it directly.
 const INTERNAL_ONLY: &[&str] = &["research"];
 
+/// Tools that MUST run off the UI/event-loop thread. They do blocking network
+/// I/O (`reqwest::blocking` via [`internet::http_get_blocking`]), so running them
+/// inline in `process_tools` — which executes on the main event-loop thread —
+/// would freeze the TUI for the whole HTTP round-trip (no redraw, no input).
+/// `process_tools` intercepts any call whose name is in this list and runs it on
+/// a plain `std::thread`, parking the tool round until the result lands (the same
+/// defer machinery the `task` tool uses for sub-agents). `research` is absent: it
+/// is already deferred via the sub-agent (`researcher`) path, never run inline.
+pub const ASYNC_TOOLS: &[&str] = &["web_fetch", "web_search"];
+
 /// Tool names advertised to the MAIN chat model (everything except agent-only
 /// tools). Used by the interactive loop's `stream_complete` call so the main
 /// model never sees [`INTERNAL_ONLY`] tools.

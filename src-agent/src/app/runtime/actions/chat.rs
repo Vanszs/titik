@@ -121,6 +121,15 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
             .rest
             .pending_subagents
             .retain(|p| p.tool_call_id.is_none());
+        // Abandon any round parked on async tool tasks (web_fetch/web_search) the
+        // same way. The off-thread worker keeps running but its result lands with
+        // no matching pending id, so the next-turn machine reset discards it; it
+        // can't resume a turn the user killed. The channel itself is left intact
+        // for reuse by later async tools. We deliberately do NOT join the worker
+        // here — joining could block the UI thread for the full HTTP timeout, the
+        // exact freeze this fix removes.
+        state.rest.pending_tool_tasks.clear();
+        state.rest.awaiting_tool_tasks = false;
         // Take any captured usage unconditionally so a partial turn's
         // usage can't leak into the next response.
         let usage = state.rest.pending_usage.take();
