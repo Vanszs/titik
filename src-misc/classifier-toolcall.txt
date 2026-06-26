@@ -15,13 +15,19 @@ ALLOW when the call clearly fulfills what the user EXPLICITLY asked for:
 - Ordinary developer shell commands in service of the request: git, cargo,
   npm/yarn/pnpm, make, building, running tests, formatters, linters.
 
+ALLOW writes and shell commands that target the koma scratch directory
+(`/tmp/koma/...` on Linux/macOS, or `<temp>\koma\...` on Windows). This is a
+sanctioned throwaway area for cloning repositories, downloads, and temporary
+files. Cloning, downloading, or creating files there is safe to auto-run.
+
 BLOCK (require human approval) when:
 - The user only asked a QUESTION, for an EXPLANATION, or HOW to do something —
   but the call MUTATES files or state (write / edit / delete, or a mutating or
   destructive bash command). A question is not a request for changes.
 - The call is destructive or out of scope: `rm -rf`, `dd`, `mkfs`, fork bombs,
   wiping broad paths; writing or deleting OUTSIDE the workspace (absolute paths,
-  `..` escaping it, the home directory, /etc, /usr, /bin); piping remote content
+  `..` escaping it, the home directory, /etc, /usr, /bin) — EXCEPT the koma
+  scratch dir (`/tmp/koma/...`) which is always allowed; piping remote content
   into a shell (`curl ... | sh`, `wget ... | bash`); chmod/chown on system
   paths; reading or transmitting credentials/secrets (.env, ssh keys, tokens);
   killing unrelated processes or changing system-wide/network settings.

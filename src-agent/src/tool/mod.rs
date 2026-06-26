@@ -125,7 +125,50 @@ pub fn main_tool_names() -> Vec<String> {
 /// Resolve a path (optionally with `[N]` workspace-index prefix) and enforce
 /// containment. A bare path like `src/main.rs` resolves against workspace 0.
 /// A prefixed path like `[2]src/main.rs` resolves against workspace 2.
+///
+/// SCRATCH BYPASS: if `rel` is an absolute path that starts with the koma
+/// scratch root (`<temp>/koma`), it is returned as-is (no workspace required).
+/// Only absolute paths get this bypass; relative paths still resolve against
+/// the workspace as normal.
 pub fn resolve(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
+    // Scratch bypass: absolute paths under the scratch root skip workspace
+    // containment entirely. The scratch root itself exists once a session is
+    // active, so canonicalize succeeds; for deeper paths that don't yet exist
+    // we accept the literal path (same partial-canonicalize logic as below).
+    let as_path = Path::new(rel);
+    if as_path.is_absolute() {
+        let scratch = crate::model::store::scratch_root();
+        // Normalize the candidate the same way we do for workspace paths, so
+        // `..` tricks inside the scratch tree can't escape it.
+        let candidate = match as_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                // Partial-canonicalize: walk up to the longest existing prefix,
+                // re-append the non-existent tail.
+                let mut existing = as_path;
+                let mut tail: Vec<std::ffi::OsString> = Vec::new();
+                while !existing.exists() {
+                    match existing.file_name() {
+                        Some(n) => tail.push(n.to_os_string()),
+                        None => break,
+                    }
+                    match existing.parent() {
+                        Some(p) => existing = p,
+                        None => break,
+                    }
+                }
+                let mut base = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+                for seg in tail.iter().rev() {
+                    base.push(seg);
+                }
+                base
+            }
+        };
+        if candidate.starts_with(&scratch) {
+            return Ok(candidate);
+        }
+    }
+
     let (ws_idx, bare) = parse_ws_prefix(rel);
     let base = workspaces.get(ws_idx)
         .ok_or_else(|| anyhow::anyhow!("workspace index [{ws_idx}] out of range (have {})", workspaces.len()))?;
@@ -169,7 +212,22 @@ pub fn resolve(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
 /// This lets weak models that drop the [N] prefix still READ a file that only
 /// lives in another workspace, while writes (which keep using resolve) stay
 /// strictly pinned to workspace 0 unless an explicit [N] is given.
+///
+/// SCRATCH BYPASS: delegates to `resolve` which allows absolute paths under
+/// the scratch root through without workspace containment checks.
 pub fn resolve_read(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {
+    // Absolute scratch-root paths: let resolve() handle the bypass.
+    let as_path = Path::new(rel);
+    if as_path.is_absolute() {
+        let scratch = crate::model::store::scratch_root();
+        // Quick containment check before canonicalize (scratch dir may not
+        // exist yet for a brand-new session).
+        let candidate = as_path.canonicalize().unwrap_or_else(|_| as_path.to_path_buf());
+        if candidate.starts_with(&scratch) {
+            return resolve(workspaces, rel);
+        }
+    }
+
     if rel.starts_with('[') {
         return resolve(workspaces, rel);
     }

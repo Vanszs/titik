@@ -65,6 +65,17 @@ pub fn base_dir() -> Result<PathBuf> {
     Ok(home.join(APP_DIR_NAME))
 }
 
+/// Root of koma's throwaway scratch space (`<temp>/koma`). Bash + file tools
+/// are permitted to read/write anywhere under here.
+pub fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join("koma")
+}
+
+/// Per-session scratch dir (`<temp>/koma/<session_id>`).
+pub fn scratch_dir(session_id: &str) -> PathBuf {
+    scratch_root().join(session_id)
+}
+
 /// One-time, non-destructive migration: rename `~/.simple-coder` to `~/.koma`
 /// if the new dir does not yet exist and the old one does.
 ///
@@ -228,6 +239,12 @@ pub fn create_session() -> Result<Session> {
     // Pre-create memory/ so the user can drop MEMORY.md there immediately. This
     // also creates the session dir (and its bucket parent) as a side effect.
     std::fs::create_dir_all(dir.join("memory"))?;
+
+    // Best-effort: create the per-session scratch dir so it is ready immediately.
+    let scratch = scratch_dir(&uuid);
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
+    }
 
     let workdir_str = workdir.display().to_string();
     let settings = Settings {
