@@ -51,14 +51,23 @@ case "$_arch" in
 esac
 
 # ---------------------------------------------------------------------------
+# Supported platform gate
+# ---------------------------------------------------------------------------
+# Currently only Linux x86_64 is supported.
+if [ "$os" != "linux" ] || [ "$arch" != "x86_64" ]; then
+    echo "ERROR: koma currently supports Linux x86_64 only." >&2
+    echo "Detected ${os}/${arch}, which is not supported yet." >&2
+    echo "Linux arm64 and macOS builds are coming soon." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Build asset URL
 # ---------------------------------------------------------------------------
-# The current release publishes a SINGLE binary asset named "koma" (built for
-# the maintainer's platform). os/arch are detected below for the macOS
-# quarantine step and the info line, but are not yet part of the asset name.
-# TODO(koma.run): when per-platform artifacts exist, switch to
-#   asset="koma-${os}-${arch}"  and publish koma-linux-x86_64 / koma-darwin-arm64 etc.
-asset="koma"
+# The current release publishes a single Linux x86_64 binary asset named
+# "koma-linux-64". It is installed as "koma" at $INSTALL_DIR/koma.
+# TODO(koma.run): when per-platform artifacts exist, publish koma-linux-arm64 and macOS builds.
+asset="koma-linux-64"
 url="${KOMA_RELEASE_BASE}/${asset}"
 
 echo "koma installer — detected ${os}/${arch}"
@@ -109,13 +118,6 @@ else
         sudo mv "$tmp" "$INSTALL_DIR/koma"
         sudo chmod +x "$INSTALL_DIR/koma"
     fi
-fi
-
-# ---------------------------------------------------------------------------
-# macOS: strip Gatekeeper quarantine attribute
-# ---------------------------------------------------------------------------
-if [ "$os" = "darwin" ]; then
-    xattr -d com.apple.quarantine "$INSTALL_DIR/koma" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
