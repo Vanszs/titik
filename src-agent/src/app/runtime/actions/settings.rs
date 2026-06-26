@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::model::app_config::{ModelEntry, ProviderConn};
+use crate::model::settings::InternetMode;
 use crate::model::store;
 use crate::service::openrouter::OpenRouterClient;
 
@@ -225,14 +226,14 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    `resolve_role`, so the existing keyless Arc serves the new
         //    settings on the next request. (This also keeps the cache-stable
         //    plan_word intact across a settings save.)
-        // f) Transient toast when switching internet mode (shared helper
-        //    so the Full-needs-install line matches the `/internet` and
-        //    Ctrl+E paths exactly).  Only fires when the mode actually
-        //    changed AND the helper has something to say (i.e. Full
-        //    without the browser backend installed).
+        // f) Brief status line flash when switching internet mode (shared
+        //    helper so the Full-needs-install line matches the `/internet`
+        //    and Ctrl+E paths exactly).  Only fires when the mode actually
+        //    changed; it resets to "ready" on the next action.
         if old_internet.is_some_and(|old| old != internet_mode) {
-            if let Some(msg) = crate::app::runtime::commands::internet::internet_status(internet_mode) {
-                state.rest.set_toast_info(msg);
+            state.rest.status = crate::app::runtime::commands::internet::internet_status(internet_mode);
+            if internet_mode == InternetMode::Full && !crate::internet::is_installed() {
+                state.rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(internet_mode));
             }
         }
     }

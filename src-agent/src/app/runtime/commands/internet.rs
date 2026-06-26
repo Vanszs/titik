@@ -5,19 +5,17 @@ use anyhow::Result;
 use crate::app::state::AppState;
 use crate::model::settings::InternetMode;
 
-/// Status line for a just-applied internet `mode`.
+/// Brief status label for a just-applied internet `mode`.
 ///
-/// Returns `Some(msg)` **only** when `Full` is selected but the full-mode
-/// browser backend is not installed yet — that is the one case where the
-/// user needs to act (`koma --internet-fullmode-install`).  In all other
-/// cases (`Simple`, or `Full` + already installed) the mode switch is
-/// silent, so we return `None` and the caller skips the toast.
-pub(crate) fn internet_status(mode: InternetMode) -> Option<String> {
+/// Always returns a string; the caller writes it to `rest.status` so it
+/// flashes in the status bar until the next action resets it to `"ready"`.
+pub(crate) fn internet_status(mode: InternetMode) -> String {
     match mode {
         InternetMode::Full if !crate::internet::is_installed() => {
-            Some("internet: full needs `koma --internet-fullmode-install`".to_string())
+            "internet: full needs `koma --internet-fullmode-install`".to_string()
         }
-        _ => None,
+        InternetMode::Full => "internet: full".to_string(),
+        InternetMode::Simple => "internet: simple".to_string(),
     }
 }
 
@@ -50,8 +48,12 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
         return Ok(());
     }
 
-    if let Some(msg) = internet_status(new_mode) {
-        state.rest.set_toast_info(msg);
+    state.rest.status = internet_status(new_mode);
+    // Toast the install instructions when Full is selected without the
+    // browser backend — status bar resets on next keypress, so the toast
+    // gives the user time to read the command.
+    if new_mode == InternetMode::Full && !crate::internet::is_installed() {
+        state.rest.set_toast_info(internet_status(new_mode));
     }
 
     Ok(())

@@ -173,8 +173,9 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
-                    if let Some(msg) = crate::app::runtime::commands::internet::internet_status(new_mode) {
-                        rest.set_toast_info(msg);
+                    rest.status = crate::app::runtime::commands::internet::internet_status(new_mode);
+                    if new_mode == InternetMode::Full && !crate::internet::is_installed() {
+                        rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(new_mode));
                     }
                 }
                 Err(e) => {
