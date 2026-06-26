@@ -807,6 +807,106 @@ pub(super) fn apply_action(
             });
         }
 
+        Action::GeneratePrompt => {
+            // One-shot agent-prompt GENERATOR (Ctrl+G in the `/agents` full-screen
+            // prompt editor): a SINGLE non-streaming Main-model `complete` call (no
+            // tools, no loop) runs on a background task and fills the editor buffer
+            // with the result. Never blocks the UI — same spawn + channel + drain
+            // pattern as the endpoints fetch / prompt classifier.
+
+            // Guard: need a client + an active session, and we must currently be in
+            // the agents prompt editor. Otherwise this Action is a no-op.
+            if client.is_none() || state.rest.session.is_none() {
+                return Ok(());
+            }
+            let editor_open =
+                matches!(&state.mode, Mode::Agents(a) if a.prompt_editor.is_some());
+            if !editor_open {
+                return Ok(());
+            }
+
+            // Pull the draft name + description and the live editor buffer (owned)
+            // out of the mode so no borrow of `state.mode` crosses into the resolve
+            // / spawn below.
+            let (name, desc, buffer) = match &state.mode {
+                Mode::Agents(a) => (
+                    a.draft_name.trim().to_string(),
+                    a.draft_description.trim().to_string(),
+                    a.prompt_editor.as_ref().map(|ed| ed.text()).unwrap_or_default(),
+                ),
+                _ => return Ok(()),
+            };
+
+            // Need at least a name or a description to have anything to generate from.
+            if name.is_empty() && desc.is_empty() {
+                state.rest.status = "fill description first to generate".into();
+                return Ok(());
+            }
+
+            // Resolve the Main route (endpoint + key + model + upstream slug). Clone
+            // the session settings out first so the resolve doesn't hold a borrow of
+            // `state.rest.session` while we read the sibling `config`.
+            let settings = state.rest.session.as_ref().unwrap().settings.clone();
+            let resolved = match crate::app::resolve::resolve_role(
+                &state.rest.config,
+                &settings,
+                ModelRole::Main,
+            ) {
+                Some(r) => r,
+                None => {
+                    state.rest.status = "no main model configured".into();
+                    return Ok(());
+                }
+            };
+
+            // Build the two-message prompt: a directive SYSTEM message + a USER
+            // message carrying the agent's name + purpose, optionally seeding the
+            // model with the current buffer to improve on.
+            let system = "You write the SYSTEM PROMPT for a specialized sub-agent in a \
+terminal coding assistant. Output ONLY the prompt text — second person ('You are...'), \
+concise and directive: state the agent's role, how it should work (read before acting, \
+use its tools, stay scoped), what to focus on, and that it must finish with a clear, \
+complete report. No preamble, no markdown code fences, no surrounding quotes.";
+            let mut user = format!(
+                "Agent name: {name}\nPurpose / when to use: {desc}\n\nWrite the system prompt."
+            );
+            if !buffer.trim().is_empty() {
+                user.push_str("\n\nImprove on this existing draft:\n");
+                user.push_str(&buffer);
+            }
+            let messages = vec![
+                crate::dto::chat::ChatMessage::new(Role::System, system),
+                crate::dto::chat::ChatMessage::new(Role::User, user),
+            ];
+
+            // Own copies of the route pieces so the spawned task builds its own
+            // `Conn` (which borrows the endpoint/key strings) entirely inside the
+            // task — mirrors the sub-agent engine's `stream_step` clone-before-spawn.
+            let endpoint = resolved.endpoint.clone();
+            let api_key = resolved.api_key.clone();
+            let model_id = resolved.model_id.clone();
+            let provider = resolved.provider().to_string();
+            let c = Arc::clone(client.as_ref().unwrap());
+
+            // Open a fresh channel (dropping any prior in-flight generation's
+            // receiver — the desired stale-cancel), mark generating, and kick off
+            // the single call. The drain in `run_loop` folds the result back in.
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.rest.prompt_gen_rx = Some(rx);
+            state.rest.prompt_generating = true;
+            state.rest.status = "generating prompt...".into();
+            handle.spawn(async move {
+                let conn = crate::service::openrouter::Conn {
+                    endpoint: &endpoint,
+                    api_key: &api_key,
+                };
+                let r = c.complete(conn, &model_id, &provider, messages).await;
+                // A dropped receiver (editor closed / app closing) makes this a
+                // no-op — same contract as the streaming + endpoints channels.
+                let _ = tx.send(r.map(|s| s.trim().to_string()).map_err(|e| e.to_string()));
+            });
+        }
+
         Action::SkipLoading => {
             // Esc on the loading splash: drop straight into Chat. The warm tasks
             // keep running in the background and their results still populate

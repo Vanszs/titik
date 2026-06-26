@@ -64,18 +64,23 @@ fn truncate(s: &str, max: usize) -> String {
 /// models, listed first in the model picker). Both are threaded down to the
 /// detail/editor rows and the model picker.
 ///
+/// `generating` is `state.rest.prompt_generating`: when the full-screen prompt
+/// editor is open it drives the header "generating…" spinner (a Ctrl+G one-shot
+/// generation is in flight). Ignored outside the editor.
+///
 /// All colours flow through `palette` — no hardcoded `Color::` values.
 pub fn draw(
     frame: &mut Frame,
     st: &AgentsState,
     config: &AppConfig,
     settings: Option<&Settings>,
+    generating: bool,
     palette: &Palette,
 ) {
     // The full-screen prompt editor takes over the WHOLE frame when open: render
     // it instead of the normal list/detail dashboard and bail (it owns all input).
     if let Some(ed) = &st.prompt_editor {
-        draw_prompt_editor(frame, ed, palette);
+        draw_prompt_editor(frame, ed, generating, palette);
         return;
     }
 
@@ -147,12 +152,12 @@ pub fn draw(
 /// Layout (minimalist, matching the app's header convention):
 ///
 /// ```text
-///  edit prompt
+///  edit prompt   ⠹ generating…              ← spinner only while Ctrl+G runs
 /// ─────────────────────────────────────────  ← dim BOTTOM rule
 ///   You are a focused subagent…             ← body (clipped, h-scrolled)
 ///   …                                        ← real terminal cursor sits here
 ///
-///  ↑↓←→ move · Enter newline · Esc save & back ← dim footer
+///  ↑↓←→ move · Enter newline · ^G generate · Esc save & back ← dim footer
 /// ```
 ///
 /// ## Wrapping vs cursor placement
@@ -165,7 +170,17 @@ pub fn draw(
 /// The stored `scroll` is treated as a seed: the effective vertical scroll is
 /// recomputed every frame from the cursor and body height, so the view stays
 /// correct without mutating state (the renderer only borrows `ed`).
-fn draw_prompt_editor(frame: &mut Frame, ed: &TextEditorState, palette: &Palette) {
+///
+/// `generating` is true while a Ctrl+G one-shot prompt generation is in flight:
+/// the header gains an animated braille spinner + "generating…" note. The (now
+/// stale) buffer keeps rendering underneath; the event-loop drain replaces it
+/// with the generated text when the single call returns.
+fn draw_prompt_editor(
+    frame: &mut Frame,
+    ed: &TextEditorState,
+    generating: bool,
+    palette: &Palette,
+) {
     let area = frame.area();
 
     // Header (title + BOTTOM rule) | body | footer.
@@ -178,21 +193,35 @@ fn draw_prompt_editor(frame: &mut Frame, ed: &TextEditorState, palette: &Palette
         ])
         .split(area);
 
-    // --- Header: "edit prompt" (dim) with a BOTTOM rule. ---
+    // --- Header: "edit prompt" (dim) with a BOTTOM rule. While a one-shot
+    //     generation is in flight, append an animated braille spinner +
+    //     "generating…" (same time-driven 80ms cadence as the sub-agent spinner). ---
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(palette.dim));
     let header_inner = header_block.inner(outer[0]);
     frame.render_widget(header_block, outer[0]);
+    let mut header_spans = vec![Span::styled("edit prompt", Style::default().fg(palette.dim))];
+    if generating {
+        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let elapsed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let glyph = SPINNER[((elapsed_ms / 80) as usize) % SPINNER.len()];
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled(glyph.to_string(), Style::default().fg(palette.accent)));
+        header_spans.push(Span::styled(" generating…", Style::default().fg(palette.dim)));
+    }
     frame.render_widget(
-        Paragraph::new(Span::styled("edit prompt", Style::default().fg(palette.dim))),
+        Paragraph::new(Line::from(header_spans)),
         header_inner.inner(Margin { horizontal: 2, vertical: 0 }),
     );
 
     // --- Footer hint (dim). ---
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} Esc save & back",
+            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} ^G generate \u{b7} Esc save & back",
             Style::default().fg(palette.dim),
         )),
         outer[2].inner(Margin { horizontal: 2, vertical: 0 }),

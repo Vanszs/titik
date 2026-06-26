@@ -64,6 +64,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             a,
             &state.rest.config,
             state.rest.session.as_ref().map(|s| &s.settings),
+            state.rest.prompt_generating,
             &palette,
         ),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
