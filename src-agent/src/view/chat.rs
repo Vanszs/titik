@@ -166,7 +166,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     // Padded, flat. Each message is a block: a coloured bullet (★ user / ● ai)
     // on the first line, text hanging-indented under it, blank line between
     // blocks. Pre-wrapped by hand for the hanging indent.
-    let body = chunks[1].inner(Margin { horizontal: 2, vertical: 1 });
+    let body = chunks[1].inner(Margin { horizontal: 2, vertical: 0 });
     let wrap_w = (body.width as usize).saturating_sub(2).max(1);
 
     // Render (or reuse) each committed message's lines. Cache is keyed by width
