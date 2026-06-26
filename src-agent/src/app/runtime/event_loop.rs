@@ -423,47 +423,6 @@ pub(super) fn run_loop(
             }
         }
 
-        // 1b-3a2. Drain the one-shot prompt GENERATOR channel (Ctrl+G in the
-        //         `/agents` full-screen prompt editor). Fully independent of
-        //         streaming: the background `complete` call sends exactly one
-        //         Result. On success, REPLACE the editor buffer with the generated
-        //         text (only while the editor is still open, so a result that lands
-        //         after Esc is simply dropped); on failure, surface the error. In
-        //         every terminal case clear `prompt_generating` and drop the rx.
-        //         Take() the receiver so the arms can mutate the mode + rest; put it
-        //         back only on `Empty` (still pending).
-        if let Some(mut grx) = state.rest.prompt_gen_rx.take() {
-            match grx.try_recv() {
-                Ok(Ok(text)) => {
-                    if let Mode::Agents(a) = &mut state.mode {
-                        if a.prompt_editor.is_some() {
-                            a.prompt_editor = Some(
-                                crate::app::mode::editor::TextEditorState::from_text(&text),
-                            );
-                        }
-                    }
-                    state.rest.prompt_generating = false;
-                    state.rest.status = "prompt generated".into();
-                    dirty = true;
-                }
-                Ok(Err(e)) => {
-                    state.rest.prompt_generating = false;
-                    state.rest.status = format!("generate failed: {e}");
-                    dirty = true;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    // Still in flight: keep listening on later ticks.
-                    state.rest.prompt_gen_rx = Some(grx);
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // Task dropped its sender without a result (shouldn't happen):
-                    // clear the in-flight flag so the spinner doesn't stick.
-                    state.rest.prompt_generating = false;
-                    dirty = true;
-                }
-            }
-        }
-
         // 1b-3b. Fire a DEBOUNCED, on-demand model-catalogue fetch. The model
         //        omnisearch arms `catalogue_pending` (via `request_catalogue`) on
         //        each keystroke / provider change, pushing `due` ~300ms forward so a
@@ -832,14 +791,7 @@ pub(super) fn run_loop(
             .subagents
             .iter()
             .any(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running));
-        // A one-shot prompt generation is in flight (Ctrl+G in the agents prompt
-        // editor): force a redraw each tick too so its "generating…" braille
-        // spinner advances even though no stream events arrive.
-        if state.rest.compact_anim_start.is_some()
-            || shimmer_active
-            || has_running_subagents
-            || state.rest.prompt_generating
-        {
+        if state.rest.compact_anim_start.is_some() || shimmer_active || has_running_subagents {
             dirty = true;
         }
 
@@ -859,7 +811,6 @@ pub(super) fn run_loop(
             || state.rest.catalogue_pending.is_some()
             || matches!(state.mode, Mode::Loading(_))
             || has_running_subagents
-            || state.rest.prompt_generating
         {
             Duration::from_millis(8)
         } else {

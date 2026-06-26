@@ -337,19 +337,6 @@ pub struct AppStateRest {
     /// then resumes the round (`finish_tool_round`) so the main agent reacts to the
     /// delegated reports. Keeps the busy/shimmer indicator on while parked.
     pub awaiting_subagents: bool,
-    /// Receiver for the one-shot agent-prompt GENERATOR (Ctrl+G in the `/agents`
-    /// full-screen prompt editor). A single non-streaming Main-model `complete`
-    /// call runs on a background task and sends exactly one result here:
-    /// `Ok(prompt_text)` on success, `Err(message)` on failure. Opened (replacing
-    /// any prior, which drops a superseded generation's receiver) when a generation
-    /// starts; drained in `run_loop`, which loads the text into the editor and
-    /// clears it. `None` when no generation is in flight.
-    pub prompt_gen_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
-    /// True while a one-shot prompt generation is in flight (between the Ctrl+G
-    /// that spawned it and the `prompt_gen_rx` drain that lands the result). Gates
-    /// a second concurrent Ctrl+G and drives the editor's "generating…" spinner +
-    /// the fast-tick redraw that animates it.
-    pub prompt_generating: bool,
 }
 
 impl AppState {
@@ -435,8 +422,6 @@ impl AppStateRest {
             next_subagent_id: 0,
             pending_subagent_calls: Vec::new(),
             awaiting_subagents: false,
-            prompt_gen_rx: None,
-            prompt_generating: false,
         }
     }
 

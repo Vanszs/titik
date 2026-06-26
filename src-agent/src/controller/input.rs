@@ -94,12 +94,6 @@ pub enum Action {
     /// marked any non-terminal step `Skipped` for correctness; the runtime just
     /// swaps the mode to `Chat`.
     SkipLoading,
-    /// Ctrl+G in the `/agents` full-screen prompt editor: generate a complete
-    /// agent system prompt from the draft name + description (and the current
-    /// buffer as an improvable seed) with ONE non-streaming Main-model call on a
-    /// background task. The runtime opens `prompt_gen_rx`, sets `prompt_generating`,
-    /// and spawns the call; the `run_loop` drain fills the editor with the result.
-    GeneratePrompt,
 }
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -1389,16 +1383,6 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
     // line, Backspace/Delete remove, and Esc COMMITS the text back into the draft
     // and closes (returning to the field list). Everything else is swallowed.
     if let Some(ed) = s.prompt_editor.as_mut() {
-        // Ctrl+G: one-shot prompt GENERATION (Main model). Fires BEFORE the normal
-        // editor keys so it isn't shadowed by a printable-char insert. While a
-        // generation is already in flight it is SWALLOWED (no double-spawn) — the
-        // drain swaps the buffer in when the single call returns.
-        if is_ctrl(&key, 'g') {
-            if rest.prompt_generating {
-                return Action::None;
-            }
-            return Action::GeneratePrompt;
-        }
         match key.code {
             KeyCode::Esc => {
                 // Commit: write the edited text back into `draft_body`, close.
