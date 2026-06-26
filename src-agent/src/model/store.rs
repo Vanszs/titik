@@ -1,33 +1,43 @@
-//! Filesystem session registry: list, create, rename sessions.
+//! Session store: list, create, rename sessions in the pwd-keyed layout.
 //!
-//! All sessions live under `~/.simple-coder/sessions/`. Each session is a
-//! sub-directory whose name is both the session `id` and the filesystem slug:
+//! Sessions are bucketed by the working directory they were opened from. Every
+//! session opened from the same canonical workdir shares one `pwd_hash` bucket,
+//! which holds a shared `settings.json` (the per-dir model catalogue) plus one
+//! sub-directory per session UUID. Which sessions belong to which bucket — and
+//! their display names + timestamps — is tracked in the SQLite registry
+//! (`session_registry`), NOT by scanning the filesystem.
 //!
 //! ```text
 //! ~/.simple-coder/
+//!     session.sqlite                               ← registry (uuid → pwd_hash, name, …)
 //!     sessions/
-//!         550e8400-e29b-41d4-a716-446655440000/   ← UUID (new session)
-//!         my-project-notes/                        ← slug (after rename)
-//!             settings.json
-//!             messages.json
-//!             memory/
-//!                 MEMORY.md
+//!         <pwd_hash>/                              ← one bucket per working dir
+//!             settings.json                        ← shared LocalConfig (session_models)
+//!             550e8400-e29b-41d4-a716-446655440000/  ← one dir per session UUID
+//!                 settings.json                    ← per-session behavioural settings
+//!                 messages.json
+//!                 messages.sqlite
+//!                 memory/
+//!                     MEMORY.md
 //! ```
 //!
 //! **Key operations:**
-//! - `list_sessions` — enumerate directories, sort by mtime descending.
-//! - `create_session` — allocate a UUID directory, call `rebuild_system`, save.
-//! - `rename_session` — slugify the new name, find a free directory, `fs::rename`.
-//! - `slugify` — normalise a human name into a safe directory name.
+//! - `list_sessions` — registry rows for the CURRENT dir's `pwd_hash`, newest first.
+//! - `create_session` — allocate a UUID dir under the cwd's bucket, register, save.
+//! - `rename_session` — update the registry `name` only (no filesystem move).
+//!
+//! Pre-swap `sessions/<name>/` directories from the old layout are never
+//! registered, so they are simply not listed (and never crash the list).
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
 use crate::config::APP_DIR_NAME;
 use crate::dto::chat::{ChatMessage, Role};
 use crate::model::conversation::Conversation;
 use crate::model::session::Session;
+use crate::model::session_registry;
 use crate::model::settings::Settings;
 
 /// Lightweight metadata about a session used in the session-list UI.
@@ -67,13 +77,11 @@ pub fn ensure_dirs() -> Result<()> {
     Ok(())
 }
 
-// --- pwd-keyed layout (additive; not wired into the live flows yet) ----------
+// --- pwd-keyed layout paths --------------------------------------------------
 //
-// The target storage layout buckets sessions by their working directory: every
-// session opened from the same canonical workdir shares one `pwd_hash` bucket,
-// which holds a shared `settings.json` (the per-dir model setup) plus one
-// sub-directory per session UUID. These helpers compute the hash and the paths;
-// the registry (`session_registry`) tracks which sessions belong to which bucket.
+// These helpers compute the bucket hash and the on-disk paths for the pwd-keyed
+// layout; the registry (`session_registry`) tracks which sessions belong to
+// which bucket.
 
 /// Deterministic hash of a working directory, stable across runs.
 ///
@@ -82,7 +90,6 @@ pub fn ensure_dirs() -> Result<()> {
 /// infallible. The canonical path string is hashed with UUID v5 over the OID
 /// namespace, and the simple (hyphenless) hex form is returned. Same directory
 /// → same hash every time.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn pwd_hash(workdir: &Path) -> String {
     let canonical = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
     let path_str = canonical.to_string_lossy();
@@ -93,7 +100,6 @@ pub fn pwd_hash(workdir: &Path) -> String {
 
 /// The bucket directory for a working dir: `~/.simple-coder/sessions/<pwd_hash>/`.
 /// Shared by every session opened from that directory.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn pwd_bucket_dir(pwd_hash: &str) -> Result<PathBuf> {
     Ok(sessions_dir()?.join(pwd_hash))
 }
@@ -101,7 +107,6 @@ pub fn pwd_bucket_dir(pwd_hash: &str) -> Result<PathBuf> {
 /// Shared per-dir settings path: `<pwd_bucket_dir>/settings.json`. Holds the
 /// [`LocalConfig`](crate::model::settings::LocalConfig) (model setup) common to
 /// all sessions in this working directory.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn shared_settings_path(pwd_hash: &str) -> Result<PathBuf> {
     Ok(pwd_bucket_dir(pwd_hash)?.join("settings.json"))
 }
@@ -109,48 +114,36 @@ pub fn shared_settings_path(pwd_hash: &str) -> Result<PathBuf> {
 /// A single session's directory under its bucket:
 /// `<pwd_bucket_dir>/<uuid>/`. Holds the per-session behavioural settings,
 /// messages, memory, and agents.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn session_dir(pwd_hash: &str, uuid: &str) -> Result<PathBuf> {
     Ok(pwd_bucket_dir(pwd_hash)?.join(uuid))
 }
 
 /// Path to the SQLite session registry: `~/.simple-coder/session.sqlite`.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn registry_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("session.sqlite"))
 }
 
-/// List all sessions, sorted by directory mtime descending (most-recent first).
+/// List the sessions for the CURRENT working directory, most-recently updated
+/// first.
 ///
-/// Unreadable directories are silently skipped so a single corrupt session
-/// doesn't break the list. The System message is excluded from `message_count`.
+/// The list is driven by the SQLite registry (`session_registry`), NOT a
+/// filesystem scan: only sessions whose `pwd_hash` matches `std::env::current_dir()`
+/// are returned, already ordered by `updated_at` descending. Old pre-swap
+/// `sessions/<name>/` directories are never registered, so they simply don't
+/// appear — and an absent registry (first run) yields an empty list rather than
+/// an error. The System message is excluded from `message_count`.
 pub fn list_sessions() -> Result<Vec<SessionMeta>> {
-    let dir = sessions_dir()?;
-    let mut metas: Vec<SessionMeta> = Vec::new();
+    let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let hash = pwd_hash(&workdir);
 
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(metas), // sessions dir not created yet — return empty
-    };
+    let rows = session_registry::list_by_pwd(&hash)?;
+    let mut metas: Vec<SessionMeta> = Vec::with_capacity(rows.len());
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let id = match path.file_name() {
-            Some(s) => s.to_string_lossy().into_owned(),
-            None => continue,
-        };
+    for row in rows {
+        let path = session_dir(&hash, &row.uuid)?;
 
-        // Prefer settings.name; fall back to the directory id.
-        let settings_path = path.join("settings.json");
-        let name = match Settings::load(&settings_path) {
-            Ok(s) if !s.name.is_empty() => s.name,
-            _ => id.clone(),
-        };
-
-        // Count non-System messages for the list view; 0 on any parse failure.
+        // Count non-System messages for the list view; 0 on any parse failure
+        // (e.g. a session that's registered but never saved messages.json yet).
         let messages_path = path.join("messages.json");
         let message_count = match std::fs::read(&messages_path) {
             Ok(bytes) => serde_json::from_slice::<Vec<ChatMessage>>(&bytes)
@@ -159,8 +152,14 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
             Err(_) => 0,
         };
 
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
+        // The registry's updated_at (unix seconds) is the "modified" time; the
+        // picker view formats it as an elapsed duration. Saturating add keeps a
+        // garbage/negative timestamp from panicking.
+        let modified = row
+            .updated_at
+            .try_into()
+            .ok()
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         // Lock state for the picker. `is_locked` treats a stale lock (dead PID)
@@ -169,8 +168,8 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
         let locked = is_locked(&path);
 
         metas.push(SessionMeta {
-            id,
-            name,
+            id: row.uuid,
+            name: row.name,
             path,
             modified,
             message_count,
@@ -178,77 +177,55 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
         });
     }
 
-    // Most-recently modified session first.
-    metas.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(metas)
 }
 
-/// Create a brand-new session with a UUID id.
+/// Create a brand-new session with a UUID id, bucketed by the current working
+/// directory's `pwd_hash`.
 ///
-/// Also creates `memory/` inside the session directory so `load_memory` can
-/// scan it without an error. Calls `rebuild_system` before the first save so
-/// the system prompt is set correctly.
+/// Layout: the session lives at `sessions/<pwd_hash>/<uuid>/`. Also creates
+/// `memory/` inside the session directory so `load_memory` can scan it without
+/// an error, registers the session in the SQLite registry (the rename/list
+/// source of truth), and calls `rebuild_system` before the first save so the
+/// system prompt is set correctly.
 pub fn create_session() -> Result<Session> {
-    let id = Uuid::new_v4().to_string();
-    let dir = sessions_dir()?.join(&id);
-    // Pre-create memory/ so the user can drop MEMORY.md there immediately.
+    // The launch cwd determines both the bucket (pwd_hash) and the seeded
+    // workdir. Fall back to "." if the cwd can't be resolved.
+    let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let hash = pwd_hash(&workdir);
+    let uuid = Uuid::new_v4().to_string();
+    let dir = session_dir(&hash, &uuid)?;
+    // Pre-create memory/ so the user can drop MEMORY.md there immediately. This
+    // also creates the session dir (and its bucket parent) as a side effect.
     std::fs::create_dir_all(dir.join("memory"))?;
 
+    let workdir_str = workdir.display().to_string();
     let settings = Settings {
-        name: id.clone(),
+        name: uuid.clone(),
         // Seed the workdir path list with a single entry: the launch cwd.
-        workdir: std::env::current_dir()
-            .map(|p| vec![p.display().to_string()])
-            .unwrap_or_default(),
+        workdir: vec![workdir_str.clone()],
         ..Default::default()
     };
     let conversation = Conversation::from_messages(vec![]);
-    let mut session = Session::new(id, dir, settings, conversation);
+    let mut session = Session::new(uuid.clone(), dir, hash.clone(), settings, conversation);
+    // Register before the first save so the row exists for list/rename. The
+    // initial display name is the uuid (matches settings.name).
+    session_registry::register(&uuid, &hash, &uuid, &workdir_str)?;
     session.rebuild_system();
     session.save()?;
     Ok(session)
 }
 
-/// Rename a session by slugifying `new_name` and moving its directory.
+/// Rename a session by updating its registry `name` only.
 ///
-/// The new directory name is `slugify(new_name)`. If that directory already
-/// exists (and is not the current session), a numeric suffix is appended:
-/// `<slug>-2`, `<slug>-3`, … until a free slot is found. The session's `id`,
-/// `path`, `name`, and `settings.name` are updated in-place, then saved.
+/// In the pwd-keyed layout the on-disk directory is the immutable session UUID;
+/// the display name lives in the SQLite registry, so a rename is just a name
+/// update there — NO filesystem move, NO collision handling. The session's
+/// in-memory `name` / `settings.name` are updated to match (the `id`, `path`,
+/// and `pwd_hash` are unchanged), then the session is saved.
 pub fn rename_session(session: &mut Session, new_name: &str) -> Result<()> {
-    let slug = slugify(new_name)?;
-    let parent = sessions_dir()?;
-
-    // Start with the bare slug; if taken (by a different session), increment.
-    let mut target = parent.join(&slug);
-    if target.exists() && target != session.path {
-        let mut n = 2;
-        loop {
-            let candidate = parent.join(format!("{slug}-{n}"));
-            if !candidate.exists() {
-                target = candidate;
-                break;
-            }
-            n += 1;
-        }
-    }
-
-    // Only rename on disk if the path actually changed (avoids a no-op syscall
-    // when the slug happens to match the current directory name).
-    if target != session.path {
-        std::fs::rename(&session.path, &target)?;
-    }
-
-    let final_id = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| slug.clone());
-
-    session.id = final_id;
-    session.path = target;
-    // Keep the raw display name (untrimmed is already trimmed below) separate
-    // from the slug-derived id so the UI can show "My Project" not "my-project".
     let display = new_name.trim().to_string();
+    session_registry::set_name(&session.id, &display)?;
     session.name = display.clone();
     session.settings.name = display;
     session.save()?;
@@ -267,6 +244,11 @@ pub fn rename_session(session: &mut Session, new_name: &str) -> Result<()> {
 /// Returns `Err` if the result is empty (e.g. the input was all punctuation).
 ///
 /// Examples: `"My Project!"` → `"my-project"`, `"  foo  bar  "` → `"foo-bar"`.
+///
+/// Retained for potential reuse / a friendlier on-disk layout; the pwd-keyed
+/// rename no longer slugifies (directories are immutable UUIDs, the name lives
+/// in the registry), so this is currently unused.
+#[allow(dead_code)]
 pub(crate) fn slugify(name: &str) -> Result<String> {
     let mut mapped = String::new();
     for c in name.chars() {

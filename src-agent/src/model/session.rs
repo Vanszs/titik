@@ -24,19 +24,28 @@ use crate::dto::chat::ChatMessage;
 use crate::model::agent_def::AgentRegistry;
 use crate::model::conversation::Conversation;
 use crate::model::memory::{load_agents, load_memory};
-use crate::model::settings::Settings;
+use crate::model::session_registry;
+use crate::model::settings::{LocalConfig, Settings};
+use crate::model::store::shared_settings_path;
 use crate::resources;
 
 /// One named chat session.
 ///
-/// `id` is the directory name under `~/.simple-coder/sessions/` (a UUID for
-/// new sessions, or a slug after `store::rename_session`). `name` is the
-/// human-readable label shown in the session list — it defaults to `id` when
-/// `settings.name` is empty.
+/// `id` is the session UUID — the leaf directory name under the session's pwd
+/// bucket (`sessions/<pwd_hash>/<id>/`). It is allocated once at creation and
+/// never changes (rename only touches the registry `name`, never the path).
+/// `pwd_hash` is the working-directory bucket this session lives in. `name` is
+/// the human-readable label shown in the session list — it defaults to `id`
+/// when `settings.name` is empty, and is sourced from the SQLite registry on
+/// load.
 pub struct Session {
     pub id: String,
     pub name: String,
     pub path: PathBuf,
+    /// Working-directory bucket: the parent dir name of `path`
+    /// (`sessions/<pwd_hash>/<id>`). Identifies the shared `LocalConfig` that
+    /// holds this session's `session_models` (see `store::shared_settings_path`).
+    pub pwd_hash: String,
     pub settings: Settings,
     pub conversation: Conversation,
 }
@@ -46,9 +55,12 @@ impl Session {
     ///
     /// `name` is derived from `settings.name`, falling back to `id` when the
     /// name is blank. This is the only place that enforces the fallback.
+    /// `pwd_hash` is the working-directory bucket the session lives in
+    /// (`path`'s parent dir name).
     pub fn new(
         id: String,
         path: PathBuf,
+        pwd_hash: String,
         settings: Settings,
         conversation: Conversation,
     ) -> Self {
@@ -61,6 +73,7 @@ impl Session {
             id,
             name,
             path,
+            pwd_hash,
             settings,
             conversation,
         }
@@ -76,12 +89,18 @@ impl Session {
 
     /// Load a session from `dir` on disk.
     ///
+    /// `dir` is the per-session directory `sessions/<pwd_hash>/<uuid>/`.
+    ///
     /// Steps:
-    /// 1. Derive `id` from the directory name.
-    /// 2. Read `settings.json` (or use defaults if absent).
-    /// 3. Read `messages.json` verbatim. A missing or unparseable file yields
+    /// 1. Derive `id` from `dir`'s file name (the session UUID) and `pwd_hash`
+    ///    from `dir.parent()`'s file name (the working-directory bucket).
+    /// 2. Read the per-session `settings.json` (or use defaults if absent), then
+    ///    overlay `session_models` from the shared `LocalConfig` for this bucket
+    ///    (it is `#[serde(skip)]` in the per-session file — see `settings.rs`).
+    /// 3. Source `name` from the SQLite registry (falling back to `id`).
+    /// 4. Read `messages.json` verbatim. A missing or unparseable file yields
     ///    an empty vec; no placeholder system message is inserted here.
-    /// 4. Call `rebuild_system()` to seed/overwrite `messages[0]` with the
+    /// 5. Call `rebuild_system()` to seed/overwrite `messages[0]` with the
     ///    embedded system prompt + live MEMORY.md. This ensures the stored
     ///    system message (which may be stale) is always replaced on resume.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -89,9 +108,15 @@ impl Session {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // The bucket this session lives in is the parent dir's name.
+        let pwd_hash = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let settings_path = dir.join("settings.json");
-        let settings = if settings_path.exists() {
+        let mut settings = if settings_path.exists() {
             Settings::load(&settings_path)?
         } else {
             Settings {
@@ -99,6 +124,16 @@ impl Session {
                 ..Default::default()
             }
         };
+
+        // session_models is no longer in the per-session settings.json; overlay
+        // it from the shared per-dir LocalConfig so the in-memory Settings carry
+        // the catalogue the resolver expects. Best-effort: a missing/blank shared
+        // file yields an empty catalogue (LocalConfig::load handles that).
+        if let Ok(shared) = shared_settings_path(&pwd_hash) {
+            settings.session_models = LocalConfig::load(&shared)
+                .map(|c| c.session_models)
+                .unwrap_or_default();
+        }
 
         // Read messages.json verbatim. If missing OR the parsed vec is empty,
         // start with an empty conversation (no placeholder System seeding here).
@@ -110,16 +145,20 @@ impl Session {
 
         let conversation = Conversation::from_messages(messages);
 
-        let name = if settings.name.is_empty() {
-            id.clone()
-        } else {
-            settings.name.clone()
+        // Display name comes from the registry (the rename source of truth), not
+        // the per-session settings.json. Fall back to the id when there's no row.
+        let name = match session_registry::get(&id) {
+            Ok(Some(row)) if !row.name.trim().is_empty() => row.name,
+            _ => id.clone(),
         };
+        // Keep settings.name in sync so a later save() writes a consistent file.
+        settings.name = name.clone();
 
         let mut session = Self {
             id,
             name,
             path: dir.to_path_buf(),
+            pwd_hash,
             settings,
             conversation,
         };
@@ -130,15 +169,41 @@ impl Session {
         Ok(session)
     }
 
-    /// Persist `settings.json` and `messages.json` to `self.path`.
+    /// Persist the session to disk + registry.
+    ///
+    /// Writes, in order:
+    /// 1. the per-session `settings.json` to `self.path` (`session_models` is
+    ///    `#[serde(skip)]`, so it is omitted here automatically);
+    /// 2. the shared per-dir `LocalConfig` (carrying `session_models`) to this
+    ///    bucket's `shared_settings_path`, creating the bucket dir if needed;
+    /// 3. `messages.json` to `self.path`;
+    /// 4. a registry `touch` so the session sorts most-recent in its bucket.
     ///
     /// Creates `self.path` if it does not exist (needed for a brand-new
     /// session before its first save).
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.path)?;
         self.settings.save(&self.settings_path())?;
+
+        // Persist the per-dir model catalogue to the SHARED bucket settings.json
+        // (the only place session_models lives now). Create the bucket dir if the
+        // session dir's parent doesn't exist yet.
+        let shared = shared_settings_path(&self.pwd_hash)?;
+        if let Some(parent) = shared.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        LocalConfig {
+            session_models: self.settings.session_models.clone(),
+        }
+        .save(&shared)?;
+
         let json = serde_json::to_vec_pretty(self.conversation.messages())?;
         std::fs::write(self.messages_path(), json)?;
+
+        // Best-effort: bump the registry's updated_at so /resume sorts this
+        // session to the top. A missing row (e.g. an unregistered session) just
+        // updates nothing; a DB hiccup must not fail the save.
+        let _ = session_registry::touch(&self.id);
         Ok(())
     }
 

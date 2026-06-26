@@ -11,9 +11,10 @@
 //! schema on every entry point, `execute` with bound params for writes,
 //! `prepare` + `query_map` for reads. Timestamps are unix seconds.
 //!
-//! Additive: nothing calls into this module yet (the live create/list/rename
-//! flows are swapped over in a later stage). It must compile and pass clippy
-//! unused.
+//! Wired into the live flows by `store::{create_session, list_sessions,
+//! rename_session}` and `Session::{load, save}`: `register` on create, `touch`
+//! on save, `set_name` on rename, `list_by_pwd` for the picker, `get` to source
+//! a session's display name on load.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,24 +25,36 @@ use crate::model::store::registry_path;
 
 /// One registry row as listed for a working directory. `pwd_hash` is implied by
 /// the query (`list_by_pwd` already filters on it), so it isn't repeated here.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
+///
+/// Mirrors the selected columns one-to-one; `list_sessions` consumes `uuid`,
+/// `name`, and `updated_at`. `workdir` is carried for completeness (the
+/// effective workdir is read from the session's own settings) — hence the
+/// field-level `allow`.
 #[derive(Debug, Clone)]
 pub struct RegRow {
     pub uuid: String,
     pub name: String,
+    #[allow(dead_code)] // selected for completeness; workdir is read from settings
     pub workdir: String,
     pub updated_at: i64,
 }
 
 /// A single registry row fetched by UUID, including which bucket it belongs to
 /// (`pwd_hash`) — needed to locate the session's on-disk directory.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
+///
+/// `Session::load` consumes `name` (the rename source of truth); the remaining
+/// columns are carried as a faithful row representation for future callers,
+/// hence the field-level `allow`.
 #[derive(Debug, Clone)]
 pub struct RegRowFull {
+    #[allow(dead_code)] // faithful row; name is the only field read today
     pub uuid: String,
+    #[allow(dead_code)] // faithful row; name is the only field read today
     pub pwd_hash: String,
     pub name: String,
+    #[allow(dead_code)] // faithful row; name is the only field read today
     pub workdir: String,
+    #[allow(dead_code)] // faithful row; name is the only field read today
     pub updated_at: i64,
 }
 
@@ -82,7 +95,6 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Insert a new session row. `created_at` and `updated_at` are both set to now.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn register(uuid: &str, pwd_hash: &str, name: &str, workdir: &str) -> Result<()> {
     let conn = open()?;
     let now = now_secs();
@@ -95,7 +107,6 @@ pub fn register(uuid: &str, pwd_hash: &str, name: &str, workdir: &str) -> Result
 }
 
 /// Rename a session: update its `name` and bump `updated_at`.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn set_name(uuid: &str, name: &str) -> Result<()> {
     let conn = open()?;
     conn.execute(
@@ -107,7 +118,6 @@ pub fn set_name(uuid: &str, name: &str) -> Result<()> {
 
 /// Bump a session's `updated_at` to now (marks it most-recently used so it sorts
 /// to the top of its bucket's listing).
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn touch(uuid: &str) -> Result<()> {
     let conn = open()?;
     conn.execute(
@@ -118,7 +128,6 @@ pub fn touch(uuid: &str) -> Result<()> {
 }
 
 /// All sessions for a working directory, most-recently updated first.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn list_by_pwd(pwd_hash: &str) -> Result<Vec<RegRow>> {
     let conn = open()?;
     let mut stmt = conn.prepare(
@@ -141,7 +150,6 @@ pub fn list_by_pwd(pwd_hash: &str) -> Result<Vec<RegRow>> {
 }
 
 /// Fetch a single session by UUID, or `None` if no such row exists.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 pub fn get(uuid: &str) -> Result<Option<RegRowFull>> {
     let conn = open()?;
     let row = conn

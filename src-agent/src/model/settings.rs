@@ -211,9 +211,15 @@ pub struct Settings {
     /// never written to the global `config.json`; they live here so they survive a
     /// reload without leaking into other sessions. Mirrors the global
     /// [`crate::model::app_config::ModelEntry`] shape (each still references a
-    /// provider by uuid). Empty by default so old `settings.json` files load
-    /// unchanged.
-    #[serde(default)]
+    /// provider by uuid).
+    ///
+    /// `#[serde(skip)]`: this is NO LONGER persisted in the per-session
+    /// `settings.json`. In the pwd-keyed layout it lives in the shared
+    /// [`LocalConfig`] at [`crate::model::store::shared_settings_path`] (one
+    /// catalogue per working directory). The field stays in the in-memory struct
+    /// so `resolve_role`/`resolve_agent` are unchanged; `Session::load` overlays it
+    /// from the shared file and `Session::save` writes it back there.
+    #[serde(skip)]
     pub session_models: Vec<crate::model::app_config::ModelEntry>,
 }
 
@@ -311,10 +317,10 @@ impl Settings {
 /// stay in each session's own [`Settings`]. This is the deserialised form of
 /// that shared file.
 ///
-/// Additive: nothing reads or writes it yet (wired in a later stage). The single
+/// Wired in by `Session::load` (overlays `session_models` onto the in-memory
+/// [`Settings`]) and `Session::save` (writes this file back). The single
 /// `session_models` field carries `#[serde(default)]` so a missing or partially
 /// written file loads as an empty catalogue.
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalConfig {
     /// Model catalogue shared by all sessions in this working directory. Mirrors
@@ -324,7 +330,6 @@ pub struct LocalConfig {
     pub session_models: Vec<crate::model::app_config::ModelEntry>,
 }
 
-#[allow(dead_code)] // consumed by the storage swap (later stage)
 impl LocalConfig {
     /// Load the shared per-dir config from `path`.
     ///
