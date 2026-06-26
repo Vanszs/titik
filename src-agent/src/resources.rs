@@ -218,10 +218,16 @@ pub fn build_system_prompt(
         if !sa.is_empty() {
             s.push_str("\n\n# Sub-agents\n");
             s.push_str(
-                "You can delegate self-contained work to these specialist sub-agents with the \
-                 `task` tool. Each runs autonomously to completion and returns a full report \
-                 you must read and react to. The `agent` argument must be one of the names \
-                 below:\n",
+                "Default to delegating via the `task` tool — do NOT explore the codebase \
+                 yourself when you can delegate it. Specifically: any broad codebase \
+                 exploration, searching, mapping, or research (understanding how something \
+                 works, finding where things live across multiple files, surveying a module) \
+                 MUST go to the explore sub-agent. Scoped, self-contained implementation or \
+                 mechanical work goes to the general sub-agent. Only use your own \
+                 read/grep/glob for small, targeted confirmations on a specific known file or \
+                 line — never for open-ended exploration. The `task` tool runs the agent to \
+                 completion and returns its full report for you to read and react to. The \
+                 `agent` argument must be one of the names below:\n",
             );
             s.push_str(sa);
         }
