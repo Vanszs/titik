@@ -16,7 +16,11 @@ use crate::view::theme::Palette;
 
 use super::{model_display, truncate};
 
-/// Render the FULL-SCREEN nano-style prompt editor over the whole frame.
+/// Render the FULL-SCREEN nano-style text editor over the whole frame.
+///
+/// `title` is the active field's label (e.g. `"prompt"`, `"description"`,
+/// `"conditions"`) shown dim in the header — the same editor serves all three
+/// full-size-editable fields.
 ///
 /// Layout (minimalist, matching the app's header convention):
 ///
@@ -39,7 +43,12 @@ use super::{model_display, truncate};
 /// The stored `scroll` is treated as a seed: the effective vertical scroll is
 /// recomputed every frame from the cursor and body height, so the view stays
 /// correct without mutating state (the renderer only borrows `ed`).
-pub(super) fn draw_prompt_editor(frame: &mut Frame, ed: &TextEditorState, palette: &Palette) {
+pub(super) fn draw_field_editor(
+    frame: &mut Frame,
+    ed: &TextEditorState,
+    title: &str,
+    palette: &Palette,
+) {
     let area = frame.area();
 
     // Header (title + BOTTOM rule) | body | footer.
@@ -59,7 +68,10 @@ pub(super) fn draw_prompt_editor(frame: &mut Frame, ed: &TextEditorState, palett
     let header_inner = header_block.inner(outer[0]);
     frame.render_widget(header_block, outer[0]);
     frame.render_widget(
-        Paragraph::new(Span::styled("edit prompt", Style::default().fg(palette.dim))),
+        Paragraph::new(Span::styled(
+            format!("edit {title}"),
+            Style::default().fg(palette.dim),
+        )),
         header_inner.inner(Margin { horizontal: 2, vertical: 0 }),
     );
 
@@ -206,14 +218,43 @@ pub(super) fn editor_lines<'a>(
             continue;
         }
 
+        if f == AgentEditField::Description || f == AgentEditField::Conditions {
+            // Full-size editable: Enter opens the nano editor (never inline-edited),
+            // so the row is a single-line PREVIEW of the draft's first line — no
+            // block cursor — with an "enter edit fullsize" hint when selected.
+            let raw = st.draft(f);
+            let first = raw.lines().next().unwrap_or("");
+            let (shown, color) = if first.is_empty() {
+                let ph = if f == AgentEditField::Description {
+                    "(required)"
+                } else {
+                    "(optional — when to delegate)"
+                };
+                (ph.to_string(), palette.dim)
+            } else {
+                (truncate(first, value_w), palette.fg)
+            };
+            let mut row = vec![marker, label, Span::styled(shown, Style::default().fg(color))];
+            if selected {
+                row.push(Span::styled(
+                    "  enter edit fullsize",
+                    Style::default().fg(palette.dim),
+                ));
+            }
+            lines.push(Line::from(row));
+            continue;
+        }
+
         // Single-line text fields.
         let raw = st.draft(f);
         let (shown, color) = if raw.is_empty() && !editing_here {
             let ph = match f {
                 AgentEditField::Name => "(required)",
-                AgentEditField::Description => "(required)",
                 AgentEditField::Tools => "(read-only default)",
-                AgentEditField::Model | AgentEditField::Body => "",
+                AgentEditField::Description
+                | AgentEditField::Conditions
+                | AgentEditField::Model
+                | AgentEditField::Body => "",
             };
             (ph.to_string(), palette.dim)
         } else {

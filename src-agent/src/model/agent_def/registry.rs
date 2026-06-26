@@ -56,6 +56,7 @@ pub(crate) fn builtin_agents() -> Vec<AgentDef> {
     vec![
         AgentDef {
             steps: Some(15),
+            conditions: "When you need to locate where something is defined, used, or how code is structured across the codebase.".to_string(),
             ..AgentDef::builtin(
                 "explore",
                 "Read-only code locator: find where things are defined and used",
@@ -65,6 +66,7 @@ pub(crate) fn builtin_agents() -> Vec<AgentDef> {
         },
         AgentDef {
             steps: Some(25),
+            conditions: "When you have a scoped, self-contained task to complete end-to-end (read + edit + run), not just locating code.".to_string(),
             ..AgentDef::builtin(
                 "general",
                 "General-purpose subagent for a scoped task",

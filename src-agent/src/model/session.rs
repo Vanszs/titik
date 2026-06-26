@@ -269,15 +269,15 @@ impl Session {
         let roster: String = visible
             .iter()
             .map(|a| {
-                // Condense the description to a single line (take first line).
-                let desc = a
-                    .description
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                format!("- {}: {}", a.name, desc)
+                // The roster line describes WHEN to delegate: prefer `conditions`
+                // (its first line), falling back to `description` when it's empty.
+                // `description` alone is a human-facing label and never injected.
+                let when = if !a.conditions.trim().is_empty() {
+                    a.conditions.lines().next().unwrap_or("").trim().to_string()
+                } else {
+                    a.description.lines().next().unwrap_or("").trim().to_string()
+                };
+                format!("- {}: {}", a.name, when)
             })
             .collect::<Vec<_>>()
             .join("\n");

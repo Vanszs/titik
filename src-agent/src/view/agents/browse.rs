@@ -117,6 +117,11 @@ pub(super) fn browse_lines<'a>(
         truncate(&a.description, value_w),
         palette.fg,
     ));
+    // Conditions (when to delegate) — only shown when set; it's what the roster
+    // injects into the system prompt.
+    if !a.conditions.trim().is_empty() {
+        lines.push(row("conditions", truncate(&a.conditions, value_w), palette.fg));
+    }
     // Model is the chosen REGISTERED model (resolved to `name @ provider`); None =
     // inherit the Main role, shown dim (with a legacy slug hint for old files).
     let (model_text, model_chosen) = model_display(config, settings, &a.model_uuid, &a.model);

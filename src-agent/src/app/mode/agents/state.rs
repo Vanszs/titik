@@ -38,6 +38,8 @@ pub struct AgentsState {
     pub draft_name: String,
     /// Draft: description.
     pub draft_description: String,
+    /// Draft: conditions (when to delegate to this agent). Optional free text.
+    pub draft_conditions: String,
     /// Draft: uuid of the REGISTERED model this agent runs on (`None` = inherit
     /// the Main role). Selected via the single-select model picker; on save it
     /// becomes [`AgentDef::model_uuid`].
@@ -61,11 +63,12 @@ pub struct AgentsState {
     /// the Model field). Like `tool_picker` it owns all key input while open; the
     /// deepest modal in the agents editor.
     pub model_picker: Option<ModelPickerState>,
-    /// When `Some`, the FULL-SCREEN nano-style prompt editor is active (opened by
-    /// activating the Prompt/Body field). It replaces the whole agents view and
-    /// owns all key input; on Esc it commits its text back into `draft_body` and
-    /// closes (`= None`). A sub-state of `Mode::Agents`, not a separate mode.
-    pub prompt_editor: Option<crate::app::mode::editor::TextEditorState>,
+    /// When `Some`, the FULL-SCREEN nano-style text editor is active (opened by
+    /// activating the Body, Description, or Conditions field). It replaces the
+    /// whole agents view and owns all key input; on Esc it commits its text back
+    /// into the matching draft (tagged by the [`AgentEditField`]) and closes
+    /// (`= None`). A sub-state of `Mode::Agents`, not a separate mode.
+    pub editor: Option<(AgentEditField, crate::app::mode::editor::TextEditorState)>,
 }
 
 impl AgentsState {
@@ -83,6 +86,7 @@ impl AgentsState {
             create_scope: AgentScope::Session,
             draft_name: String::new(),
             draft_description: String::new(),
+            draft_conditions: String::new(),
             draft_model_uuid: None,
             draft_model_legacy: None,
             draft_tools: String::new(),
@@ -90,7 +94,7 @@ impl AgentsState {
             session_dir: session.path.clone(),
             tool_picker: None,
             model_picker: None,
-            prompt_editor: None,
+            editor: None,
         }
     }
 
@@ -160,6 +164,7 @@ impl AgentsState {
         match self.field {
             AgentEditField::Name => &mut self.draft_name,
             AgentEditField::Description => &mut self.draft_description,
+            AgentEditField::Conditions => &mut self.draft_conditions,
             AgentEditField::Tools => &mut self.draft_tools,
             AgentEditField::Body => &mut self.draft_body,
             // Model is a picker, not a text field; it never enters text-edit mode.
@@ -175,6 +180,7 @@ impl AgentsState {
         match f {
             AgentEditField::Name => &self.draft_name,
             AgentEditField::Description => &self.draft_description,
+            AgentEditField::Conditions => &self.draft_conditions,
             AgentEditField::Tools => &self.draft_tools,
             AgentEditField::Body => &self.draft_body,
             // Model is a picker, not a text field; the view reads its uuid instead.
@@ -218,6 +224,7 @@ impl AgentsState {
         };
         self.draft_name = a.name.clone();
         self.draft_description = a.description.clone();
+        self.draft_conditions = a.conditions.clone();
         self.draft_model_uuid = a.model_uuid.clone();
         // Legacy hint only when the file predates `model_uuid` (no registered
         // model chosen, but an old free-text `model` slug is present).
@@ -238,6 +245,7 @@ impl AgentsState {
     pub fn enter_create(&mut self) {
         self.draft_name = String::new();
         self.draft_description = String::new();
+        self.draft_conditions = String::new();
         self.draft_model_uuid = None;
         self.draft_model_legacy = None;
         self.draft_tools = String::new();
@@ -272,7 +280,7 @@ impl AgentsState {
         self.field = AgentEditField::Description;
         self.tool_picker = None;
         self.model_picker = None;
-        self.prompt_editor = None;
+        self.editor = None;
     }
 
     // --- Tool picker overlay ---
@@ -323,23 +331,37 @@ impl AgentsState {
         self.model_picker = None;
     }
 
-    // --- Full-screen prompt editor ---
+    // --- Full-screen field editor (Body / Description / Conditions) ---
 
-    /// Open the full-screen prompt editor, seeded from the current `draft_body`.
+    /// Open the full-screen nano editor for a full-size-editable `field`, seeded
+    /// from that field's current draft. Only `Body`, `Description`, and
+    /// `Conditions` open this editor; any other field is a no-op.
     ///
-    /// Called instead of starting inline editing when the user activates the
-    /// Prompt/Body field (Enter on its row). While open it owns all key input and
-    /// replaces the whole agents view.
-    pub fn open_prompt_editor(&mut self) {
-        self.prompt_editor =
-            Some(crate::app::mode::editor::TextEditorState::from_text(&self.draft_body));
+    /// Called instead of starting inline editing when the user activates one of
+    /// these rows (Enter). While open it owns all key input, tagged by `field`,
+    /// and replaces the whole agents view.
+    pub fn open_editor(&mut self, field: AgentEditField) {
+        let text = match field {
+            AgentEditField::Body => &self.draft_body,
+            AgentEditField::Description => &self.draft_description,
+            AgentEditField::Conditions => &self.draft_conditions,
+            _ => return, // only these three are full-size editable
+        };
+        self.editor = Some((field, crate::app::mode::editor::TextEditorState::from_text(text)));
     }
 
-    /// Commit the prompt editor: write its text back into `draft_body` and close
-    /// the editor (returning to the field list). No-op when it isn't open.
-    pub fn commit_prompt_editor(&mut self) {
-        if let Some(ed) = self.prompt_editor.take() {
-            self.draft_body = ed.text();
+    /// Commit the open editor: write its text back into the draft tagged by the
+    /// active field and close the editor (returning to the field list). No-op when
+    /// it isn't open.
+    pub fn commit_editor(&mut self) {
+        if let Some((field, ed)) = self.editor.take() {
+            let text = ed.text();
+            match field {
+                AgentEditField::Body => self.draft_body = text,
+                AgentEditField::Description => self.draft_description = text,
+                AgentEditField::Conditions => self.draft_conditions = text,
+                _ => {}
+            }
         }
     }
 
@@ -368,6 +390,7 @@ impl AgentsState {
         AgentDef {
             name,
             description: self.draft_description.trim().to_string(),
+            conditions: self.draft_conditions.trim().to_string(),
             // The chosen registered model (None = inherit Main). The editor no
             // longer writes the legacy `model` / `provider` / `provider_uuid`
             // fields — they stay at their `None` default for new/edited agents.

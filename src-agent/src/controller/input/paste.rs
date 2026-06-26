@@ -88,10 +88,10 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         Mode::Agents(a) => {
             use crate::app::mode::AgentEditField;
             // Deepest-modal priority, mirroring `handle_agents`:
-            //   prompt editor (multiline) > model picker (no text field) >
+            //   field editor (multiline) > model picker (no text field) >
             //   tool picker (filter) > draft field.
-            if let Some(ed) = a.prompt_editor.as_mut() {
-                // Full-screen prompt editor: insert the WHOLE clipboard at the
+            if let Some((_field, ed)) = a.editor.as_mut() {
+                // Full-screen field editor: insert the WHOLE clipboard at the
                 // cursor, newlines and all (multi-line aware). Drop bare CRs of a
                 // CRLF pair so pasted Windows text doesn't leave stray carriage
                 // returns in the buffer.

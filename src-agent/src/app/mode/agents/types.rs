@@ -45,8 +45,12 @@ pub enum AgentSubMode {
 pub enum AgentEditField {
     /// Create-only: the filename slug (sanitised by the data layer on save).
     Name,
-    /// Required user-facing description (frontmatter `description`).
+    /// Required user-facing description (frontmatter `description`). Full-size
+    /// editable (opens the nano editor like the Body).
     Description,
+    /// Optional free-text describing WHEN to delegate to this agent (frontmatter
+    /// `conditions`). Full-size editable (opens the nano editor like the Body).
+    Conditions,
     /// Registered model the agent runs on; `(inherit main)` when unset. Opens a
     /// single-select picker over the models registered in `/settings`.
     Model,
@@ -62,6 +66,7 @@ impl AgentEditField {
         match self {
             AgentEditField::Name => "name",
             AgentEditField::Description => "description",
+            AgentEditField::Conditions => "conditions",
             AgentEditField::Model => "model",
             AgentEditField::Tools => "tools",
             AgentEditField::Body => "prompt",
@@ -72,6 +77,7 @@ impl AgentEditField {
 /// Field order while EDITING an existing agent (no name row).
 pub(super) const EDIT_FIELDS: &[AgentEditField] = &[
     AgentEditField::Description,
+    AgentEditField::Conditions,
     AgentEditField::Model,
     AgentEditField::Tools,
     AgentEditField::Body,
@@ -81,6 +87,7 @@ pub(super) const EDIT_FIELDS: &[AgentEditField] = &[
 pub(super) const CREATE_FIELDS: &[AgentEditField] = &[
     AgentEditField::Name,
     AgentEditField::Description,
+    AgentEditField::Conditions,
     AgentEditField::Model,
     AgentEditField::Tools,
     AgentEditField::Body,
