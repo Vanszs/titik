@@ -326,6 +326,15 @@ pub(super) fn process_tools(
                     call.id.clone(),
                     "error: task requires non-empty 'agent' and 'prompt'".to_string(),
                 ));
+            } else if running_subagents(state) >= crate::app::subagent::MAX_SUBAGENTS {
+                // Concurrency cap hit: do NOT spawn. Answer the call now with an
+                // error so the conversation stays API-valid and the main agent sees
+                // it must wait for a running sub-agent to finish before delegating
+                // again (rather than parking forever on an un-spawned delegation).
+                state.rest.tool_results.push((
+                    call.id.clone(),
+                    "error: sub-agent limit reached (5 running). Wait for one to finish before delegating again.".to_string(),
+                ));
             } else {
                 let agent = agent.to_string();
                 let prompt = prompt.to_string();
@@ -546,6 +555,21 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
         dir_cache: state.rest.dir_cache.clone(),
         memory_dir,
     }
+}
+
+/// Count the sub-agents currently in [`crate::app::subagent::SubAgentStatus::Running`].
+///
+/// This is the live concurrency figure both spawn paths check against
+/// [`crate::app::subagent::MAX_SUBAGENTS`] before launching: terminated
+/// sub-agents are pruned each tick, so a `Running` count is exactly the number
+/// of occupied slots. `pub(crate)` so the `/task` command handler can share it.
+pub(crate) fn running_subagents(state: &AppState) -> usize {
+    state
+        .rest
+        .subagents
+        .iter()
+        .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
+        .count()
 }
 
 /// Spawn a background sub-agent for `agent_name` running `task_text`, wiring it

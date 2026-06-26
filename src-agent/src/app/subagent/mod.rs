@@ -41,6 +41,13 @@ pub use event::AgentEvent;
 #[allow(unused_imports)]
 pub use spawn::spawn_subagent;
 
+/// Hard cap on the number of sub-agents that may run CONCURRENTLY. Both spawn
+/// paths (the model-callable `task` tool and the `/task` slash command) refuse
+/// to launch a new sub-agent while this many are already in [`SubAgentStatus::Running`],
+/// so a misbehaving main agent can't fan out an unbounded swarm. Terminated
+/// sub-agents are pruned each tick, freeing slots as they finish.
+pub const MAX_SUBAGENTS: usize = 5;
+
 /// Lifecycle state of a [`SubAgent`], folded from its [`AgentEvent`] stream by
 /// the orchestrator (wired up later).
 ///

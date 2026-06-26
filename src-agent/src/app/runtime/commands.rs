@@ -398,6 +398,14 @@ pub(super) fn apply_slash(
                 state.rest.status = "usage: /task <agent> <task>".into();
                 return Ok(());
             }
+            // Concurrency cap: refuse a new spawn while the max are already running
+            // (terminated sub-agents are pruned each tick, freeing slots). Surface a
+            // toast + status and bail without spawning, mirroring the `task` tool.
+            if super::stream::running_subagents(state) >= crate::app::subagent::MAX_SUBAGENTS {
+                state.rest.set_toast("sub-agent limit reached (5 running)".into());
+                state.rest.status = "sub-agent limit reached (5 running)".into();
+                return Ok(());
+            }
 
             // Spawn via the shared helper (same path the `task` tool uses) so the
             // ctx/registry/awareness/memory inputs + bookkeeping never diverge.
