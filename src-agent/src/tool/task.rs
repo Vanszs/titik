@@ -17,11 +17,13 @@ impl Tool for Task {
     fn name(&self) -> &'static str { "task" }
 
     fn description(&self) -> &'static str {
-        "Delegate a self-contained task to a named specialist sub-agent. The \
-         sub-agent runs autonomously to completion; its FULL report is returned \
-         as this tool's result for you to read and react to. Use it to offload \
-         exploration, research, or mechanical edits. The `agent` must be one of \
-         the sub-agents listed in your system prompt."
+        "Delegate a self-contained task to a named specialist sub-agent that runs \
+         autonomously to completion and returns its FULL report as this tool's result \
+         for you to read and react to. You MAY call this tool MULTIPLE times in a \
+         single turn to run several sub-agents IN PARALLEL (up to 5 at once) — each \
+         returns its own report. Use it to offload exploration, research, or mechanical \
+         edits. The `agent` argument must be one of the sub-agents listed in your \
+         system prompt."
     }
 
     fn parameters(&self) -> Value {

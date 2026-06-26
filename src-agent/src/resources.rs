@@ -226,7 +226,10 @@ pub fn build_system_prompt(
                  mechanical work goes to the general sub-agent. Only use your own \
                  read/grep/glob for small, targeted confirmations on a specific known file or \
                  line — never for open-ended exploration. The `task` tool runs the agent to \
-                 completion and returns its full report for you to read and react to. The \
+                 completion and returns its full report for you to read and react to. You may \
+                 delegate SEVERAL tasks in one turn by calling the task tool multiple times — \
+                 up to 5 sub-agents run concurrently, in parallel, and each returns its own \
+                 report; do this whenever the work splits into independent parts. The \
                  `agent` argument must be one of the names below:\n",
             );
             s.push_str(sa);
