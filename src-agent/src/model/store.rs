@@ -59,10 +59,40 @@ pub struct SessionMeta {
     pub locked: bool,
 }
 
-/// Returns `~/.simple-coder/` (the application data root).
+/// Returns `~/.koma/` (the application data root).
 pub fn base_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory"))?;
     Ok(home.join(APP_DIR_NAME))
+}
+
+/// One-time, non-destructive migration: rename `~/.simple-coder` to `~/.koma`
+/// if the new dir does not yet exist and the old one does.
+///
+/// Must be called ONCE at startup before any code reads `base_dir()`.
+/// Never panics — any error is printed to stderr and silently ignored so the
+/// app can proceed (it will create a fresh `~/.koma` on first use).
+pub fn migrate_legacy_dir() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            eprintln!("koma: warning: cannot resolve home directory; skipping config migration");
+            return;
+        }
+    };
+    let old_dir = home.join(".simple-coder");
+    let new_dir = home.join(APP_DIR_NAME); // ".koma"
+    if new_dir.exists() {
+        // New dir already exists — nothing to do.
+        return;
+    }
+    if !old_dir.exists() {
+        // Neither dir exists yet — fresh install, nothing to migrate.
+        return;
+    }
+    match std::fs::rename(&old_dir, &new_dir) {
+        Ok(()) => eprintln!("migrated config: ~/.simple-coder -> ~/.koma"),
+        Err(e) => eprintln!("koma: warning: could not migrate ~/.simple-coder to ~/.koma: {e}"),
+    }
 }
 
 /// Returns `~/.simple-coder/sessions/`.

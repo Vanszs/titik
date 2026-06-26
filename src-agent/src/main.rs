@@ -32,6 +32,11 @@ mod tool;
 mod view;
 
 fn main() -> anyhow::Result<()> {
+    // Migrate legacy config dir (~/.simple-coder -> ~/.koma) before anything
+    // reads base_dir(), so every entry path (TUI, --install-internet, --resume)
+    // sees the migrated directory.
+    model::store::migrate_legacy_dir();
+
     let opts = cli::parse(std::env::args());
 
     // --- short-circuit: provisioner modes (no TUI) ---

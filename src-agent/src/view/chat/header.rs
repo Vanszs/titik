@@ -12,7 +12,7 @@ use crate::config::DEFAULT_MODEL;
 use crate::view::theme::Palette;
 use super::helpers::truncate_chars;
 
-/// Render the header line ("simple-coder" + mode indicator) into `chunk`.
+/// Render the header line ("koma" + mode indicator) into `chunk`.
 ///
 /// Mode colours are fixed regardless of theme: Normal = green, Auto = yellow.
 pub(super) fn render_header(frame: &mut Frame, chunk: Rect, rest: &AppStateRest, palette: &Palette) {
@@ -25,7 +25,7 @@ pub(super) fn render_header(frame: &mut Frame, chunk: Rect, rest: &AppStateRest,
     let mode_str = format!("{mode_icon} {mode_label}");
     // header_inner width = frame width minus 2 (border) minus 4 (horizontal padding 2+2)
     let header_inner_w = frame.area().width.saturating_sub(2 + 4) as usize;
-    let brand = "simple-coder";
+    let brand = "koma";
     // Gap = available width minus brand chars minus mode string chars; floor at 1 space.
     let gap = header_inner_w
         .saturating_sub(brand.chars().count() + mode_str.chars().count())

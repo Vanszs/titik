@@ -27,7 +27,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename the current session"),
     ("/select", "Dump history to the terminal to copy/paste"),
     ("/help", "List the available commands"),
-    ("/quit", "Quit simple-coder"),
+    ("/quit", "Quit koma"),
 ];
 
 /// True while the user is still typing a command NAME: input starts with `/`

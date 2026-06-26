@@ -27,3 +27,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ignore = "0.4"
 regex = "1"
 globset = "0.4"
+
+[[bin]]
+name = "koma"
+path = "src/main.rs"

@@ -234,10 +234,10 @@ pub fn draw(
         frame.render_widget(Paragraph::new(line), rect);
     };
 
-    // Row 0: "simple-coder" in accent, left-aligned at the block's left edge.
+    // Row 0: "koma" in accent, left-aligned at the block's left edge.
     render_line(
         frame,
-        Line::from(Span::styled("simple-coder", Style::default().fg(palette.accent))),
+        Line::from(Span::styled("koma", Style::default().fg(palette.accent))),
         row,
     );
     row += 1;
