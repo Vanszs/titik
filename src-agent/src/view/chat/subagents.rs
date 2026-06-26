@@ -267,8 +267,7 @@ pub(super) fn render_agent_viewer(
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let max_scroll = total.saturating_sub(body.height);
     rest.last_max_scroll.set(max_scroll);
-    let running = matches!(sa.status, crate::app::subagent::SubAgentStatus::Running);
-    let top = if running {
+    let top = if rest.agent_viewer_follow {
         max_scroll
     } else {
         rest.agent_viewer_scroll.min(max_scroll)

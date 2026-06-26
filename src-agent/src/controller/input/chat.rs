@@ -108,7 +108,8 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             KeyCode::Enter => {
                 if rest.subagent_sel < count {
                     rest.agent_viewer = Some(rest.subagent_sel);
-                    rest.agent_viewer_scroll = 0; // reset; renderer follows while Running
+                    rest.agent_viewer_scroll = 0;
+                    rest.agent_viewer_follow = true; // open pinned to the bottom
                 } else {
                     rest.status = "sub-agent queued — not started yet".into();
                 }

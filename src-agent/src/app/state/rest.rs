@@ -231,10 +231,12 @@ pub struct AppStateRest {
     /// in the `$` panel; Esc closes it back to the panel. Short-circuits the
     /// normal chat draw while set (mirrors the full-screen prompt editor).
     pub agent_viewer: Option<usize>,
-    /// Scroll offset (top visual line) for the sub-agent viewer. Auto-follows the
-    /// bottom while the viewed agent is `Running` so live progress shows; Up/Down/
-    /// PgUp pause the follow. Reset to 0 when the viewer opens.
+    /// Scroll offset (top visual line) for the sub-agent viewer. Used only when
+    /// `agent_viewer_follow` is false (not pinned). Reset to 0 when the viewer opens.
     pub agent_viewer_scroll: u16,
+    /// true = pinned to the newest line; cleared when the user scrolls up,
+    /// re-set when they scroll back to the bottom.
+    pub agent_viewer_follow: bool,
     /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
     #[allow(dead_code)]
     pub next_subagent_id: usize,
@@ -364,6 +366,7 @@ impl AppStateRest {
             subagent_sel: 0,
             agent_viewer: None,
             agent_viewer_scroll: 0,
+            agent_viewer_follow: true,
             next_subagent_id: 0,
             pending_subagents: std::collections::VecDeque::new(),
             pending_subagent_calls: Vec::new(),
