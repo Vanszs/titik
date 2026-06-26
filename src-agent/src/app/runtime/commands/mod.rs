@@ -10,6 +10,10 @@ use crate::service::openrouter::OpenRouterClient;
 
 mod compact;
 mod effort;
+// `pub(crate)` so the shared `internet_status` helper is reachable from the
+// Ctrl+E handler (controller) and the settings-save action, which flip the same
+// mode and must show the identical status line.
+pub(crate) mod internet;
 mod misc;
 mod new_session;
 mod task;
@@ -35,6 +39,7 @@ pub(super) fn apply_slash(
         Command::Help => misc::handle_help(state)?,
         Command::Quit => misc::handle_quit(state)?,
         Command::Task(args) => task::handle_task(args, state, client, handle)?,
+        Command::Internet(target) => internet::handle_internet(target, state)?,
         Command::Unknown(s) => {
             state.rest.status = format!("unknown command: /{s}");
         }

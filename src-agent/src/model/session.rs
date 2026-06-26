@@ -163,6 +163,14 @@ impl Session {
             conversation,
         };
 
+        // Ensure the per-session scratch dir exists. Best-effort: a failure here
+        // (read-only /tmp, unusual permissions) must never prevent the session
+        // from loading.
+        let scratch = crate::model::store::scratch_dir(&session.id);
+        if let Err(e) = std::fs::create_dir_all(&scratch) {
+            eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
+        }
+
         // Overwrite the stored system message with the live one so that
         // changes to the embedded prompt or MEMORY.md take effect on resume.
         session.rebuild_system();
@@ -261,15 +269,15 @@ impl Session {
         let roster: String = visible
             .iter()
             .map(|a| {
-                // Condense the description to a single line (take first line).
-                let desc = a
-                    .description
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                format!("- {}: {}", a.name, desc)
+                // The roster line describes WHEN to delegate: prefer `conditions`
+                // (its first line), falling back to `description` when it's empty.
+                // `description` alone is a human-facing label and never injected.
+                let when = if !a.conditions.trim().is_empty() {
+                    a.conditions.lines().next().unwrap_or("").trim().to_string()
+                } else {
+                    a.description.lines().next().unwrap_or("").trim().to_string()
+                };
+                format!("- {}: {}", a.name, when)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -280,11 +288,20 @@ impl Session {
             Some(roster)
         };
 
-        let sys = resources::build_system_prompt(
+        let mut sys = resources::build_system_prompt(
             mem.as_deref(),
             agents.as_deref(),
             subagents.as_deref(),
         );
+
+        // Append the scratch space section so the model knows where it can
+        // freely write temporary files and clone repositories.
+        let scratch_path = crate::model::store::scratch_dir(&self.id);
+        sys.push_str(&format!(
+            "\n\n# Scratch space\nYou have a writable scratch directory at: {}\nUse it for temporary files, cloning repositories, and downloads. Both bash and the file tools may read and write under it. It is separate from the user's workspace — keep throwaway work here, not in the project.",
+            scratch_path.display()
+        ));
+
         self.conversation.set_system(sys);
     }
 }

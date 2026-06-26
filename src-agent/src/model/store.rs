@@ -59,10 +59,51 @@ pub struct SessionMeta {
     pub locked: bool,
 }
 
-/// Returns `~/.simple-coder/` (the application data root).
+/// Returns `~/.koma/` (the application data root).
 pub fn base_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory"))?;
     Ok(home.join(APP_DIR_NAME))
+}
+
+/// Root of koma's throwaway scratch space (`<temp>/koma`). Bash + file tools
+/// are permitted to read/write anywhere under here.
+pub fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join("koma")
+}
+
+/// Per-session scratch dir (`<temp>/koma/<session_id>`).
+pub fn scratch_dir(session_id: &str) -> PathBuf {
+    scratch_root().join(session_id)
+}
+
+/// One-time, non-destructive migration: rename `~/.simple-coder` to `~/.koma`
+/// if the new dir does not yet exist and the old one does.
+///
+/// Must be called ONCE at startup before any code reads `base_dir()`.
+/// Never panics — any error is printed to stderr and silently ignored so the
+/// app can proceed (it will create a fresh `~/.koma` on first use).
+pub fn migrate_legacy_dir() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            eprintln!("koma: warning: cannot resolve home directory; skipping config migration");
+            return;
+        }
+    };
+    let old_dir = home.join(".simple-coder");
+    let new_dir = home.join(APP_DIR_NAME); // ".koma"
+    if new_dir.exists() {
+        // New dir already exists — nothing to do.
+        return;
+    }
+    if !old_dir.exists() {
+        // Neither dir exists yet — fresh install, nothing to migrate.
+        return;
+    }
+    match std::fs::rename(&old_dir, &new_dir) {
+        Ok(()) => eprintln!("migrated config: ~/.simple-coder -> ~/.koma"),
+        Err(e) => eprintln!("koma: warning: could not migrate ~/.simple-coder to ~/.koma: {e}"),
+    }
 }
 
 /// Returns `~/.simple-coder/sessions/`.
@@ -198,6 +239,12 @@ pub fn create_session() -> Result<Session> {
     // Pre-create memory/ so the user can drop MEMORY.md there immediately. This
     // also creates the session dir (and its bucket parent) as a side effect.
     std::fs::create_dir_all(dir.join("memory"))?;
+
+    // Best-effort: create the per-session scratch dir so it is ready immediately.
+    let scratch = scratch_dir(&uuid);
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
+    }
 
     let workdir_str = workdir.display().to_string();
     let settings = Settings {

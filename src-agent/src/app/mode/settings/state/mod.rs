@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use crate::model::app_config::{AppConfig, ThemeMode};
 use crate::model::session::Session;
+use crate::model::settings::InternetMode;
 use crate::view::theme::ACCENTS;
 
 use super::super::SettingField;
@@ -81,6 +82,8 @@ pub struct SettingsState {
     pub short_send_enabled: bool,
     /// Draft: cache-warmth-adaptive summarization toggle.
     pub sliding_cache: bool,
+    /// Draft: internet-access tier toggle.
+    pub internet_mode: InternetMode,
     /// The session's effective working directory, captured at construction. Used
     /// as the base for resolving workspace-relative paths in the FS picker.
     pub cwd: PathBuf,
@@ -201,6 +204,7 @@ impl SettingsState {
             allowed_folders,
             short_send_enabled: session.settings.short_send_enabled,
             sliding_cache: session.settings.sliding_cache,
+            internet_mode: session.settings.internet_mode,
             cwd: effective_cwd,
             list_editing: false,
             list_sel: 0,
@@ -306,6 +310,12 @@ impl SettingsState {
             }
             SettingField::SlidingCache => {
                 self.sliding_cache = !self.sliding_cache;
+            }
+            SettingField::InternetMode => {
+                self.internet_mode = match self.internet_mode {
+                    InternetMode::Simple => InternetMode::Full,
+                    InternetMode::Full   => InternetMode::Simple,
+                };
             }
             SettingField::Workdir | SettingField::AllowedFolders => {
                 self.list_editing = true;

@@ -39,7 +39,14 @@ pub struct AgentDef {
     pub name: String,
 
     /// User-facing description (when to use this agent; shown in menus). Required.
+    /// Human-facing label only — NOT injected into the system-prompt roster.
     pub description: String,
+
+    /// Free-text describing WHEN the main agent should delegate to this sub-agent.
+    /// This is the only field injected into the system-prompt sub-agent roster
+    /// (falling back to `description` when empty). Optional.
+    #[serde(default)]
+    pub conditions: String,
 
     /// UUID of a registered [`crate::model::app_config::ModelEntry`] this agent
     /// runs on. When `Some`, the resolver looks up the entry in `session_models`
@@ -121,6 +128,7 @@ impl Default for AgentDef {
         Self {
             name: String::new(),
             description: String::new(),
+            conditions: String::new(),
             model_uuid: None,
             model: None,
             provider: None,
@@ -176,6 +184,11 @@ impl AgentDef {
 
         // Required.
         fm.insert(key("description"), sval(&self.description));
+
+        // Optional: only emit when set (when to delegate to this agent).
+        if !self.conditions.trim().is_empty() {
+            fm.insert(key("conditions"), sval(&self.conditions));
+        }
 
         if let Some(model_uuid) = &self.model_uuid {
             fm.insert(key("model_uuid"), sval(model_uuid));

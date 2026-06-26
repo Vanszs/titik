@@ -3,6 +3,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::state::AppStateRest;
 use crate::controller::command;
+use crate::model::settings::InternetMode;
 use super::{is_ctrl, Action};
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -154,6 +155,32 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
     // this works on every terminal since Ctrl+J is literally the LF control code).
     if is_ctrl(&key, 'j') {
         rest.push_char('\n');
+        return Action::None;
+    }
+    // Ctrl+E: toggle internet mode (Simple <-> Full), persist, and set status.
+    // Session is directly on AppStateRest so this can be done inline, matching
+    // the BackTab agent_mode toggle pattern.
+    if is_ctrl(&key, 'e') {
+        if let Some(sess) = rest.session.as_mut() {
+            let new_mode = match sess.settings.internet_mode {
+                InternetMode::Simple => InternetMode::Full,
+                InternetMode::Full => InternetMode::Simple,
+            };
+            sess.settings.internet_mode = new_mode;
+            // Refresh the system-prompt roster so any mode-gated agents stay in
+            // sync on this mid-session flip (rebuild reads in-memory settings).
+            sess.rebuild_system();
+            match sess.save() {
+                Ok(()) => {
+                    rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(new_mode));
+                }
+                Err(e) => {
+                    rest.set_toast(format!("error saving settings: {e}"));
+                }
+            }
+        } else {
+            rest.set_toast("no active session".to_string());
+        }
         return Action::None;
     }
 

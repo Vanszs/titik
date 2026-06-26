@@ -35,6 +35,7 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             s.allowed_folders.clone(),
             s.short_send_enabled,
             s.sliding_cache,
+            s.internet_mode,
             s.providers.clone(),
             s.models.clone(),
         )),
@@ -58,6 +59,7 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         allowed_folders,
         short_send_enabled,
         sliding_cache,
+        internet_mode,
         provider_drafts,
         model_drafts,
     )) = drafts
@@ -165,6 +167,13 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             // Sliding-cache toggle: no client rebuild needed; a later
             // wave's summarization logic reads this flag per-send.
             sess.settings.sliding_cache = sliding_cache;
+            // Internet-mode toggle: no client rebuild needed; the tool
+            // dispatch layer reads this flag per-request.
+            sess.settings.internet_mode = internet_mode;
+            // But DO refresh the system-prompt roster so any mode-gated agents
+            // stay in sync on a mid-session mode change (rebuild reads in-memory
+            // settings; nothing else here rebuilds).
+            sess.rebuild_system();
             // Session-only models live in the per-session override layer,
             // never in the global config. Persisted via sess.save() below.
             sess.settings.session_models = session_model_entries;
@@ -213,6 +222,13 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    `resolve_role`, so the existing keyless Arc serves the new
         //    settings on the next request. (This also keeps the cache-stable
         //    plan_word intact across a settings save.)
+        // f) Transient toast when switching internet mode (shared helper
+        //    so the Full-needs-install / token-usage / simple lines match the
+        //    `/internet` and Ctrl+E paths exactly). Placed here (after the
+        //    `if let Some(sess)` block closes) so `state.rest` is free to borrow.
+        state.rest.set_toast_info(
+            crate::app::runtime::commands::internet::internet_status(internet_mode),
+        );
     }
     state.mode = Mode::Chat;
     Ok(())

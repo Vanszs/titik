@@ -38,6 +38,7 @@ use ratatui::{
 };
 use crate::app::mode::{SETTING_CATEGORIES, SettingField, SettingsState};
 use crate::model::app_config::ThemeMode;
+use crate::model::settings::InternetMode;
 use crate::view::theme::{resolve_accent, Palette};
 use providers::{draw_providers, draw_models};
 use pickers::draw_role_picker;
@@ -276,6 +277,14 @@ pub fn draw(
                     // Boolean toggle: on/off (on only for providers with a sliding
                     // prompt cache, e.g. Anthropic).
                     let v = if st.sliding_cache { "on" } else { "off" };
+                    vec![Span::styled(v, Style::default().fg(palette.accent))]
+                }
+                SettingField::InternetMode => {
+                    // Enum toggle: simple (in-process DDG) vs full (scrapion subprocess).
+                    let v = match st.internet_mode {
+                        InternetMode::Simple => "simple",
+                        InternetMode::Full   => "full",
+                    };
                     vec![Span::styled(v, Style::default().fg(palette.accent))]
                 }
                 SettingField::AwarenessSource => {

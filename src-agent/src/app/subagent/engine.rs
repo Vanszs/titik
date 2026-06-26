@@ -10,10 +10,11 @@
 //!
 //! ## Differences from the interactive loop (deliberate)
 //!
-//! - **Allow-list enforcement.** `stream_complete` still advertises the FULL
-//!   built-in tool set to the model (unchanged), so the loop itself rejects any
-//!   call whose name is not in the agent's `tools` allow-list with an `error: …`
-//!   tool result, keeping the conversation API-valid.
+//! - **Allow-list enforcement.** `stream_complete` advertises ONLY this agent's
+//!   `tools` allow-list to the model, so the model sees just the tools it is
+//!   permitted to call. The loop ALSO rejects any call whose name is not in that
+//!   allow-list with an `error: …` tool result — a backstop that keeps the
+//!   conversation API-valid even if a model fabricates a name.
 //! - **Fail CLOSED on classifier outage.** The interactive loop fails OPEN in
 //!   Auto mode (an unavailable classifier auto-runs a risky call). A sub-agent
 //!   has no human to fall back to, so an unavailable classifier BLOCKS the risky
@@ -129,7 +130,9 @@ pub async fn run_agent_loop(
         emit(&tx, AgentEvent::Step(step));
 
         // 1. Stream one model reply on a fresh per-step channel, then drain it.
-        let outcome = stream_step(&client, &resolved, convo.history(), &tx).await;
+        //    Advertise ONLY this agent's allow-list to the model (the execution
+        //    gate below stays as a backstop).
+        let outcome = stream_step(&client, &resolved, convo.history(), &tools, &tx).await;
 
         // A fatal stream error ends the run immediately.
         if let Some(err) = outcome.error {
@@ -259,6 +262,7 @@ async fn stream_step(
     client: &Arc<OpenRouterClient>,
     resolved: &Resolved,
     history: Vec<crate::dto::chat::ChatMessage>,
+    tools: &[String],
     tx: &UnboundedSender<AgentEvent>,
 ) -> StreamOutcome {
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
@@ -270,13 +274,15 @@ async fn stream_step(
     let effort = resolved.effort.clone();
     let endpoint = resolved.endpoint.clone();
     let api_key = resolved.api_key.clone();
+    // Advertise only this agent's allow-list (owned clone moved into the task).
+    let advertise = tools.to_vec();
     let send = tokio::spawn(async move {
         let conn = crate::service::openrouter::Conn {
             endpoint: &endpoint,
             api_key: &api_key,
         };
         let _ = c
-            .stream_complete(conn, &model_id, &provider, &effort, history, inner_tx)
+            .stream_complete(conn, &model_id, &provider, &effort, history, &advertise, inner_tx)
             .await;
     });
 

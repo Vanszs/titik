@@ -45,11 +45,15 @@ pub const DEFAULT_CLASSIFIER_PROVIDER: &str = "groq";
 /// Value sent as the `HTTP-Referer` header with every OpenRouter request.
 ///
 /// OpenRouter uses this to attribute usage to the originating project.
-pub const HTTP_REFERER: &str = "https://github.com/simple-coders";
+pub const HTTP_REFERER: &str = "https://koma.run";
 
 /// Human-readable application name (displayed in the TUI title bar).
-pub const APP_TITLE: &str = "simple-coders-agent";
+pub const APP_TITLE: &str = "koma";
 
 /// Name of the hidden directory created in the user's home folder to store
 /// session files and configuration.
-pub const APP_DIR_NAME: &str = ".simple-coder";
+pub const APP_DIR_NAME: &str = ".koma";
+
+/// Hard cap on a single tool result's size, in characters. ~100k tokens at
+/// ~4 chars/token. Tool outputs are not truncated below this.
+pub const MAX_TOOL_OUTPUT_CHARS: usize = 400_000;

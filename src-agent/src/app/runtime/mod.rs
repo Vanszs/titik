@@ -20,7 +20,9 @@ mod terminal;
 mod event_loop;
 mod stream;
 mod actions;
-mod commands;
+// `pub(crate)` so the shared `commands::internet::internet_status` helper is
+// reachable from the controller's Ctrl+E handler (outside this module tree).
+pub(crate) mod commands;
 mod shortsend;
 
 use std::io::stdout;

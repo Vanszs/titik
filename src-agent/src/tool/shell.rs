@@ -3,7 +3,8 @@
 //! `bash` is RISKY — it requires user approval in Normal mode. Its safety
 //! relies entirely on the approval gate, not path-sandboxing (unlike the
 //! filesystem tools). Output is captured (stdout + stderr) and capped at the
-//! last 8 000 characters so verbose build output doesn't flood the context.
+//! last `MAX_TOOL_OUTPUT_CHARS` characters so verbose build output doesn't
+//! flood the context.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -80,8 +81,8 @@ impl Tool for Bash {
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
 
-        // Cap to the LAST 8 000 chars so big build logs don't flood the context.
-        const MAX_CHARS: usize = 8_000;
+        // Cap to the LAST MAX_CHARS chars so big build logs don't flood the context.
+        const MAX_CHARS: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
         let truncated;
         let tail: String = if combined.chars().count() > MAX_CHARS {
             truncated = true;
@@ -96,7 +97,7 @@ impl Tool for Bash {
 
         let mut out = String::new();
         if truncated {
-            out.push_str("... (output truncated to last 8000 chars; redirect to a file and read it if you need the full output)\n");
+            out.push_str(&format!("... (output truncated to last {MAX_CHARS} chars; redirect to a file and read it if you need the full output)\n"));
         }
         out.push_str(&tail);
         if !out.ends_with('\n') {

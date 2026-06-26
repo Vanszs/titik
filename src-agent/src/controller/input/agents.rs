@@ -35,16 +35,17 @@ pub fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent
         return Action::Quit;
     }
 
-    // --- Full-screen prompt editor (TOP priority: intercepts ALL keys) ---
-    // A nano-style 2D editor over `draft_body`. While open it owns every key:
+    // --- Full-screen field editor (TOP priority: intercepts ALL keys) ---
+    // A nano-style 2D editor over the active field's draft (Body / Description /
+    // Conditions — tagged inside `s.editor`). While open it owns every key:
     // printable chars insert, arrows/Home/End move the cursor, Enter splits the
-    // line, Backspace/Delete remove, and Esc COMMITS the text back into the draft
-    // and closes (returning to the field list). Everything else is swallowed.
-    if let Some(ed) = s.prompt_editor.as_mut() {
+    // line, Backspace/Delete remove, and Esc COMMITS the text back into the matching
+    // draft and closes (returning to the field list). Everything else is swallowed.
+    if let Some((_field, ed)) = s.editor.as_mut() {
         match key.code {
             KeyCode::Esc => {
-                // Commit: write the edited text back into `draft_body`, close.
-                s.commit_prompt_editor();
+                // Commit: write the edited text back into the tagged draft, close.
+                s.commit_editor();
             }
             KeyCode::Enter => ed.newline(),
             KeyCode::Backspace => ed.backspace(),
@@ -213,13 +214,19 @@ pub fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent
                                     s.open_model_picker(&rest.config, &settings);
                                 }
                             }
-                            // Prompt/Body opens the full-screen nano-style editor
-                            // (comfortable multi-line editing) instead of the
-                            // cramped inline path.
+                            // Body, Description, and Conditions all open the
+                            // full-screen nano-style editor (comfortable multi-line
+                            // editing) instead of the cramped inline path.
                             AgentEditField::Body => {
-                                s.open_prompt_editor();
+                                s.open_editor(AgentEditField::Body);
                             }
-                            // Every other field is a plain text box.
+                            AgentEditField::Description => {
+                                s.open_editor(AgentEditField::Description);
+                            }
+                            AgentEditField::Conditions => {
+                                s.open_editor(AgentEditField::Conditions);
+                            }
+                            // Every other field (Name in Create) is a plain text box.
                             _ => {
                                 s.editing = true;
                             }

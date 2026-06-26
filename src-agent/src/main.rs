@@ -1,8 +1,15 @@
 //! Binary entry point for the simple-coders-agent TUI.
 //!
-//! Parses CLI arguments via [`cli::parse`], then hands control to
-//! [`app::run`] which initialises the terminal, enters the event loop,
-//! and returns when the user quits.
+//! Parses CLI arguments via [`cli::parse`], handles any short-circuit modes
+//! (provisioner flags), then hands control to [`app::run`] which initialises
+//! the terminal, enters the event loop, and returns when the user quits.
+//!
+//! # Short-circuit modes (exit before TUI)
+//!
+//! | Flag | Action |
+//! |---|---|
+//! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
+//! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
 //!
 //! Data flow overview:
 //! ```text
@@ -17,6 +24,7 @@ mod cli;
 mod config;
 mod controller;
 mod dto;
+mod internet;
 mod model;
 mod resources;
 mod service;
@@ -24,6 +32,35 @@ mod tool;
 mod view;
 
 fn main() -> anyhow::Result<()> {
+    // Migrate legacy config dir (~/.simple-coder -> ~/.koma) before anything
+    // reads base_dir(), so every entry path (TUI, --internet-fullmode-install,
+    // --resume) sees the migrated directory.
+    model::store::migrate_legacy_dir();
+
     let opts = cli::parse(std::env::args());
+
+    // --- short-circuit: provisioner modes (no TUI) ---
+
+    if opts.internet_fullmode_install {
+        return match internet::install(opts.force) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    if opts.internet_fullmode_uninstall {
+        return match internet::uninstall() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // --- normal path: launch the TUI ---
     app::run(opts)
 }

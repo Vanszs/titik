@@ -258,7 +258,15 @@ pub(crate) fn start_stream_task(
                 ));
             } else {
                 let _ = c
-                    .stream_complete(m.conn(), &m.model_id, m.provider(), &m.effort, history, tx)
+                    .stream_complete(
+                        m.conn(),
+                        &m.model_id,
+                        m.provider(),
+                        &m.effort,
+                        history,
+                        &crate::tool::main_tool_names(),
+                        tx,
+                    )
                     .await;
             }
         }

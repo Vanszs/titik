@@ -34,6 +34,9 @@ pub enum SettingField {
     /// Toggle: cache-warmth-adaptive summarization. On only for models with a
     /// sliding/refreshing prompt cache (e.g. Anthropic).
     SlidingCache,
+    /// Toggle: internet-access tier — `simple` (DDG in-process) vs `full`
+    /// (scrapion Firefox subprocess, higher token usage).
+    InternetMode,
 }
 
 impl SettingField {
@@ -57,6 +60,7 @@ impl SettingField {
             SettingField::AllowedFolders     => "Allowed dirs",
             SettingField::ShortSendEnabled   => "Short-send",
             SettingField::SlidingCache       => "Sliding cache",
+            SettingField::InternetMode       => "Internet mode",
         }
     }
 }
@@ -81,7 +85,7 @@ pub const SETTING_CATEGORIES: &[SettingCategory] = &[
     SettingCategory {
         name: "Session",
         group: "general",
-        fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled, SettingField::SlidingCache],
+        fields: &[SettingField::Name, SettingField::Workdir, SettingField::ShortSendEnabled, SettingField::SlidingCache, SettingField::InternetMode],
     },
     SettingCategory {
         name: "API Providers",

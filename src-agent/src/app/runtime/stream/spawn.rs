@@ -23,11 +23,18 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
     let memory_dir = session_ref
         .as_ref()
         .map(|s| s.path.join("memory"));
+    // The active internet tier drives `web_fetch`'s backend choice (Full →
+    // scrapion browser, else raw HTTP). No session ⇒ default Simple.
+    let internet_mode = session_ref
+        .as_ref()
+        .map(|s| s.settings.internet_mode)
+        .unwrap_or_default();
     crate::tool::ToolCtx {
         workspace,
         workspaces,
         dir_cache: state.rest.dir_cache.clone(),
         memory_dir,
+        internet_mode,
     }
 }
 

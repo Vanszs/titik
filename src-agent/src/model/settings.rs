@@ -108,6 +108,23 @@ impl Default for Compaction {
     }
 }
 
+/// Controls which internet-access tier is active for this session.
+///
+/// `Simple` (the default) keeps `web_search` (DDG) and `web_fetch` on the
+/// lightweight in-process raw-HTTP path (low overhead, no subprocess). `Full`
+/// upgrades `web_fetch` to the opt-in scrapion browser backend (a Firefox
+/// subprocess that renders JS and beats Cloudflare), which costs more tokens
+/// and spawns an external process; `web_search` is unchanged. Full requires the
+/// environment to be provisioned (`koma --internet-fullmode-install`); until
+/// then `web_fetch` silently stays on the raw-HTTP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InternetMode {
+    #[default]
+    Simple,
+    Full,
+}
+
 /// Per-session user-configurable settings.
 ///
 /// Deserialized from (and serialized to) `<session_dir>/settings.json`.
@@ -206,6 +223,12 @@ pub struct Settings {
     /// (e.g. Anthropic). When false (the default), no such adaptation is attempted.
     #[serde(default = "default_sliding_cache")]
     pub sliding_cache: bool,
+    /// Internet-access tier for this session. `Simple` (default) keeps
+    /// `web_fetch`/`web_search` on the lightweight in-process raw-HTTP path.
+    /// `Full` upgrades `web_fetch` to the opt-in scrapion browser backend
+    /// (Firefox subprocess, higher token usage); `web_search` is unchanged.
+    #[serde(default = "default_internet_mode")]
+    pub internet_mode: InternetMode,
     /// Per-session override layer for the global model catalogue: models the user
     /// saved for THIS session only (the `/settings` "Save session" path). They are
     /// never written to the global `config.json`; they live here so they survive a
@@ -267,6 +290,10 @@ fn default_sliding_cache() -> bool {
     false
 }
 
+fn default_internet_mode() -> InternetMode {
+    InternetMode::Simple
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -288,6 +315,7 @@ impl Default for Settings {
             short_send_enabled: default_short_send_enabled(),
             short_send_tail_n: default_short_send_tail_n(),
             sliding_cache: default_sliding_cache(),
+            internet_mode: InternetMode::Simple,
             session_models: Vec::new(),
         }
     }

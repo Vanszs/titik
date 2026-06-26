@@ -42,7 +42,7 @@ use crate::model::settings::Settings;
 use crate::view::theme::Palette;
 
 use browse::{draw_detail, draw_list, footer_hint};
-use editor::draw_prompt_editor;
+use editor::draw_field_editor;
 use pickers::{draw_model_picker, draw_tool_picker};
 
 /// List (sidebar) column width in terminal columns (includes the RIGHT border).
@@ -116,10 +116,11 @@ pub fn draw(
     settings: Option<&Settings>,
     palette: &Palette,
 ) {
-    // The full-screen prompt editor takes over the WHOLE frame when open: render
-    // it instead of the normal list/detail dashboard and bail (it owns all input).
-    if let Some(ed) = &st.prompt_editor {
-        draw_prompt_editor(frame, ed, palette);
+    // The full-screen field editor takes over the WHOLE frame when open: render it
+    // instead of the normal list/detail dashboard and bail (it owns all input). The
+    // title is the active field's label (prompt / description / conditions).
+    if let Some((field, ed)) = &st.editor {
+        draw_field_editor(frame, ed, field.label(), palette);
         return;
     }
 
