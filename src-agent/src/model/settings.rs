@@ -125,6 +125,40 @@ pub enum InternetMode {
     Full,
 }
 
+impl InternetMode {
+    /// Lowercase label / wire token (`"simple"` | `"full"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Full => "full",
+        }
+    }
+
+    /// The opposite mode (Simple <-> Full).
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Simple => Self::Full,
+            Self::Full => Self::Simple,
+        }
+    }
+
+    /// Parse a user token (case-insensitive, trimmed). `None` for empty or
+    /// anything unrecognised — callers treat that as "toggle".
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "simple" => Some(Self::Simple),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for InternetMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Per-session user-configurable settings.
 ///
 /// Deserialized from (and serialized to) `<session_dir>/settings.json`.

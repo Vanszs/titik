@@ -3,7 +3,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::state::AppStateRest;
 use crate::controller::command;
-use crate::model::settings::InternetMode;
 use super::{is_ctrl, Action};
 
 /// If the input's current (last, whitespace-delimited) token is a file
@@ -163,19 +162,18 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
     // the BackTab agent_mode toggle pattern.
     if is_ctrl(&key, 'e') {
         if let Some(sess) = rest.session.as_mut() {
-            let new_mode = match sess.settings.internet_mode {
-                InternetMode::Simple => InternetMode::Full,
-                InternetMode::Full => InternetMode::Simple,
-            };
+            let new_mode = sess.settings.internet_mode.toggled();
             sess.settings.internet_mode = new_mode;
             // Refresh the system-prompt roster so any mode-gated agents stay in
             // sync on this mid-session flip (rebuild reads in-memory settings).
             sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
-                    rest.status = crate::app::runtime::commands::internet::internet_status(new_mode);
-                    if new_mode == InternetMode::Full && !crate::internet::is_installed() {
-                        rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(new_mode));
+                    let (status, toast) =
+                        crate::app::runtime::commands::internet::internet_feedback(new_mode);
+                    rest.status = status;
+                    if let Some(t) = toast {
+                        rest.set_toast_info(t);
                     }
                 }
                 Err(e) => {

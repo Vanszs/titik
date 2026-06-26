@@ -8,7 +8,6 @@ use anyhow::Result;
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::model::app_config::{ModelEntry, ProviderConn};
-use crate::model::settings::InternetMode;
 use crate::model::store;
 use crate::service::openrouter::OpenRouterClient;
 
@@ -231,9 +230,11 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    and Ctrl+E paths exactly).  Only fires when the mode actually
         //    changed; it resets to "ready" on the next action.
         if old_internet.is_some_and(|old| old != internet_mode) {
-            state.rest.status = crate::app::runtime::commands::internet::internet_status(internet_mode);
-            if internet_mode == InternetMode::Full && !crate::internet::is_installed() {
-                state.rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(internet_mode));
+            let (status, toast) =
+                crate::app::runtime::commands::internet::internet_feedback(internet_mode);
+            state.rest.status = status;
+            if let Some(t) = toast {
+                state.rest.set_toast_info(t);
             }
         }
     }

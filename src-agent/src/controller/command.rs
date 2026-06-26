@@ -112,14 +112,7 @@ pub fn parse(line: &str) -> Command {
         "settings" | "config" => Command::Settings,
         "agents" | "agent" => Command::Agents,
         "task" => Command::Task(rest.to_string()),
-        "internet" => {
-            let target = match rest.to_lowercase().trim() {
-                "full" => Some(InternetMode::Full),
-                "simple" => Some(InternetMode::Simple),
-                _ => None, // empty or anything else → toggle
-            };
-            Command::Internet(target)
-        }
+        "internet" => Command::Internet(InternetMode::from_token(rest)),
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,

@@ -38,7 +38,6 @@ use ratatui::{
 };
 use crate::app::mode::{SETTING_CATEGORIES, SettingField, SettingsState};
 use crate::model::app_config::ThemeMode;
-use crate::model::settings::InternetMode;
 use crate::view::theme::{resolve_accent, Palette};
 use providers::{draw_providers, draw_models};
 use pickers::draw_role_picker;
@@ -281,10 +280,7 @@ pub fn draw(
                 }
                 SettingField::InternetMode => {
                     // Enum toggle: simple (in-process DDG) vs full (scrapion subprocess).
-                    let v = match st.internet_mode {
-                        InternetMode::Simple => "simple",
-                        InternetMode::Full   => "full",
-                    };
+                    let v = st.internet_mode.as_str();
                     vec![Span::styled(v, Style::default().fg(palette.accent))]
                 }
                 SettingField::AwarenessSource => {

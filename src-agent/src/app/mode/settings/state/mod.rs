@@ -312,10 +312,7 @@ impl SettingsState {
                 self.sliding_cache = !self.sliding_cache;
             }
             SettingField::InternetMode => {
-                self.internet_mode = match self.internet_mode {
-                    InternetMode::Simple => InternetMode::Full,
-                    InternetMode::Full   => InternetMode::Simple,
-                };
+                self.internet_mode = self.internet_mode.toggled();
             }
             SettingField::Workdir | SettingField::AllowedFolders => {
                 self.list_editing = true;

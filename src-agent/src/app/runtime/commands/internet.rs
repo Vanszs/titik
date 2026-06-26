@@ -5,17 +5,20 @@ use anyhow::Result;
 use crate::app::state::AppState;
 use crate::model::settings::InternetMode;
 
-/// Brief status label for a just-applied internet `mode`.
+/// Status-bar label + optional actionable toast for a just-applied internet `mode`.
 ///
-/// Always returns a string; the caller writes it to `rest.status` so it
-/// flashes in the status bar until the next action resets it to `"ready"`.
-pub(crate) fn internet_status(mode: InternetMode) -> String {
+/// The first element is written to `rest.status` (a brief flash that resets to
+/// `"ready"` on the next action). The second is `Some(_)` only when `Full` is
+/// selected without its browser backend installed — that message is also
+/// toasted so it persists long enough to read the install command.
+pub(crate) fn internet_feedback(mode: InternetMode) -> (String, Option<String>) {
     match mode {
         InternetMode::Full if !crate::internet::is_installed() => {
-            "internet: full needs `koma --internet-fullmode-install`".to_string()
+            let msg = "internet: full needs `koma --internet-fullmode-install`".to_string();
+            (msg.clone(), Some(msg))
         }
-        InternetMode::Full => "internet: full".to_string(),
-        InternetMode::Simple => "internet: simple".to_string(),
+        InternetMode::Full => ("internet: full".to_string(), None),
+        InternetMode::Simple => ("internet: simple".to_string(), None),
     }
 }
 
@@ -30,13 +33,7 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
         return Ok(());
     };
 
-    let new_mode = match target {
-        Some(m) => m,
-        None => match sess.settings.internet_mode {
-            InternetMode::Simple => InternetMode::Full,
-            InternetMode::Full => InternetMode::Simple,
-        },
-    };
+    let new_mode = target.unwrap_or_else(|| sess.settings.internet_mode.toggled());
 
     sess.settings.internet_mode = new_mode;
     // Refresh the system-prompt roster so any mode-gated agents stay in sync on
@@ -48,12 +45,12 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
         return Ok(());
     }
 
-    state.rest.status = internet_status(new_mode);
-    // Toast the install instructions when Full is selected without the
-    // browser backend — status bar resets on next keypress, so the toast
-    // gives the user time to read the command.
-    if new_mode == InternetMode::Full && !crate::internet::is_installed() {
-        state.rest.set_toast_info(internet_status(new_mode));
+    // Status bar resets on next keypress; the optional toast persists so the
+    // user can read the install command when Full lacks its backend.
+    let (status, toast) = internet_feedback(new_mode);
+    state.rest.status = status;
+    if let Some(t) = toast {
+        state.rest.set_toast_info(t);
     }
 
     Ok(())

@@ -10,7 +10,7 @@ use crate::service::openrouter::OpenRouterClient;
 
 mod compact;
 mod effort;
-// `pub(crate)` so the shared `internet_status` helper is reachable from the
+// `pub(crate)` so the shared `internet_feedback` helper is reachable from the
 // Ctrl+E handler (controller) and the settings-save action, which flip the same
 // mode and must show the identical status line.
 pub(crate) mod internet;
