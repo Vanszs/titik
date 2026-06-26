@@ -126,13 +126,11 @@ pub(super) fn apply_action(
                 state.rest.approval_reason = None;
                 state.rest.tool_idx = 0;
                 state.rest.tool_results.clear();
-                // Abandon any round parked on deferred task-tool delegations so a
-                // sub-agent that finishes AFTER this interrupt can't resume a turn
-                // the user killed. The orphaned sub-agents keep running in the
-                // background; their terminal delivery finds no matching pending id
-                // and is dropped (no chat fold, no re-stream).
-                state.rest.pending_subagent_calls.clear();
-                state.rest.awaiting_subagents = false;
+                // Deliberately do NOT clear `subagent_nudges`: any delegated
+                // sub-agent that has already finished (or finishes after this
+                // interrupt) still has its report queued for delivery to the main
+                // agent. The interrupt only kills the in-flight response, not the
+                // background sub-agents' right to report back.
                 // Take any captured usage unconditionally so a partial turn's
                 // usage can't leak into the next response.
                 let usage = state.rest.pending_usage.take();

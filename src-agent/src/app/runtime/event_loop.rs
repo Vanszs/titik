@@ -494,14 +494,6 @@ pub(super) fn run_loop(
                 }
             }
 
-            // Deferred `task`-tool results to deliver into the PARKED tool round
-            // (call_id, result_text), accumulated across every sub-agent this tick
-            // and applied after the loop. A sub-agent that reaches a terminal state
-            // and still has its call id in `pending_subagent_calls` fills its result
-            // here (the FULL report on Done, an error/killed note otherwise) so the
-            // parked round can resume with no dangling tool_call ids.
-            let mut deferred_results: Vec<(String, String)> = Vec::new();
-
             for i in 0..state.rest.subagents.len() {
                 // --- collect phase: drain rx into a local vec ---
                 let mut disconnected = false;
@@ -591,34 +583,45 @@ pub(super) fn run_loop(
                 // --- terminal delivery / fold ---
                 // Inspect the SETTLED status + origin once events are folded, capturing
                 // owned values up front so the immutable borrow of `subagents[i]` is
-                // released before any `state.rest.session` mutation below. Runs every
-                // tick (even when no events arrived, so a disconnect-only Killed is
-                // still delivered). The "still in pending_subagent_calls" guard makes a
-                // task-tool delivery happen EXACTLY ONCE (the id is removed after the
-                // loop, so later ticks skip it).
+                // released before any `state.rest` mutation below. Runs every tick (even
+                // when no events arrived, so a disconnect-only Killed is still
+                // delivered). The agent is pruned at the END of this tick and the loop
+                // visits each agent exactly once, so a terminal agent is seen exactly
+                // once here — enqueue/fold fires EXACTLY ONCE, no extra guard needed.
                 //
-                // `chat_fold` carries the /task chat-fold note; `defer` carries the
-                // (call_id, result) for the task-tool deferred delivery. At most one
-                // is Some (the two origins are mutually exclusive on tool_call_id).
-                let (chat_fold, defer): (Option<String>, Option<(String, String)>) = {
+                // `chat_fold` carries the /task chat-fold note (injected as an assistant
+                // turn below); `nudge` carries the formatted delegated-agent report to
+                // enqueue onto `subagent_nudges`. At most one is Some (the two origins
+                // are mutually exclusive on `tool_call_id`).
+                let (chat_fold, nudge): (Option<String>, Option<String>) = {
                     let sa = &state.rest.subagents[i];
                     match (&sa.tool_call_id, &sa.status) {
-                        // task-tool path: deliver the deferred result back to the model.
-                        (Some(call_id), status)
-                            if state.rest.pending_subagent_calls.contains(call_id) =>
-                        {
-                            let result = match status {
-                                // Deliver the FULL, untruncated report.
-                                SubAgentStatus::Done(s) => Some(s.clone()),
-                                SubAgentStatus::Error(e) => Some(format!("sub-agent error: {e}")),
-                                // Killed (user Ctrl+X / task died) — fill so the round
-                                // can't hang waiting on a result that will never come.
-                                SubAgentStatus::Killed => Some("[sub-agent killed]".to_string()),
-                                // Still running: nothing to deliver this tick.
-                                SubAgentStatus::Running => None,
-                            };
-                            (None, result.map(|r| (call_id.clone(), r)))
-                        }
+                        // task-tool path (delegated): on a terminal status, build the
+                        // nudge string the main agent will react to later. The full,
+                        // untruncated report on Done; an error/killed note otherwise.
+                        (Some(_), SubAgentStatus::Done(report)) => (
+                            None,
+                            Some(format!(
+                                "[sub-agent #{} {}] finished:\n{report}",
+                                sa.id, sa.agent_name
+                            )),
+                        ),
+                        (Some(_), SubAgentStatus::Error(e)) => (
+                            None,
+                            Some(format!(
+                                "[sub-agent #{} {}] failed: {e}",
+                                sa.id, sa.agent_name
+                            )),
+                        ),
+                        (Some(_), SubAgentStatus::Killed) => (
+                            None,
+                            Some(format!(
+                                "[sub-agent #{} {}] was killed before reporting.",
+                                sa.id, sa.agent_name
+                            )),
+                        ),
+                        // Delegated but still running: nothing to enqueue this tick.
+                        (Some(_), SubAgentStatus::Running) => (None, None),
                         // /task command path (tool_call_id == None): on Done, build the
                         // FULL, untruncated report note (injected as an assistant turn
                         // below). Done is terminal and the agent is pruned this tick, so
@@ -648,18 +651,12 @@ pub(super) fn run_loop(
                         let _ = sess.save();
                     }
                 }
-                if let Some(pair) = defer {
-                    deferred_results.push(pair);
+                if let Some(note) = nudge {
+                    // Delegated `task`-tool path: queue the finished report to nudge
+                    // the main agent later (delivery is a later stage). Enqueued once
+                    // per agent (pruned this tick).
+                    state.rest.subagent_nudges.push_back(note);
                 }
-            }
-
-            // Deliver every terminal task-tool result into the parked round's
-            // `tool_results` and drop its id from `pending_subagent_calls`. Done
-            // AFTER the loop so the per-agent borrow above stays immutable.
-            for (call_id, result) in deferred_results {
-                state.rest.pending_subagent_calls.retain(|c| c != &call_id);
-                state.rest.tool_results.push((call_id, result));
-                dirty = true;
             }
 
             // --- prune terminated sub-agents ---
@@ -679,18 +676,6 @@ pub(super) fn run_loop(
                 } else if after_len == 0 {
                     state.rest.subagent_sel = 0;
                 }
-            }
-
-            // --- resume a round parked on deferred task-tool delegations ---
-            // Once every pending delegation has filled its result (above), unpark
-            // the tool round: `finish_tool_round` flushes ALL collected `tool_results`
-            // into the conversation and re-streams, so the MAIN AGENT now reacts to
-            // each delegated report. Clearing `awaiting_subagents` drops the parked
-            // status; `waiting` stays true through the re-stream.
-            if state.rest.awaiting_subagents && state.rest.pending_subagent_calls.is_empty() {
-                state.rest.awaiting_subagents = false;
-                super::stream::resume_after_subagents(state, client, handle);
-                dirty = true;
             }
         }
 

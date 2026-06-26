@@ -321,22 +321,17 @@ pub struct AppStateRest {
     /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
     #[allow(dead_code)]
     pub next_subagent_id: usize,
-    /// Tool-call ids of in-flight `task`-tool delegations whose result the main
-    /// agent is still waiting for. The model-callable `task` tool DEFERS its tool
-    /// result (mirroring the `awaiting_approval` park): `process_tools` pushes the
-    /// call id here instead of an immediate "started" result, the round parks, and
-    /// the event-loop sub-agent drain delivers the FULL report into `tool_results`
-    /// (removing the id) once that sub-agent reaches a terminal state. Empty when
-    /// no task delegation is pending. The `/task` slash command path never touches
-    /// this (its sub-agents carry `tool_call_id == None`).
-    pub pending_subagent_calls: Vec<String>,
-    /// True while a tool round is PARKED waiting on one or more deferred
-    /// `task`-tool delegations (see `pending_subagent_calls`). Set when
-    /// `process_tools` returns without calling `finish_tool_round`; cleared by the
-    /// event-loop drain once every pending delegation has filled its result, which
-    /// then resumes the round (`finish_tool_round`) so the main agent reacts to the
-    /// delegated reports. Keeps the busy/shimmer indicator on while parked.
-    pub awaiting_subagents: bool,
+    /// Finished delegated-agent reports awaiting delivery to the main agent. The
+    /// model-callable `task` tool is NON-BLOCKING: on spawn it pushes an immediate
+    /// ack tool result and the round finishes right away, so the user keeps
+    /// chatting while the sub-agent runs. When a DELEGATED sub-agent
+    /// (`tool_call_id == Some(_)`) reaches a terminal state, the event-loop drain
+    /// enqueues a formatted nudge string here (full report on Done, an error/killed
+    /// note otherwise). A later stage drains this queue to nudge the main agent to
+    /// react AFTER any in-flight response. NOT cleared on interrupt (queued reports
+    /// should still be delivered). The `/task` slash command path never touches
+    /// this (its sub-agents carry `tool_call_id == None` and fold to chat directly).
+    pub subagent_nudges: std::collections::VecDeque<String>,
 }
 
 impl AppState {
@@ -420,8 +415,7 @@ impl AppStateRest {
             subagents_open: false,
             subagent_sel: 0,
             next_subagent_id: 0,
-            pending_subagent_calls: Vec::new(),
-            awaiting_subagents: false,
+            subagent_nudges: std::collections::VecDeque::new(),
         }
     }
 
