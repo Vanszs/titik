@@ -746,7 +746,8 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
             ("Enter", "send message / run command"),
             ("Tab", "complete the selected command"),
             ("Ctrl+R", "resend the last message"),
-            ("Esc", "interrupt while busy, else quit"),
+            ("Esc", "interrupt while busy"),
+            ("/quit", "exit the app"),
             ("Up/Down/wheel", "scroll the transcript"),
             ("$", "open the sub-agents panel — Ctrl+X kills the selected"),
         ];

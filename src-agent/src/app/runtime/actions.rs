@@ -416,6 +416,13 @@ pub(super) fn apply_action(
             state.rest.status = "ready".into();
         }
 
+        Action::CancelPickerToChat => {
+            // Esc/Ctrl+C in the /resume-opened session picker: the active
+            // session is still in state.rest.session (untouched), so just
+            // swap the mode back to Chat without disturbing anything else.
+            state.mode = Mode::Chat;
+        }
+
         Action::PickerSelect => {
             // Extract selected path first (borrow of mode released before
             // mutating rest/mode below).

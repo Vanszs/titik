@@ -50,6 +50,10 @@ pub enum Action {
     /// Esc from a KeyInput that was opened from the --resume picker: go back to
     /// the picker rather than pinning a no-client Chat.
     CancelKeyInputToPicker,
+    /// Esc/Ctrl+C in the session picker opened via /resume (an active session
+    /// exists) — discard the picker and return to the unchanged Chat. The
+    /// --resume startup picker has no session, so it Quits instead.
+    CancelPickerToChat,
     // --- Picker actions ---
     /// Enter on the session picker — open the highlighted session.
     PickerSelect,
@@ -345,7 +349,7 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         return if rest.waiting || rest.compact_anim_start.is_some() {
             Action::Interrupt
         } else {
-            Action::Quit
+            Action::None
         };
     }
     // Ctrl+R: resend (only when idle).
@@ -371,11 +375,11 @@ fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         KeyCode::Esc => {
             // Interrupt if waiting OR a compaction animation is still running
             // (compact_anim_start remains set during the deferred-apply window).
-            // Quitting mid-animation would leave the spinner permanently stuck.
+            // When idle, do nothing — only /quit exits the app.
             if rest.waiting || rest.compact_anim_start.is_some() {
                 Action::Interrupt
             } else {
-                Action::Quit
+                Action::None
             }
         }
         KeyCode::Enter => {
@@ -722,14 +726,25 @@ fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: KeyEv
 /// Handle a key press inside the `--resume` session picker.
 ///
 /// Typing characters updates the live search query and triggers `refilter`.
-/// `_rest` is accepted for API consistency with the other handlers but unused.
-fn handle_picker(p: &mut PickerState, _rest: &mut AppStateRest, key: KeyEvent) -> Action {
+/// Esc/Ctrl+C return to Chat when an active session exists (opened via /resume),
+/// or quit when there is no session (opened by the --resume startup flag).
+fn handle_picker(p: &mut PickerState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
     if is_ctrl(&key, 'c') {
-        return Action::Quit;
+        return if rest.session.is_some() {
+            Action::CancelPickerToChat
+        } else {
+            Action::Quit
+        };
     }
 
     match key.code {
-        KeyCode::Esc => Action::Quit,
+        KeyCode::Esc => {
+            if rest.session.is_some() {
+                Action::CancelPickerToChat
+            } else {
+                Action::Quit
+            }
+        }
         KeyCode::Up => {
             p.move_up();
             Action::None
