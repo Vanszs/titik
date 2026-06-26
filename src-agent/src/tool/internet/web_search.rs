@@ -8,17 +8,15 @@
 //!
 //! DDG returns HTTP 202 when it detects bot-like requests.  This module works
 //! around that by:
-//!   - Rotating across a pool of realistic desktop browser User-Agent strings.
-//!   - Adding browser-like request headers (Accept, Accept-Language, Referer,
-//!     Sec-Fetch-*, Origin, Upgrade-Insecure-Requests).
-//!   - Appending a pseudo-random `fbid` URL parameter (mirrors what scrapion
-//!     does to defeat per-session fingerprinting).
-//!   - Retrying up to 3 times with a different UA + fresh fbid after any 202
-//!     or zero-result response, with short jittered backoff sleeps (safe here
-//!     because `run` is called from the off-UI async-defer thread).
+//!   - Rotating across a pool of Chrome desktop User-Agent strings.
+//!   - Sending a real browser POST (form body) instead of a GET with query params.
+//!   - Adding browser-like request headers including Chrome client hints
+//!     (sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform) paired to each UA's OS.
+//!   - Retrying up to 3 times with a different UA after any 202 or zero-result
+//!     response, with short jittered backoff sleeps (safe here because `run` is
+//!     called from the off-UI async-defer thread).
 
 use anyhow::Result;
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use scraper::{Html, Selector};
 use serde_json::{json, Value};
 use std::sync::mpsc;
@@ -28,33 +26,60 @@ use super::{Tool, ToolCtx};
 const DEFAULT_REGION: &str = "wt-wt";
 const TOP_N: usize = 8;
 
-/// Realistic desktop browser User-Agent pool (8 entries).
-/// Mix of Firefox + Chrome on Windows / macOS / Linux — all plausibly current.
-const UA_POOL: &[&str] = &[
+/// Chrome desktop User-Agent pool with paired platform tokens.
+///
+/// Client hint headers (sec-ch-ua-platform, sec-ch-ua) are Chrome-only, so
+/// every entry here is a Chrome UA.  Each entry is (ua, platform) where
+/// platform matches the `sec-ch-ua-platform` value.
+const UA_POOL: &[(&str, &str)] = &[
+    // Chrome 125 — Windows
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Windows",
+    ),
+    // Chrome 125 — macOS
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "macOS",
+    ),
+    // Chrome 125 — Linux
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Linux",
+    ),
     // Chrome 124 — Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Windows",
+    ),
     // Chrome 124 — macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "macOS",
+    ),
     // Chrome 124 — Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    // Firefox 125 — Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) \
-     Gecko/20100101 Firefox/125.0",
-    // Firefox 125 — macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) \
-     Gecko/20100101 Firefox/125.0",
-    // Firefox 125 — Linux
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:125.0) \
-     Gecko/20100101 Firefox/125.0",
-    // Chrome 123 — Windows (slightly older, adds variety)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    // Edge 124 — Windows (Chromium-based, distinct UA)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Linux",
+    ),
+    // Chrome 123 — Windows
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Windows",
+    ),
+    // Chrome 123 — macOS
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "macOS",
+    ),
 ];
 
 /// Derive a pseudo-random `u64` seed from `SystemTime` nanoseconds.
@@ -66,35 +91,45 @@ fn nanos_seed() -> u64 {
         .unwrap_or(42)
 }
 
-/// Pick a UA from the pool using the given seed, offset by `skip` so that
-/// consecutive retry attempts always pick a *different* UA.
-fn pick_ua(seed: u64, skip: usize) -> &'static str {
+/// Pick a (ua, platform) pair from the pool using the given seed, offset by
+/// `skip` so that consecutive retry attempts always pick a *different* UA.
+fn pick_ua(seed: u64, skip: usize) -> (&'static str, &'static str) {
     let idx = ((seed ^ (skip as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
         % UA_POOL.len() as u64) as usize;
     UA_POOL[idx]
 }
 
-/// Derive a pseudo-random `fbid` value (9-digit decimal, matching scrapion's
-/// pattern) from the seed.
-fn make_fbid(seed: u64) -> u64 {
-    // Keep it in the 100_000_000 – 999_999_999 range.
-    100_000_000 + (seed % 900_000_000)
-}
-
-/// DDG-specific blocking GET.
+/// DDG-specific blocking POST (form body).
 ///
 /// Spawns a dedicated OS thread (no tokio context), builds a
 /// `reqwest::blocking::Client` with browser-like headers there, performs the
-/// GET, and returns `(status_code, body)` over an mpsc channel.
+/// POST, and returns `(status_code, body)` over an mpsc channel.
 /// Mirrors the `http_get_blocking` pattern exactly — std::thread + recv_timeout.
 ///
-/// `ua`: the User-Agent to use for this attempt.
-/// `fbid`: the pseudo-random fbid query parameter value.
-fn ddg_get(query_url: &str, ua: &str, timeout: Duration) -> Result<(u16, String), String> {
+/// The URL is always the clean `https://html.duckduckgo.com/html/` with NO
+/// query string.  Form params are sent in the request body with
+/// `Content-Type: application/x-www-form-urlencoded` (set automatically by
+/// reqwest's `.form()`).
+///
+/// `ua`: the User-Agent string to use for this attempt.
+/// `platform`: the `sec-ch-ua-platform` value matching the UA's OS.
+/// `form_params`: slice of (name, value) pairs for the POST body.
+fn ddg_post(
+    ua: &str,
+    platform: &str,
+    form_params: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    const DDG_HTML_URL: &str = "https://html.duckduckgo.com/html/";
     const MAX_BODY_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
 
-    let url_owned = query_url.to_string();
     let ua_owned = ua.to_string();
+    let platform_owned = platform.to_string();
+    // Own the form params so they can cross the thread boundary.
+    let params_owned: Vec<(String, String)> = form_params
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
     let (tx, rx) = mpsc::channel::<Result<(u16, String), String>>();
 
@@ -115,50 +150,83 @@ fn ddg_get(query_url: &str, ua: &str, timeout: Duration) -> Result<(u16, String)
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
+            // Referer and Origin both use the html. subdomain, matching the
+            // real browser capture.
             default_headers.insert(
                 reqwest::header::REFERER,
-                "https://duckduckgo.com/"
+                "https://html.duckduckgo.com/"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
                 reqwest::header::ORIGIN,
-                "https://duckduckgo.com"
+                "https://html.duckduckgo.com"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
-                "Sec-Fetch-Site".parse::<reqwest::header::HeaderName>()
+                "Sec-Fetch-Site"
+                    .parse::<reqwest::header::HeaderName>()
                     .map_err(|e| format!("header name: {e}"))?,
                 "same-origin"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
-                "Sec-Fetch-Mode".parse::<reqwest::header::HeaderName>()
+                "Sec-Fetch-Mode"
+                    .parse::<reqwest::header::HeaderName>()
                     .map_err(|e| format!("header name: {e}"))?,
                 "navigate"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
-                "Sec-Fetch-Dest".parse::<reqwest::header::HeaderName>()
+                "Sec-Fetch-Dest"
+                    .parse::<reqwest::header::HeaderName>()
                     .map_err(|e| format!("header name: {e}"))?,
                 "document"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
-                "Sec-Fetch-User".parse::<reqwest::header::HeaderName>()
+                "Sec-Fetch-User"
+                    .parse::<reqwest::header::HeaderName>()
                     .map_err(|e| format!("header name: {e}"))?,
                 "?1"
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
             default_headers.insert(
-                "Upgrade-Insecure-Requests".parse::<reqwest::header::HeaderName>()
+                "Upgrade-Insecure-Requests"
+                    .parse::<reqwest::header::HeaderName>()
                     .map_err(|e| format!("header name: {e}"))?,
                 "1"
+                    .parse()
+                    .map_err(|e| format!("header parse: {e}"))?,
+            );
+            // Chrome client hints — must be consistent with the Chrome UA.
+            default_headers.insert(
+                "sec-ch-ua"
+                    .parse::<reqwest::header::HeaderName>()
+                    .map_err(|e| format!("header name: {e}"))?,
+                "\"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\""
+                    .parse()
+                    .map_err(|e| format!("header parse: {e}"))?,
+            );
+            default_headers.insert(
+                "sec-ch-ua-mobile"
+                    .parse::<reqwest::header::HeaderName>()
+                    .map_err(|e| format!("header name: {e}"))?,
+                "?0"
+                    .parse()
+                    .map_err(|e| format!("header parse: {e}"))?,
+            );
+            let platform_header_val = format!("\"{}\"", platform_owned);
+            default_headers.insert(
+                "sec-ch-ua-platform"
+                    .parse::<reqwest::header::HeaderName>()
+                    .map_err(|e| format!("header name: {e}"))?,
+                platform_header_val
                     .parse()
                     .map_err(|e| format!("header parse: {e}"))?,
             );
@@ -170,8 +238,16 @@ fn ddg_get(query_url: &str, ua: &str, timeout: Duration) -> Result<(u16, String)
                 .build()
                 .map_err(|e| format!("client build error: {e}"))?;
 
+            // POST with form body — reqwest sets Content-Type automatically.
+            // The URL has no query string; all params go in the body.
+            let params_refs: Vec<(&str, &str)> = params_owned
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+
             let resp = client
-                .get(&url_owned)
+                .post(DDG_HTML_URL)
+                .form(&params_refs)
                 .send()
                 .map_err(|e| format!("request failed: {e}"))?;
 
@@ -261,13 +337,11 @@ impl Tool for WebSearch {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_REGION);
 
-        let encoded_query = utf8_percent_encode(query, NON_ALPHANUMERIC).to_string();
         let per_request_timeout = Duration::from_secs(12);
 
         const MAX_ATTEMPTS: usize = 3;
 
-        // Seed once per search invocation; each attempt offsets the UA index
-        // and refreshes fbid with a new nanos sample.
+        // Seed once per search invocation; each attempt offsets the UA index.
         let base_seed = nanos_seed();
 
         for attempt in 0..MAX_ATTEMPTS {
@@ -279,18 +353,21 @@ impl Tool for WebSearch {
                 std::thread::sleep(Duration::from_millis(base_ms + jitter_ms));
             }
 
-            // Pick a UA that differs across attempts.
-            let ua = pick_ua(base_seed, attempt);
+            // Pick a (UA, platform) pair that differs across attempts.
+            let (ua, platform) = pick_ua(base_seed, attempt);
 
-            // Fresh fbid per attempt.
-            let fbid = make_fbid(nanos_seed() ^ (attempt as u64).wrapping_mul(0xdead_beef_cafe_1337));
+            // Build the POST form body.
+            // `b` is the page offset (empty string = first page).
+            // `kl` is the region; include only when non-empty.
+            let mut form_params: Vec<(&str, &str)> = vec![
+                ("q", query),
+                ("b", ""),
+            ];
+            if !region.is_empty() {
+                form_params.push(("kl", region));
+            }
 
-            let url = format!(
-                "https://html.duckduckgo.com/html/?q={}&kl={}&fbid={}",
-                encoded_query, region, fbid
-            );
-
-            let (status, body) = match ddg_get(&url, ua, per_request_timeout) {
+            let (status, body) = match ddg_post(ua, platform, &form_params, per_request_timeout) {
                 Ok(v) => v,
                 Err(e) => {
                     // Network-level error; no point retrying further.
