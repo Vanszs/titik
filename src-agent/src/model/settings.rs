@@ -301,3 +301,51 @@ impl Settings {
         Ok(())
     }
 }
+
+/// Shared per-working-directory model setup.
+///
+/// In the pwd-keyed storage layout every session opened from the same working
+/// directory shares ONE `settings.json` in the bucket directory (see
+/// [`crate::model::store::shared_settings_path`]). That shared file holds only
+/// the model catalogue for the directory — the per-session behavioural knobs
+/// stay in each session's own [`Settings`]. This is the deserialised form of
+/// that shared file.
+///
+/// Additive: nothing reads or writes it yet (wired in a later stage). The single
+/// `session_models` field carries `#[serde(default)]` so a missing or partially
+/// written file loads as an empty catalogue.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalConfig {
+    /// Model catalogue shared by all sessions in this working directory. Mirrors
+    /// the global [`crate::model::app_config::ModelEntry`] shape; each entry still
+    /// references a provider by uuid.
+    #[serde(default)]
+    pub session_models: Vec<crate::model::app_config::ModelEntry>,
+}
+
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+impl LocalConfig {
+    /// Load the shared per-dir config from `path`.
+    ///
+    /// Returns an empty default when the file is missing or blank (a directory
+    /// that has never had its model setup written yet), but propagates a genuine
+    /// parse error so a corrupt file is surfaced rather than silently dropped.
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return Ok(Self::default()), // absent → empty catalogue
+        };
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default()); // blank file → empty catalogue
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Serialise (pretty-printed) to `path`, creating or overwriting the file.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_vec_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+}

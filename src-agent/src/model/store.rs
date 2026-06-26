@@ -67,6 +67,59 @@ pub fn ensure_dirs() -> Result<()> {
     Ok(())
 }
 
+// --- pwd-keyed layout (additive; not wired into the live flows yet) ----------
+//
+// The target storage layout buckets sessions by their working directory: every
+// session opened from the same canonical workdir shares one `pwd_hash` bucket,
+// which holds a shared `settings.json` (the per-dir model setup) plus one
+// sub-directory per session UUID. These helpers compute the hash and the paths;
+// the registry (`session_registry`) tracks which sessions belong to which bucket.
+
+/// Deterministic hash of a working directory, stable across runs.
+///
+/// Canonicalises `workdir` (resolving symlinks / `..`); if canonicalisation
+/// fails (e.g. the dir doesn't exist yet) the path is used as-is so the call is
+/// infallible. The canonical path string is hashed with UUID v5 over the OID
+/// namespace, and the simple (hyphenless) hex form is returned. Same directory
+/// → same hash every time.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+pub fn pwd_hash(workdir: &Path) -> String {
+    let canonical = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, path_str.as_bytes())
+        .simple()
+        .to_string()
+}
+
+/// The bucket directory for a working dir: `~/.simple-coder/sessions/<pwd_hash>/`.
+/// Shared by every session opened from that directory.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+pub fn pwd_bucket_dir(pwd_hash: &str) -> Result<PathBuf> {
+    Ok(sessions_dir()?.join(pwd_hash))
+}
+
+/// Shared per-dir settings path: `<pwd_bucket_dir>/settings.json`. Holds the
+/// [`LocalConfig`](crate::model::settings::LocalConfig) (model setup) common to
+/// all sessions in this working directory.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+pub fn shared_settings_path(pwd_hash: &str) -> Result<PathBuf> {
+    Ok(pwd_bucket_dir(pwd_hash)?.join("settings.json"))
+}
+
+/// A single session's directory under its bucket:
+/// `<pwd_bucket_dir>/<uuid>/`. Holds the per-session behavioural settings,
+/// messages, memory, and agents.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+pub fn session_dir(pwd_hash: &str, uuid: &str) -> Result<PathBuf> {
+    Ok(pwd_bucket_dir(pwd_hash)?.join(uuid))
+}
+
+/// Path to the SQLite session registry: `~/.simple-coder/session.sqlite`.
+#[allow(dead_code)] // consumed by the storage swap (later stage)
+pub fn registry_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("session.sqlite"))
+}
+
 /// List all sessions, sorted by directory mtime descending (most-recent first).
 ///
 /// Unreadable directories are silently skipped so a single corrupt session
