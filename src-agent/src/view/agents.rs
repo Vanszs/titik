@@ -25,7 +25,7 @@
 //! lives in [`crate::controller::input::handle_agents`].
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -33,6 +33,7 @@ use ratatui::{
 };
 
 use crate::app::mode::agents::{source_label, ModelPickerState, ToolPickerState};
+use crate::app::mode::editor::TextEditorState;
 use crate::app::mode::{AgentEditField, AgentSubMode, AgentsState};
 use crate::model::app_config::AppConfig;
 use crate::model::settings::Settings;
@@ -71,6 +72,13 @@ pub fn draw(
     settings: Option<&Settings>,
     palette: &Palette,
 ) {
+    // The full-screen prompt editor takes over the WHOLE frame when open: render
+    // it instead of the normal list/detail dashboard and bail (it owns all input).
+    if let Some(ed) = &st.prompt_editor {
+        draw_prompt_editor(frame, ed, palette);
+        return;
+    }
+
     // Outer vertical zones: header | body | footer.
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -132,6 +140,114 @@ pub fn draw(
     if let Some(picker) = &st.model_picker {
         draw_model_picker(frame, picker, palette, frame.area());
     }
+}
+
+/// Render the FULL-SCREEN nano-style prompt editor over the whole frame.
+///
+/// Layout (minimalist, matching the app's header convention):
+///
+/// ```text
+///  edit prompt
+/// ─────────────────────────────────────────  ← dim BOTTOM rule
+///   You are a focused subagent…             ← body (clipped, h-scrolled)
+///   …                                        ← real terminal cursor sits here
+///
+///  ↑↓←→ move · Enter newline · Esc save & back ← dim footer
+/// ```
+///
+/// ## Wrapping vs cursor placement
+/// We DELIBERATELY do not soft-wrap. Each logical line is HARD-CLIPPED to the
+/// inner width, and the body scrolls BOTH ways — vertically by whole lines and
+/// horizontally by chars — so the cursor cell is always on screen. This keeps the
+/// real terminal cursor's `(x, y)` EXACT (column maps 1:1 to a screen cell), which
+/// soft-wrapping would make fragile. Correctness over fanciness, per the spec.
+///
+/// The stored `scroll` is treated as a seed: the effective vertical scroll is
+/// recomputed every frame from the cursor and body height, so the view stays
+/// correct without mutating state (the renderer only borrows `ed`).
+fn draw_prompt_editor(frame: &mut Frame, ed: &TextEditorState, palette: &Palette) {
+    let area = frame.area();
+
+    // Header (title + BOTTOM rule) | body | footer.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // title line + BOTTOM border
+            Constraint::Min(0),    // editable body
+            Constraint::Length(1), // footer hint
+        ])
+        .split(area);
+
+    // --- Header: "edit prompt" (dim) with a BOTTOM rule. ---
+    let header_block = Block::new()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(palette.dim));
+    let header_inner = header_block.inner(outer[0]);
+    frame.render_widget(header_block, outer[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled("edit prompt", Style::default().fg(palette.dim))),
+        header_inner.inner(Margin { horizontal: 2, vertical: 0 }),
+    );
+
+    // --- Footer hint (dim). ---
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} Esc save & back",
+            Style::default().fg(palette.dim),
+        )),
+        outer[2].inner(Margin { horizontal: 2, vertical: 0 }),
+    );
+
+    // --- Body: horizontal margin so text isn't glued to the edge (chat-style). ---
+    let body = outer[1].inner(Margin { horizontal: 2, vertical: 0 });
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let inner_w = body.width as usize;
+    let body_h = body.height as usize;
+
+    // Vertical scroll: keep the cursor row inside [scroll, scroll + body_h).
+    // Seed from the stored scroll, then clamp it around the cursor.
+    let mut v_scroll = ed.scroll.min(ed.lines.len().saturating_sub(1));
+    if ed.row < v_scroll {
+        v_scroll = ed.row;
+    } else if ed.row >= v_scroll + body_h {
+        v_scroll = ed.row + 1 - body_h;
+    }
+
+    // Horizontal scroll: keep the cursor column inside [h_scroll, h_scroll+inner_w).
+    // Recomputed from 0 each frame (no stored horizontal offset) → always exact.
+    let h_scroll = if ed.col >= inner_w {
+        ed.col + 1 - inner_w
+    } else {
+        0
+    };
+
+    // Render the visible window: each logical line hard-clipped to the h-window.
+    let mut lines: Vec<Line> = Vec::with_capacity(body_h);
+    for li in v_scroll..(v_scroll + body_h).min(ed.lines.len()) {
+        let chars: Vec<char> = ed.lines[li].chars().collect();
+        let slice: String = if h_scroll < chars.len() {
+            chars[h_scroll..(h_scroll + inner_w).min(chars.len())]
+                .iter()
+                .collect()
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(Span::styled(slice, Style::default().fg(palette.fg))));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+
+    // --- Real terminal cursor at the exact mapped cell. ---
+    // x = body.x + (col - h_scroll); y = body.y + (row - v_scroll). Both offsets
+    // are non-negative by construction (the scroll math above guarantees the
+    // cursor is inside the window). Clamp to the body rect for safety.
+    let cursor_x = body.x + (ed.col.saturating_sub(h_scroll)) as u16;
+    let cursor_y = body.y + (ed.row.saturating_sub(v_scroll)) as u16;
+    frame.set_cursor_position(Position {
+        x: cursor_x.min(body.right().saturating_sub(1)),
+        y: cursor_y.min(body.bottom().saturating_sub(1)),
+    });
 }
 
 /// The display label for the agent's chosen registered model in a detail/browse

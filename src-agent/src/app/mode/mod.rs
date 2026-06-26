@@ -22,6 +22,7 @@ mod loading;
 mod picker;
 pub mod settings;
 pub mod agents;
+pub mod editor;
 
 pub use agents::{AgentEditField, AgentScope, AgentSubMode, AgentsState};
 pub use effort::EffortPickerState;

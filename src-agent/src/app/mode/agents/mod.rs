@@ -390,6 +390,11 @@ pub struct AgentsState {
     /// the Model field). Like `tool_picker` it owns all key input while open; the
     /// deepest modal in the agents editor.
     pub model_picker: Option<ModelPickerState>,
+    /// When `Some`, the FULL-SCREEN nano-style prompt editor is active (opened by
+    /// activating the Prompt/Body field). It replaces the whole agents view and
+    /// owns all key input; on Esc it commits its text back into `draft_body` and
+    /// closes (`= None`). A sub-state of `Mode::Agents`, not a separate mode.
+    pub prompt_editor: Option<crate::app::mode::editor::TextEditorState>,
 }
 
 impl AgentsState {
@@ -414,6 +419,7 @@ impl AgentsState {
             session_dir: session.path.clone(),
             tool_picker: None,
             model_picker: None,
+            prompt_editor: None,
         }
     }
 
@@ -595,6 +601,7 @@ impl AgentsState {
         self.field = AgentEditField::Description;
         self.tool_picker = None;
         self.model_picker = None;
+        self.prompt_editor = None;
     }
 
     // --- Tool picker overlay ---
@@ -643,6 +650,26 @@ impl AgentsState {
     /// Cancel the picker without modifying `draft_model_uuid`.
     pub fn cancel_model_picker(&mut self) {
         self.model_picker = None;
+    }
+
+    // --- Full-screen prompt editor ---
+
+    /// Open the full-screen prompt editor, seeded from the current `draft_body`.
+    ///
+    /// Called instead of starting inline editing when the user activates the
+    /// Prompt/Body field (Enter on its row). While open it owns all key input and
+    /// replaces the whole agents view.
+    pub fn open_prompt_editor(&mut self) {
+        self.prompt_editor =
+            Some(crate::app::mode::editor::TextEditorState::from_text(&self.draft_body));
+    }
+
+    /// Commit the prompt editor: write its text back into `draft_body` and close
+    /// the editor (returning to the field list). No-op when it isn't open.
+    pub fn commit_prompt_editor(&mut self) {
+        if let Some(ed) = self.prompt_editor.take() {
+            self.draft_body = ed.text();
+        }
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime

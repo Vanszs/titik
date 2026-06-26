@@ -235,8 +235,16 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         Mode::Agents(a) => {
             use crate::app::mode::AgentEditField;
             // Deepest-modal priority, mirroring `handle_agents`:
-            //   model picker (no text field) > tool picker (filter) > draft field.
-            if a.model_picker.is_some() {
+            //   prompt editor (multiline) > model picker (no text field) >
+            //   tool picker (filter) > draft field.
+            if let Some(ed) = a.prompt_editor.as_mut() {
+                // Full-screen prompt editor: insert the WHOLE clipboard at the
+                // cursor, newlines and all (multi-line aware). Drop bare CRs of a
+                // CRLF pair so pasted Windows text doesn't leave stray carriage
+                // returns in the buffer.
+                let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
+                ed.insert_str(&cleaned);
+            } else if a.model_picker.is_some() {
                 // Single-select list — no text entry; swallow the paste.
             } else if let Some(p) = a.tool_picker.as_mut() {
                 // Tool picker live filter (single-line).
@@ -1369,6 +1377,36 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
         return Action::Quit;
     }
 
+    // --- Full-screen prompt editor (TOP priority: intercepts ALL keys) ---
+    // A nano-style 2D editor over `draft_body`. While open it owns every key:
+    // printable chars insert, arrows/Home/End move the cursor, Enter splits the
+    // line, Backspace/Delete remove, and Esc COMMITS the text back into the draft
+    // and closes (returning to the field list). Everything else is swallowed.
+    if let Some(ed) = s.prompt_editor.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                // Commit: write the edited text back into `draft_body`, close.
+                s.commit_prompt_editor();
+            }
+            KeyCode::Enter => ed.newline(),
+            KeyCode::Backspace => ed.backspace(),
+            KeyCode::Delete => ed.delete(),
+            KeyCode::Left => ed.move_left(),
+            KeyCode::Right => ed.move_right(),
+            KeyCode::Up => ed.move_up(),
+            KeyCode::Down => ed.move_down(),
+            KeyCode::Home => ed.home(),
+            KeyCode::End => ed.end(),
+            // Printable char with no Ctrl modifier → insert it.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ed.insert_char(c);
+            }
+            // Swallow anything else (other Ctrl combos, Tab, function keys, …).
+            _ => {}
+        }
+        return Action::None;
+    }
+
     // --- Model picker overlay (DEEPEST priority: intercepts ALL keys) ---
     // Single-select pick-one list over the registered models: ↑/↓ navigate, Enter
     // commits the cursor's model uuid into the draft, Esc discards. Sits above the
@@ -1516,6 +1554,12 @@ fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent) ->
                                 {
                                     s.open_model_picker(&rest.config, &settings);
                                 }
+                            }
+                            // Prompt/Body opens the full-screen nano-style editor
+                            // (comfortable multi-line editing) instead of the
+                            // cramped inline path.
+                            AgentEditField::Body => {
+                                s.open_prompt_editor();
                             }
                             // Every other field is a plain text box.
                             _ => {
