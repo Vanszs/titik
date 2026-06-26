@@ -784,7 +784,14 @@ pub(super) fn run_loop(
         // The same applies while the comet shimmer is active: it must keep
         // travelling even when NO stream events arrive (first-token latency, tool
         // exec, the summarizer fold), so force a redraw each tick then too.
-        if state.rest.compact_anim_start.is_some() || shimmer_active {
+        // Similarly, while any sub-agent is running (background `/task` agents
+        // that don't set `waiting`), force redraws so the in-chat spinner animates.
+        let has_running_subagents = state
+            .rest
+            .subagents
+            .iter()
+            .any(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running));
+        if state.rest.compact_anim_start.is_some() || shimmer_active || has_running_subagents {
             dirty = true;
         }
 
@@ -803,6 +810,7 @@ pub(super) fn run_loop(
         let timeout = if state.rest.waiting
             || state.rest.catalogue_pending.is_some()
             || matches!(state.mode, Mode::Loading(_))
+            || has_running_subagents
         {
             Duration::from_millis(8)
         } else {

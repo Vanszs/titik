@@ -578,10 +578,10 @@ pub(crate) fn running_subagents(state: &AppState) -> usize {
 /// memory inputs and advance the same bookkeeping.
 ///
 /// On success: increments `next_subagent_id`, pushes the [`crate::app::subagent::SubAgent`]
-/// into `state.rest.subagents`, sets `subagents_open = true`, and returns
-/// `Some(id)` (the id assigned to the spawned sub-agent). Returns `None` when
-/// there is no client/session or the named agent doesn't exist — the caller
-/// surfaces that as it sees fit. Does NOT await the sub-agent.
+/// into `state.rest.subagents`, and returns `Some(id)` (the id assigned to the
+/// spawned sub-agent). Returns `None` when there is no client/session or the
+/// named agent doesn't exist — the caller surfaces that as it sees fit. Does NOT
+/// await the sub-agent. The `$` panel is NOT auto-opened; the user opens it manually.
 pub(crate) fn spawn_task(
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
@@ -628,7 +628,6 @@ pub(crate) fn spawn_task(
     )?;
     state.rest.next_subagent_id += 1;
     state.rest.subagents.push(sub);
-    state.rest.subagents_open = true;
     Some(id)
 }
 
