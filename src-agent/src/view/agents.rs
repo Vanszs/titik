@@ -221,7 +221,7 @@ fn draw_prompt_editor(
     // --- Footer hint (dim). ---
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} ^G generate \u{b7} Esc save & back",
+            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} F2 generate \u{b7} Esc save & back",
             Style::default().fg(palette.dim),
         )),
         outer[2].inner(Margin { horizontal: 2, vertical: 0 }),
