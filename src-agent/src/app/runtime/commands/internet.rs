@@ -7,20 +7,17 @@ use crate::model::settings::InternetMode;
 
 /// Status line for a just-applied internet `mode`.
 ///
-/// Shared by the three places that flip `internet_mode` (`/internet`, Ctrl+E,
-/// and the settings save) so the messaging never drifts:
-/// - `Full` but the full-mode env is NOT installed → tell the user nothing
-///   actually changed and how to provision it (the browser backend is inert
-///   until installed; `web_fetch` silently stays on raw HTTP otherwise).
-/// - `Full` and installed → the higher-token-usage note (exact em-dash kept).
-/// - `Simple` → the plain note.
-pub(crate) fn internet_status(mode: InternetMode) -> String {
+/// Returns `Some(msg)` **only** when `Full` is selected but the full-mode
+/// browser backend is not installed yet — that is the one case where the
+/// user needs to act (`koma --internet-fullmode-install`).  In all other
+/// cases (`Simple`, or `Full` + already installed) the mode switch is
+/// silent, so we return `None` and the caller skips the toast.
+pub(crate) fn internet_status(mode: InternetMode) -> Option<String> {
     match mode {
         InternetMode::Full if !crate::internet::is_installed() => {
-            "internet: full needs `koma --internet-fullmode-install`".to_string()
+            Some("internet: full needs `koma --internet-fullmode-install`".to_string())
         }
-        InternetMode::Full => "internet: full \u{2014} higher token usage".to_string(),
-        InternetMode::Simple => "internet: simple".to_string(),
+        _ => None,
     }
 }
 
@@ -53,7 +50,9 @@ pub(super) fn handle_internet(target: Option<InternetMode>, state: &mut AppState
         return Ok(());
     }
 
-    state.rest.set_toast_info(internet_status(new_mode));
+    if let Some(msg) = internet_status(new_mode) {
+        state.rest.set_toast_info(msg);
+    }
 
     Ok(())
 }

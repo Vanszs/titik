@@ -144,6 +144,9 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
             .filter(|d| d.session_only)
             .map(&to_entry)
             .collect();
+        // Capture old internet mode before overwriting, so we can toast only
+        // on actual change (avoids a spurious toast on every settings save).
+        let old_internet = state.rest.session.as_ref().map(|s| s.settings.internet_mode);
         if let Some(sess) = state.rest.session.as_mut() {
             sess.settings.api_key = api_key;
             sess.settings.model = model;
@@ -223,12 +226,15 @@ pub(super) fn handle_save_settings(state: &mut AppState) -> Result<()> {
         //    settings on the next request. (This also keeps the cache-stable
         //    plan_word intact across a settings save.)
         // f) Transient toast when switching internet mode (shared helper
-        //    so the Full-needs-install / token-usage / simple lines match the
-        //    `/internet` and Ctrl+E paths exactly). Placed here (after the
-        //    `if let Some(sess)` block closes) so `state.rest` is free to borrow.
-        state.rest.set_toast_info(
-            crate::app::runtime::commands::internet::internet_status(internet_mode),
-        );
+        //    so the Full-needs-install line matches the `/internet` and
+        //    Ctrl+E paths exactly).  Only fires when the mode actually
+        //    changed AND the helper has something to say (i.e. Full
+        //    without the browser backend installed).
+        if old_internet.is_some_and(|old| old != internet_mode) {
+            if let Some(msg) = crate::app::runtime::commands::internet::internet_status(internet_mode) {
+                state.rest.set_toast_info(msg);
+            }
+        }
     }
     state.mode = Mode::Chat;
     Ok(())

@@ -173,7 +173,9 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
             sess.rebuild_system();
             match sess.save() {
                 Ok(()) => {
-                    rest.set_toast_info(crate::app::runtime::commands::internet::internet_status(new_mode));
+                    if let Some(msg) = crate::app::runtime::commands::internet::internet_status(new_mode) {
+                        rest.set_toast_info(msg);
+                    }
                 }
                 Err(e) => {
                     rest.set_toast(format!("error saving settings: {e}"));
