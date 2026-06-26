@@ -1,0 +1,298 @@
+//! Key handler for the normal Chat mode.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::app::state::AppStateRest;
+use crate::controller::command;
+use super::{is_ctrl, Action};
+
+/// If the input's current (last, whitespace-delimited) token is a file
+/// reference (`@...`), return the partial path after the `@`. The file palette
+/// is shown while this is `Some`.
+pub fn file_ref_partial(input: &str) -> Option<&str> {
+    let start = input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+    let token = &input[start..];
+    token.strip_prefix('@')
+}
+
+/// Replace the current `@token` in `rest.input` with the selected entry.
+/// Completing a FILE appends a trailing space (closes the palette).
+/// Completing a FOLDER (trailing `/`) does NOT append a space so the palette
+/// stays open and the user can browse into the subfolder.
+fn complete_file_ref(rest: &mut AppStateRest, matches: &[String]) {
+    let sel = rest.palette_sel.min(matches.len().saturating_sub(1));
+    let entry = &matches[sel];
+    let start = rest.input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+    rest.input.truncate(start);
+    rest.input.push('@');
+    rest.input.push_str(entry);
+    if !entry.ends_with('/') {
+        rest.input.push(' '); // a FILE completion closes the palette
+    }
+    // a FOLDER (trailing '/') gets NO space → palette stays open at the new depth
+    rest.palette_sel = 0;
+    // The input was rewritten wholesale (truncate + push); park the caret at the
+    // end so it doesn't dangle inside the old, now-replaced @token.
+    rest.cursor_end();
+}
+
+/// This session's sent user messages, oldest-first (for bash-style recall).
+fn user_messages(rest: &AppStateRest) -> Vec<String> {
+    rest.session
+        .as_ref()
+        .map(|s| {
+            s.conversation
+                .messages()
+                .iter()
+                .filter(|m| m.role == crate::dto::chat::Role::User)
+                .map(|m| m.content.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Handle a key press while the app is in Chat mode.
+///
+/// Ctrl+C and Esc both interrupt an in-flight request when `waiting` is true;
+/// when idle they quit the app.  Ctrl+R re-sends the last message (idle only).
+pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
+    // The help overlay is modal: any key closes it and is otherwise swallowed.
+    if rest.help_open {
+        rest.help_open = false;
+        return Action::None;
+    }
+
+    // The sub-agents panel is modal: Up/Down move the selection, Ctrl+X kills the
+    // selected one (abrupt abort), Esc or any other key closes it. Mirrors the
+    // help-overlay modal handling above.
+    if rest.subagents_open {
+        let count = rest.subagents.len();
+        if is_ctrl(&key, 'x') {
+            if let Some(sa) = rest.subagents.get_mut(rest.subagent_sel) {
+                sa.abort.abort();
+                sa.status = crate::app::subagent::SubAgentStatus::Killed;
+            }
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Up => {
+                rest.subagent_sel = rest.subagent_sel.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if count > 0 {
+                    rest.subagent_sel = (rest.subagent_sel + 1).min(count - 1);
+                }
+            }
+            // Esc or any non-nav key closes the panel.
+            _ => {
+                rest.subagents_open = false;
+            }
+        }
+        return Action::None;
+    }
+
+    // Tool-approval modal: while a risky call is paused, only y/n/Esc matter.
+    // `y` approves (run it), `n`/Esc deny (feed "denied by user"); every other
+    // key is swallowed so the prompt stays up and input can't leak underneath.
+    if rest.awaiting_approval {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Action::ApproveTool,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::DenyTool,
+            _ => Action::None,
+        };
+    }
+
+    // Ctrl+C: interrupt if waiting OR a compaction animation is in flight
+    // (the animation keeps `compact_anim_start` set while the deferred apply
+    // is pending, and `waiting` may have already cleared if the model replied
+    // fast). Never quit mid-animation — that would leave the spinner stuck.
+    if is_ctrl(&key, 'c') {
+        return if rest.waiting || rest.compact_anim_start.is_some() {
+            Action::Interrupt
+        } else {
+            Action::None
+        };
+    }
+    // Ctrl+R: resend (only when idle).
+    if is_ctrl(&key, 'r') {
+        return if rest.waiting {
+            Action::None
+        } else {
+            Action::Resend
+        };
+    }
+    // Ctrl+J: insert a newline (reliable multiline trigger; unlike Shift+Enter
+    // this works on every terminal since Ctrl+J is literally the LF control code).
+    if is_ctrl(&key, 'j') {
+        rest.push_char('\n');
+        return Action::None;
+    }
+
+    // Max visible entries in the `@` file-reference palette (shared across all
+    // key handlers in this function and kept in sync with the view constant).
+    const FILE_PAL_MAX: usize = 10;
+
+    match key.code {
+        KeyCode::Esc => {
+            // Interrupt if waiting OR a compaction animation is still running
+            // (compact_anim_start remains set during the deferred-apply window).
+            // When idle, do nothing — only /quit exits the app.
+            if rest.waiting || rest.compact_anim_start.is_some() {
+                Action::Interrupt
+            } else {
+                Action::None
+            }
+        }
+        KeyCode::Enter => {
+            // Shift+Enter inserts a newline instead of submitting — but only when
+            // the terminal actually reports the SHIFT modifier on Enter (many do
+            // not). Ctrl+J above is the always-works fallback. Plain Enter falls
+            // through to the palette/slash/submit logic unchanged.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                rest.push_char('\n');
+                return Action::None;
+            }
+            let cmd_matches = command::palette_matches(&rest.input);
+            if !cmd_matches.is_empty() {
+                // Command palette open: run the highlighted command, not the raw text.
+                let sel = rest.palette_sel.min(cmd_matches.len() - 1);
+                let name = cmd_matches[sel].0;
+                rest.take_input();
+                Action::Slash(command::parse(name))
+            } else {
+                // File palette: complete instead of submitting when a file match is selected.
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    complete_file_ref(rest, &fmatches);
+                    Action::None
+                } else if rest.input.trim().starts_with('/') {
+                    let line = rest.take_input();
+                    Action::Slash(command::parse(&line))
+                } else if !rest.input.trim().is_empty() && !rest.waiting {
+                    Action::Submit(rest.take_input())
+                } else {
+                    Action::None
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            rest.backspace();
+            Action::None
+        }
+        // Caret movement within the input line (mid-text editing). Left/Right
+        // step one char; Home jumps to the start. End is handled below (it also
+        // doubles as "scroll to bottom" when the input is empty).
+        KeyCode::Left => {
+            rest.cursor_left();
+            Action::None
+        }
+        KeyCode::Right => {
+            rest.cursor_right();
+            Action::None
+        }
+        KeyCode::Home => {
+            rest.cursor_home();
+            Action::None
+        }
+        KeyCode::Up => {
+            // Command palette takes precedence; then file palette; then within-input
+            // line movement; finally history recall (only when already on line 0).
+            if !command::palette_matches(&rest.input).is_empty() {
+                rest.palette_sel = rest.palette_sel.saturating_sub(1);
+            } else {
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    rest.palette_sel = rest.palette_sel.saturating_sub(1);
+                } else if !rest.cursor_up() {
+                    let users = user_messages(rest);
+                    rest.history_prev(&users);
+                }
+            }
+            Action::None
+        }
+        KeyCode::Down => {
+            let n = command::palette_matches(&rest.input).len();
+            if n > 0 {
+                rest.palette_sel = (rest.palette_sel + 1).min(n - 1);
+            } else {
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    rest.palette_sel = (rest.palette_sel + 1).min(fmatches.len() - 1);
+                } else if !rest.cursor_down() {
+                    let users = user_messages(rest);
+                    rest.history_next(&users);
+                }
+            }
+            Action::None
+        }
+        KeyCode::Tab => {
+            let cmd_matches = command::palette_matches(&rest.input);
+            if !cmd_matches.is_empty() {
+                let sel = rest.palette_sel.min(cmd_matches.len() - 1);
+                rest.input = format!("{} ", cmd_matches[sel].0);
+                rest.palette_sel = 0;
+                rest.cursor_end(); // input replaced wholesale → caret to the end
+            } else {
+                let fmatches: Vec<String> = file_ref_partial(&rest.input)
+                    .map(|p| rest.dir_cache.read().map(|c| c.search(p, FILE_PAL_MAX)).unwrap_or_default())
+                    .unwrap_or_default();
+                if !fmatches.is_empty() {
+                    complete_file_ref(rest, &fmatches);
+                }
+            }
+            Action::None
+        }
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                rest.scroll_up();
+            }
+            Action::None
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                rest.scroll_down();
+            }
+            Action::None
+        }
+        // End: with input present, move the caret to the end of the line (text
+        // editing). With an EMPTY input it keeps its old meaning — jump the
+        // transcript to the bottom and resume following.
+        KeyCode::End => {
+            if rest.input.is_empty() {
+                rest.reset_scroll();
+            } else {
+                rest.cursor_end();
+            }
+            Action::None
+        }
+        // Shift+Tab toggles the tool-approval mode (Auto <-> Normal). Crossterm
+        // reports Shift+Tab as BackTab, so it never collides with plain Tab.
+        KeyCode::BackTab => {
+            rest.agent_mode = rest.agent_mode.toggled();
+            rest.status = format!("mode: {}", rest.agent_mode.label());
+            Action::None
+        }
+        // `$` on an EMPTY input opens the sub-agents panel instead of being typed
+        // (mirrors the `/` and `@` palette triggers). With any input present it's
+        // a normal character.
+        KeyCode::Char('$')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) && rest.input.is_empty() =>
+        {
+            rest.subagents_open = true;
+            rest.subagent_sel = rest
+                .subagent_sel
+                .min(rest.subagents.len().saturating_sub(1));
+            Action::None
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            rest.push_char(c);
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
