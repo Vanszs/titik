@@ -1,0 +1,152 @@
+#!/bin/sh
+# koma installer — https://koma.run
+# Usage:
+#   curl -fsSL https://koma.run/install.sh | sh
+#   curl -fsSL https://koma.run/install.sh | sh -s -- --with-research
+#
+# Environment overrides:
+#   KOMA_RELEASE_BASE   override the base download URL
+#   KOMA_INSTALL_DIR    override the install directory (default /usr/local/bin)
+
+set -e
+
+# Base download URL (GitHub latest release). Override with KOMA_RELEASE_BASE=...
+KOMA_RELEASE_BASE="${KOMA_RELEASE_BASE:-https://github.com/aula-id/simple-coders/releases/latest/download}"
+
+INSTALL_DIR="${KOMA_INSTALL_DIR:-/usr/local/bin}"
+
+WITH_RESEARCH=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-research) WITH_RESEARCH=1 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# OS detection
+# ---------------------------------------------------------------------------
+_os=$(uname -s)
+case "$_os" in
+    Linux)  os="linux"  ;;
+    Darwin) os="darwin" ;;
+    *)
+        echo "ERROR: unsupported operating system: $_os" >&2
+        echo "koma currently supports Linux and macOS." >&2
+        exit 1
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Architecture detection
+# ---------------------------------------------------------------------------
+_arch=$(uname -m)
+case "$_arch" in
+    x86_64|amd64)   arch="x86_64" ;;
+    aarch64|arm64)  arch="arm64"  ;;
+    *)
+        echo "ERROR: unsupported architecture: $_arch" >&2
+        echo "koma currently supports x86_64 and arm64." >&2
+        exit 1
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Build asset URL
+# ---------------------------------------------------------------------------
+# The current release publishes a SINGLE binary asset named "koma" (built for
+# the maintainer's platform). os/arch are detected below for the macOS
+# quarantine step and the info line, but are not yet part of the asset name.
+# TODO(koma.run): when per-platform artifacts exist, switch to
+#   asset="koma-${os}-${arch}"  and publish koma-linux-x86_64 / koma-darwin-arm64 etc.
+asset="koma"
+url="${KOMA_RELEASE_BASE}/${asset}"
+
+echo "koma installer — detected ${os}/${arch}"
+echo "  url:      $url"
+echo "  install:  $INSTALL_DIR/koma"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Temp file + cleanup trap
+# ---------------------------------------------------------------------------
+tmp=$(mktemp)
+cleanup() {
+    rm -f "$tmp"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+echo "Downloading koma..."
+if command -v curl > /dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp" || {
+        echo "ERROR: download failed from $url" >&2
+        exit 1
+    }
+elif command -v wget > /dev/null 2>&1; then
+    wget -qO "$tmp" "$url" || {
+        echo "ERROR: download failed from $url" >&2
+        exit 1
+    }
+else
+    echo "ERROR: neither curl nor wget found; please install one and retry." >&2
+    exit 1
+fi
+
+chmod +x "$tmp"
+
+# ---------------------------------------------------------------------------
+# Install — fall back to sudo if the directory is not user-writable
+# ---------------------------------------------------------------------------
+if [ -w "$INSTALL_DIR" ]; then
+    mv "$tmp" "$INSTALL_DIR/koma"
+else
+    if [ "$(id -u)" = "0" ]; then
+        mv "$tmp" "$INSTALL_DIR/koma"
+    else
+        echo "  $INSTALL_DIR is not writable; using sudo for install step."
+        sudo mv "$tmp" "$INSTALL_DIR/koma"
+        sudo chmod +x "$INSTALL_DIR/koma"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# macOS: strip Gatekeeper quarantine attribute
+# ---------------------------------------------------------------------------
+if [ "$os" = "darwin" ]; then
+    xattr -d com.apple.quarantine "$INSTALL_DIR/koma" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: provision Python research environment
+# ---------------------------------------------------------------------------
+if [ "$WITH_RESEARCH" = "1" ]; then
+    echo ""
+    echo "Provisioning internet/research environment (downloads ~80MB Firefox)..."
+    "$INSTALL_DIR/koma" --install-internet
+fi
+
+# ---------------------------------------------------------------------------
+# Success
+# ---------------------------------------------------------------------------
+echo ""
+echo "koma installed to $INSTALL_DIR/koma"
+echo ""
+echo "  Run 'koma' to start."
+echo "  Re-run this installer with --with-research (or run 'koma --install-internet')"
+echo "  inside koma) to enable full internet / research mode."
+echo ""
+
+# Warn if install dir may not be on PATH
+case ":${PATH}:" in
+    *":${INSTALL_DIR}:"*) ;;
+    *)
+        echo "  NOTE: $INSTALL_DIR does not appear to be in your PATH."
+        echo "  Add the following to your shell profile and restart your terminal:"
+        echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
+        echo ""
+        ;;
+esac
+
+echo "  https://koma.run"
