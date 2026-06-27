@@ -184,6 +184,67 @@ pub fn strip_tool_call_tags(content: &str) -> String {
     collapse_blank_runs(s.trim_end())
 }
 
+/// Strip ANSI/VT escape sequences from `s`, returning clean plain text.
+///
+/// Handles the three common sequence families that colorized CLI output
+/// (git, cargo, tsc, etc.) emits:
+///
+/// - **CSI** (`ESC [` followed by params ending in a final-byte in `@`..`~`):
+///   covers `\x1b[96m`, `\x1b[0m`, `\x1b[1;31m`, cursor-move, erase, etc.
+/// - **OSC** (`ESC ]` terminated by BEL `\x07` or ESC-backslash `ESC \`):
+///   window-title and hyperlink sequences.
+/// - **All others** (`ESC` followed by any single byte): two-byte escapes such
+///   as `\x1b(B` (G0 charset select).
+///
+/// All other characters are copied verbatim; the scanner operates on Rust
+/// `char`s so UTF-8 boundaries are always respected.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // ESC: peek at the next char to determine sequence type.
+        match chars.peek().copied() {
+            Some('[') => {
+                // CSI: consume '[' then skip until the final byte (0x40..=0x7E).
+                chars.next(); // consume '['
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break; // final byte consumed; sequence done
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: consume ']' then skip until BEL or ESC-backslash ST.
+                chars.next(); // consume ']'
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\u{07}') => break, // BEL terminator
+                        Some('\u{1b}') => {
+                            // ESC-backslash (ST) terminator: consume '\\'.
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => {} // interior OSC byte, skip
+                    }
+                }
+            }
+            Some(_) => {
+                // Any other two-byte escape (e.g. ESC ( B): skip the next byte.
+                chars.next();
+            }
+            None => {} // lone ESC at end of string: nothing to consume
+        }
+    }
+    out
+}
+
 /// Collapse any run of 3+ consecutive newlines into exactly 2, leaving other
 /// whitespace untouched. Used to tidy the gap left behind when a `<tool_call>`
 /// span is removed from between blocks of prose.
@@ -532,3 +593,31 @@ mod sanitize_tool_arguments_tests {
         assert_json_eq(&out, r#"{"command":"x"}"#);
     }
 }
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_color_codes() {
+        // ESC[96m...ESC[0m — the canonical colorized output case
+        assert_eq!(strip_ansi("\x1b[96mhello\x1b[0m"), "hello");
+    }
+
+    #[test]
+    fn plain_text_unchanged() {
+        let plain = "just a normal string with no escapes";
+        assert_eq!(strip_ansi(plain), plain);
+    }
+
+    #[test]
+    fn strips_bold_and_multi_param() {
+        assert_eq!(strip_ansi("\x1b[1;31merror\x1b[0m: bad"), "error: bad");
+    }
+
+    #[test]
+    fn strips_mixed_content() {
+        assert_eq!(strip_ansi("\x1b[32mok\x1b[0m plain \x1b[31mfail\x1b[0m"), "ok plain fail");
+    }
+}
+

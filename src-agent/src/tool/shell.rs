@@ -81,6 +81,10 @@ impl Tool for Bash {
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
 
+        // Strip ANSI color codes so git/cargo colorized output doesn't bleed into
+        // tool results, history, and the rolling summary.
+        let combined = crate::dto::chat::strip_ansi(&combined);
+
         // Cap to the LAST MAX_CHARS chars so big build logs don't flood the context.
         const MAX_CHARS: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
         let truncated;
