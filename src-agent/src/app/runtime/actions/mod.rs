@@ -33,7 +33,7 @@ pub(super) fn apply_action(
         Action::None => {}
 
         Action::Quit => {
-            if state.rest.waiting {
+            if state.rest.fg().waiting {
                 crate::app::runtime::stream::abort_current(&mut state.rest);
             }
             state.rest.should_quit = true;

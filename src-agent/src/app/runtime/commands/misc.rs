@@ -20,7 +20,7 @@ pub(super) fn handle_mode(state: &mut AppState) -> Result<()> {
 /// Needs an active session (drafts seed from it); also blocked while a
 /// request is in flight, mirroring the /compact guard.
 pub(super) fn handle_settings(state: &mut AppState) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
@@ -29,7 +29,7 @@ pub(super) fn handle_settings(state: &mut AppState) -> Result<()> {
     // (debounced) the first time it opens / a key is typed — see
     // `controller::input::handle_settings`. A boot prefetch keyed to the
     // Main endpoint was wrong for editing a model on a DIFFERENT provider.
-    let Some(session) = state.rest.session.as_ref() else {
+    let Some(session) = state.rest.fg().session.as_ref() else {
         state.rest.status = "no active session".into();
         return Ok(());
     };
@@ -43,11 +43,11 @@ pub(super) fn handle_settings(state: &mut AppState) -> Result<()> {
 /// Needs an active session (the registry loads from it); also blocked
 /// while a request is in flight, mirroring the /settings + /compact guards.
 pub(super) fn handle_agents(state: &mut AppState) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
-    let Some(session) = state.rest.session.as_ref() else {
+    let Some(session) = state.rest.fg().session.as_ref() else {
         state.rest.status = "no active session".into();
         return Ok(());
     };
@@ -58,11 +58,11 @@ pub(super) fn handle_agents(state: &mut AppState) -> Result<()> {
 
 /// Handle the `/select` command: arm text-selection mode.
 pub(super) fn handle_select(state: &mut AppState) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
-    if state.rest.session.is_none() {
+    if state.rest.fg().session.is_none() {
         state.rest.status = "no active session".into();
         return Ok(());
     }
@@ -78,7 +78,7 @@ pub(super) fn handle_help(state: &mut AppState) -> Result<()> {
 
 /// Handle the `/quit` command: abort any in-flight request and exit.
 pub(super) fn handle_quit(state: &mut AppState) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         abort_current(&mut state.rest);
     }
     state.rest.should_quit = true;

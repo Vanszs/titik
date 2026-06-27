@@ -12,7 +12,7 @@ use super::{is_ctrl, Action};
 /// or quit when there is no session (opened by the --resume startup flag).
 pub fn handle_picker(p: &mut PickerState, rest: &mut AppStateRest, key: KeyEvent) -> Action {
     if is_ctrl(&key, 'c') {
-        return if rest.session.is_some() {
+        return if rest.fg().session.is_some() {
             Action::CancelPickerToChat
         } else {
             Action::Quit
@@ -21,7 +21,7 @@ pub fn handle_picker(p: &mut PickerState, rest: &mut AppStateRest, key: KeyEvent
 
     match key.code {
         KeyCode::Esc => {
-            if rest.session.is_some() {
+            if rest.fg().session.is_some() {
                 Action::CancelPickerToChat
             } else {
                 Action::Quit

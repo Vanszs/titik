@@ -24,14 +24,14 @@ pub(super) fn handle_new(
     abort_current(&mut state.rest);
     // Halt any in-flight agentic loop before swapping sessions, including
     // a half-finished approval machine.
-    state.rest.pending_tool_calls.clear();
-    state.rest.agent_steps = 0;
-    state.rest.awaiting_approval = false;
-    state.rest.tool_idx = 0;
-    state.rest.tool_results.clear();
+    state.rest.fg_mut().pending_tool_calls.clear();
+    state.rest.fg_mut().agent_steps = 0;
+    state.rest.fg_mut().awaiting_approval = false;
+    state.rest.fg_mut().tool_idx = 0;
+    state.rest.fg_mut().tool_results.clear();
     // Drop any staged image attachments so they don't leak into the new session.
     state.rest.pending_attachments.clear();
-    let _ = state.rest.take_stream(); // discard partial; belongs to old session
+    let _ = state.rest.fg_mut().take_stream(); // discard partial; belongs to old session
     let mut sess = match store::create_session() {
         Ok(s) => s,
         Err(e) => {
@@ -49,11 +49,11 @@ pub(super) fn handle_new(
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     sess.settings.provider = state.rest.last_provider.clone().unwrap_or_default();
     let _ = sess.save();
-    state.rest.prev_session = state.rest.session.take();
+    state.rest.prev_session = state.rest.fg_mut().session.take();
     state.rest.reset_scroll();
     if sess.settings.api_key.is_empty() {
         // No creds known yet — fall back to the credential prompt.
-        state.rest.session = Some(sess);
+        state.rest.fg_mut().session = Some(sess);
         *client = None;
         state.mode = Mode::KeyInput(KeyInputForm::prefilled(
             String::new(),
@@ -64,7 +64,7 @@ pub(super) fn handle_new(
     } else {
         *client = Some(super::super::build_client());
         let sess_path = sess.path.clone();
-        state.rest.session = Some(sess);
+        state.rest.fg_mut().session = Some(sess);
         // Fresh session → totals are 0; calling is harmless and keeps the
         // readout reset when switching sessions.
         state.rest.load_token_totals(&sess_path);
@@ -86,7 +86,7 @@ pub(super) fn handle_new(
 /// Unlike CancelKeyInputToPicker we do NOT clear the current session/client —
 /// if the user Escapes the picker they return to the active chat unchanged.
 pub(super) fn handle_resume(state: &mut AppState) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
@@ -107,7 +107,7 @@ pub(super) fn handle_rename(state: &mut AppState, name: String) -> Result<()> {
         state.rest.status = "usage: /rename <name>".into();
         return Ok(());
     }
-    if let Some(sess) = state.rest.session.as_mut() {
+    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
         match store::rename_session(sess, &name) {
             Ok(()) => state.rest.status = format!("renamed to {}", sess.name),
             Err(e) => state.rest.status = format!("error: {e}"),

@@ -19,7 +19,7 @@ pub(super) fn handle_task(
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
     // Guard: needs an active client + session.
-    if client.is_none() || state.rest.session.is_none() {
+    if client.is_none() || state.rest.fg().session.is_none() {
         state.rest.status = "no active session".into();
         return Ok(());
     }

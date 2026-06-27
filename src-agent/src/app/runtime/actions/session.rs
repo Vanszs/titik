@@ -36,8 +36,8 @@ pub(super) fn handle_cancel_key_input(
         } else {
             None
         };
-        state.rest.session = Some(prev);
-    } else if let Some(settings) = state.rest.session.as_ref().map(|s| s.settings.clone()) {
+        state.rest.fg_mut().session = Some(prev);
+    } else if let Some(settings) = state.rest.fg().session.as_ref().map(|s| s.settings.clone()) {
         // Defensive: no stashed prev; rebuild from current session.
         *client = if usable(state, &settings) {
             Some(build_client())
@@ -68,7 +68,7 @@ pub(super) fn handle_cancel_key_input_to_picker(
     // Esc out of a picker-launched KeyInput: drop the partially-set
     // session, clear any client, and return to the session picker
     // instead of pinning a no-client Chat.
-    state.rest.session = None;
+    state.rest.fg_mut().session = None;
     state.rest.prev_session = None;
     *client = None;
     state.rest.reset_scroll();
@@ -81,7 +81,7 @@ pub(super) fn handle_cancel_key_input_to_picker(
 /// session state.
 pub(super) fn handle_cancel_picker_to_chat(state: &mut AppState) -> Result<()> {
     // Esc/Ctrl+C in the /resume-opened session picker: the active
-    // session is still in state.rest.session (untouched), so just
+    // session is still in state.rest.fg().session (untouched), so just
     // swap the mode back to Chat without disturbing anything else.
     state.mode = Mode::Chat;
     Ok(())
@@ -127,7 +127,7 @@ pub(super) fn handle_picker_select(
             .last_model
             .clone()
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        state.rest.session = Some(sess);
+        state.rest.fg_mut().session = Some(sess);
         state.rest.reset_scroll();
         state.mode = Mode::KeyInput(KeyInputForm::prefilled(lk, lm, false, true));
     } else {
@@ -141,7 +141,7 @@ pub(super) fn handle_picker_select(
         // don't leak into the newly-selected one.
         state.rest.pending_attachments.clear();
         let sess_path = sess.path.clone();
-        state.rest.session = Some(sess);
+        state.rest.fg_mut().session = Some(sess);
         // Existing session: seed the running totals from its full sqlite
         // log so the readout reflects prior usage.
         state.rest.load_token_totals(&sess_path);

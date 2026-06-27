@@ -40,6 +40,7 @@ pub(super) fn render_transcript(
             cache.blocks.clear();
         }
         let committed: Vec<&crate::dto::chat::ChatMessage> = rest
+            .fg()
             .session
             .as_ref()
             .map(|s| {
@@ -115,8 +116,8 @@ pub(super) fn render_transcript(
         // answers), so the block shows whenever EITHER buffer has text — they
         // share one `●` bullet. Stream renders plain (not markdown) for perf +
         // partial-fence safety.
-        let partial_content = rest.streaming.as_deref().unwrap_or("");
-        let partial_reasoning = rest.stream_reasoning.as_str();
+        let partial_content = rest.fg().streaming.as_deref().unwrap_or("");
+        let partial_reasoning = rest.fg().stream_reasoning.as_str();
         if !partial_content.is_empty() || !partial_reasoning.is_empty() {
             if !first {
                 lines.push(Line::from(""));
@@ -162,6 +163,7 @@ pub(super) fn render_transcript(
         // sub-agent is Running; disappears automatically when all finish.
         const SA_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let running_agents: Vec<&crate::app::subagent::SubAgent> = rest
+            .fg()
             .subagents
             .iter()
             .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))

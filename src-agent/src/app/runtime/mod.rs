@@ -11,7 +11,7 @@
 //! 100ms when idle) so a quiet UI burns no CPU.
 //!
 //! Async bridge: one channel per request. [`start_stream_task`] opens a fresh
-//! channel, stashes the receiver in `state.rest.active_rx`, and spawns a task
+//! channel, stashes the receiver in `state.rest.fg().active_rx`, and spawns a task
 //! holding the sender. Cancelling (interrupt / `/new` / quit) just drops the
 //! receiver, so a superseded task's late events vanish with no generation
 //! bookkeeping.
@@ -52,18 +52,18 @@ pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 /// is unchanged (so calling it on every activation is cheap and idempotent).
 /// All lock IO is best-effort, so this never fails or blocks.
 pub(super) fn reconcile_session_lock(state: &mut AppState) {
-    let cur = state.rest.session.as_ref().map(|s| s.path.clone());
-    if state.rest.held_lock == cur {
+    let cur = state.rest.fg().session.as_ref().map(|s| s.path.clone());
+    if state.rest.fg().held_lock == cur {
         return; // active session unchanged → on-disk lock already correct
     }
     // Drop the stale lock first so switching away from a session unlocks it.
-    if let Some(old) = state.rest.held_lock.take() {
+    if let Some(old) = state.rest.fg_mut().held_lock.take() {
         crate::model::store::remove_lock(&old);
     }
     // Acquire the new session's lock (if there is an active session now).
     if let Some(new) = cur {
         crate::model::store::write_lock(&new);
-        state.rest.held_lock = Some(new);
+        state.rest.fg_mut().held_lock = Some(new);
     }
 }
 
@@ -100,14 +100,14 @@ pub(super) fn warm_session(
     // Snapshot what we need, dropping the session borrow before mutating
     // `state.mode` / `state.rest`. `config` is cloned so the role resolution
     // below doesn't borrow `state` across the spawn.
-    let (workdir, settings, workdirs) = match state.rest.session.as_ref() {
+    let (workdir, settings, workdirs) = match state.rest.fg().session.as_ref() {
         Some(s) => (s.workdir(), s.settings.clone(), s.workdirs()),
         None => return,
     };
     let config = state.rest.config.clone();
     // Workspace reindex is already async (background thread); fire it always,
     // independent of whether we show the loading splash.
-    crate::tool::dircache::reindex(workdirs, state.rest.dir_cache.clone());
+    crate::tool::dircache::reindex(workdirs, state.rest.fg().dir_cache.clone());
 
     // Decide the warm work. Awareness runs only when the setting is on. It needs a
     // client AND a routable resolved route (an Anthropic-typed provider can't be
@@ -226,7 +226,7 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
                     sess.settings.provider = lp.clone().unwrap_or_default();
                     let _ = sess.save();
                     let sess_path = sess.path.clone();
-                    st.rest.session = Some(sess);
+                    st.rest.fg_mut().session = Some(sess);
                     // Fresh startup session → totals 0; harmless and explicit.
                     st.rest.load_token_totals(&sess_path);
                 }
@@ -286,6 +286,7 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // itself is keyless; the gate just preserves the no-client-no-send invariant.
     let mut client: Option<Arc<OpenRouterClient>> = state
         .rest
+        .fg()
         .session
         .as_ref()
         .filter(|s| {
@@ -308,7 +309,7 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // session is immediately re-enterable. Runs on both the Ok and Err paths
     // (this is after run_loop returns either way). A crash that skips this is
     // covered by PID-liveness staleness in `store::is_locked`.
-    if let Some(p) = state.rest.held_lock.take() {
+    if let Some(p) = state.rest.fg_mut().held_lock.take() {
         crate::model::store::remove_lock(&p);
     }
 

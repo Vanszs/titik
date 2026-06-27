@@ -11,7 +11,7 @@ use crate::service::openrouter::OpenRouterClient;
 /// `run_tool` (inline tool calls) and the `/task` spawner (sub-agent launch)
 /// use the EXACT same paths and dir-cache reference.
 pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
-    let session_ref = state.rest.session.as_ref();
+    let session_ref = state.rest.fg().session.as_ref();
     let workspace = session_ref
         .as_ref()
         .map(|s| s.workdir())
@@ -38,7 +38,7 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
     crate::tool::ToolCtx {
         workspace,
         workspaces,
-        dir_cache: state.rest.dir_cache.clone(),
+        dir_cache: state.rest.fg().dir_cache.clone(),
         memory_dir,
         internet_mode,
     }
@@ -53,6 +53,7 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
 pub(crate) fn running_subagents(state: &AppState) -> usize {
     state
         .rest
+        .fg()
         .subagents
         .iter()
         .filter(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
@@ -79,18 +80,18 @@ fn spawn_task_with_id(
     task_text: &str,
     tool_call_id: Option<String>,
 ) -> Option<usize> {
-    if client.is_none() || state.rest.session.is_none() {
+    if client.is_none() || state.rest.fg().session.is_none() {
         return None;
     }
     // Snapshot inputs before borrowing state mutably below — identical to the
     // `/task` command's construction so the two paths can never diverge.
     let ctx = build_tool_ctx(state);
     let (session_dir, config, settings, awareness, memory_md) = {
-        let sess = state.rest.session.as_ref().unwrap();
+        let sess = state.rest.fg().session.as_ref().unwrap();
         let session_dir = sess.path.clone();
         let config = state.rest.config.clone();
         let settings = sess.settings.clone();
-        let awareness = state.rest.awareness_summary.clone().unwrap_or_default();
+        let awareness = state.rest.fg().awareness_summary.clone().unwrap_or_default();
         // Sub-agents receive the per-PROJECT memory INDEX (pointers only), the
         // same text injected into the main system prompt. Empty when absent.
         let memory_md = crate::model::store::memory_dir(&sess.pwd_hash)
@@ -117,7 +118,7 @@ fn spawn_task_with_id(
         task_text,
         tool_call_id,
     )?;
-    state.rest.subagents.push(sub);
+    state.rest.fg_mut().subagents.push(sub);
     Some(id)
 }
 
@@ -139,10 +140,10 @@ pub(crate) fn spawn_task(
     task_text: &str,
     tool_call_id: Option<String>,
 ) -> Option<usize> {
-    let id = state.rest.next_subagent_id;
+    let id = state.rest.fg().next_subagent_id;
     let spawned = spawn_task_with_id(state, client, handle, id, agent_name, task_text, tool_call_id)?;
     // Only consume the id on a successful spawn (a failed spawn leaves it free).
-    state.rest.next_subagent_id += 1;
+    state.rest.fg_mut().next_subagent_id += 1;
     Some(spawned)
 }
 
@@ -190,13 +191,14 @@ pub(crate) fn spawn_or_queue(
     } else {
         // Over cap: enqueue (unlimited). Needs a client+session so the queued
         // delegation can eventually run and (for a task-tool call) unpark the turn.
-        if client.is_none() || state.rest.session.is_none() {
+        if client.is_none() || state.rest.fg().session.is_none() {
             return SpawnOutcome::Failed;
         }
-        let id = state.rest.next_subagent_id;
-        state.rest.next_subagent_id += 1;
+        let id = state.rest.fg().next_subagent_id;
+        state.rest.fg_mut().next_subagent_id += 1;
         state
             .rest
+            .fg_mut()
             .pending_subagents
             .push_back(crate::app::subagent::PendingSubagent {
                 id,
@@ -232,11 +234,11 @@ pub(crate) fn try_start_pending(
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
-    if client.is_none() || state.rest.session.is_none() {
+    if client.is_none() || state.rest.fg().session.is_none() {
         return;
     }
     while running_subagents(state) < crate::app::subagent::MAX_SUBAGENTS {
-        let Some(pending) = state.rest.pending_subagents.pop_front() else {
+        let Some(pending) = state.rest.fg_mut().pending_subagents.pop_front() else {
             break;
         };
         let started = spawn_task_with_id(
@@ -252,9 +254,9 @@ pub(crate) fn try_start_pending(
             // The agent no longer resolves. Drop the entry; for a task-tool
             // delegation, free its parked call so the round can't hang.
             if let Some(call_id) = pending.tool_call_id {
-                if state.rest.pending_subagent_calls.contains(&call_id) {
-                    state.rest.pending_subagent_calls.retain(|c| c != &call_id);
-                    state.rest.tool_results.push((
+                if state.rest.fg().pending_subagent_calls.contains(&call_id) {
+                    state.rest.fg_mut().pending_subagent_calls.retain(|c| c != &call_id);
+                    state.rest.fg_mut().tool_results.push((
                         call_id,
                         format!("error: unknown agent '{}'", pending.agent_name),
                     ));

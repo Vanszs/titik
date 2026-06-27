@@ -20,11 +20,11 @@ pub(super) fn handle_submit(
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
-    if client.is_none() || state.rest.session.is_none() {
+    if client.is_none() || state.rest.fg().session.is_none() {
         state.rest.status = "no active session".into();
         return Ok(());
     }
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
@@ -38,7 +38,7 @@ pub(super) fn handle_submit(
     // `take_attachments()` so the interactive attachments are still on the
     // composer; the scan's attachments are appended to them afterward.
     let (text, scan_attachments) =
-        if let Some(sess) = state.rest.session.as_ref() {
+        if let Some(sess) = state.rest.fg().session.as_ref() {
             let images_dir = sess.images_dir();
             let workdir = sess.workdir();
             crate::model::attachment::scan_at_image_tokens(&text, &images_dir, &workdir)
@@ -52,7 +52,7 @@ pub(super) fn handle_submit(
     attachments.extend(scan_attachments);
     let had_image = !attachments.is_empty();
     let history = {
-        let sess = state.rest.session.as_mut().unwrap();
+        let sess = state.rest.fg_mut().session.as_mut().unwrap();
         let _ = msglog::append(&sess.path, Role::User, &text, None);
         sess.conversation.push_user_with_attachments(text, attachments);
         if let Err(e) = sess.save() {
@@ -66,7 +66,7 @@ pub(super) fn handle_submit(
     // chat and keep the image un-sent (the orange attachment tree still shows it).
     // Capability mirrors run.rs: cold/None catalogue => assume capable (never wrongly block).
     if had_image {
-        let main = state.rest.session.as_ref().and_then(|sess| {
+        let main = state.rest.fg().session.as_ref().and_then(|sess| {
             crate::app::resolve::resolve_role(
                 &state.rest.config,
                 &sess.settings,
@@ -85,19 +85,19 @@ pub(super) fn handle_submit(
         }
     }
     state.rest.reset_scroll();
-    state.rest.begin_stream();
-    state.rest.waiting = true;
+    state.rest.fg_mut().begin_stream();
+    state.rest.fg_mut().waiting = true;
     // A new user turn starts fresh: no carried-over tool-call rounds or
     // a half-finished approval machine.
-    state.rest.agent_steps = 0;
-    state.rest.pending_tool_calls.clear();
-    state.rest.awaiting_approval = false;
-    state.rest.tool_idx = 0;
-    state.rest.tool_results.clear();
+    state.rest.fg_mut().agent_steps = 0;
+    state.rest.fg_mut().pending_tool_calls.clear();
+    state.rest.fg_mut().awaiting_approval = false;
+    state.rest.fg_mut().tool_idx = 0;
+    state.rest.fg_mut().tool_results.clear();
     // Hard-reset the deferred-task lane so a new submit can never inherit
     // awaiting_tool_tasks=true or stale pending ids from a prior halt path.
-    state.rest.pending_tool_tasks.clear();
-    state.rest.awaiting_tool_tasks = false;
+    state.rest.fg_mut().pending_tool_tasks.clear();
+    state.rest.fg_mut().awaiting_tool_tasks = false;
     // Phase label for the comet: a single word the shimmer sweeps across
     // (the elapsed counter is appended by the renderer). No trailing dots —
     // the comet supplies the motion, `· Ns` supplies the elapsed.
@@ -109,8 +109,8 @@ pub(super) fn handle_submit(
     // task. It sends one HarnessVerdict on a dedicated channel (drained
     // in run_loop) — it NEVER gates the stream that just started. Drop
     // any stale receiver from a prior turn first.
-    state.rest.harness_rx = None;
-    let pc_inputs = match (client.as_ref(), state.rest.session.as_ref()) {
+    state.rest.fg_mut().harness_rx = None;
+    let pc_inputs = match (client.as_ref(), state.rest.fg().session.as_ref()) {
         (Some(c), Some(sess)) if sess.settings.classifier_enabled => Some((
             Arc::clone(c),
             state.rest.config.clone(),
@@ -120,7 +120,7 @@ pub(super) fn handle_submit(
     };
     if let Some((c, config, settings)) = pc_inputs {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        state.rest.harness_rx = Some(rx);
+        state.rest.fg_mut().harness_rx = Some(rx);
         handle.spawn(async move {
             let v =
                 crate::app::harness::classify_prompt(&c, &config, &settings, &pc_prompt)
@@ -142,30 +142,31 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
     // Custom finalization (not finish_stream): the partial buffer is
     // committed with an "  [interrupted]" marker. abort_current drops
     // active_rx, so the aborted task's late events are ignored.
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         abort_current(&mut state.rest);
         // Halt the agentic loop: drop any stashed tool calls, reset the
         // step counter, and clear the approval machine so a halt mid-
         // approval doesn't leave the turn wedged.
-        state.rest.pending_tool_calls.clear();
-        state.rest.agent_steps = 0;
-        state.rest.awaiting_approval = false;
-        state.rest.approval_reason = None;
-        state.rest.tool_idx = 0;
-        state.rest.tool_results.clear();
+        state.rest.fg_mut().pending_tool_calls.clear();
+        state.rest.fg_mut().agent_steps = 0;
+        state.rest.fg_mut().awaiting_approval = false;
+        state.rest.fg_mut().approval_reason = None;
+        state.rest.fg_mut().tool_idx = 0;
+        state.rest.fg_mut().tool_results.clear();
         // Abandon any round parked on deferred task-tool delegations so a
         // sub-agent that finishes AFTER this interrupt can't resume a turn
         // the user killed. The orphaned sub-agents keep running in the
         // background; their terminal delivery finds no matching pending id
         // and is dropped (no chat fold, no re-stream).
-        state.rest.pending_subagent_calls.clear();
-        state.rest.awaiting_subagents = false;
+        state.rest.fg_mut().pending_subagent_calls.clear();
+        state.rest.fg_mut().awaiting_subagents = false;
         // Also drop any QUEUED `task`-tool delegations that belonged to this
         // killed turn (their call ids were just cleared above, so they'd never
         // resume anything). User-initiated `/task` queue entries (tool_call_id
         // == None) are turn-independent and stay queued.
         state
             .rest
+            .fg_mut()
             .pending_subagents
             .retain(|p| p.tool_call_id.is_none());
         // Abandon any round parked on a deferred tool task (the heavy/blocking
@@ -177,19 +178,19 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
         // join the worker here — joining could block the UI thread for the full
         // duration of the tool (e.g. a long bash or HTTP timeout), the exact freeze
         // this fix removes.
-        state.rest.pending_tool_tasks.clear();
-        state.rest.awaiting_tool_tasks = false;
+        state.rest.fg_mut().pending_tool_tasks.clear();
+        state.rest.fg_mut().awaiting_tool_tasks = false;
         // Take any captured usage unconditionally so a partial turn's
         // usage can't leak into the next response.
-        let usage = state.rest.pending_usage.take();
+        let usage = state.rest.fg_mut().pending_usage.take();
         // Likewise drain the reasoning buffer unconditionally so a
         // half-streamed thinking block can't bleed into the next turn;
         // it's folded onto the interrupted message (display-only).
-        let reasoning = state.rest.take_reasoning();
-        let buf = state.rest.take_stream();
+        let reasoning = state.rest.fg_mut().take_reasoning();
+        let buf = state.rest.fg_mut().take_stream();
         if let Some(b) = buf {
             if !b.is_empty() {
-                if let Some(sess) = state.rest.session.as_mut() {
+                if let Some(sess) = state.rest.fg_mut().session.as_mut() {
                     let content = format!("{b}  [interrupted]");
                     let _ = msglog::append(&sess.path, Role::Assistant, &content, usage);
                     sess.conversation.push_assistant(content, reasoning);
@@ -214,16 +215,16 @@ pub(super) fn handle_resend(
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
-    if state.rest.waiting {
+    if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
-    if client.is_none() || state.rest.session.is_none() {
+    if client.is_none() || state.rest.fg().session.is_none() {
         state.rest.status = "no active session".into();
         return Ok(());
     }
     let history = {
-        let sess = state.rest.session.as_mut().unwrap();
+        let sess = state.rest.fg_mut().session.as_mut().unwrap();
         if sess.conversation.last_user_content().is_none() {
             state.rest.status = "nothing to resend".into();
             return Ok(());
@@ -233,8 +234,8 @@ pub(super) fn handle_resend(
         sess.conversation.history()
     };
     state.rest.reset_scroll();
-    state.rest.begin_stream();
-    state.rest.waiting = true;
+    state.rest.fg_mut().begin_stream();
+    state.rest.fg_mut().waiting = true;
     state.rest.status = "thinking".into();
     start_stream_task(history, state, client, handle);
     Ok(())
@@ -251,9 +252,9 @@ pub(super) fn handle_approve_tool(
     // resume the machine (which may pause again on the next risky call or
     // finish the round). Clone the call out first so `run_tool`'s mutable
     // borrow of `state` doesn't overlap the `pending_tool_calls` read.
-    state.rest.awaiting_approval = false;
-    state.rest.approval_reason = None;
-    if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
+    state.rest.fg_mut().awaiting_approval = false;
+    state.rest.fg_mut().approval_reason = None;
+    if let Some(call) = state.rest.fg().pending_tool_calls.get(state.rest.fg().tool_idx).cloned() {
         // The approved call is a risky tool (write/edit/delete/bash) — all of which
         // are heavy/blocking and live in `DEFERRED_TOOLS`. Run it OFF the UI thread
         // and PARK rather than running it inline here: an approved large write would
@@ -267,8 +268,8 @@ pub(super) fn handle_approve_tool(
             return Ok(());
         }
         let result = run_tool(state, &call);
-        state.rest.tool_results.push((call.id.clone(), result));
-        state.rest.tool_idx += 1;
+        state.rest.fg_mut().tool_results.push((call.id.clone(), result));
+        state.rest.fg_mut().tool_idx += 1;
     }
     process_tools(state, client, handle);
     Ok(())
@@ -277,21 +278,22 @@ pub(super) fn handle_approve_tool(
 /// Handle `Action::DenyTool`: answer every pending call with "denied by user",
 /// commit, and stop — do not re-stream.
 pub(super) fn handle_deny_tool(state: &mut AppState) -> Result<()> {
-    state.rest.awaiting_approval = false;
-    state.rest.approval_reason = None;
+    state.rest.fg_mut().awaiting_approval = false;
+    state.rest.fg_mut().approval_reason = None;
     // Denial halts the turn. Answer the denied call AND every remaining
     // pending call with "denied by user" (so the conversation stays
     // API-valid: every tool_call gets a result), commit any results
     // already collected this round, then STOP — do not re-stream.
-    let results = state.rest.tool_results.clone();
+    let results = state.rest.fg().tool_results.clone();
     let denied_ids: Vec<String> = state
         .rest
+        .fg()
         .pending_tool_calls
         .iter()
-        .skip(state.rest.tool_idx)
+        .skip(state.rest.fg().tool_idx)
         .map(|c| c.id.clone())
         .collect();
-    if let Some(sess) = state.rest.session.as_mut() {
+    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
         for (id, result) in &results {
             let _ = msglog::append(
                 &sess.path,
@@ -313,18 +315,18 @@ pub(super) fn handle_deny_tool(state: &mut AppState) -> Result<()> {
         let _ = sess.save();
     }
     // Reset the agentic-loop state and end the turn.
-    state.rest.pending_tool_calls.clear();
-    state.rest.tool_idx = 0;
-    state.rest.tool_results.clear();
-    state.rest.agent_steps = 0;
-    state.rest.waiting = false;
-    state.rest.current_task = None;
+    state.rest.fg_mut().pending_tool_calls.clear();
+    state.rest.fg_mut().tool_idx = 0;
+    state.rest.fg_mut().tool_results.clear();
+    state.rest.fg_mut().agent_steps = 0;
+    state.rest.fg_mut().waiting = false;
+    state.rest.fg_mut().current_task = None;
     // Clear deferred-task state so the resume gate can't ghost-restart
     // a killed turn via stale awaiting flags or leftover pending ids.
-    state.rest.pending_subagent_calls.clear();
-    state.rest.awaiting_subagents = false;
-    state.rest.pending_tool_tasks.clear();
-    state.rest.awaiting_tool_tasks = false;
+    state.rest.fg_mut().pending_subagent_calls.clear();
+    state.rest.fg_mut().awaiting_subagents = false;
+    state.rest.fg_mut().pending_tool_tasks.clear();
+    state.rest.fg_mut().awaiting_tool_tasks = false;
     state.rest.status = "denied — stopped".into();
     Ok(())
 }

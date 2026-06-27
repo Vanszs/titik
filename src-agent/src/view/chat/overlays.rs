@@ -82,7 +82,7 @@ pub(super) fn render_file_palette(
 ) {
     if let Some(partial) = crate::controller::input::file_ref_partial(&rest.input) {
         const MAX_VIS: usize = 10;
-        let files: Vec<String> = rest.dir_cache.read().map(|c| c.search(partial, MAX_VIS)).unwrap_or_default();
+        let files: Vec<String> = rest.fg().dir_cache.read().map(|c| c.search(partial, MAX_VIS)).unwrap_or_default();
         if !files.is_empty() {
             let sel = rest.palette_sel.min(files.len() - 1);
             // window start keeps `sel` visible (anchors to bottom when scrolling down)
@@ -238,7 +238,7 @@ pub(super) fn render_tool_approval(
 ) {
     let warn = Color::Rgb(255, 180, 60);
     let mut rows: Vec<Line> = Vec::new();
-    if let Some(call) = rest.pending_tool_calls.get(rest.tool_idx) {
+    if let Some(call) = rest.fg().pending_tool_calls.get(rest.fg().tool_idx) {
         let name = call.function.name.as_str();
         // header: which tool
         rows.push(Line::from(Span::styled(
@@ -247,7 +247,7 @@ pub(super) fn render_tool_approval(
         )));
         // When the harness (TAC) forced this approval, show its reason so the
         // user knows WHY the call was flagged rather than auto-run.
-        if let Some(reason) = rest.approval_reason.as_ref() {
+        if let Some(reason) = rest.fg().approval_reason.as_ref() {
             if !reason.is_empty() {
                 rows.push(Line::from(Span::styled(
                     format!(" harness: {reason}"),

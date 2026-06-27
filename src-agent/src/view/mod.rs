@@ -51,10 +51,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             // Resolve the actual Main model that will be used for chat requests.
             // Session overrides win over the global catalogue; falls back to
             // settings.model (the legacy field) when nothing is configured.
-            let resolved_model: String = state.rest.session.as_ref()
+            let resolved_model: String = state.rest.fg().session.as_ref()
                 .and_then(|s| resolve_role(&state.rest.config, &s.settings, ModelRole::Main))
                 .map(|r| r.model_id)
-                .or_else(|| state.rest.session.as_ref().map(|s| s.settings.model.clone()))
+                .or_else(|| state.rest.fg().session.as_ref().map(|s| s.settings.model.clone()))
                 .unwrap_or_default();
             chat::draw(frame, &state.rest, &resolved_model, &palette);
         }
@@ -65,7 +65,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             frame,
             a,
             &state.rest.config,
-            state.rest.session.as_ref().map(|s| &s.settings),
+            state.rest.fg().session.as_ref().map(|s| &s.settings),
             &palette,
         ),
         Mode::Effort(e) => effort::draw(frame, e, &palette),

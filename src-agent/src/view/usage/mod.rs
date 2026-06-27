@@ -505,7 +505,7 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, pa
         return;
     }
 
-    let uuid        = rest.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+    let uuid        = rest.fg().session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
     let sess_models = session_models(&uuid);
     let hourly      = session_hourly(&uuid);
     // DB totals used only for the call count; live rest counters take precedence

@@ -54,25 +54,25 @@ pub(super) fn run_loop(
         // 1. Drain the active stream's events. take() the receiver so the match
         //    arms can mutate other fields of state.rest without a borrow
         //    conflict; put it back if the stream is still open.
-        if let Some(mut rx) = state.rest.active_rx.take() {
+        if let Some(mut rx) = state.rest.fg_mut().active_rx.take() {
             let mut still_streaming = true;
             while let Ok(event) = rx.try_recv() {
                 dirty = true;
                 match event {
                     StreamEvent::Token(t) => {
-                        state.rest.append_token(&t);
+                        state.rest.fg_mut().append_token(&t);
                         state.rest.status = "streaming".into();
                     }
                     StreamEvent::Reasoning(t) => {
                         // Accumulate the model's thinking into the parallel buffer;
                         // `dirty` is already set so it animates in like content.
-                        state.rest.append_reasoning(&t);
+                        state.rest.fg_mut().append_reasoning(&t);
                         state.rest.status = "thinking".into();
                     }
                     StreamEvent::Usage { prompt_tokens, completion_tokens, cached_tokens, cost } => {
                         // Stash for the assistant-commit step; do NOT break —
                         // usage arrives just before Done.
-                        state.rest.pending_usage = Some((prompt_tokens, completion_tokens, cost));
+                        state.rest.fg_mut().pending_usage = Some((prompt_tokens, completion_tokens, cost));
                         // Cached-prompt-token count for THIS prompt (current
                         // context, like tokens_in — not cumulative). Set straight
                         // away so the readout can show the cache hit even on a
@@ -81,13 +81,13 @@ pub(super) fn run_loop(
                         // Latch: once any response reports cache hits we know this
                         // provider supports prompt caching. Never reset.
                         if cached_tokens > 0 {
-                            state.rest.provider_caches = true;
+                            state.rest.fg_mut().provider_caches = true;
                         }
                     }
                     StreamEvent::ToolCalls(calls) => {
                         // Stash the requested tool calls; do NOT break — Done
                         // follows and `advance_turn` consumes them there.
-                        state.rest.pending_tool_calls = calls;
+                        state.rest.fg_mut().pending_tool_calls = calls;
                     }
                     StreamEvent::Done => {
                         // Drive the turn: commit the assistant message and either
@@ -101,12 +101,12 @@ pub(super) fn run_loop(
                         // Surface the error and halt the whole turn (drop any
                         // half-stashed tool calls / step count / approval machine).
                         finish_stream(&mut state.rest, Some(e));
-                        state.rest.agent_steps = 0;
-                        state.rest.pending_tool_calls.clear();
-                        state.rest.awaiting_approval = false;
-                        state.rest.approval_reason = None;
-                        state.rest.tool_idx = 0;
-                        state.rest.tool_results.clear();
+                        state.rest.fg_mut().agent_steps = 0;
+                        state.rest.fg_mut().pending_tool_calls.clear();
+                        state.rest.fg_mut().awaiting_approval = false;
+                        state.rest.fg_mut().approval_reason = None;
+                        state.rest.fg_mut().tool_idx = 0;
+                        state.rest.fg_mut().tool_results.clear();
                         // Clear any in-flight compaction animation so a failed
                         // compaction (e.g. null content decode error) doesn't leave
                         // the spinner stuck driving per-tick redraws indefinitely.
@@ -118,7 +118,7 @@ pub(super) fn run_loop(
                     }
                     StreamEvent::Compacted { summary, kept_tail } => {
                         // The model is done; the task is finished either way.
-                        state.rest.current_task = None;
+                        state.rest.fg_mut().current_task = None;
                         // Enforce a short cosmetic minimum so a fast compaction
                         // doesn't flash the animation. If we haven't shown the
                         // animation long enough yet, stash the result and defer
@@ -152,7 +152,7 @@ pub(super) fn run_loop(
                 }
             }
             if still_streaming {
-                state.rest.active_rx = Some(rx);
+                state.rest.fg_mut().active_rx = Some(rx);
             }
         }
 
@@ -161,7 +161,7 @@ pub(super) fn run_loop(
         //     turn already proceeded and is never cancelled here. Take() the
         //     receiver so the match can mutate state.rest; put it back unless the
         //     PC task has finished (channel closed) or delivered its verdict.
-        if let Some(mut hrx) = state.rest.harness_rx.take() {
+        if let Some(mut hrx) = state.rest.fg_mut().harness_rx.take() {
             let mut keep = true;
             while let Ok(event) = hrx.try_recv() {
                 if let StreamEvent::HarnessVerdict { allow, reason } = event {
@@ -176,7 +176,7 @@ pub(super) fn run_loop(
                 }
             }
             if keep {
-                state.rest.harness_rx = Some(hrx);
+                state.rest.fg_mut().harness_rx = Some(hrx);
             }
         }
 
@@ -268,7 +268,7 @@ pub(super) fn run_loop(
                         // Always populate the summary (appended to the system
                         // message on every request), even if we've already skipped
                         // to chat.
-                        state.rest.awareness_summary = summary;
+                        state.rest.fg_mut().awareness_summary = summary;
                         if let Mode::Loading(s) = &mut state.mode {
                             // Some → ready; None → "no docs" (treated as a benign
                             // terminal Done detail, not a hard failure).
@@ -347,7 +347,7 @@ pub(super) fn run_loop(
         }
 
         // 1b-3c. Drain each sub-agent's event channel. Sub-agents live in
-        //        `state.rest.subagents`; each has its own `rx`. We iterate by index so
+        //        `state.rest.fg().subagents`; each has its own `rx`. We iterate by index so
         //        we can reborrow mutably after collecting events into a local vec (borrow
         //        checker: the collect loop holds &mut subagents[i].rx; the apply loop
         //        needs &mut subagents[i].{status,transcript} and later &mut session).
@@ -373,11 +373,11 @@ pub(super) fn run_loop(
             // parked round can resume with no dangling tool_call ids.
             let mut deferred_results: Vec<(String, String)> = Vec::new();
 
-            for i in 0..state.rest.subagents.len() {
+            for i in 0..state.rest.fg().subagents.len() {
                 // --- collect phase: drain rx into a local vec ---
                 let mut disconnected = false;
                 let events: Vec<AgentEvent> = {
-                    let sa = &mut state.rest.subagents[i];
+                    let sa = &mut state.rest.fg_mut().subagents[i];
                     let mut evs = Vec::new();
                     loop {
                         match sa.rx.try_recv() {
@@ -394,7 +394,7 @@ pub(super) fn run_loop(
 
                 // Channel closed (task ended): mark Killed if still Running.
                 if disconnected {
-                    let sa = &mut state.rest.subagents[i];
+                    let sa = &mut state.rest.fg_mut().subagents[i];
                     if matches!(sa.status, SubAgentStatus::Running) {
                         sa.status = SubAgentStatus::Killed;
                         dirty = true;
@@ -408,7 +408,7 @@ pub(super) fn run_loop(
                 // `deferred_results` (computed from the settled status below), not here.
                 if !events.is_empty() {
                     dirty = true;
-                    let sa = &mut state.rest.subagents[i];
+                    let sa = &mut state.rest.fg_mut().subagents[i];
                     for ev in events {
                         match ev {
                             AgentEvent::Token(t) => {
@@ -475,7 +475,7 @@ pub(super) fn run_loop(
                 // --- terminal delivery / fold ---
                 // Inspect the SETTLED status + origin once events are folded, capturing
                 // owned values up front so the immutable borrow of `subagents[i]` is
-                // released before any `state.rest.session` mutation below. Runs every
+                // released before any `state.rest.fg().session` mutation below. Runs every
                 // tick (even when no events arrived, so a disconnect-only Killed is
                 // still delivered). The "still in pending_subagent_calls" guard makes a
                 // task-tool delivery happen EXACTLY ONCE (the id is removed after the
@@ -488,7 +488,7 @@ pub(super) fn run_loop(
                 // defer is Some (the two origins are mutually exclusive on tool_call_id).
                 // sub_usage is Some whenever the status is terminal and usage > 0.
                 let (chat_fold, defer, sub_usage) = {
-                    let sa = &state.rest.subagents[i];
+                    let sa = &state.rest.fg().subagents[i];
                     // Capture usage once; only carry it if there is something to record.
                     let usage_tuple = if sa.usage_tokens_out > 0 || sa.usage_cost > 0.0 {
                         Some((
@@ -503,7 +503,7 @@ pub(super) fn run_loop(
                     match (&sa.tool_call_id, &sa.status) {
                         // task-tool path: deliver the deferred result back to the model.
                         (Some(call_id), status)
-                            if state.rest.pending_subagent_calls.contains(call_id) =>
+                            if state.rest.fg().pending_subagent_calls.contains(call_id) =>
                         {
                             let result = match status {
                                 // Deliver the FULL, untruncated report.
@@ -537,7 +537,7 @@ pub(super) fn run_loop(
                 if let Some(note) = chat_fold {
                     // /task command path: append the full report as a display-only
                     // assistant turn so the main session retains a complete record.
-                    if let Some(sess) = state.rest.session.as_mut() {
+                    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
                         // Log to sqlite (no usage/cost for a sub-agent fold).
                         let _ = crate::model::msglog::append(
                             &sess.path,
@@ -563,11 +563,12 @@ pub(super) fn run_loop(
                     // Record one ledger row per sub-agent completion (best-effort).
                     let (sess_uuid, pwd_hash) = state
                         .rest
+                        .fg()
                         .session
                         .as_ref()
                         .map(|s| (s.id.clone(), s.pwd_hash.clone()))
                         .unwrap_or_default();
-                    let sa_name = state.rest.subagents[i].agent_name.clone();
+                    let sa_name = state.rest.fg().subagents[i].agent_name.clone();
                     crate::model::usage::record_usage(
                         &sub_model_id,
                         &format!("sub:{sa_name}"),
@@ -588,8 +589,8 @@ pub(super) fn run_loop(
             // `tool_results` and drop its id from `pending_subagent_calls`. Done
             // AFTER the loop so the per-agent borrow above stays immutable.
             for (call_id, result) in deferred_results {
-                state.rest.pending_subagent_calls.retain(|c| c != &call_id);
-                state.rest.tool_results.push((call_id, result));
+                state.rest.fg_mut().pending_subagent_calls.retain(|c| c != &call_id);
+                state.rest.fg_mut().tool_results.push((call_id, result));
                 dirty = true;
             }
 
@@ -609,7 +610,7 @@ pub(super) fn run_loop(
             // unstartable entry delivers its error result + drops its id HERE — so
             // the `pending_subagent_calls.is_empty()` test sees the settled set and
             // can't resume a round that still has a queued delegation outstanding.
-            if !state.rest.pending_subagents.is_empty() {
+            if !state.rest.fg().pending_subagents.is_empty() {
                 super::stream::try_start_pending(state, client, handle);
                 dirty = true;
             }
@@ -624,20 +625,23 @@ pub(super) fn run_loop(
             // this same block (before the gate) so both lanes' results are in place
             // when emptiness is tested. A round runs its deferred tools ONE AT A
             // TIME, so at most one id settles here per resume.
-            if let Some(rx) = state.rest.tool_task_rx.as_mut() {
-                // Drain into a local vec first to release the rx borrow before
-                // touching pending_tool_tasks / tool_results on state.rest.
+            {
+                // Drain into a local vec FIRST inside a narrow scope so the `rx`
+                // borrow of the foreground runtime is released before we touch
+                // `pending_tool_tasks` / `tool_results` on the same runtime below.
                 let mut received: Vec<(String, String)> = Vec::new();
-                while let Ok(pair) = rx.try_recv() {
-                    received.push(pair);
+                if let Some(rx) = state.rest.fg_mut().tool_task_rx.as_mut() {
+                    while let Ok(pair) = rx.try_recv() {
+                        received.push(pair);
+                    }
                 }
                 // Fold only results whose id is still in pending_tool_tasks;
                 // anything else is a stale delivery from a killed/interrupted
                 // turn and must be discarded rather than corrupting the next turn.
                 for (id, result) in received {
-                    if let Some(pos) = state.rest.pending_tool_tasks.iter().position(|c| c == &id) {
-                        state.rest.pending_tool_tasks.remove(pos);
-                        state.rest.tool_results.push((id, result));
+                    if let Some(pos) = state.rest.fg().pending_tool_tasks.iter().position(|c| c == &id) {
+                        state.rest.fg_mut().pending_tool_tasks.remove(pos);
+                        state.rest.fg_mut().tool_results.push((id, result));
                         dirty = true;
                     }
                     // else: stale delivery — drop silently
@@ -656,12 +660,12 @@ pub(super) fn run_loop(
             // the parked status; `waiting` stays true through the re-stream. Gating
             // on both lists means a mixed round waits for the last pending id of
             // either kind before resuming — no dangling tool_call ids.
-            if (state.rest.awaiting_subagents || state.rest.awaiting_tool_tasks)
-                && state.rest.pending_subagent_calls.is_empty()
-                && state.rest.pending_tool_tasks.is_empty()
+            if (state.rest.fg().awaiting_subagents || state.rest.fg().awaiting_tool_tasks)
+                && state.rest.fg().pending_subagent_calls.is_empty()
+                && state.rest.fg().pending_tool_tasks.is_empty()
             {
-                state.rest.awaiting_subagents = false;
-                state.rest.awaiting_tool_tasks = false;
+                state.rest.fg_mut().awaiting_subagents = false;
+                state.rest.fg_mut().awaiting_tool_tasks = false;
                 super::stream::resume_after_subagents(state, client, handle);
                 dirty = true;
             }
@@ -709,6 +713,7 @@ pub(super) fn run_loop(
             if matches!(s.workspace, WarmStatus::Running) {
                 let settled = state
                     .rest
+                    .fg()
                     .dir_cache
                     .read()
                     .map(|c| !c.indexing)
@@ -753,7 +758,7 @@ pub(super) fn run_loop(
         // vs what we last warned, so it fires exactly once per change and does
         // not depend on catching the brief indexing=true window (an all-missing
         // reindex can finish before the loop ever observes it).
-        let (indexing_now, missing_now) = match state.rest.dir_cache.read() {
+        let (indexing_now, missing_now) = match state.rest.fg().dir_cache.read() {
             Ok(c) => (c.indexing, c.missing_roots.clone()),
             Err(_) => (true, state.rest.warned_missing_roots.clone()),
         };
@@ -777,7 +782,7 @@ pub(super) fn run_loop(
         //    and the travelling head start from this moment.
         //  - falling edge (!active && Some) → clear it; idle / approval renders the
         //    status statically with no comet and no timer.
-        let shimmer_active = state.rest.waiting && !state.rest.awaiting_approval;
+        let shimmer_active = state.rest.fg().waiting && !state.rest.fg().awaiting_approval;
         match (shimmer_active, state.rest.work_since.is_some()) {
             (true, false) => state.rest.work_since = Some(std::time::Instant::now()),
             (false, true) => state.rest.work_since = None,
@@ -794,6 +799,7 @@ pub(super) fn run_loop(
         // that don't set `waiting`), force redraws so the in-chat spinner animates.
         let has_running_subagents = state
             .rest
+            .fg()
             .subagents
             .iter()
             .any(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running));
@@ -813,7 +819,7 @@ pub(super) fn run_loop(
         // at the fast cadence, not idle-sleep for 100ms between frames). And while a
         // debounced catalogue fetch is pending, so its ~300ms `due` fires promptly
         // rather than waiting out a 100ms idle sleep (treat it like the splash).
-        let timeout = if state.rest.waiting
+        let timeout = if state.rest.fg().waiting
             || state.rest.catalogue_pending.is_some()
             || matches!(state.mode, Mode::Loading(_))
             || has_running_subagents
