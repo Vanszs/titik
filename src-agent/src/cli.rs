@@ -7,6 +7,8 @@
 //! - `--force`                     — modifier for `--internet-fullmode-install`: force a reinstall
 //!   even when the environment is already present.
 //! - `--ipc-selftest`              — round-trip the daemon IPC transport end-to-end, then exit.
+//! - `--daemon`                    — run the headless koma-daemon event loop (no terminal).
+//! - `--attach`                    — run as a thin client that attaches to a running daemon.
 //!
 //! `parse` accepts anything that yields `String` items so it can be called
 //! with `std::env::args()` directly from `main`.
@@ -25,6 +27,12 @@ pub struct Opts {
     /// When `true`, run the daemon IPC transport self-test then exit
     /// (`--ipc-selftest` flag).
     pub ipc_selftest: bool,
+    /// When `true`, run the headless koma-daemon event loop with no terminal
+    /// (`--daemon` flag). Owns the agent runtime; a TUI attaches as a client.
+    pub daemon: bool,
+    /// When `true`, run as a thin client that attaches to a running daemon
+    /// (`--attach` flag). Parsed now; the attach client lands in a later stage.
+    pub attach: bool,
 }
 
 /// Parse command-line arguments into [`Opts`].
@@ -40,6 +48,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
             "--internet-fullmode-uninstall"  => opts.internet_fullmode_uninstall = true,
             "--force"                        => opts.force = true,
             "--ipc-selftest"                 => opts.ipc_selftest = true,
+            "--daemon"                       => opts.daemon = true,
+            "--attach"                       => opts.attach = true,
             _                                => {}
         }
     }

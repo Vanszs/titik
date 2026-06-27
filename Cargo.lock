@@ -22,6 +22,7 @@ dependencies = [
  "ignore",
  "include_dir",
  "infer",
+ "libc",
  "percent-encoding",
  "pulldown-cmark",
  "ratatui",

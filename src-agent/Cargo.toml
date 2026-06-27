@@ -29,6 +29,7 @@ regex = "1"
 globset = "0.4"
 infer = "0.16"
 base64 = "0.22"
+libc = "0.2"
 
 [[bin]]
 name = "koma"

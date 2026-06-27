@@ -42,6 +42,7 @@ use crate::service::WarmEvent;
 
 use terminal::TerminalGuard;
 use event_loop::run_loop;
+use event_loop::daemon::{daemon_loop, DaemonHub};
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -195,7 +196,29 @@ fn prefill_creds() -> (Option<String>, Option<String>, Option<String>) {
     }
 }
 
-pub fn run(opts: crate::cli::Opts) -> Result<()> {
+/// The shared startup prefix for BOTH the interactive TUI ([`run`]) and the
+/// headless daemon ([`daemon_run`]).
+///
+/// Does everything that is independent of the terminal: ensure the config dirs
+/// exist, build the tokio runtime + clone its handle, decide the initial
+/// [`AppState`] (resume picker / returning-user chat / first-run wizard), load the
+/// global config, capture the launch cwd for the harness workspace check, build
+/// the keyless per-session client when a usable Main route resolves, and warm the
+/// active session (workspace reindex + awareness). Returns the owned runtime (kept
+/// alive + dropped LAST by the caller), its handle, the constructed state, and the
+/// optional client (the no-client-no-send gate).
+///
+/// SAFE FOR HEADLESS USE: nothing here touches stdout / the terminal. `warm_session`
+/// only spawns background tasks + mutates state + does best-effort lock IO, so the
+/// daemon path can call this identically to the TUI path.
+fn build_startup(
+    opts: &crate::cli::Opts,
+) -> Result<(
+    tokio::runtime::Runtime,
+    tokio::runtime::Handle,
+    AppState,
+    Option<Arc<OpenRouterClient>>,
+)> {
     store::ensure_dirs()?;
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -270,15 +293,6 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
         state.rest.launch_dir = cwd;
     }
 
-    // Terminal setup. Guard created BEFORE the Terminal so its Drop covers a
-    // failing Terminal::new, any later `?`-error, and panic-unwind.
-    let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
-    // Clear the alternate screen so no shell scrollback bleeds through the
-    // cells the UI never paints (e.g. the empty part of the transcript).
-    terminal.clear()?;
-
     // If startup opened a session straight into chat (returning user), build its
     // client now; otherwise it's built when the user confirms credentials. The
     // None-gate is the "is there a usable session/key?" signal the whole runtime
@@ -286,7 +300,7 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // condition is whether the MAIN role resolves to a usable route (a route with a
     // non-empty api_key) — NOT the old `!settings.api_key.is_empty()`. The client
     // itself is keyless; the gate just preserves the no-client-no-send invariant.
-    let mut client: Option<Arc<OpenRouterClient>> = state
+    let client: Option<Arc<OpenRouterClient>> = state
         .rest
         .fg()
         .session
@@ -303,28 +317,88 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     // later when a session becomes active (picker-select / creds-confirm / /new).
     warm_session(&mut state, &client, &handle);
 
-    let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
+    Ok((rt, handle, state, client))
+}
 
-    // Terminal teardown is handled by `_guard`'s Drop at function scope.
-
-    // Clean-exit unlock: release the lock held for EVERY live session so each one
-    // is immediately re-enterable. Multi-session aware — a quit (kill-all OR
-    // detach) can leave several sessions holding locks, so releasing only the
-    // foreground's would strand the rest until PID-liveness staleness kicked in.
-    // Runs on both the Ok and Err paths (this is after run_loop returns either
-    // way). A crash that skips this is covered by PID-liveness staleness in
-    // `store::is_locked`.
+/// Release every live session's on-disk lock, then drop the tokio runtime LAST.
+///
+/// Shared clean-exit teardown for both the TUI and daemon paths. Multi-session
+/// aware — a quit (kill-all OR detach) can leave several sessions holding locks,
+/// so releasing only the foreground's would strand the rest until PID-liveness
+/// staleness kicked in. Dropping `rt` last cancels every spawned task; each task
+/// owns the sender of its own per-request channel, and `let _ =` on each send
+/// makes a post-drop send a safe no-op (no panic, no deadlock). A crash that skips
+/// this is covered by PID-liveness staleness in `store::is_locked`.
+fn shutdown_runtime(state: &mut AppState, rt: tokio::runtime::Runtime) {
     for s in &mut state.rest.sessions {
         if let Some(p) = s.held_lock.take() {
             crate::model::store::remove_lock(&p);
         }
     }
-
-    // drop(rt) LAST: runtime shutdown cancels spawned tasks. Each task owns the
-    // sender of its own per-request channel; once dropped here (or earlier when
-    // its receiver in state was dropped), every send is a no-op. The `let _ =`
-    // on each send makes this safe — no panic, no deadlock.
     drop(rt);
+}
+
+pub fn run(opts: crate::cli::Opts) -> Result<()> {
+    // Shared, terminal-independent startup (dirs, runtime, state, client, warm).
+    let (rt, handle, mut state, mut client) = build_startup(&opts)?;
+
+    // Terminal setup. Guard created BEFORE the Terminal so its Drop covers a
+    // failing Terminal::new, any later `?`-error, and panic-unwind.
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+    // Clear the alternate screen so no shell scrollback bleeds through the
+    // cells the UI never paints (e.g. the empty part of the transcript).
+    terminal.clear()?;
+
+    let result = run_loop(&mut terminal, &mut state, &handle, &mut client);
+
+    // Terminal teardown is handled by `_guard`'s Drop at function scope.
+    // Release all session locks, then drop the runtime LAST (runs on Ok and Err).
+    shutdown_runtime(&mut state, rt);
 
     result
+}
+
+/// Headless entry point: run the koma-daemon event loop with NO terminal.
+///
+/// Shares [`build_startup`] with the TUI [`run`] (same dirs / runtime / state /
+/// client / warm), then — instead of the terminal + `run_loop` — ignores SIGPIPE
+/// and enters [`daemon_loop`]. The loop runs forever this stage (no socket, no
+/// self-exit); it is stopped with Ctrl-C, after which the shared teardown releases
+/// every session lock and drops the runtime.
+///
+/// NOTE: `daemon_loop` currently never returns (it loops forever), so the teardown
+/// below is reached only via a future self-exit stage. Ctrl-C terminates the
+/// process directly (PID-liveness staleness reclaims any held locks). The teardown
+/// is wired now so the lifecycle stage has nothing to retrofit.
+pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
+    // Critique #10: writing to a dead client must never kill the daemon. Ignore
+    // SIGPIPE process-wide BEFORE any socket IO so a broken-pipe write returns
+    // EPIPE (handled per-write) instead of terminating the process. `libc` is a
+    // direct dependency; this is the one tiny unsafe FFI call it is needed for.
+    // SAFETY: `signal` with SIG_IGN on SIGPIPE is async-signal-safe and the
+    // canonical way to opt out of SIGPIPE; it touches no Rust state.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    // Shared, terminal-independent startup — identical to the TUI path.
+    let (rt, handle, mut state, mut client) = build_startup(&opts)?;
+
+    // Sync-loop <-> per-client-task bridge (critique #1). The accept loop that
+    // feeds `req_rx` lands in a later stage; the runner holds the paired sender so
+    // `req_rx` never goes `Disconnected` before a client connects. `#[allow]` on
+    // the binding: in this stage nothing ever sends on `_req_tx` yet.
+    let (mut hub, _req_tx) = DaemonHub::new();
+
+    // Enter the headless loop. NO terminal, NO input — just service_all_sessions +
+    // service_global + the request-bridge drain on the adaptive cadence. Runs
+    // forever this stage (lifecycle/self-exit is a later stage).
+    daemon_loop(&mut state, &mut client, &handle, &mut hub);
+
+    // Reached only via a future self-exit stage (the loop is currently infinite).
+    shutdown_runtime(&mut state, rt);
+
+    Ok(())
 }

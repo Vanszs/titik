@@ -11,6 +11,7 @@
 //! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
 //! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
 //! | `--ipc-selftest`                        | round-trip the daemon IPC transport then exit |
+//! | `--daemon`                              | run the headless koma-daemon event loop (no TUI) |
 //!
 //! Data flow overview:
 //! ```text
@@ -68,6 +69,13 @@ fn main() -> anyhow::Result<()> {
     // (always exits the process with OK/FAIL status).
     if opts.ipc_selftest {
         ipc::selftest::run();
+    }
+
+    // --- headless path: run the koma-daemon event loop (no TUI) ---
+    // Owns the agent runtime with no terminal; a TUI attaches as a thin client in
+    // a later stage. Stays in this branch (loops forever) until Ctrl-C.
+    if opts.daemon {
+        return app::run_daemon(opts);
     }
 
     // --- normal path: launch the TUI ---
