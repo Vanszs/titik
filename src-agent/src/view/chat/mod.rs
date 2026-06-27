@@ -82,7 +82,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, resolved_model: &str, palett
     // --- Input height ---
     // The input box grows to fit its wrapped content (capped). Compute the row
     // count BEFORE the layout split so the layout can reserve the right height.
-    let input_rows = input::input_row_count(rest, frame.area().width);
+    let input_rows = input::input_row_count(rest, frame.area().width, frame.area().height);
     let input_h = (input_rows as u16) + 2; // + top & bottom borders
 
     // Layout: header (text + bottom rule) | transcript | model name row |
