@@ -21,3 +21,4 @@ pub mod session;
 pub mod session_registry;
 pub mod settings;
 pub mod store;
+pub mod usage;

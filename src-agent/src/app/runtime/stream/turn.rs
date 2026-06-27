@@ -62,6 +62,28 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
                 rest.cost += cost;
             }
         }
+        // Record into the global usage ledger (best-effort telemetry, non-fatal).
+        if let Some((pt, ct, cost)) = usage {
+            if let Some(sess) = rest.session.as_ref() {
+                let model_id = crate::app::resolve::resolve_role(
+                    &rest.config,
+                    &sess.settings,
+                    crate::model::app_config::ModelRole::Main,
+                )
+                .map(|r| r.model_id)
+                .unwrap_or_default();
+                crate::model::usage::record_usage(
+                    &model_id,
+                    "main",
+                    &sess.id,
+                    &sess.pwd_hash,
+                    pt,
+                    rest.tokens_cached,
+                    ct,
+                    cost,
+                );
+            }
+        }
     }
     rest.waiting = false;
     rest.current_task = None;
@@ -173,6 +195,28 @@ pub(crate) fn advance_turn(
                 rest.tokens_in = pt; // current context size, not a sum
                 rest.tokens_out += ct;
                 rest.cost += cost;
+            }
+        }
+        // Record into the global usage ledger (best-effort telemetry, non-fatal).
+        if let Some((pt, ct, cost)) = usage {
+            if let Some(sess) = rest.session.as_ref() {
+                let model_id = crate::app::resolve::resolve_role(
+                    &rest.config,
+                    &sess.settings,
+                    crate::model::app_config::ModelRole::Main,
+                )
+                .map(|r| r.model_id)
+                .unwrap_or_default();
+                crate::model::usage::record_usage(
+                    &model_id,
+                    "main",
+                    &sess.id,
+                    &sess.pwd_hash,
+                    pt,
+                    rest.tokens_cached,
+                    ct,
+                    cost,
+                );
             }
         }
     }
