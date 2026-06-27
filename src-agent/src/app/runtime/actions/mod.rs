@@ -132,8 +132,8 @@ pub(super) fn apply_action(
             rewind::handle_rewind_cancel(state)?;
         }
 
-        Action::RewindSelect => {
-            rewind::handle_rewind_select(state)?;
+        Action::RewindToMessage(idx) => {
+            rewind::handle_rewind_to_message(idx, state)?;
         }
     }
     Ok(())

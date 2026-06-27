@@ -29,7 +29,12 @@ pub fn handle_rewind(rw: &mut RewindState, _rest: &mut AppStateRest, key: KeyEve
             rw.move_down();
             Action::None
         }
-        KeyCode::Enter => Action::RewindSelect,
+        KeyCode::Enter => match rw.selected_entry() {
+            // Carry the selected user message's vec index out to the runtime so
+            // it can cut the conversation to just before that turn.
+            Some(entry) => Action::RewindToMessage(entry.vec_index),
+            None => Action::RewindCancel,
+        },
         _ => Action::None,
     }
 }

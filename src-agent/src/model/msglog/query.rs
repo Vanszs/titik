@@ -152,3 +152,42 @@ pub fn max_message_id(session_dir: &Path) -> i64 {
     }
     inner(session_dir).unwrap_or(0)
 }
+
+/// Truncate the append-only archive to drop every row at or after `cut_id`:
+/// delete `messages` (and their `blobs`) WHERE `id >= cut_id`, then rewind the
+/// rolling-summary watermark so it can no longer claim to cover dropped content.
+///
+/// This is the ONE place the otherwise append-only `messages`/`blobs` tables are
+/// deleted from. It exists for the message-rewind ("edit a previous message")
+/// flow: when the live `Conversation` (and `messages.json`) are truncated to
+/// before a user turn, the sqlite archive must be capped at the same boundary so
+/// the short-send reshaper (`shape`) can never rehydrate an orphaned blob whose
+/// owning message was rewound away. `cut_id` is the sqlite `messages.id` of the
+/// FIRST dropped message (the selected user turn); everything `< cut_id` is kept.
+///
+/// The summary row (id = 1, in the `summary` table) is rewound, NOT deleted: if
+/// `covers_up_to >= cut_id` the summary folded in now-dropped messages, so its
+/// `covers_up_to`/`sent_start` are clamped to `cut_id - 1` so `shape` only ever
+/// rehydrates surviving blobs. The summary TEXT is left as-is (a stale-but-
+/// harmless reference; the next fold rewrites it). All in one transaction.
+/// Best-effort: callers ignore the error.
+pub fn truncate_after(session_dir: &Path, cut_id: i64) -> Result<()> {
+    let mut conn = open(session_dir)?;
+    let tx = conn.transaction()?;
+    // Drop orphaned heavy-blob index rows first (FK-free, but keep it tidy), then
+    // the messages themselves. `blobs.msg_id` mirrors `messages.id`.
+    tx.execute("DELETE FROM blobs WHERE msg_id >= ?1", rusqlite::params![cut_id])?;
+    tx.execute("DELETE FROM messages WHERE id >= ?1", rusqlite::params![cut_id])?;
+    // Rewind the summary watermark so it never references a dropped message. Clamp
+    // both bookkeeping ids to the last surviving id (`cut_id - 1`, floored at 0).
+    let last_kept = (cut_id - 1).max(0);
+    tx.execute(
+        "UPDATE summary
+            SET covers_up_to = MIN(covers_up_to, ?1),
+                sent_start   = MIN(sent_start, ?1)
+          WHERE id = 1",
+        rusqlite::params![last_kept],
+    )?;
+    tx.commit()?;
+    Ok(())
+}

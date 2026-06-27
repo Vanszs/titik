@@ -10,9 +10,7 @@
 pub struct RewindEntry {
     /// Index of this message in `Conversation::messages()` (the vec position).
     /// Truncation keeps `messages[0..idx]`, dropping this message and all after.
-    /// Consumed by the stage-2 select path; carried now so the list rows map back
-    /// to exact vec positions.
-    #[allow(dead_code)]
+    /// Carried out on Enter so the runtime knows the exact cut position.
     pub vec_index: usize,
     /// The user message's text content, shown (truncated) in the list and
     /// loaded verbatim into the composer on select.
@@ -70,8 +68,8 @@ impl RewindState {
     }
 
     /// Return a reference to the currently highlighted entry, or `None` if the
-    /// list is somehow empty. Used by the stage-2 select path.
-    #[allow(dead_code)]
+    /// list is somehow empty. Read by the input handler on Enter to resolve the
+    /// rewind target's vec index.
     pub fn selected_entry(&self) -> Option<&RewindEntry> {
         self.entries.get(self.selected)
     }

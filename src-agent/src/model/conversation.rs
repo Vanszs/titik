@@ -268,6 +268,23 @@ impl Conversation {
         self.messages = rebuilt;
     }
 
+    /// Rewind the conversation to JUST BEFORE the message at `idx`, dropping that
+    /// message and every message after it. Keeps `messages[0..idx]`.
+    ///
+    /// Used by the double-Esc message-rewind picker: `idx` is the vec position of
+    /// the selected user message (from `messages()`), so the cut leaves the
+    /// history exactly as it was before that turn was sent. The System message at
+    /// index 0 is never dropped: `idx == 0` is treated as a no-op (there is no
+    /// pre-system state to rewind to), and an out-of-range `idx` (>= len) also
+    /// leaves the history untouched.
+    pub fn truncate_to_before_index(&mut self, idx: usize) {
+        // Never drop the system message; never index past the end.
+        if idx == 0 || idx >= self.messages.len() {
+            return;
+        }
+        self.messages.truncate(idx);
+    }
+
     /// Pop all trailing `Assistant` messages (used before a resend so the
     /// model doesn't see its own previous partial reply as context).
     ///
