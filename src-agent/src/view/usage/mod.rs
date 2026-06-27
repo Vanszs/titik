@@ -43,8 +43,8 @@ use ratatui::{
 use crate::app::mode::{UsageMetric, UsageNavState, UsageRange, UsageView};
 use crate::app::state::AppStateRest;
 use crate::model::usage::{
-    range_totals, role_split, session_hourly, session_models, spend_buckets,
-    top_models_in_range, BucketSize, SpendBucket,
+    range_totals, role_split, session_hourly, session_models, session_totals,
+    spend_buckets, top_models_in_range, BucketSize, SpendBucket,
 };
 use crate::view::theme::Palette;
 
@@ -431,16 +431,20 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, ar
         return;
     }
 
-    let uuid = rest.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+    let uuid        = rest.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
     let sess_models = session_models(&uuid);
     let hourly      = session_hourly(&uuid);
+    // DB totals used only for the call count; live rest counters take precedence
+    // for tokens/cost since they may be ahead of the ledger (last call not yet
+    // committed, or session opened without a prior ledger entry).
+    let db_totals   = session_totals(&uuid);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
 
-    draw_session_kpi(frame, rest, rows[0]);
+    draw_session_kpi(frame, rest, db_totals.calls, rows[0]);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -451,7 +455,7 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, ar
     draw_session_hourly(frame, &hourly, cols[1]);
 }
 
-fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, area: Rect) {
+fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, db_calls: i64, area: Rect) {
     let block = amber_panel("SESSION TOTALS");
     let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
     frame.render_widget(block, area);
@@ -460,6 +464,8 @@ fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, area: Rect) {
         return;
     }
 
+    // Use live rest counters for tokens/cost (ahead of the ledger mid-session);
+    // call count from the DB totals (rest doesn't track a call counter).
     let line = Line::from(vec![
         kv("in",     &fmt_tokens_u64(rest.tokens_in)),
         dim_sep(),
@@ -468,6 +474,8 @@ fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, area: Rect) {
         kv("out",    &fmt_tokens_u64(rest.tokens_out)),
         dim_sep(),
         kv("cost",   &fmt_cost(rest.cost)),
+        dim_sep(),
+        kv("calls",  &db_calls.to_string()),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
 }
@@ -481,8 +489,20 @@ fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCo
         return;
     }
 
+    // Fixed columns: cost(9) + tokens(9) + calls(6) + separators → 30 chars.
+    // "usage" bar takes whatever is left after model name and fixed cols.
     let fixed_cols = 30usize;
-    let col_model = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
+    let col_model  = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
+    let bar_w      = (inner.width as usize)
+        .saturating_sub(col_model + fixed_cols + 2)
+        .clamp(0, 12);
+
+    let max_tokens: i64 = models
+        .iter()
+        .map(|m| m.tokens_in + m.tokens_out)
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -491,13 +511,16 @@ fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCo
     )));
 
     for m in models {
-        let id = truncate(&m.model_id, col_model);
+        let id        = truncate(&m.model_id, col_model);
         let total_tok = m.tokens_in + m.tokens_out;
+        let bar       = build_bar(total_tok, max_tokens, bar_w);
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<col_model$}", id),              Style::default().fg(BB_VALUE)),
-            Span::styled(format!("  {:>9}", fmt_cost(m.total_cost)), Style::default().fg(BB_VALUE)),
-            Span::styled(format!("  {:>9}", fmt_tokens_i64(total_tok)), Style::default().fg(BB_DIM)),
-            Span::styled(format!("  {:>6}", m.call_count),           Style::default().fg(BB_DIM)),
+            Span::styled(format!("{:<col_model$}", id),                  Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_cost(m.total_cost)),     Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_tokens_i64(total_tok)),  Style::default().fg(BB_DIM)),
+            Span::styled(format!("  {:>6}", m.call_count),               Style::default().fg(BB_DIM)),
+            // "usage" bar — token proportion relative to the top model.
+            Span::styled(format!("  {bar}"),                             Style::default().fg(BB_AMBER)),
         ]));
     }
 
@@ -510,36 +533,86 @@ fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCo
 }
 
 fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], area: Rect) {
-    let block = amber_panel("HOURLY SPEND");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    let block = amber_panel("HOURLY HEATMAP");
+    let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 1 || inner.width < 8 {
+    if inner.height < 2 || inner.width < 4 {
         return;
     }
 
-    let values: Vec<f64> = hourly.iter().map(|b| b.cost).collect();
-    let spark = build_sparkline(&values, inner.width as usize);
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(spark, Style::default().fg(BB_AMBER))),
-    ];
-
-    // Hour labels on the second line if space permits.
-    if hourly.len() > 1 && inner.height >= 2 {
-        let label: String = hourly
-            .iter()
-            .map(|b| format!("{:02}", (b.bucket_epoch / 3600) % 24))
-            .take(inner.width as usize / 2)
-            .collect::<Vec<_>>()
-            .join(" ");
-        lines.push(Line::from(Span::styled(
-            truncate_str(&label, inner.width as usize),
-            Style::default().fg(BB_DIM),
-        )));
-    }
-
+    let lines = build_session_hourly_heatmap(hourly, inner.width as usize);
     let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// Build a cell-based hourly heatmap for View B (session scope).
+///
+/// One row of colored full-block cells — one cell per hour present in `hourly`
+/// — plus a row of hour labels every 2 hours and the standard legend.  The
+/// intensity ramp reuses the same [`heat_color`] + [`percentile_thresholds`]
+/// logic as the global hourly heatmap so the visual language is consistent.
+fn build_session_hourly_heatmap(hourly: &[SpendBucket], max_width: usize) -> Vec<Line<'static>> {
+    if hourly.is_empty() {
+        return vec![
+            Line::from(Span::styled("no data yet", Style::default().fg(BB_DIM))),
+        ];
+    }
+
+    // Build a lookup by bucket epoch for fast access.
+    let map: std::collections::HashMap<i64, &SpendBucket> =
+        hourly.iter().map(|b| (b.bucket_epoch, b)).collect();
+
+    let nonzero: Vec<f64> = hourly.iter().map(|b| b.cost).filter(|&v| v > 0.0).collect();
+    let (p33, p66, p90)   = percentile_thresholds(&nonzero);
+
+    // Determine range: first bucket → last bucket (consecutive hours).
+    let first = hourly.first().map(|b| b.bucket_epoch).unwrap_or(0);
+    let last  = hourly.last().map(|b| b.bucket_epoch).unwrap_or(first);
+    let n_hours = (((last - first) / 3600) + 1) as usize;
+    // Cap to fit within available width (leave a small left margin).
+    let margin_w = 1usize;
+    let n = n_hours.min(max_width.saturating_sub(margin_w));
+
+    let margin = " ".repeat(margin_w);
+
+    // Row 1: colored cells.
+    let mut cells: Vec<Span<'static>> = vec![Span::raw(margin.clone())];
+    // Row 2: hour labels (every 2 hours, or every hour if space).
+    let mut labels: Vec<Span<'static>> = vec![Span::raw(margin.clone())];
+    let label_every = if n <= 12 { 1usize } else { 2 };
+
+    for i in 0..n {
+        let epoch = first + i as i64 * 3600;
+        let v     = map.get(&epoch).map(|b| b.cost).unwrap_or(0.0);
+        let col   = heat_color(v, p33, p66, p90, false);
+        cells.push(Span::styled(CELL, Style::default().fg(col)));
+
+        let h = ((epoch / 3600) % 24) as usize;
+        if i % label_every == 0 {
+            labels.push(Span::styled(
+                if label_every > 1 {
+                    format!("{h:02}")
+                } else {
+                    // Single-char label when very dense (just the ones digit).
+                    format!("{}", h % 10)
+                },
+                Style::default().fg(BB_DIM),
+            ));
+            // Pad label chars to match cell width (CELL is one char wide).
+            for _ in 1..label_every {
+                labels.push(Span::raw(" "));
+            }
+        } else if label_every == 1 {
+            // Already pushed one label per cell above.
+        }
+    }
+
+    vec![
+        Line::from(cells),
+        Line::from(labels),
+        heat_legend(),
+    ]
 }
 
 // ── Heatmap builder ──────────────────────────────────────────────────────────
@@ -820,7 +893,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn truncate_str(s: &str, max: usize) -> String { truncate(s, max) }
 
 // ── Time ──────────────────────────────────────────────────────────────────────
 

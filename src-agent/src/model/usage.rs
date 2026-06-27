@@ -500,6 +500,38 @@ pub fn session_models(session_uuid: &str) -> Vec<ModelCostRange> {
     rows.flatten().collect()
 }
 
+/// Aggregated totals (cost, token breakdown, call count) for a single session.
+/// Used for View B's KPI strip.
+///
+/// **Non-fatal**: returns [`RangeTotals::default()`] (all zeroes) on any DB error.
+#[allow(dead_code)]
+pub fn session_totals(session_uuid: &str) -> RangeTotals {
+    let Some(conn) = open() else { return RangeTotals::default() };
+    let mut stmt = match conn.prepare(
+        "SELECT
+            COALESCE(SUM(cost), 0.0),
+            COALESCE(SUM(tokens_in), 0),
+            COALESCE(SUM(tokens_cached), 0),
+            COALESCE(SUM(tokens_out), 0),
+            COUNT(*)
+         FROM usage
+         WHERE session_uuid = ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return RangeTotals::default(),
+    };
+    stmt.query_row(rusqlite::params![session_uuid], |r| {
+        Ok(RangeTotals {
+            cost: r.get(0)?,
+            tokens_in: r.get(1)?,
+            tokens_cached: r.get(2)?,
+            tokens_out: r.get(3)?,
+            calls: r.get(4)?,
+        })
+    })
+    .unwrap_or_default()
+}
+
 /// Hourly spend/token buckets for a specific session UUID, ordered ascending.
 /// Used for View B's hourly heatmap.
 ///
