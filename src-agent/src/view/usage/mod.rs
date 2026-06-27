@@ -659,7 +659,9 @@ fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], palette: &Pale
     }
 
     let lines = build_session_hourly_heatmap(hourly, palette, w);
-    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    let h = area.height as usize;
+    let skip = lines.len().saturating_sub(h);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -682,11 +684,11 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
     let (p33, p66, p90) = percentile_thresholds(&nonzero);
     let max_val = hourly.iter().map(|b| b.cost).fold(0.0_f64, f64::max);
 
-    // Rebuild full 24-hour range from session data so gaps are visible.
+    // Rebuild range from session data starting at the first hour WITH data,
+    // not midnight — so early empty hours are dropped and active bars render.
     let first = hourly.first().map(|b| b.bucket_epoch).unwrap_or(0);
     let last  = hourly.last().map(|b| b.bucket_epoch).unwrap_or(first);
-    let first_day = first - first % 86400;
-    let n_hours = (((last - first_day) / 3600) + 1).min(24) as usize;
+    let n_hours = (((last - first) / 3600) + 1).clamp(1, 24) as usize;
 
     let label_w = 3usize; // "HH"
     let bar_w = max_width.saturating_sub(label_w).max(1);
@@ -694,7 +696,7 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(n_hours + 1); // bars + legend
 
     for i in 0..n_hours {
-        let epoch = first_day + i as i64 * 3600;
+        let epoch = first + i as i64 * 3600;
         let v = map.get(&epoch).map(|b| b.cost).unwrap_or(0.0);
         let col = heat_color(v, p33, p66, p90, false);
         let fill = if max_val <= 0.0 {
