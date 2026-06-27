@@ -60,8 +60,9 @@ pub(super) fn render_status(frame: &mut Frame, chunk: Rect, rest: &AppStateRest,
     match &readout {
         Some(r) => {
             // `↑ ↓ $` and digits are each one display column, so a char count is
-            // the exact width; +1 keeps a gap from the status text.
-            let w = u16::try_from(r.chars().count() + 1).unwrap_or(u16::MAX);
+            // the exact width; +1 keeps a gap from the status text, +4 accounts for
+            // the ` [!]` aggregate marker appended after the cost figure.
+            let w = u16::try_from(r.chars().count() + 1 + 4).unwrap_or(u16::MAX);
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(0), Constraint::Length(w)])
@@ -69,10 +70,15 @@ pub(super) fn render_status(frame: &mut Frame, chunk: Rect, rest: &AppStateRest,
             // Per-span styles (the comet's colours, or the static dim) own the look;
             // no paragraph-level base style so it doesn't flatten the comet head.
             frame.render_widget(Paragraph::new(status_line), cols[0]);
+            // Two spans: accent for the counters, dim for the [!] aggregate marker.
+            // [!] signals that the cost figure is an aggregate (includes sub-agent
+            // spend); the detail will be visible in a future /usage screen.
+            let readout_line = Line::from(vec![
+                Span::styled(r.as_str(), Style::default().fg(palette.accent)),
+                Span::styled(" [!]", Style::default().fg(palette.dim)),
+            ]);
             frame.render_widget(
-                Paragraph::new(r.as_str())
-                    .style(Style::default().fg(palette.accent))
-                    .alignment(Alignment::Right),
+                Paragraph::new(readout_line).alignment(Alignment::Right),
                 cols[1],
             );
         }
