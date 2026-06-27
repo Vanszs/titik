@@ -1,4 +1,4 @@
-# simple-coders-agent
+# koma
 
 A terminal UI (TUI) agent written in **Rust** that provides a chat‑style interface for interacting with LLMs.
 
@@ -17,7 +17,7 @@ A terminal UI (TUI) agent written in **Rust** that provides a chat‑style inter
 | **service** | External services (e.g., OpenRouter API). |
 | **tool** | Helper utilities (filesystem cache, etc.). |
 | **dto** | Data transfer objects for chat messages (`ChatMessage`, `Role`, `ToolCall`). |
-| **config** | Loading/saving of the global user config (`~/.simple-coder/config.json`). |
+| **config** | Loading/saving of the global user config (`~/.koma/config.json`). |
 | **resources** | Static assets (icons, help text). |
 
 ### `model` sub‑modules
@@ -25,7 +25,7 @@ A terminal UI (TUI) agent written in **Rust** that provides a chat‑style inter
 - **conversation.rs** – In‑memory chat history guaranteeing a system message at index 0. Provides push helpers, compaction (`split_for_compaction`, `apply_compaction`), and utilities for resending.
 - **session.rs** – Represents a named session with its own `Settings`, `Conversation`, and persistent files (`settings.json`, `messages.json`).
 - **settings.rs** – Per‑session configuration (model, temperature, etc.).
-- **store.rs** – Filesystem registry for sessions under `~/.simple-coder/`.
+- **store.rs** – Filesystem registry for sessions under `~/.koma/`.
 - **msglog.rs** – Append‑only SQLite log of every chat message.
 - **memory.rs** – Optional `MEMORY.md` file loaded from a session directory to seed context.
 

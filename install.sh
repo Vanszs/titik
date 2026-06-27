@@ -11,7 +11,7 @@
 set -e
 
 # Base download URL (GitHub latest release). Override with KOMA_RELEASE_BASE=...
-KOMA_RELEASE_BASE="${KOMA_RELEASE_BASE:-https://github.com/aula-id/simple-coders/releases/latest/download}"
+KOMA_RELEASE_BASE="${KOMA_RELEASE_BASE:-https://github.com/aula-id/koma/releases/latest/download}"
 
 INSTALL_DIR="${KOMA_INSTALL_DIR:-/usr/local/bin}"
 
