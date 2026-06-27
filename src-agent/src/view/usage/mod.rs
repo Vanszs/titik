@@ -384,7 +384,7 @@ fn heatmap_title(nav: &UsageNavState) -> String {
 fn heatmap_content_height(nav: &UsageNavState) -> usize {
     match nav.range {
         UsageRange::Today => 3, // cells + hour labels + legend
-        UsageRange::Week  => 2, // cells + legend
+        UsageRange::Week  => 8, // 7 day rows (Mon–Sun) + legend
         UsageRange::Month => 2, // cells + legend
         UsageRange::Year  => 9, // 7 day rows + blank + legend
     }
@@ -753,13 +753,13 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
 fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
     match nav.range {
         UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8, palette),
-        UsageRange::Week  => build_bar_chart(since, BucketSize::Day,   7, nav.metric, max_width, 8, palette),
+        UsageRange::Week  => build_horizontal_bar_chart(since, nav.metric, max_width, palette),
         UsageRange::Month => build_bar_chart(since, BucketSize::Day,  30, nav.metric, max_width, 8, palette),
         UsageRange::Year  => build_heatmap_yearly(since, nav.metric, palette),
     }
 }
 
-/// Vertical bar chart for Today / Week / Month ranges.
+/// Vertical bar chart for Today and Month ranges.
 ///
 /// `height` rows of vertical bars (top-to-bottom, origin at bottom), each column
 /// one char wide, colored by the heat ramp.  An x-axis label row is appended below
@@ -840,9 +840,9 @@ fn build_bar_chart(
                 ' '
             };
             let style = if ch == ' ' {
-                Style::default()
+                Style::default().bg(HEAT_EMPTY)
             } else {
-                Style::default().fg(col_color)
+                Style::default().fg(col_color).bg(HEAT_EMPTY)
             };
             spans.push(Span::styled(ch.to_string(), style));
         }
@@ -878,7 +878,7 @@ fn build_bar_chart(
         };
         label_spans.push(Span::styled(
             label_char.to_string(),
-            Style::default().fg(palette.dim),
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY),
         ));
     }
     lines.push(Line::from(label_spans));
@@ -889,6 +889,79 @@ fn build_bar_chart(
     lines
 }
 
+/// Horizontal bar chart for the Week view: one row per day (Mon–Sun), each bar
+/// extending rightward, colored by the heat ramp.  A y-axis label row is
+/// prepended to the left of each bar.
+fn build_horizontal_bar_chart(
+    since: i64,
+    metric: UsageMetric,
+    max_width: usize,
+    palette: &Palette,
+) -> Vec<Line<'static>> {
+    const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let buckets = spend_buckets(since, BucketSize::Day, 7);
+    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+
+    // Build ordered epochs oldest first (Mon on top).
+    let now  = now_secs();
+    let snap = now - now % 86400;
+    // snap is today (Sun=6); walk back 6 days to get Monday.
+    let today_dow = ((now / 86400 + 4) % 7) as i64; // 0=Sun..6=Sat
+    let monday = snap - today_dow * 86400;
+    let epochs: Vec<i64> = (0..7).map(|i| monday + i * 86400).collect();
+
+    let values: Vec<f64> = epochs
+        .iter()
+        .map(|ep| map.get(ep).map(|b| metric_val(b, metric)).unwrap_or(0.0))
+        .collect();
+
+    // Thresholds for heat coloring.
+    let nonzero: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
+    let (p33, p66, p90) = percentile_thresholds(&nonzero);
+    let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
+
+    // Fixed label width "Mon " = 4 chars.
+    let label_w = 4usize;
+    let bar_w = max_width.saturating_sub(label_w).max(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(9); // 7 bars + legend
+
+    for (i, (&v, label)) in values.iter().zip(DAY_LABELS.iter()).enumerate() {
+        let col = heat_color(v, p33, p66, p90, false);
+        let fill = if max_val <= 0.0 {
+            0usize
+        } else {
+            ((v / max_val) * bar_w as f64).round() as usize
+        };
+
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
+
+        // Day label: today gets bold accent, others dim.
+        let label_style = if i as i64 == today_dow {
+            Style::default().fg(palette.accent).bg(HEAT_EMPTY).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY)
+        };
+        spans.push(Span::styled(
+            format!("{label} "),
+            label_style,
+        ));
+
+        // Bar cells: filled portion colored, rest dark empty cells.
+        for j in 0..bar_w {
+            if j < fill {
+                spans.push(Span::styled(CELL, Style::default().fg(col).bg(HEAT_EMPTY)));
+            } else {
+                spans.push(Span::styled(CELL, Style::default().fg(HEAT_EMPTY).bg(HEAT_EMPTY)));
+            }
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(heat_legend(palette));
+    lines
+}
 
 
 fn build_heatmap_yearly(since: i64, metric: UsageMetric, palette: &Palette) -> Vec<Line<'static>> {
