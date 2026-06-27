@@ -29,6 +29,13 @@ use crate::tool::DirCache;
 /// Per-session execution state. Always non-empty in [`super::AppStateRest::sessions`];
 /// the foreground one is reached through `fg()` / `fg_mut()`.
 pub struct SessionRuntime {
+    /// Stable, process-unique identity (UUID v4), assigned once at creation and
+    /// never reused or reordered. This is how the daemon's IPC clients address a
+    /// session — NEVER by its `Vec` index, which later session-lifecycle
+    /// (tombstoning) would shift and silently cross-wire (see `ipc::proto`
+    /// critique #2). Purely additive; the single-process TUI ignores it for now.
+    #[allow(dead_code)] // read by the daemon IPC layer in stage 2+
+    pub id: String,
     pub session: Option<Session>,
     pub waiting: bool,
     pub streaming: Option<String>,
@@ -194,6 +201,10 @@ impl Default for SessionRuntime {
 impl SessionRuntime {
     pub fn new() -> Self {
         Self {
+            // Fresh stable id per session. Every construction path (the initial
+            // session in `AppStateRest::new` and each `/new` spawn) routes
+            // through here, so every session is uniquely keyed automatically.
+            id: uuid::Uuid::new_v4().to_string(),
             session: None,
             waiting: false,
             streaming: None,

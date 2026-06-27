@@ -25,6 +25,7 @@ mod config;
 mod controller;
 mod dto;
 mod internet;
+mod ipc;
 mod model;
 mod resources;
 mod service;
