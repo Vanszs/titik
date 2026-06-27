@@ -117,6 +117,7 @@ pub(super) fn handle_rewind_to_message(idx: usize, state: &mut AppState) -> Resu
     //    the history-recall load: replace input, caret to end, and leave recall /
     //    palette state clean so the editor starts fresh.
     state.rest.input = text;
+    state.rest.pending_attachments.clear();
     state.rest.cursor_end();
     state.rest.hist_idx = None;
     state.rest.input_stash.clear();
