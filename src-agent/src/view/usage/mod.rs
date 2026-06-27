@@ -23,7 +23,7 @@
 //!
 //! # Layout (View A)
 //! ```text
-//! koma / usage  [tab: global]  1:today 2:week 3:month 4:year  [m: cost]
+//! koma / usage  [tab: global]  1:today 2:week 3:year  [m: cost]
 //!
 //! KPI ──────────────────────────────────────────────────────────────────
 //! total      $0.0234
@@ -158,8 +158,7 @@ fn draw_header(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: 
         let ranges: &[(UsageRange, &str)] = &[
             (UsageRange::Today, "1:today"),
             (UsageRange::Week,  "2:week"),
-            (UsageRange::Month, "3:month"),
-            (UsageRange::Year,  "4:year"),
+            (UsageRange::Year,  "3:year"),
         ];
         for (r, label) in ranges {
             if *r == nav.range {
@@ -201,7 +200,7 @@ fn draw_footer(frame: &mut Frame, palette: &Palette, area: Rect) {
     let margin = area.inner(Margin { horizontal: 1, vertical: 0 });
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "[Tab] view  [1-4] range  [m] metric  [Esc] exit",
+            "[Tab] view  [1-3] range  [m] metric  [Esc] exit",
             Style::default().fg(palette.dim),
         )),
         margin,
@@ -374,7 +373,6 @@ fn heatmap_title(nav: &UsageNavState) -> String {
     match nav.range {
         UsageRange::Today => format!("{metric_label} (HOURLY)"),
         UsageRange::Week  => format!("{metric_label} (DAILY)"),
-        UsageRange::Month => format!("{metric_label} (DAILY)"),
         UsageRange::Year  => "HEATMAP (YEARLY)".to_string(),
     }
 }
@@ -385,7 +383,6 @@ fn heatmap_content_height(nav: &UsageNavState) -> usize {
     match nav.range {
         UsageRange::Today => 3, // cells + hour labels + legend
         UsageRange::Week  => 8, // 7 day rows (Mon–Sun) + legend
-        UsageRange::Month => 2, // cells + legend
         UsageRange::Year  => 9, // 7 day rows + blank + legend
     }
 }
@@ -748,18 +745,16 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
 /// |-------|--------------------------|
 /// | Today | 24 hourly cells (1 row)  |
 /// | Week  | 7 daily cells (1 row)    |
-/// | Month | 30 daily cells (1 row)   |
 /// | Year  | 7 rows x 53 cols Github  |
 fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
     match nav.range {
         UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8, palette),
         UsageRange::Week  => build_horizontal_bar_chart(since, nav.metric, max_width, palette),
-        UsageRange::Month => build_bar_chart(since, BucketSize::Day,  30, nav.metric, max_width, 8, palette),
         UsageRange::Year  => build_heatmap_yearly(since, nav.metric, palette),
     }
 }
 
-/// Vertical bar chart for Today and Month ranges.
+/// Vertical bar chart for the Today range.
 ///
 /// `height` rows of vertical bars (top-to-bottom, origin at bottom), each column
 /// one char wide, colored by the heat ramp.  An x-axis label row is appended below

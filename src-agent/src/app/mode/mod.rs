@@ -55,8 +55,6 @@ pub enum UsageRange {
     Today,
     /// Last 7 days.
     Week,
-    /// Last 30 days.
-    Month,
     /// Last 365 days.
     Year,
 }
@@ -74,7 +72,6 @@ impl UsageRange {
             // Floor to midnight UTC so "today" always starts at 00:00:00.
             Self::Today => now - now % 86400,
             Self::Week  => now - 7 * 86400,
-            Self::Month => now - 30 * 86400,
             Self::Year  => now - 365 * 86400,
         }
     }
@@ -85,7 +82,6 @@ impl UsageRange {
         match self {
             Self::Today => "today",
             Self::Week  => "week",
-            Self::Month => "month",
             Self::Year  => "year",
         }
     }

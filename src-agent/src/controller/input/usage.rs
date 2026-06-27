@@ -2,7 +2,7 @@
 //!
 //! Handled keys:
 //! - `Tab`   – toggle Global / Session view.
-//! - `1`–`4` – set date range: Today / Week / Month / Year (View A only).
+//! - `1`–`3` – set date range: Today / Week / Year (View A only).
 //! - `m`     – toggle metric: Cost / Tokens.
 //! - `Esc`   – close dashboard and return to Chat.
 //! - `Ctrl+C`– quit the application.
@@ -34,13 +34,12 @@ pub(super) fn handle_usage(nav: &mut UsageNavState, key: KeyEvent) -> Action {
             Action::None
         }
 
-        // 1-4 set the date range (only meaningful in Global view, but we
+        // 1-3 set the date range (only meaningful in Global view, but we
         // accept the key in both views so the user doesn't have to think
         // about which view they're in).
         KeyCode::Char('1') => { nav.range = UsageRange::Today; Action::None }
         KeyCode::Char('2') => { nav.range = UsageRange::Week;  Action::None }
-        KeyCode::Char('3') => { nav.range = UsageRange::Month; Action::None }
-        KeyCode::Char('4') => { nav.range = UsageRange::Year;  Action::None }
+        KeyCode::Char('3') => { nav.range = UsageRange::Year;  Action::None }
 
         // 'm' toggles between cost and token intensity.
         KeyCode::Char('m') => {
