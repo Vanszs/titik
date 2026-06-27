@@ -41,17 +41,16 @@ pub struct DailyCost {
 
 /// Aggregate spend per model, returned by [`top_models`].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ModelCost {
     pub model_id: String,
     pub total_cost: f64,
+    #[allow(dead_code)]
     pub total_tokens: i64,
     pub call_count: i64,
 }
 
 /// Cost per 7-day window, returned by [`weekly_costs`].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WeeklyCost {
     /// Unix-seconds of the start of this 7-day bucket (`ts - ts % 604800`).
     pub week_epoch: i64,
@@ -231,7 +230,6 @@ pub fn top_models(limit: i64) -> Vec<ModelCost> {
 /// weeks -- sufficient for relative bar-chart comparison).
 ///
 /// **Non-fatal**: returns an empty `Vec` on any DB error.
-#[allow(dead_code)]
 pub fn weekly_costs(weeks: i64) -> Vec<WeeklyCost> {
     fn inner(weeks: i64) -> rusqlite::Result<Vec<WeeklyCost>> {
         let conn = open().ok_or(rusqlite::Error::InvalidPath("no db".into()))?;

@@ -6,7 +6,8 @@
 //!    tokens_cached, tokens_out, cost.  No DB query needed; data is in memory.
 //! 2. **Yearly heatmap** -- GitHub-style cost-per-day grid: 7 rows x ~53 cols.
 //! 3. **Top models** -- top models by total spend from the global ledger.
-//! 4. **Weekly breakdown** -- placeholder header; filled in Stage 3.
+//! 4. **Weekly breakdown** -- cost per week for the last 12 weeks with a
+//!    block-char bar scaled to the max week cost.
 //!
 //! Border convention (matches project rules):
 //! - Page header: `Borders::BOTTOM` only (single horizontal rule).
@@ -36,7 +37,7 @@ use ratatui::{
 };
 
 use crate::app::state::AppStateRest;
-use crate::model::usage::{daily_costs, top_models, DailyCost};
+use crate::model::usage::{daily_costs, top_models, weekly_costs, DailyCost};
 use crate::view::theme::Palette;
 
 // ── Heatmap constants ────────────────────────────────────────────────────────
@@ -51,6 +52,14 @@ const HEAT_4: Color = Color::Rgb(57, 211, 83);
 
 /// Single block character used for each heatmap cell.
 const CELL: &str = "\u{2588}"; // U+2588 FULL BLOCK
+
+// ── Weekly bar constants ─────────────────────────────────────────────────────
+
+// Block chars for the inline bar (8 levels: empty through full block).
+const BAR_CHARS: [char; 9] = [' ', '\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}'];
+
+/// Max bar width in chars for each weekly row.
+const BAR_MAX_WIDTH: usize = 20;
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
@@ -168,13 +177,22 @@ fn build_body(rest: &AppStateRest, palette: &Palette) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(Line::default());
 
-    // ---- Section: weekly breakdown (Stage 3 placeholder) -------------------
+    // ---- Section: weekly breakdown -----------------------------------------
     lines.push(section_header("weekly", palette));
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "  weekly totals -- available after Stage 3",
-        Style::default().fg(palette.dim).add_modifier(Modifier::ITALIC),
-    )));
+
+    let weeks = weekly_costs(12);
+    if weeks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no data yet",
+            Style::default().fg(palette.dim),
+        )));
+    } else {
+        let max_cost = weeks.iter().map(|w| w.cost).fold(0.0_f64, f64::max);
+        for w in &weeks {
+            lines.push(build_weekly_row(w.week_epoch, w.cost, max_cost, palette));
+        }
+    }
 
     lines
 }
@@ -303,6 +321,84 @@ fn percentile(sorted: &[f64], pct: usize) -> f64 {
     }
     let idx = ((sorted.len() - 1) * pct) / 100;
     sorted[idx]
+}
+
+// ── Weekly row builder ───────────────────────────────────────────────────────
+
+/// Build one weekly breakdown row:
+/// `  YYYY-MM-DD  ████████████         $N.NNNN`
+///
+/// The bar is scaled linearly to `BAR_MAX_WIDTH` chars using 1/8-block
+/// precision (9 block chars from space to full-block).
+fn build_weekly_row(
+    week_epoch: i64,
+    cost: f64,
+    max_cost: f64,
+    palette: &Palette,
+) -> Line<'static> {
+    // Format the week start date as YYYY-MM-DD from unix seconds.
+    let date_label = epoch_to_date(week_epoch);
+
+    // Build the block bar.
+    let bar = if max_cost <= 0.0 {
+        " ".repeat(BAR_MAX_WIDTH)
+    } else {
+        // Scale: total units = BAR_MAX_WIDTH * 8 (sub-block precision).
+        let units = ((cost / max_cost) * (BAR_MAX_WIDTH * 8) as f64).round() as usize;
+        let full_blocks = units / 8;
+        let remainder = units % 8;
+        let mut s = String::with_capacity(BAR_MAX_WIDTH);
+        for _ in 0..full_blocks {
+            s.push(BAR_CHARS[8]); // full block
+        }
+        if full_blocks < BAR_MAX_WIDTH {
+            if remainder > 0 {
+                s.push(BAR_CHARS[remainder]);
+                // Pad remainder of bar with spaces.
+                let pad = BAR_MAX_WIDTH - full_blocks - 1;
+                for _ in 0..pad {
+                    s.push(' ');
+                }
+            } else {
+                let pad = BAR_MAX_WIDTH - full_blocks;
+                for _ in 0..pad {
+                    s.push(' ');
+                }
+            }
+        }
+        s
+    };
+
+    let cost_label = format_cost(cost);
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(date_label, Style::default().fg(palette.dim)),
+        Span::raw("  "),
+        Span::styled(bar, Style::default().fg(palette.accent)),
+        Span::raw("  "),
+        Span::styled(cost_label, Style::default().fg(palette.dim)),
+    ])
+}
+
+/// Convert a unix-seconds epoch to a `YYYY-MM-DD` string (UTC, manual arithmetic).
+///
+/// Uses the proleptic Gregorian algorithm so there is no chrono dependency.
+fn epoch_to_date(ts: i64) -> String {
+    // Days since unix epoch.
+    let days = ts / 86400;
+    // Shift to the civil epoch used by the algorithm (March 1, year 0).
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month prime [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
