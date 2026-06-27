@@ -1,5 +1,5 @@
 //! Miscellaneous simple commands: `/mode`, `/settings`, `/agents`, `/select`,
-//! `/help`, `/quit`.
+//! `/help`, `/quit`, `/usage`.
 
 use anyhow::Result;
 
@@ -82,5 +82,13 @@ pub(super) fn handle_quit(state: &mut AppState) -> Result<()> {
         abort_current(&mut state.rest);
     }
     state.rest.should_quit = true;
+    Ok(())
+}
+
+/// Handle the `/usage` command: open the cost/token usage dashboard.
+///
+/// Read-only; no waiting guard needed (the dashboard never writes).
+pub(super) fn handle_usage(state: &mut AppState) -> Result<()> {
+    state.mode = Mode::Usage;
     Ok(())
 }

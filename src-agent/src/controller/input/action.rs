@@ -74,6 +74,9 @@ pub enum Action {
     /// edit; the modal's loading flags are already set by the caller. The
     /// runtime opens a fresh `endpoints_rx` channel and spawns the fetch.
     FetchModelEndpoints(String),
+    // --- Usage dashboard actions ---
+    /// Esc on the usage dashboard — return to Chat.
+    CloseUsage,
     // --- Loading splash actions ---
     /// Esc on the startup loading splash — skip the remaining warm steps and drop
     /// straight into Chat. The background warm tasks keep running; their results

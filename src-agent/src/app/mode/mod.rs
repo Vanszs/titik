@@ -34,7 +34,7 @@ pub use settings::{
     SETTING_CATEGORIES,
 };
 
-/// The three mutually-exclusive UI modes of the application.
+/// The mutually-exclusive UI modes of the application.
 pub enum Mode {
     /// Credentials form: collects api key and model name before a session can
     /// start.  The inner [`KeyInputForm`] holds the in-progress field values
@@ -71,4 +71,9 @@ pub enum Mode {
     /// holds the option list, the cursor, and a one-line capability note. Boxed
     /// to keep `Mode` small and consistent with `Settings`.
     Effort(Box<EffortPickerState>),
+    /// Cost and token usage dashboard (`/usage`): full-screen read-only view
+    /// showing the current session's live counters and (in later stages) DB-backed
+    /// heatmap, top-models table, and weekly breakdown. No inner state is needed
+    /// for the current-session panel — all data comes directly from `AppStateRest`.
+    Usage,
 }

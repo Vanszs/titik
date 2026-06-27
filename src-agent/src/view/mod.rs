@@ -21,6 +21,7 @@ pub mod markdown;
 pub mod session_picker;
 pub mod settings;
 pub mod theme;
+pub mod usage;
 
 use ratatui::Frame;
 use crate::app::mode::Mode;
@@ -68,5 +69,6 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         ),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
         Mode::Loading(s) => loading::draw(frame, s, &palette),
+        Mode::Usage => usage::draw(frame, &state.rest, &palette),
     }
 }

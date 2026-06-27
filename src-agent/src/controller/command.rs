@@ -24,6 +24,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/agents", "Create, modify, or delete agent definitions"),
     ("/task", "Run an agent on a task in the background"),
     ("/compact", "Summarize and compact the conversation"),
+    ("/usage", "Show the cost and token usage dashboard"),
     ("/rename", "Rename the current session"),
     ("/select", "Dump history to the terminal to copy/paste"),
     ("/help", "List the available commands"),
@@ -77,6 +78,8 @@ pub enum Command {
     Select,
     /// Print available commands to the chat view.
     Help,
+    /// Open the usage dashboard (`/usage`).
+    Usage,
     /// Exit the application.
     Quit,
     /// An unrecognised command verb; holds the raw verb for display.
@@ -116,6 +119,7 @@ pub fn parse(line: &str) -> Command {
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,
         "help" => Command::Help,
+        "usage" => Command::Usage,
         "quit" | "q" | "exit" => Command::Quit,
         "rename" => {
             // Accept "/rename session <name>" as well as "/rename <name>".

@@ -37,6 +37,7 @@ pub(super) fn apply_slash(
         Command::Resume => new_session::handle_resume(state)?,
         Command::Select => misc::handle_select(state)?,
         Command::Help => misc::handle_help(state)?,
+        Command::Usage => misc::handle_usage(state)?,
         Command::Quit => misc::handle_quit(state)?,
         Command::Task(args) => task::handle_task(args, state, client, handle)?,
         Command::Internet(target) => internet::handle_internet(target, state)?,

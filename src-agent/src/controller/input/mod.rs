@@ -20,6 +20,7 @@ mod key_input;
 mod paste;
 mod picker;
 mod settings;
+mod usage;
 
 pub use action::Action;
 pub use chat::{file_ref_partial, handle_chat};
@@ -63,6 +64,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Agents(a) => agents::handle_agents(a, &mut state.rest, key),
         Mode::Effort(e) => handle_effort(e, &mut state.rest, key),
         Mode::Loading(l) => handle_loading(l, key),
+        Mode::Usage => usage::handle_usage(key),
     }
 }
 

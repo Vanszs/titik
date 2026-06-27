@@ -117,6 +117,11 @@ pub(super) fn apply_action(
         Action::SkipLoading => {
             session::handle_skip_loading(state)?;
         }
+
+        Action::CloseUsage => {
+            state.mode = crate::app::mode::Mode::Chat;
+            state.rest.status = "ready".into();
+        }
     }
     Ok(())
 }
