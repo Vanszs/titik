@@ -846,7 +846,7 @@ fn build_day_horizontal_chart(
 
     let now = now_secs();
     let snap = now - now % 86400;
-    let today_dow = ((now / 86400 + 4) % 7) as i64; // 0=Sun..6=Sat
+    let today_dow = (now / 86400 + 4) % 7; // 0=Sun..6=Sat
     let monday = snap - today_dow * 86400;
     let epochs: Vec<i64> = (0..7).map(|i| monday + i * 86400).collect();
 
