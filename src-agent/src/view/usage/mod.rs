@@ -1,32 +1,42 @@
-//! View — `/usage` Bloomberg-terminal cost and token usage dashboard.
+//! View — `/usage` cost and token usage dashboard.
 //!
 //! Two views toggled with Tab:
-//! - **View A (Global)**: KPI strip, range-adaptive heatmap, top-models table,
+//! - **View A (Global)**: KPI line, range-adaptive heatmap, top-models table,
 //!   per-model token bars, role split, spend sparkline.
 //! - **View B (Session)**: models-used table, hourly heatmap, session KPI totals.
 //!
 //! All DB queries are non-fatal (return empty/zero on missing ledger).
 //!
-//! # Bloomberg aesthetic
-//! Fixed RGB colours independent of the user theme:
+//! # Aesthetic
+//! Fixed RGB colours independent of the user theme, and — per koma's house
+//! style — NO full bordered boxes. Each section is an amber uppercase LABEL
+//! followed by a single thin horizontal rule (`Borders::BOTTOM`-equivalent),
+//! then its content packed to its own height. Lots of data, almost no
+//! box-drawing except the section rules and the bars / sparkline / heatmap cells.
 //! - Background: black (terminal default).
-//! - Labels/borders: amber `Rgb(255,176,0)`.
+//! - Section labels: amber `Rgb(255,176,0)`; rules: dim amber `Rgb(120,84,0)`.
 //! - Numeric values: near-white `Rgb(230,230,230)`.
-//! - Heatmap ramp (cheap->expensive): dim-grey -> green -> yellow-green -> amber -> red.
+//! - Heatmap ramp (cheap->expensive): grey -> green -> yellow-green -> amber -> red.
 //!
 //! # Layout (View A)
 //! ```text
-//! header: "koma / usage  [tab: global]  [1:today 2:week 3:month 4:year]  [m: cost]"
-//! ┌─ KPI STRIP ────────────────────────────────────────────────────────────────┐
-//! │ total $  in  cached  out  calls  avg/call                                  │
-//! └────────────────────────────────────────────────────────────────────────────┘
-//! ┌─ HEATMAP (range-adaptive) ──────┐ ┌─ TOP MODELS ───────────────────────── ┐
-//! │ hourly / daily / github grid    │ │ model  cost  tokens  calls  %          │
-//! └─────────────────────────────────┘ └──────────────────────────────────────  ┘
-//! ┌─ ROLE SPLIT ─────────┐ ┌─ SPEND OVER TIME ──────────────────────────────  ┐
-//! │ main vs sub bars     │ │ ▁▂▃▄▅▆▇█ sparkline                                │
-//! └──────────────────────┘ └────────────────────────────────────────────────── ┘
-//! footer: [Tab] view  [1-4] range  [m] metric  [Esc] exit
+//! koma / usage  [tab: global]  1:today 2:week 3:month 4:year  [m: cost]
+//!
+//! KPI ──────────────────────────────────────────────────────────────────
+//! total $0.0234 | in 1.2M | cached 0 | out 340.0k | calls 42 | avg/call …
+//!
+//! HEATMAP (HOURLY) ─────────────────  TOP MODELS ─────────────────────────
+//! ███▇▅▃ … hourly cells                model      cost   tokens calls  %
+//!                                      gpt-…    $0.012    1.2M    20  51
+//!
+//! ROLE SPLIT ────────────────────────────────────────────────────────────
+//! main $0.018  ████████          60%  30c
+//! sub  $0.012  █████             40%  12c
+//!
+//! SPEND OVER TIME ───────────────────────────────────────────────────────
+//! ▁▂▃▄▅▆▇█ sparkline
+//!
+//! [Tab] view  [1-4] range  [m] metric  [Esc] exit
 //! ```
 
 use std::collections::HashMap;
@@ -48,10 +58,12 @@ use crate::model::usage::{
 };
 use crate::view::theme::Palette;
 
-// ── Bloomberg fixed palette ──────────────────────────────────────────────────
+// ── Fixed palette ─────────────────────────────────────────────────────────────
 
-/// Panel border and title colour: amber.
+/// Section-label colour: amber.
 const BB_AMBER: Color = Color::Rgb(255, 176, 0);
+/// Section-rule colour: dim amber (the thin `─` underline under a label).
+const BB_RULE: Color = Color::Rgb(120, 84, 0);
 /// Numeric value colour: near-white.
 const BB_VALUE: Color = Color::Rgb(230, 230, 230);
 /// Secondary label / separator colour: dim grey.
@@ -70,6 +82,9 @@ const HEAT_4: Color = Color::Rgb(220, 50, 50);      // red   (expensive)
 /// Full-block cell character used in every heatmap.
 const CELL: &str = "\u{2588}";
 
+/// Single horizontal-rule character for section underlines.
+const RULE: &str = "\u{2500}";
+
 // ── Bar / sparkline character sets ───────────────────────────────────────────
 
 /// 8-level block chars: index 0 = space (empty), index 8 = full block.
@@ -87,6 +102,9 @@ const SPARK_CHARS: [char; 9] = [
 /// Max bar width for per-model token bars (chars).
 const BAR_MAX_WIDTH: usize = 20;
 
+/// Column gap between the two side-by-side sections in the middle row.
+const COL_GAP: u16 = 2;
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Render the `/usage` dashboard every frame while `Mode::Usage` is active.
@@ -102,12 +120,12 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, nav: &UsageNavState, _palett
         return;
     }
 
-    // Three vertical zones: header | panels | footer.
+    // Three vertical zones: header | body | footer.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // title line + BOTTOM border
-            Constraint::Min(0),    // panel grid
+            Constraint::Length(2), // nav line + BOTTOM rule
+            Constraint::Min(0),    // sections
             Constraint::Length(1), // hotkey legend
         ])
         .split(area);
@@ -121,7 +139,7 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, nav: &UsageNavState, _palett
     }
 }
 
-// ── Header ───────────────────────────────────────────────────────────────────
+// ── Nav header ─────────────────────────────────────────────────────────────────
 
 fn draw_header(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
     let view_label = match nav.view {
@@ -167,9 +185,10 @@ fn draw_header(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
         spans.push(Span::styled(metric_label, Style::default().fg(BB_DIM)));
     }
 
+    // House style: a single BOTTOM rule, not a box.
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(BB_AMBER));
+        .border_style(Style::default().fg(BB_RULE));
     let inner = header_block.inner(area);
     frame.render_widget(header_block, area);
     let margin = inner.inner(Margin { horizontal: 1, vertical: 0 });
@@ -189,10 +208,51 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
     );
 }
 
+// ── Section primitive (label + thin rule, NO box) ──────────────────────────────
+
+/// Draw an amber uppercase section LABEL followed by a single dim-amber `─`
+/// rule that fills the rest of the row, then return the inner content rect
+/// (everything below the rule).  This is the boxless, top-down house style:
+/// a header underline, never a surrounding box.
+///
+/// Returns a zero-height rect when `area` cannot hold the label row.
+fn section(frame: &mut Frame, title: &str, area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect { x: area.x, y: area.y, width: area.width, height: 0 };
+    }
+
+    let w = area.width as usize;
+    // "LABEL ───…" — one space after the label, then the rule fills the rest.
+    let label_w = title.chars().count().min(w);
+    // Account for label + one trailing space before the rule.
+    let rule_len = w.saturating_sub(label_w + 1);
+    let rule: String = RULE.repeat(rule_len);
+
+    let line = Line::from(vec![
+        Span::styled(
+            title.chars().take(label_w).collect::<String>(),
+            Style::default().fg(BB_AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(rule, Style::default().fg(BB_RULE)),
+    ]);
+
+    let label_row = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+    frame.render_widget(Paragraph::new(line), label_row);
+
+    // Content sits directly under the rule.
+    Rect {
+        x: area.x,
+        y: area.y.saturating_add(1),
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    }
+}
+
 // ── View A: Global ────────────────────────────────────────────────────────────
 
 fn draw_global(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
-    if area.height < 4 {
+    if area.height < 3 {
         return;
     }
 
@@ -203,43 +263,83 @@ fn draw_global(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
     let (bucket, n_buckets) = range_bucket(nav.range);
     let buckets = spend_buckets(since, bucket, n_buckets);
 
-    // Vertical: KPI(3) | middle(min) | bottom(5)
+    // Pre-measure the side-by-side middle row so it sizes to the TALLER of its
+    // two contents — never stretched to fill the screen.
+    let mid_w        = area.width.saturating_sub(COL_GAP) as usize;
+    let left_w       = mid_w * 45 / 100;
+    let right_w      = mid_w.saturating_sub(left_w);
+    let heatmap_rows = heatmap_content_height(nav);
+    // models = 1 header row + 2 lines (row+bar) per model, or 1 "no data" line.
+    let model_rows   = if models.is_empty() { 2 } else { 1 + models.len() * 2 };
+    let mid_content  = heatmap_rows.max(model_rows).max(1);
+    let mid_total    = (mid_content + 1) as u16; // +1 for the section label row
+
+    // Role-split content height: 2 bar rows (main/sub), +1 label row.
+    let role_total = 3u16;
+    // Spend-over-time: 1 sparkline row, +1 label row.
+    let spend_total = 2u16;
+    // KPI: 1 value line, +1 label row.
+    let kpi_total = 2u16;
+
+    // Sections, each sized to its own content, with a single blank line between
+    // them. A trailing Min(0) spacer soaks up any remaining height so nothing
+    // gets stretched into an empty cavern.
+    let blank = Constraint::Length(1);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(kpi_total),
+            blank,
+            Constraint::Length(mid_total),
+            blank,
+            Constraint::Length(role_total),
+            blank,
+            Constraint::Length(spend_total),
             Constraint::Min(0),
-            Constraint::Length(5),
         ])
         .split(area);
 
-    draw_kpi_strip(frame, &totals, rows[0]);
+    // KPI — single full-width line.
+    {
+        let inner = section(frame, "KPI", rows[0]);
+        draw_kpi_strip(frame, &totals, inner);
+    }
 
-    // Middle: heatmap 45% | top-models 55%
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(rows[1]);
-    draw_heatmap_panel(frame, nav, since, mid[0]);
-    draw_models_panel(frame, &models, &totals, nav, mid[1]);
+    // Middle: heatmap (left) | top-models (right), sized to the taller content.
+    {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(left_w as u16),
+                Constraint::Length(COL_GAP),
+                Constraint::Min(0),
+            ])
+            .split(rows[2]);
 
-    // Bottom: role-split 35% | sparkline 65%
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(rows[2]);
-    draw_role_split_panel(frame, &rsplit, bot[0]);
-    draw_sparkline_panel(frame, &buckets, nav, bot[1]);
+        let heat_inner = section(frame, &heatmap_title(nav.range), cols[0]);
+        draw_heatmap(frame, nav, since, heat_inner);
+
+        let models_inner = section(frame, "TOP MODELS", cols[2]);
+        draw_models(frame, &models, &totals, nav, models_inner, right_w);
+    }
+
+    // Role split — full-width compact section.
+    {
+        let inner = section(frame, "ROLE SPLIT", rows[4]);
+        draw_role_split(frame, &rsplit, inner);
+    }
+
+    // Spend over time — full-width compact section.
+    {
+        let inner = section(frame, "SPEND OVER TIME", rows[6]);
+        draw_sparkline(frame, &buckets, nav, inner);
+    }
 }
 
 // ── KPI strip ────────────────────────────────────────────────────────────────
 
 fn draw_kpi_strip(frame: &mut Frame, totals: &crate::model::usage::RangeTotals, area: Rect) {
-    let block = amber_panel("KPI");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.width < 10 {
+    if area.height == 0 || area.width < 10 {
         return;
     }
 
@@ -259,45 +359,54 @@ fn draw_kpi_strip(frame: &mut Frame, totals: &crate::model::usage::RangeTotals, 
         kv("avg/call", &fmt_cost(avg)),
     ]);
 
-    frame.render_widget(Paragraph::new(line), inner);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
-// ── Heatmap panel ────────────────────────────────────────────────────────────
+// ── Heatmap section ────────────────────────────────────────────────────────────
 
-fn draw_heatmap_panel(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect) {
-    let title = match nav.range {
-        UsageRange::Today => "HEATMAP (hourly)",
-        UsageRange::Week  => "HEATMAP (daily)",
-        UsageRange::Month => "HEATMAP (daily)",
-        UsageRange::Year  => "HEATMAP (yearly)",
-    };
-    let block = amber_panel(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+fn heatmap_title(range: UsageRange) -> String {
+    match range {
+        UsageRange::Today => "HEATMAP (HOURLY)",
+        UsageRange::Week  => "HEATMAP (DAILY)",
+        UsageRange::Month => "HEATMAP (DAILY)",
+        UsageRange::Year  => "HEATMAP (YEARLY)",
+    }
+    .to_string()
+}
 
-    if inner.width < 8 || inner.height < 2 {
+/// Content-row count a heatmap occupies for the active range (excludes the
+/// section label row). Drives tight middle-row sizing.
+fn heatmap_content_height(nav: &UsageNavState) -> usize {
+    match nav.range {
+        UsageRange::Today => 3, // cells + hour labels + legend
+        UsageRange::Week  => 2, // cells + legend
+        UsageRange::Month => 2, // cells + legend
+        UsageRange::Year  => 9, // 7 day rows + blank + legend
+    }
+}
+
+fn draw_heatmap(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect) {
+    if area.width < 8 || area.height == 0 {
         return;
     }
 
-    let lines = build_heatmap(nav, since, inner.width as usize);
-    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let lines = build_heatmap(nav, since, area.width as usize);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
-// ── Top models + per-model token bars panel ───────────────────────────────────
+// ── Top models + per-model token bars section ──────────────────────────────────
 
-fn draw_models_panel(
+fn draw_models(
     frame: &mut Frame,
     models: &[crate::model::usage::ModelCostRange],
     totals: &crate::model::usage::RangeTotals,
     nav: &UsageNavState,
     area: Rect,
+    width_hint: usize,
 ) {
-    let block = amber_panel("TOP MODELS");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.width < 20 || inner.height < 2 {
+    let w = (area.width as usize).max(width_hint.min(area.width as usize));
+    if w < 20 || area.height == 0 {
         return;
     }
 
@@ -306,7 +415,7 @@ fn draw_models_panel(
 
     // Fit the model-name column into available width.
     let fixed_cols = 34usize; // cost(9) + tokens(9) + calls(6) + pct(6) + sep spaces
-    let col_model = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
+    let col_model = w.saturating_sub(fixed_cols).clamp(8, 24);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -333,7 +442,7 @@ fn draw_models_panel(
         ]));
 
         // Per-model bar below the row, scaled to the metric.
-        let bar_w = (inner.width as usize).saturating_sub(col_model + 3).min(BAR_MAX_WIDTH);
+        let bar_w = w.saturating_sub(col_model + 3).min(BAR_MAX_WIDTH);
         let (bar_val, bar_max) = match nav.metric {
             UsageMetric::Tokens => (total_tok, max_tokens),
             UsageMetric::Cost   => {
@@ -352,18 +461,14 @@ fn draw_models_panel(
         lines.push(Line::from(Span::styled("no data for range", Style::default().fg(BB_DIM))));
     }
 
-    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
-// ── Role split panel ──────────────────────────────────────────────────────────
+// ── Role split section ──────────────────────────────────────────────────────────
 
-fn draw_role_split_panel(frame: &mut Frame, split: &crate::model::usage::RoleSplit, area: Rect) {
-    let block = amber_panel("ROLE SPLIT");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.height < 2 {
+fn draw_role_split(frame: &mut Frame, split: &crate::model::usage::RoleSplit, area: Rect) {
+    if area.height == 0 || area.width < 12 {
         return;
     }
 
@@ -371,7 +476,7 @@ fn draw_role_split_panel(frame: &mut Frame, split: &crate::model::usage::RoleSpl
     let main_pct = (split.main_cost / total * 100.0).round() as u64;
     let sub_pct  = (split.sub_cost  / total * 100.0).round() as u64;
 
-    let bar_w = (inner.width as usize).saturating_sub(22).min(BAR_MAX_WIDTH);
+    let bar_w = (area.width as usize).saturating_sub(22).min(BAR_MAX_WIDTH);
     let total_i = (total * 1_000_000.0) as i64;
     let main_bar = build_bar((split.main_cost * 1_000_000.0) as i64, total_i, bar_w);
     let sub_bar  = build_bar((split.sub_cost  * 1_000_000.0) as i64, total_i, bar_w);
@@ -391,23 +496,19 @@ fn draw_role_split_panel(frame: &mut Frame, split: &crate::model::usage::RoleSpl
         ]),
     ];
 
-    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
-// ── Spend-over-time sparkline panel ───────────────────────────────────────────
+// ── Spend-over-time sparkline section ───────────────────────────────────────────
 
-fn draw_sparkline_panel(
+fn draw_sparkline(
     frame: &mut Frame,
     buckets: &[SpendBucket],
     nav: &UsageNavState,
     area: Rect,
 ) {
-    let block = amber_panel("SPEND OVER TIME");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.width < 4 || inner.height < 1 {
+    if area.width < 4 || area.height == 0 {
         return;
     }
 
@@ -419,15 +520,15 @@ fn draw_sparkline_panel(
         })
         .collect();
 
-    let spark = build_sparkline(&values, inner.width as usize);
+    let spark = build_sparkline(&values, area.width as usize);
     let visible = vec![Line::from(Span::styled(spark, Style::default().fg(BB_AMBER)))];
-    frame.render_widget(Paragraph::new(visible), inner);
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 // ── View B: Session ───────────────────────────────────────────────────────────
 
 fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, area: Rect) {
-    if area.height < 4 {
+    if area.height < 3 {
         return;
     }
 
@@ -439,28 +540,51 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, ar
     // committed, or session opened without a prior ledger entry).
     let db_totals   = session_totals(&uuid);
 
+    // Pre-measure the side-by-side row so it sizes to the taller content.
+    let mid_w     = area.width.saturating_sub(COL_GAP) as usize;
+    let left_w    = mid_w * 55 / 100;
+    let right_w   = mid_w.saturating_sub(left_w);
+    let model_rows = if sess_models.is_empty() { 2 } else { 1 + sess_models.len() };
+    let hourly_rows = if hourly.is_empty() { 1 } else { 3 }; // cells + labels + legend
+    let mid_content = model_rows.max(hourly_rows).max(1);
+    let mid_total   = (mid_content + 1) as u16; // +1 label row
+
+    let blank = Constraint::Length(1);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(2), // session totals: label + 1 line
+            blank,
+            Constraint::Length(mid_total),
+            Constraint::Min(0),
+        ])
         .split(area);
 
-    draw_session_kpi(frame, rest, db_totals.calls, rows[0]);
+    {
+        let inner = section(frame, "SESSION TOTALS", rows[0]);
+        draw_session_kpi(frame, rest, db_totals.calls, inner);
+    }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
+    {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(left_w as u16),
+                Constraint::Length(COL_GAP),
+                Constraint::Min(0),
+            ])
+            .split(rows[2]);
 
-    draw_session_models(frame, &sess_models, cols[0]);
-    draw_session_hourly(frame, &hourly, cols[1]);
+        let models_inner = section(frame, "MODELS USED", cols[0]);
+        draw_session_models(frame, &sess_models, models_inner, left_w);
+
+        let hourly_inner = section(frame, "HOURLY HEATMAP", cols[2]);
+        draw_session_hourly(frame, &hourly, hourly_inner, right_w);
+    }
 }
 
 fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, db_calls: i64, area: Rect) {
-    let block = amber_panel("SESSION TOTALS");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.width < 10 {
+    if area.height == 0 || area.width < 10 {
         return;
     }
 
@@ -477,23 +601,25 @@ fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, db_calls: i64, area:
         dim_sep(),
         kv("calls",  &db_calls.to_string()),
     ]);
-    frame.render_widget(Paragraph::new(line), inner);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCostRange], area: Rect) {
-    let block = amber_panel("MODELS USED");
-    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(block, area);
-
-    if inner.height < 2 || inner.width < 20 {
+fn draw_session_models(
+    frame: &mut Frame,
+    models: &[crate::model::usage::ModelCostRange],
+    area: Rect,
+    width_hint: usize,
+) {
+    let w = (area.width as usize).max(width_hint.min(area.width as usize));
+    if area.height == 0 || w < 20 {
         return;
     }
 
     // Fixed columns: cost(9) + tokens(9) + calls(6) + separators → 30 chars.
     // "usage" bar takes whatever is left after model name and fixed cols.
     let fixed_cols = 30usize;
-    let col_model  = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
-    let bar_w      = (inner.width as usize)
+    let col_model  = w.saturating_sub(fixed_cols).clamp(8, 24);
+    let bar_w      = w
         .saturating_sub(col_model + fixed_cols + 2)
         .clamp(0, 12);
 
@@ -528,22 +654,19 @@ fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCo
         lines.push(Line::from(Span::styled("no usage recorded yet", Style::default().fg(BB_DIM))));
     }
 
-    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], area: Rect) {
-    let block = amber_panel("HOURLY HEATMAP");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height < 2 || inner.width < 4 {
+fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], area: Rect, width_hint: usize) {
+    let w = (area.width as usize).max(width_hint.min(area.width as usize));
+    if area.height == 0 || w < 4 {
         return;
     }
 
-    let lines = build_session_hourly_heatmap(hourly, inner.width as usize);
-    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let lines = build_session_hourly_heatmap(hourly, w);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 /// Build a cell-based hourly heatmap for View B (session scope).
@@ -835,19 +958,6 @@ fn range_bucket(range: UsageRange) -> (BucketSize, usize) {
     }
 }
 
-// ── Panel primitive ───────────────────────────────────────────────────────────
-
-/// Amber-bordered panel block with a bold title on the top rail.
-/// Call `block.inner(area)` to get the inner rect after rendering.
-fn amber_panel(title: &str) -> Block<'static> {
-    Block::bordered()
-        .border_style(Style::default().fg(BB_AMBER))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(BB_AMBER).add_modifier(Modifier::BOLD),
-        ))
-}
-
 // ── Numeric formatters ────────────────────────────────────────────────────────
 
 /// USD cost: `$1.23` for >= $1, `$0.0045` for small values.
@@ -866,10 +976,10 @@ fn fmt_tok(n: f64) -> String {
 
 // ── Span helpers ─────────────────────────────────────────────────────────────
 
-/// `label: VALUE  ` with value in near-white.
+/// `label VALUE  ` with the value in near-white.
 fn kv(label: &'static str, value: &str) -> Span<'static> {
     Span::styled(
-        format!("{label}: {value}  "),
+        format!("{label} {value}  "),
         Style::default().fg(BB_VALUE),
     )
 }
