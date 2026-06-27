@@ -1,448 +1,832 @@
-//! View -- `/usage` cost and token usage dashboard (Usage mode).
+//! View — `/usage` Bloomberg-terminal cost and token usage dashboard.
 //!
-//! A full-screen, read-only page with four panels (top to bottom):
+//! Two views toggled with Tab:
+//! - **View A (Global)**: KPI strip, range-adaptive heatmap, top-models table,
+//!   per-model token bars, role split, spend sparkline.
+//! - **View B (Session)**: models-used table, hourly heatmap, session KPI totals.
 //!
-//! 1. **Current session** -- live counters from `AppStateRest`: tokens_in,
-//!    tokens_cached, tokens_out, cost.  No DB query needed; data is in memory.
-//! 2. **Yearly heatmap** -- GitHub-style cost-per-day grid: 7 rows x ~53 cols.
-//! 3. **Top models** -- top models by total spend from the global ledger.
-//! 4. **Weekly breakdown** -- cost per week for the last 12 weeks with a
-//!    block-char bar scaled to the max week cost.
+//! All DB queries are non-fatal (return empty/zero on missing ledger).
 //!
-//! Border convention (matches project rules):
-//! - Page header: `Borders::BOTTOM` only (single horizontal rule).
-//! - Section headers: plain dim bold line, no borders.
-//! - No full boxes.
+//! # Bloomberg aesthetic
+//! Fixed RGB colours independent of the user theme:
+//! - Background: black (terminal default).
+//! - Labels/borders: amber `Rgb(255,176,0)`.
+//! - Numeric values: near-white `Rgb(230,230,230)`.
+//! - Heatmap ramp (cheap->expensive): dim-grey -> green -> yellow-green -> amber -> red.
 //!
-//! Heatmap colour scheme (fixed RGB, theme-independent so it reads on both
-//! dark and light terminals):
-//!
-//! | bucket | condition          | RGB              |
-//! |--------|--------------------|------------------|
-//! | 0      | zero / no data     | (40, 40, 40)     |
-//! | 1      | > 0                | (0, 68, 27)      |
-//! | 2      | > p33              | (0, 109, 44)     |
-//! | 3      | > p66              | (38, 166, 65)    |
-//! | 4      | > p90              | (57, 211, 83)    |
+//! # Layout (View A)
+//! ```text
+//! header: "koma / usage  [tab: global]  [1:today 2:week 3:month 4:year]  [m: cost]"
+//! ┌─ KPI STRIP ────────────────────────────────────────────────────────────────┐
+//! │ total $  in  cached  out  calls  avg/call                                  │
+//! └────────────────────────────────────────────────────────────────────────────┘
+//! ┌─ HEATMAP (range-adaptive) ──────┐ ┌─ TOP MODELS ───────────────────────── ┐
+//! │ hourly / daily / github grid    │ │ model  cost  tokens  calls  %          │
+//! └─────────────────────────────────┘ └──────────────────────────────────────  ┘
+//! ┌─ ROLE SPLIT ─────────┐ ┌─ SPEND OVER TIME ──────────────────────────────  ┐
+//! │ main vs sub bars     │ │ ▁▂▃▄▅▆▇█ sparkline                                │
+//! └──────────────────────┘ └────────────────────────────────────────────────── ┘
+//! footer: [Tab] view  [1-4] range  [m] metric  [Esc] exit
+//! ```
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
-use crate::app::mode::UsageNavState;
+use crate::app::mode::{UsageMetric, UsageNavState, UsageRange, UsageView};
 use crate::app::state::AppStateRest;
-use crate::model::usage::{daily_costs, top_models, weekly_costs, DailyCost};
+use crate::model::usage::{
+    range_totals, role_split, session_hourly, session_models, spend_buckets,
+    top_models_in_range, BucketSize, SpendBucket,
+};
 use crate::view::theme::Palette;
 
-// ── Heatmap constants ────────────────────────────────────────────────────────
+// ── Bloomberg fixed palette ──────────────────────────────────────────────────
 
-// Fixed green-ramp (matches GitHub contribution graph spirit).
-// Level 0 = empty/background, levels 1-4 = ascending intensity.
-const HEAT_EMPTY: Color = Color::Rgb(40, 40, 40);
-const HEAT_1: Color = Color::Rgb(0, 68, 27);
-const HEAT_2: Color = Color::Rgb(0, 109, 44);
-const HEAT_3: Color = Color::Rgb(38, 166, 65);
-const HEAT_4: Color = Color::Rgb(57, 211, 83);
+/// Panel border and title colour: amber.
+const BB_AMBER: Color = Color::Rgb(255, 176, 0);
+/// Numeric value colour: near-white.
+const BB_VALUE: Color = Color::Rgb(230, 230, 230);
+/// Secondary label / separator colour: dim grey.
+const BB_DIM: Color = Color::Rgb(80, 80, 80);
+/// Active range-tab highlight background.
+const BB_TAB_BG: Color = Color::Rgb(60, 40, 0);
 
-/// Single block character used for each heatmap cell.
-const CELL: &str = "\u{2588}"; // U+2588 FULL BLOCK
+// ── Heatmap ramp (cheap -> expensive) ────────────────────────────────────────
 
-// ── Weekly bar constants ─────────────────────────────────────────────────────
+const HEAT_EMPTY: Color = Color::Rgb(35, 35, 35);   // no data
+const HEAT_1: Color = Color::Rgb(0, 120, 60);       // green  (cheap)
+const HEAT_2: Color = Color::Rgb(100, 160, 50);     // yellow-green
+const HEAT_3: Color = Color::Rgb(200, 140, 0);      // amber
+const HEAT_4: Color = Color::Rgb(220, 50, 50);      // red   (expensive)
 
-// Block chars for the inline bar (8 levels: empty through full block).
-const BAR_CHARS: [char; 9] = [' ', '\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}'];
+/// Full-block cell character used in every heatmap.
+const CELL: &str = "\u{2588}";
 
-/// Max bar width in chars for each weekly row.
+// ── Bar / sparkline character sets ───────────────────────────────────────────
+
+/// 8-level block chars: index 0 = space (empty), index 8 = full block.
+const BAR_CHARS: [char; 9] = [
+    ' ',
+    '\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}',
+    '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}',
+];
+
+/// 8-level sparkline chars: empty -> full.
+const SPARK_CHARS: [char; 9] = [
+    ' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█',
+];
+
+/// Max bar width for per-model token bars (chars).
 const BAR_MAX_WIDTH: usize = 20;
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-/// Render the `/usage` dashboard using live counters from `rest` and the
-/// given colour `palette`.
-pub fn draw(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, palette: &Palette) {
+/// Render the `/usage` dashboard every frame while `Mode::Usage` is active.
+pub fn draw(frame: &mut Frame, rest: &AppStateRest, nav: &UsageNavState, _palette: &Palette) {
     let area = frame.area();
 
-    // Outer zones: header | body | footer hint.
+    // Minimum-size guard — nothing below panics on a very small terminal.
+    if area.width < 20 || area.height < 6 {
+        frame.render_widget(
+            Paragraph::new(Span::styled("terminal too small", Style::default().fg(BB_AMBER))),
+            area,
+        );
+        return;
+    }
+
+    // Three vertical zones: header | panels | footer.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // "usage" title + BOTTOM border
-            Constraint::Min(0),    // scrollable body
-            Constraint::Length(1), // key hint
+            Constraint::Length(2), // title line + BOTTOM border
+            Constraint::Min(0),    // panel grid
+            Constraint::Length(1), // hotkey legend
         ])
         .split(area);
 
-    // -- Header ---------------------------------------------------------------
+    draw_header(frame, nav, outer[0]);
+    draw_footer(frame, outer[2]);
+
+    match nav.view {
+        UsageView::Global  => draw_global(frame, nav, outer[1]),
+        UsageView::Session => draw_session(frame, rest, nav, outer[1]),
+    }
+}
+
+// ── Header ───────────────────────────────────────────────────────────────────
+
+fn draw_header(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
+    let view_label = match nav.view {
+        UsageView::Global  => "global",
+        UsageView::Session => "session",
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        "koma / usage  ",
+        Style::default().fg(BB_AMBER).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("[tab: {view_label}]  "),
+        Style::default().fg(BB_DIM),
+    ));
+
+    if nav.view == UsageView::Global {
+        let ranges: &[(UsageRange, &str)] = &[
+            (UsageRange::Today, "1:today"),
+            (UsageRange::Week,  "2:week"),
+            (UsageRange::Month, "3:month"),
+            (UsageRange::Year,  "4:year"),
+        ];
+        for (r, label) in ranges {
+            if *r == nav.range {
+                spans.push(Span::styled(
+                    format!(" {label} "),
+                    Style::default().fg(BB_AMBER).bg(BB_TAB_BG).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {label} "),
+                    Style::default().fg(BB_DIM),
+                ));
+            }
+            spans.push(Span::raw("  "));
+        }
+        let metric_label = match nav.metric {
+            UsageMetric::Cost   => "[m: cost]",
+            UsageMetric::Tokens => "[m: tokens]",
+        };
+        spans.push(Span::styled(metric_label, Style::default().fg(BB_DIM)));
+    }
+
     let header_block = Block::new()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(palette.dim))
-        .padding(Padding::horizontal(1));
+        .border_style(Style::default().fg(BB_AMBER));
+    let inner = header_block.inner(area);
+    frame.render_widget(header_block, area);
+    let margin = inner.inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(Paragraph::new(Line::from(spans)), margin);
+}
+
+// ── Footer ────────────────────────────────────────────────────────────────────
+
+fn draw_footer(frame: &mut Frame, area: Rect) {
+    let margin = area.inner(Margin { horizontal: 1, vertical: 0 });
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "usage",
-            Style::default().fg(palette.dim),
-        )))
-        .block(header_block),
-        outer[0],
-    );
-
-    // -- Body -----------------------------------------------------------------
-    let body = outer[1].inner(Margin { horizontal: 1, vertical: 0 });
-
-    let lines = build_body(rest, palette);
-    frame.render_widget(Paragraph::new(lines), body);
-
-    // -- Footer hint ----------------------------------------------------------
-    let hint = outer[2].inner(Margin { horizontal: 1, vertical: 0 });
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Esc close",
-            Style::default().fg(palette.dim),
-        ))),
-        hint,
+        Paragraph::new(Span::styled(
+            "[Tab] view  [1-4] range  [m] metric  [Esc] exit",
+            Style::default().fg(BB_DIM),
+        )),
+        margin,
     );
 }
 
-// ── Body builder ────────────────────────────────────────────────────────────
+// ── View A: Global ────────────────────────────────────────────────────────────
 
-/// Build all body lines for the dashboard.
-fn build_body(rest: &AppStateRest, palette: &Palette) -> Vec<Line<'static>> {
+fn draw_global(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
+    if area.height < 4 {
+        return;
+    }
+
+    let since   = nav.range.since_secs();
+    let totals  = range_totals(since);
+    let models  = top_models_in_range(since, 8);
+    let rsplit  = role_split(since);
+    let (bucket, n_buckets) = range_bucket(nav.range);
+    let buckets = spend_buckets(since, bucket, n_buckets);
+
+    // Vertical: KPI(3) | middle(min) | bottom(5)
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(5),
+        ])
+        .split(area);
+
+    draw_kpi_strip(frame, &totals, rows[0]);
+
+    // Middle: heatmap 45% | top-models 55%
+    let mid = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(rows[1]);
+    draw_heatmap_panel(frame, nav, since, mid[0]);
+    draw_models_panel(frame, &models, &totals, nav, mid[1]);
+
+    // Bottom: role-split 35% | sparkline 65%
+    let bot = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(rows[2]);
+    draw_role_split_panel(frame, &rsplit, bot[0]);
+    draw_sparkline_panel(frame, &buckets, nav, bot[1]);
+}
+
+// ── KPI strip ────────────────────────────────────────────────────────────────
+
+fn draw_kpi_strip(frame: &mut Frame, totals: &crate::model::usage::RangeTotals, area: Rect) {
+    let block = amber_panel("KPI");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.width < 10 {
+        return;
+    }
+
+    let avg = if totals.calls > 0 { totals.cost / totals.calls as f64 } else { 0.0 };
+
+    let line = Line::from(vec![
+        kv("total",    &fmt_cost(totals.cost)),
+        dim_sep(),
+        kv("in",       &fmt_tokens_i64(totals.tokens_in)),
+        dim_sep(),
+        kv("cached",   &fmt_tokens_i64(totals.tokens_cached)),
+        dim_sep(),
+        kv("out",      &fmt_tokens_i64(totals.tokens_out)),
+        dim_sep(),
+        kv("calls",    &totals.calls.to_string()),
+        dim_sep(),
+        kv("avg/call", &fmt_cost(avg)),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
+// ── Heatmap panel ────────────────────────────────────────────────────────────
+
+fn draw_heatmap_panel(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect) {
+    let title = match nav.range {
+        UsageRange::Today => "HEATMAP (hourly)",
+        UsageRange::Week  => "HEATMAP (daily)",
+        UsageRange::Month => "HEATMAP (daily)",
+        UsageRange::Year  => "HEATMAP (yearly)",
+    };
+    let block = amber_panel(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    let lines = build_heatmap(nav, since, inner.width as usize);
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+// ── Top models + per-model token bars panel ───────────────────────────────────
+
+fn draw_models_panel(
+    frame: &mut Frame,
+    models: &[crate::model::usage::ModelCostRange],
+    totals: &crate::model::usage::RangeTotals,
+    nav: &UsageNavState,
+    area: Rect,
+) {
+    let block = amber_panel("TOP MODELS");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.width < 20 || inner.height < 2 {
+        return;
+    }
+
+    let total_cost = totals.cost;
+    let max_tokens: i64 = models.iter().map(|m| m.tokens_in + m.tokens_out).max().unwrap_or(1).max(1);
+
+    // Fit the model-name column into available width.
+    let fixed_cols = 34usize; // cost(9) + tokens(9) + calls(6) + pct(6) + sep spaces
+    let col_model = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // ---- Section: current session ------------------------------------------
-    lines.push(section_header("current session", palette));
-    lines.push(Line::default());
+    // Header row.
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{:<col_model$}  {:>9}  {:>9}  {:>6}  {:>5}",
+            "model", "cost", "tokens", "calls", "%"
+        ),
+        Style::default().fg(BB_DIM),
+    )));
 
-    let cost_str = format_cost(rest.cost);
-    let row = Line::from(vec![
-        label_span("tokens in"),
-        Span::raw("  "),
-        value_span(&fmt_tokens(rest.tokens_in), palette),
-        Span::raw("   "),
-        label_span("cached"),
-        Span::raw("  "),
-        value_span(&fmt_tokens(rest.tokens_cached), palette),
-        Span::raw("   "),
-        label_span("out"),
-        Span::raw("  "),
-        value_span(&fmt_tokens(rest.tokens_out), palette),
-        Span::raw("   "),
-        value_span(&cost_str, palette),
-    ]);
-    lines.push(row);
-    lines.push(Line::default());
-    lines.push(Line::default());
+    for m in models {
+        let id  = truncate(&m.model_id, col_model);
+        let pct = if total_cost > 0.0 { (m.total_cost / total_cost * 100.0).round() as u64 } else { 0 };
+        let total_tok = m.tokens_in + m.tokens_out;
 
-    // ---- Section: yearly heatmap -------------------------------------------
-    lines.push(section_header("yearly", palette));
-    lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<col_model$}", id),             Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_cost(m.total_cost)),Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_tokens_i64(total_tok)), Style::default().fg(BB_DIM)),
+            Span::styled(format!("  {:>6}", m.call_count),          Style::default().fg(BB_DIM)),
+            Span::styled(format!("  {:>4}%", pct),                  Style::default().fg(BB_DIM)),
+        ]));
 
-    // Query last 371 days (53 full weeks + 2 days buffer to always have 53 cols).
-    let daily = daily_costs(371);
-    for heatmap_line in build_heatmap(&daily) {
-        lines.push(heatmap_line);
+        // Per-model bar below the row, scaled to the metric.
+        let bar_w = (inner.width as usize).saturating_sub(col_model + 3).min(BAR_MAX_WIDTH);
+        let (bar_val, bar_max) = match nav.metric {
+            UsageMetric::Tokens => (total_tok, max_tokens),
+            UsageMetric::Cost   => {
+                let scale = 1_000_000i64;
+                ((m.total_cost * scale as f64) as i64, (total_cost * scale as f64).max(1.0) as i64)
+            }
+        };
+        let bar = build_bar(bar_val, bar_max.max(1), bar_w);
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:<col_model$}  ", "")),
+            Span::styled(bar, Style::default().fg(BB_AMBER)),
+        ]));
     }
-    lines.push(Line::default());
-    lines.push(Line::default());
 
-    // ---- Section: top models -----------------------------------------------
-    lines.push(section_header("top models", palette));
-    lines.push(Line::default());
-
-    let models = top_models(8);
     if models.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no data yet",
-            Style::default().fg(palette.dim),
-        )));
-    } else {
-        for m in &models {
-            let id = if m.model_id.is_empty() { "unknown".to_owned() } else { m.model_id.clone() };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                value_span(&id, palette),
-                Span::styled(
-                    format!("  {}  {} calls", format_cost(m.total_cost), m.call_count),
-                    Style::default().fg(palette.dim),
-                ),
-            ]));
-        }
-    }
-    lines.push(Line::default());
-    lines.push(Line::default());
-
-    // ---- Section: weekly breakdown -----------------------------------------
-    lines.push(section_header("weekly", palette));
-    lines.push(Line::default());
-
-    let weeks = weekly_costs(12);
-    if weeks.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no data yet",
-            Style::default().fg(palette.dim),
-        )));
-    } else {
-        let max_cost = weeks.iter().map(|w| w.cost).fold(0.0_f64, f64::max);
-        for w in &weeks {
-            lines.push(build_weekly_row(w.week_epoch, w.cost, max_cost, palette));
-        }
+        lines.push(Line::from(Span::styled("no data for range", Style::default().fg(BB_DIM))));
     }
 
-    lines
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
-// ── Heatmap builder ─────────────────────────────────────────────────────────
+// ── Role split panel ──────────────────────────────────────────────────────────
 
-/// Build the 7-row x 53-col GitHub-style heatmap lines from daily cost data.
-///
-/// Layout:
-/// ```text
-///     Mon  ██░░██...
-///     Wed  ░░██░░...
-///     Fri  ██░░██...
-///          less ░▒▓█ more
-/// ```
-///
-/// - Each cell = one `CELL` char coloured by cost intensity bucket.
-/// - Gutter = 4-char weekday label (Mon/Wed/Fri on rows 1/3/5; blank others).
-/// - Total width = 4 (gutter) + 53 (cells) = 57 chars -- fits normal terminal.
-fn build_heatmap(daily: &[DailyCost]) -> Vec<Line<'static>> {
-    // Build a day_epoch -> cost lookup.
-    let cost_map: HashMap<i64, f64> = daily
+fn draw_role_split_panel(frame: &mut Frame, split: &crate::model::usage::RoleSplit, area: Rect) {
+    let block = amber_panel("ROLE SPLIT");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let total = (split.main_cost + split.sub_cost).max(1e-12);
+    let main_pct = (split.main_cost / total * 100.0).round() as u64;
+    let sub_pct  = (split.sub_cost  / total * 100.0).round() as u64;
+
+    let bar_w = (inner.width as usize).saturating_sub(22).min(BAR_MAX_WIDTH);
+    let total_i = (total * 1_000_000.0) as i64;
+    let main_bar = build_bar((split.main_cost * 1_000_000.0) as i64, total_i, bar_w);
+    let sub_bar  = build_bar((split.sub_cost  * 1_000_000.0) as i64, total_i, bar_w);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("main ", Style::default().fg(BB_DIM)),
+            Span::styled(format!("{:>8}  ", fmt_cost(split.main_cost)), Style::default().fg(BB_VALUE)),
+            Span::styled(main_bar, Style::default().fg(HEAT_1)),
+            Span::styled(format!("  {:>3}%  {:>3}c", main_pct, split.main_calls), Style::default().fg(BB_DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled("sub  ", Style::default().fg(BB_DIM)),
+            Span::styled(format!("{:>8}  ", fmt_cost(split.sub_cost)), Style::default().fg(BB_VALUE)),
+            Span::styled(sub_bar, Style::default().fg(HEAT_3)),
+            Span::styled(format!("  {:>3}%  {:>3}c", sub_pct, split.sub_calls), Style::default().fg(BB_DIM)),
+        ]),
+    ];
+
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+// ── Spend-over-time sparkline panel ───────────────────────────────────────────
+
+fn draw_sparkline_panel(
+    frame: &mut Frame,
+    buckets: &[SpendBucket],
+    nav: &UsageNavState,
+    area: Rect,
+) {
+    let block = amber_panel("SPEND OVER TIME");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+
+    let values: Vec<f64> = buckets
         .iter()
-        .map(|d| (d.day_epoch, d.cost))
+        .map(|b| match nav.metric {
+            UsageMetric::Cost   => b.cost,
+            UsageMetric::Tokens => b.tokens as f64,
+        })
         .collect();
 
-    // "Today" in day-epoch units.
-    let today_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let today_epoch = today_secs - today_secs % 86400;
+    let spark = build_sparkline(&values, inner.width as usize);
+    let visible = vec![Line::from(Span::styled(spark, Style::default().fg(BB_AMBER)))];
+    frame.render_widget(Paragraph::new(visible), inner);
+}
 
-    // Weekday of today (0=Sun, 1=Mon ... 6=Sat, matching epoch arithmetic).
-    // Unix epoch (Jan 1 1970) was a Thursday = day 4.
-    let today_day_of_week = ((today_epoch / 86400 + 4) % 7) as usize; // 0=Sun
+// ── View B: Session ───────────────────────────────────────────────────────────
 
-    // We want the grid to end on "today" with today in the correct weekday row.
-    // Columns go left=oldest, right=newest; rows are weekdays Sun(0)..Sat(6).
-    // The rightmost column ends on today; the column starts on (today - today_dow * 86400).
-    // We use 53 columns = 53 weeks.
+fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, area: Rect) {
+    if area.height < 4 {
+        return;
+    }
+
+    let uuid = rest.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+    let sess_models = session_models(&uuid);
+    let hourly      = session_hourly(&uuid);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    draw_session_kpi(frame, rest, rows[0]);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(rows[1]);
+
+    draw_session_models(frame, &sess_models, cols[0]);
+    draw_session_hourly(frame, &hourly, cols[1]);
+}
+
+fn draw_session_kpi(frame: &mut Frame, rest: &AppStateRest, area: Rect) {
+    let block = amber_panel("SESSION TOTALS");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.width < 10 {
+        return;
+    }
+
+    let line = Line::from(vec![
+        kv("in",     &fmt_tokens_u64(rest.tokens_in)),
+        dim_sep(),
+        kv("cached", &fmt_tokens_u64(rest.tokens_cached)),
+        dim_sep(),
+        kv("out",    &fmt_tokens_u64(rest.tokens_out)),
+        dim_sep(),
+        kv("cost",   &fmt_cost(rest.cost)),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
+fn draw_session_models(frame: &mut Frame, models: &[crate::model::usage::ModelCostRange], area: Rect) {
+    let block = amber_panel("MODELS USED");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 20 {
+        return;
+    }
+
+    let fixed_cols = 30usize;
+    let col_model = (inner.width as usize).saturating_sub(fixed_cols).clamp(8, 24);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("{:<col_model$}  {:>9}  {:>9}  {:>6}", "model", "cost", "tokens", "calls"),
+        Style::default().fg(BB_DIM),
+    )));
+
+    for m in models {
+        let id = truncate(&m.model_id, col_model);
+        let total_tok = m.tokens_in + m.tokens_out;
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<col_model$}", id),              Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_cost(m.total_cost)), Style::default().fg(BB_VALUE)),
+            Span::styled(format!("  {:>9}", fmt_tokens_i64(total_tok)), Style::default().fg(BB_DIM)),
+            Span::styled(format!("  {:>6}", m.call_count),           Style::default().fg(BB_DIM)),
+        ]));
+    }
+
+    if models.is_empty() {
+        lines.push(Line::from(Span::styled("no usage recorded yet", Style::default().fg(BB_DIM))));
+    }
+
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], area: Rect) {
+    let block = amber_panel("HOURLY SPEND");
+    let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    frame.render_widget(block, area);
+
+    if inner.height < 1 || inner.width < 8 {
+        return;
+    }
+
+    let values: Vec<f64> = hourly.iter().map(|b| b.cost).collect();
+    let spark = build_sparkline(&values, inner.width as usize);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(spark, Style::default().fg(BB_AMBER))),
+    ];
+
+    // Hour labels on the second line if space permits.
+    if hourly.len() > 1 && inner.height >= 2 {
+        let label: String = hourly
+            .iter()
+            .map(|b| format!("{:02}", (b.bucket_epoch / 3600) % 24))
+            .take(inner.width as usize / 2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(Line::from(Span::styled(
+            truncate_str(&label, inner.width as usize),
+            Style::default().fg(BB_DIM),
+        )));
+    }
+
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+// ── Heatmap builder ──────────────────────────────────────────────────────────
+
+/// Build range-adaptive heatmap lines driven by `nav.range` and `nav.metric`.
+///
+/// | Range | Grid style               |
+/// |-------|--------------------------|
+/// | Today | 24 hourly cells (1 row)  |
+/// | Week  | 7 daily cells (1 row)    |
+/// | Month | 30 daily cells (1 row)   |
+/// | Year  | 7 rows x 53 cols Github  |
+fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize) -> Vec<Line<'static>> {
+    match nav.range {
+        UsageRange::Today => build_heatmap_hourly(since, nav.metric, max_width),
+        UsageRange::Week  => build_heatmap_daily(since, 7,  nav.metric),
+        UsageRange::Month => build_heatmap_daily(since, 30, nav.metric),
+        UsageRange::Year  => build_heatmap_yearly(since, nav.metric),
+    }
+}
+
+fn build_heatmap_hourly(since: i64, metric: UsageMetric, max_width: usize) -> Vec<Line<'static>> {
+    let buckets = spend_buckets(since, BucketSize::Hour, 24);
+    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+
+    let now = now_secs();
+    let cur_hour   = now   - now   % 3600;
+    let start_hour = since - since % 3600;
+    let n = (((cur_hour - start_hour) / 3600) + 1).max(1) as usize;
+    let n = n.min(24).min(max_width.saturating_sub(4));
+
+    let nonzero: Vec<f64> = map.values().map(|b| metric_val(b, metric)).filter(|&v| v > 0.0).collect();
+    let (p33, p66, p90) = percentile_thresholds(&nonzero);
+
+    let mut cells: Vec<Span<'static>> = vec![Span::styled("   ", Style::default().fg(BB_DIM))];
+    let mut labels: Vec<Span<'static>> = vec![Span::raw("   ")];
+
+    for i in 0..n {
+        let epoch = start_hour + i as i64 * 3600;
+        let v     = map.get(&epoch).map(|b| metric_val(b, metric)).unwrap_or(0.0);
+        let col   = heat_color(v, p33, p66, p90, epoch > cur_hour);
+        cells.push(Span::styled(CELL, Style::default().fg(col)));
+
+        let h = ((epoch / 3600) % 24) as u8;
+        if h.is_multiple_of(4) {
+            labels.push(Span::styled(format!("{h:02}"), Style::default().fg(BB_DIM)));
+        } else {
+            labels.push(Span::raw(" "));
+        }
+    }
+
+    vec![Line::from(cells), Line::from(labels), heat_legend()]
+}
+
+fn build_heatmap_daily(since: i64, days: usize, metric: UsageMetric) -> Vec<Line<'static>> {
+    let buckets = spend_buckets(since, BucketSize::Day, days);
+    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+
+    let today = { let n = now_secs(); n - n % 86400 };
+
+    let nonzero: Vec<f64> = map.values().map(|b| metric_val(b, metric)).filter(|&v| v > 0.0).collect();
+    let (p33, p66, p90) = percentile_thresholds(&nonzero);
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("   ", Style::default().fg(BB_DIM))];
+    for i in 0..days {
+        let epoch = today - (days as i64 - 1 - i as i64) * 86400;
+        let v     = map.get(&epoch).map(|b| metric_val(b, metric)).unwrap_or(0.0);
+        let col   = heat_color(v, p33, p66, p90, false);
+        spans.push(Span::styled(CELL, Style::default().fg(col)));
+    }
+
+    vec![Line::from(spans), heat_legend()]
+}
+
+fn build_heatmap_yearly(since: i64, metric: UsageMetric) -> Vec<Line<'static>> {
+    let buckets = spend_buckets(since, BucketSize::Day, 371);
+    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+
+    let now        = now_secs();
+    let today      = now - now % 86400;
+    let today_dow  = ((today / 86400 + 4) % 7) as usize; // 0=Sun..6=Sat
+
     const COLS: usize = 53;
-    const ROWS: usize = 7; // Sun=0, Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6
+    const ROWS: usize = 7;
+    let grid_start = today - (today_dow as i64 + (ROWS * (COLS - 1)) as i64) * 86400;
 
-    // day_epoch for the cell at (row, col): the topmost-leftmost cell is
-    // (today - (today_dow + ROWS*(COLS-1)) * 86400 + row*86400).
-    // Simpler: compute "start_of_grid" = day_epoch of row=0, col=0.
-    let grid_start = today_epoch - (today_day_of_week as i64 + (ROWS * (COLS - 1)) as i64) * 86400;
+    let nonzero: Vec<f64> = map.values().map(|b| metric_val(b, metric)).filter(|&v| v > 0.0).collect();
+    let (p33, p66, p90) = percentile_thresholds(&nonzero);
 
-    // Collect all cost values to determine intensity thresholds.
-    let mut nonzero: Vec<f64> = cost_map.values().copied().filter(|&v| v > 0.0).collect();
-    nonzero.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let p33 = percentile(&nonzero, 33);
-    let p66 = percentile(&nonzero, 66);
-    let p90 = percentile(&nonzero, 90);
-
-    // Row labels: show Mon/Wed/Fri on their respective rows (Mon=row 1, etc.)
-    // Rows: 0=Sun 1=Mon 2=Tue 3=Wed 4=Thu 5=Fri 6=Sat
     let row_labels = ["   ", "Mon", "   ", "Wed", "   ", "Fri", "   "];
-
     let mut result: Vec<Line<'static>> = Vec::with_capacity(ROWS + 2);
 
     for (row, &label) in row_labels.iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(COLS + 2);
-
-        // Weekday gutter (4 chars: label + space).
-        spans.push(Span::styled(
-            format!("{label} "),
-            Style::default().fg(Color::Rgb(100, 100, 100)),
-        ));
-
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(COLS + 1);
+        spans.push(Span::styled(format!("{label} "), Style::default().fg(BB_DIM)));
         for col in 0..COLS {
-            let day = grid_start + (col as i64 * ROWS as i64 + row as i64) * 86400;
-            // Only colour cells on or before today.
-            let cost = if day <= today_epoch {
-                cost_map.get(&day).copied().unwrap_or(0.0)
-            } else {
-                // Future cell: render as empty
-                -1.0
-            };
-
-            let color = if cost < 0.0 {
-                // Future / out-of-range: same as empty but slightly dimmer to
-                // distinguish from "zero cost today"; use same empty color.
-                HEAT_EMPTY
-            } else if cost == 0.0 {
-                HEAT_EMPTY
-            } else if cost <= p33 {
-                HEAT_1
-            } else if cost <= p66 {
-                HEAT_2
-            } else if cost <= p90 {
-                HEAT_3
-            } else {
-                HEAT_4
-            };
-
-            spans.push(Span::styled(CELL, Style::default().fg(color)));
+            let day    = grid_start + (col as i64 * ROWS as i64 + row as i64) * 86400;
+            let future = day > today;
+            let v      = if future { -1.0 } else { map.get(&day).map(|b| metric_val(b, metric)).unwrap_or(0.0) };
+            spans.push(Span::styled(CELL, Style::default().fg(heat_color(v, p33, p66, p90, future))));
         }
-
         result.push(Line::from(spans));
     }
 
-    // Legend row: "less [0][1][2][3][4] more"
-    let legend = Line::from(vec![
-        Span::styled("     less ", Style::default().fg(Color::Rgb(100, 100, 100))),
+    result.push(Line::default());
+    result.push(heat_legend());
+    result
+}
+
+// ── Heatmap helpers ──────────────────────────────────────────────────────────
+
+fn heat_legend() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("     cheap ", Style::default().fg(BB_DIM)),
         Span::styled(CELL, Style::default().fg(HEAT_EMPTY)),
         Span::styled(CELL, Style::default().fg(HEAT_1)),
         Span::styled(CELL, Style::default().fg(HEAT_2)),
         Span::styled(CELL, Style::default().fg(HEAT_3)),
         Span::styled(CELL, Style::default().fg(HEAT_4)),
-        Span::styled(" more", Style::default().fg(Color::Rgb(100, 100, 100))),
-    ]);
-    result.push(Line::default());
-    result.push(legend);
-
-    result
-}
-
-/// Return the value at the given percentile (0..=100) of a sorted slice.
-/// Returns 0.0 for empty slices.
-fn percentile(sorted: &[f64], pct: usize) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len() - 1) * pct) / 100;
-    sorted[idx]
-}
-
-// ── Weekly row builder ───────────────────────────────────────────────────────
-
-/// Build one weekly breakdown row:
-/// `  YYYY-MM-DD  ████████████         $N.NNNN`
-///
-/// The bar is scaled linearly to `BAR_MAX_WIDTH` chars using 1/8-block
-/// precision (9 block chars from space to full-block).
-fn build_weekly_row(
-    week_epoch: i64,
-    cost: f64,
-    max_cost: f64,
-    palette: &Palette,
-) -> Line<'static> {
-    // Format the week start date as YYYY-MM-DD from unix seconds.
-    let date_label = epoch_to_date(week_epoch);
-
-    // Build the block bar.
-    let bar = if max_cost <= 0.0 {
-        " ".repeat(BAR_MAX_WIDTH)
-    } else {
-        // Scale: total units = BAR_MAX_WIDTH * 8 (sub-block precision).
-        let units = ((cost / max_cost) * (BAR_MAX_WIDTH * 8) as f64).round() as usize;
-        let full_blocks = units / 8;
-        let remainder = units % 8;
-        let mut s = String::with_capacity(BAR_MAX_WIDTH);
-        for _ in 0..full_blocks {
-            s.push(BAR_CHARS[8]); // full block
-        }
-        if full_blocks < BAR_MAX_WIDTH {
-            if remainder > 0 {
-                s.push(BAR_CHARS[remainder]);
-                // Pad remainder of bar with spaces.
-                let pad = BAR_MAX_WIDTH - full_blocks - 1;
-                for _ in 0..pad {
-                    s.push(' ');
-                }
-            } else {
-                let pad = BAR_MAX_WIDTH - full_blocks;
-                for _ in 0..pad {
-                    s.push(' ');
-                }
-            }
-        }
-        s
-    };
-
-    let cost_label = format_cost(cost);
-
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(date_label, Style::default().fg(palette.dim)),
-        Span::raw("  "),
-        Span::styled(bar, Style::default().fg(palette.accent)),
-        Span::raw("  "),
-        Span::styled(cost_label, Style::default().fg(palette.dim)),
+        Span::styled(" expensive", Style::default().fg(BB_DIM)),
     ])
 }
 
-/// Convert a unix-seconds epoch to a `YYYY-MM-DD` string (UTC, manual arithmetic).
+/// Map a metric value to a heatmap colour.
 ///
-/// Uses the proleptic Gregorian algorithm so there is no chrono dependency.
-fn epoch_to_date(ts: i64) -> String {
-    // Days since unix epoch.
-    let days = ts / 86400;
-    // Shift to the civil epoch used by the algorithm (March 1, year 0).
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month prime [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
+/// Special cases:
+/// - `future = true` → HEAT_EMPTY regardless.
+/// - `v == 0.0` → HEAT_EMPTY.
+/// - All non-zero values identical (p33 == p90, i.e., uniform) → HEAT_2 (mid),
+///   NOT HEAT_1, so a period with identical uniform activity reads as something
+///   rather than zero.
+fn heat_color(v: f64, p33: f64, p66: f64, p90: f64, future: bool) -> Color {
+    if future || v < 0.0 || v == 0.0 {
+        return HEAT_EMPTY;
+    }
+    // Uniform non-zero: all percentiles equal → mid bucket.
+    if p33 >= p90 {
+        return HEAT_2;
+    }
+    if v <= p33 { HEAT_1 }
+    else if v <= p66 { HEAT_2 }
+    else if v <= p90 { HEAT_3 }
+    else { HEAT_4 }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Dim bold section header (no border, top-down convention).
-fn section_header(title: &'static str, palette: &Palette) -> Line<'static> {
-    Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(palette.dim)
-            .add_modifier(Modifier::BOLD),
-    ))
+fn metric_val(b: &SpendBucket, metric: UsageMetric) -> f64 {
+    match metric {
+        UsageMetric::Cost   => b.cost,
+        UsageMetric::Tokens => b.tokens as f64,
+    }
 }
 
-/// A dim label span (field name).
-fn label_span(text: &'static str) -> Span<'static> {
-    Span::raw(text)
+fn percentile_thresholds(nonzero: &[f64]) -> (f64, f64, f64) {
+    if nonzero.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut s = nonzero.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    (percentile(&s, 33), percentile(&s, 66), percentile(&s, 90))
 }
 
-/// An accented value span (the numeric data).
-fn value_span(text: &str, palette: &Palette) -> Span<'static> {
-    Span::styled(
-        text.to_owned(),
-        Style::default().fg(palette.accent),
-    )
+fn percentile(sorted: &[f64], pct: usize) -> f64 {
+    if sorted.is_empty() { return 0.0; }
+    sorted[((sorted.len() - 1) * pct) / 100]
 }
 
-/// Format a token count with thousands separators (space-separated groups).
-fn fmt_tokens(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let offset = bytes.len() % 3;
-    for (i, &b) in bytes.iter().enumerate() {
-        if i != 0 && i % 3 == offset {
-            out.push(' ');
+// ── Bar / sparkline builders ─────────────────────────────────────────────────
+
+/// Horizontal block-char bar scaled to `max_width` chars (1/8-block precision).
+fn build_bar(value: i64, max_val: i64, max_width: usize) -> String {
+    if max_width == 0 || max_val <= 0 {
+        return " ".repeat(max_width);
+    }
+    let v = value.max(0) as usize;
+    let total_units = max_width * 8;
+    let units = ((v as f64 / max_val as f64) * total_units as f64).round() as usize;
+    let units = units.min(total_units);
+    let full = units / 8;
+    let rem  = units % 8;
+    let mut s = String::with_capacity(max_width);
+    for _ in 0..full { s.push(BAR_CHARS[8]); }
+    if full < max_width {
+        if rem > 0 {
+            s.push(BAR_CHARS[rem]);
+            for _ in 0..(max_width - full - 1) { s.push(' '); }
+        } else {
+            for _ in 0..(max_width - full) { s.push(' '); }
         }
-        out.push(b as char);
+    }
+    s
+}
+
+/// Sparkline: down/up-sample `values` to exactly `width` block chars.
+fn build_sparkline(values: &[f64], width: usize) -> String {
+    if values.is_empty() || width == 0 {
+        return " ".repeat(width);
+    }
+    let max = values.iter().cloned().fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return " ".repeat(width);
+    }
+    let mut out = String::with_capacity(width);
+    for i in 0..width {
+        let idx   = (i * values.len()) / width;
+        let v     = values.get(idx).copied().unwrap_or(0.0);
+        let level = ((v / max) * 8.0).round() as usize;
+        out.push(SPARK_CHARS[level.min(8)]);
     }
     out
 }
 
-/// Format a cost value as `$N.NNNN` (four decimal places).
-fn format_cost(cost: f64) -> String {
-    format!("${cost:.4}")
+// ── Range -> bucket granularity ──────────────────────────────────────────────
+
+fn range_bucket(range: UsageRange) -> (BucketSize, usize) {
+    match range {
+        UsageRange::Today => (BucketSize::Hour, 24),
+        UsageRange::Week  => (BucketSize::Day,   7),
+        UsageRange::Month => (BucketSize::Day,  30),
+        UsageRange::Year  => (BucketSize::Week, 53),
+    }
+}
+
+// ── Panel primitive ───────────────────────────────────────────────────────────
+
+/// Amber-bordered panel block with a bold title on the top rail.
+/// Call `block.inner(area)` to get the inner rect after rendering.
+fn amber_panel(title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_style(Style::default().fg(BB_AMBER))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(BB_AMBER).add_modifier(Modifier::BOLD),
+        ))
+}
+
+// ── Numeric formatters ────────────────────────────────────────────────────────
+
+/// USD cost: `$1.23` for >= $1, `$0.0045` for small values.
+fn fmt_cost(cost: f64) -> String {
+    if cost >= 1.0 { format!("${cost:.2}") } else { format!("${cost:.4}") }
+}
+
+/// Humanise token count: 1_234_567 -> "1.2M", 12_345 -> "12.3k", 999 -> "999".
+fn fmt_tokens_i64(n: i64) -> String { fmt_tok(n as f64) }
+fn fmt_tokens_u64(n: u64) -> String { fmt_tok(n as f64) }
+fn fmt_tok(n: f64) -> String {
+    if n >= 1_000_000.0 { format!("{:.1}M", n / 1_000_000.0) }
+    else if n >= 1_000.0 { format!("{:.1}k", n / 1_000.0) }
+    else { format!("{n:.0}") }
+}
+
+// ── Span helpers ─────────────────────────────────────────────────────────────
+
+/// `label: VALUE  ` with value in near-white.
+fn kv(label: &'static str, value: &str) -> Span<'static> {
+    Span::styled(
+        format!("{label}: {value}  "),
+        Style::default().fg(BB_VALUE),
+    )
+}
+
+/// Dim pipe separator between KPI fields.
+fn dim_sep() -> Span<'static> {
+    Span::styled("| ", Style::default().fg(BB_DIM))
+}
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+/// Truncate to `max` chars, appending `...` if cut.  Char-aware.
+fn truncate(s: &str, max: usize) -> String {
+    if max == 0 { return String::new(); }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_owned()
+    } else {
+        let cut: String = chars[..max.saturating_sub(3)].iter().collect();
+        cut + "..."
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String { truncate(s, max) }
+
+// ── Time ──────────────────────────────────────────────────────────────────────
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

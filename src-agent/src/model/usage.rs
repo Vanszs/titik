@@ -32,6 +32,7 @@ use rusqlite::Connection;
 
 /// Cost for one calendar day, returned by [`daily_costs`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DailyCost {
     /// Unix-seconds of midnight UTC for this day (`ts - ts % 86400`).
     pub day_epoch: i64,
@@ -41,6 +42,7 @@ pub struct DailyCost {
 
 /// Aggregate spend per model, returned by [`top_models`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModelCost {
     pub model_id: String,
     pub total_cost: f64,
@@ -65,6 +67,7 @@ pub struct ModelCostRange {
 
 /// Cost per 7-day window, returned by [`weekly_costs`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WeeklyCost {
     /// Unix-seconds of the start of this 7-day bucket (`ts - ts % 604800`).
     pub week_epoch: i64,
@@ -225,6 +228,7 @@ pub fn record_usage(
 /// Cost per calendar day for the last `days` days (inclusive of today).
 ///
 /// **Non-fatal**: returns an empty `Vec` on any DB error.
+#[allow(dead_code)]
 pub fn daily_costs(days: i64) -> Vec<DailyCost> {
     let Some(conn) = open() else { return Vec::new() };
     let cutoff = now_secs() - days * 86400;
@@ -253,6 +257,7 @@ pub fn daily_costs(days: i64) -> Vec<DailyCost> {
 /// Top models by total spend, limited to `limit` rows, ordered by cost desc.
 ///
 /// **Non-fatal**: returns an empty `Vec` on any DB error.
+#[allow(dead_code)]
 pub fn top_models(limit: i64) -> Vec<ModelCost> {
     let Some(conn) = open() else { return Vec::new() };
     let mut stmt = match conn.prepare(
@@ -286,6 +291,7 @@ pub fn top_models(limit: i64) -> Vec<ModelCost> {
 /// Cost per 7-day window for the last `weeks` weeks, ordered ascending.
 ///
 /// **Non-fatal**: returns an empty `Vec` on any DB error.
+#[allow(dead_code)]
 pub fn weekly_costs(weeks: i64) -> Vec<WeeklyCost> {
     let Some(conn) = open() else { return Vec::new() };
     let cutoff = now_secs() - weeks * 604800;
