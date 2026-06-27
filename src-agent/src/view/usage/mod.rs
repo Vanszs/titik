@@ -743,8 +743,20 @@ fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Pa
     }
 }
 
+/// Format the per-bar metric value for display at the right edge.
+fn bar_metric_label(v: f64, metric: UsageMetric) -> String {
+    match metric {
+        UsageMetric::Cost   => fmt_cost(v),
+        UsageMetric::Tokens => fmt_tokens_u64(v as u64),
+    }
+}
+
+/// Width reserved for the right-aligned metric label (chars).
+const METRIC_LABEL_W: usize = 9;
+
 /// Horizontal bar chart for the Today view: one row per hour (00–23), each bar
 /// extending rightward, colored by the heat ramp.  The current hour is highlighted.
+/// Cost/token value is right-aligned at the end of each row.
 fn build_hourly_horizontal_chart(
     since: i64,
     metric: UsageMetric,
@@ -768,13 +780,14 @@ fn build_hourly_horizontal_chart(
     let (p33, p66, p90) = percentile_thresholds(&nonzero);
     let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
 
-    // Fixed label width "00 " = 3 chars.
+    // Fixed label width "00" = 2 chars + 1 space.
     let label_w = 3usize;
-    let bar_w = max_width.saturating_sub(label_w).max(1);
+    // Shrink bar area to make room for right-aligned metric value.
+    let bar_w = max_width.saturating_sub(label_w + METRIC_LABEL_W + 1).max(1);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(25); // 24 bars + legend
 
-    for (i, (&v, &h)) in values.iter().zip(epochs.iter()).enumerate() {
+    for (&v, &h) in values.iter().zip(epochs.iter()) {
         let col = heat_color(v, p33, p66, p90, false);
         let fill = if max_val <= 0.0 {
             0usize
@@ -783,7 +796,7 @@ fn build_hourly_horizontal_chart(
         };
 
         let hour = ((h % 86400) / 3600) as usize;
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 2);
 
         // Hour label: current hour gets bold accent, others dim.
         let label_style = if hour == current_hour {
@@ -804,6 +817,13 @@ fn build_hourly_horizontal_chart(
                 spans.push(Span::styled(CELL, Style::default().fg(HEAT_EMPTY).bg(HEAT_EMPTY)));
             }
         }
+
+        // Right-aligned metric value (always 9 chars, padded).
+        let val_str = bar_metric_label(v, metric);
+        spans.push(Span::styled(
+            format!(" {val_str:>width$}", width = METRIC_LABEL_W - 1),
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY),
+        ));
 
         lines.push(Line::from(spans));
     }
@@ -840,7 +860,7 @@ fn build_day_horizontal_chart(
     let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
 
     let label_w = 4usize; // "Mon " = 4 chars
-    let bar_w = max_width.saturating_sub(label_w).max(1);
+    let bar_w = max_width.saturating_sub(label_w + METRIC_LABEL_W + 1).max(1);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(8); // 7 bars + legend
 
@@ -852,7 +872,7 @@ fn build_day_horizontal_chart(
             ((v / max_val) * bar_w as f64).round() as usize
         };
 
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 2);
 
         let label_style = if i as i64 == today_dow {
             Style::default().fg(palette.accent).bg(HEAT_EMPTY).add_modifier(Modifier::BOLD)
@@ -871,6 +891,13 @@ fn build_day_horizontal_chart(
                 spans.push(Span::styled(CELL, Style::default().fg(HEAT_EMPTY).bg(HEAT_EMPTY)));
             }
         }
+
+        // Right-aligned metric value.
+        let val_str = bar_metric_label(v, metric);
+        spans.push(Span::styled(
+            format!(" {val_str:>width$}", width = METRIC_LABEL_W - 1),
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY),
+        ));
 
         lines.push(Line::from(spans));
     }
