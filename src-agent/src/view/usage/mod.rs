@@ -311,7 +311,7 @@ fn draw_global(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: 
             .split(rows[2]);
 
         let heat_inner = section(frame, &heatmap_title(nav), palette, cols[0]);
-        draw_heatmap(frame, nav, since, heat_inner);
+        draw_heatmap(frame, nav, since, heat_inner, palette);
 
         let models_inner = section(frame, "TOP MODELS", palette, cols[2]);
         draw_models(frame, &models, &totals, nav, palette, models_inner, right_w);
@@ -390,12 +390,12 @@ fn heatmap_content_height(nav: &UsageNavState) -> usize {
     }
 }
 
-fn draw_heatmap(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect) {
+fn draw_heatmap(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect, palette: &Palette) {
     if area.width < 8 || area.height == 0 {
         return;
     }
 
-    let lines = build_heatmap(nav, since, area.width as usize);
+    let lines = build_heatmap(nav, since, area.width as usize, palette);
     let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
@@ -750,12 +750,12 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
 /// | Week  | 7 daily cells (1 row)    |
 /// | Month | 30 daily cells (1 row)   |
 /// | Year  | 7 rows x 53 cols Github  |
-fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize) -> Vec<Line<'static>> {
+fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
     match nav.range {
-        UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8),
-        UsageRange::Week  => build_bar_chart(since, BucketSize::Day,   7, nav.metric, max_width, 8),
-        UsageRange::Month => build_bar_chart(since, BucketSize::Day,  30, nav.metric, max_width, 8),
-        UsageRange::Year  => build_heatmap_yearly(since, nav.metric),
+        UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8, palette),
+        UsageRange::Week  => build_bar_chart(since, BucketSize::Day,   7, nav.metric, max_width, 8, palette),
+        UsageRange::Month => build_bar_chart(since, BucketSize::Day,  30, nav.metric, max_width, 8, palette),
+        UsageRange::Year  => build_heatmap_yearly(since, nav.metric, palette),
     }
 }
 
@@ -771,6 +771,7 @@ fn build_bar_chart(
     metric: UsageMetric,
     max_width: usize,
     height: usize,
+    palette: &Palette,
 ) -> Vec<Line<'static>> {
     let buckets = spend_buckets(since, bucket, n);
     let step_secs: i64 = match bucket {
@@ -877,20 +878,20 @@ fn build_bar_chart(
         };
         label_spans.push(Span::styled(
             label_char.to_string(),
-            Style::default().fg(HEAT_EMPTY),
+            Style::default().fg(palette.dim),
         ));
     }
     lines.push(Line::from(label_spans));
 
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled("no data", Style::default().fg(HEAT_EMPTY))));
+        lines.push(Line::from(Span::styled("no data", Style::default().fg(palette.dim))));
     }
     lines
 }
 
 
 
-fn build_heatmap_yearly(since: i64, metric: UsageMetric) -> Vec<Line<'static>> {
+fn build_heatmap_yearly(since: i64, metric: UsageMetric, palette: &Palette) -> Vec<Line<'static>> {
     let buckets = spend_buckets(since, BucketSize::Day, 371);
     let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
 
@@ -911,7 +912,7 @@ fn build_heatmap_yearly(since: i64, metric: UsageMetric) -> Vec<Line<'static>> {
     for (row, &label) in row_labels.iter().enumerate() {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(COLS + 1);
         // Row labels use HEAT_EMPTY (fixed dim grey) — structural axis element.
-        spans.push(Span::styled(format!("{label} "), Style::default().fg(HEAT_EMPTY)));
+        spans.push(Span::styled(format!("{label} "), Style::default().fg(palette.dim)));
         for col in 0..COLS {
             let day    = grid_start + (col as i64 * ROWS as i64 + row as i64) * 86400;
             let future = day > today;
@@ -922,7 +923,7 @@ fn build_heatmap_yearly(since: i64, metric: UsageMetric) -> Vec<Line<'static>> {
     }
 
     result.push(Line::default());
-    result.push(heat_legend_fixed());
+    result.push(heat_legend(palette));
     result
 }
 
@@ -940,18 +941,6 @@ fn heat_legend(palette: &Palette) -> Line<'static> {
     ])
 }
 
-/// Fixed-color legend used inside pure builder fns that have no palette access.
-fn heat_legend_fixed() -> Line<'static> {
-    Line::from(vec![
-        Span::styled("     cheap ", Style::default().fg(HEAT_EMPTY)),
-        Span::styled(CELL, Style::default().fg(HEAT_EMPTY)),
-        Span::styled(CELL, Style::default().fg(HEAT_1)),
-        Span::styled(CELL, Style::default().fg(HEAT_2)),
-        Span::styled(CELL, Style::default().fg(HEAT_3)),
-        Span::styled(CELL, Style::default().fg(HEAT_4)),
-        Span::styled(" expensive", Style::default().fg(HEAT_EMPTY)),
-    ])
-}
 
 /// Map a metric value to a heatmap colour.
 ///
