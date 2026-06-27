@@ -82,7 +82,7 @@ pub fn totals(session_dir: &Path) -> Result<(u64, u64, f64)> {
     let conn = open(session_dir)?;
     let row: (i64, i64, f64) = conn.query_row(
         "SELECT
-            COALESCE(SUM(prompt_tokens), 0),
+            COALESCE((SELECT prompt_tokens FROM messages WHERE role = 'assistant' ORDER BY id DESC LIMIT 1), 0),
             COALESCE(SUM(completion_tokens), 0),
             COALESCE(SUM(cost), 0)
          FROM messages",
