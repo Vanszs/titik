@@ -19,6 +19,66 @@
 //! splicing), never raw byte offsets, so multi-byte text never splits a
 //! codepoint or panics on a byte boundary.
 
+/// Soft word-wrap one logical line (`chars`) into visual segments of at most
+/// `wrap_w` cells, returning each segment as a `(start, end)` CHAR-index range
+/// into `chars` (`start` inclusive, `end` exclusive).
+///
+/// Greedy: a segment grows until the next char would overflow `wrap_w`, then it
+/// breaks at the LAST space that still fits — that space is consumed (it ends a
+/// line and is not re-rendered at the start of the next). A single word longer
+/// than `wrap_w` (no usable space) HARD-breaks exactly at `wrap_w`. An empty
+/// line yields one empty segment `(0, 0)` so it still occupies a visual row.
+///
+/// `wrap_w` must be `>= 1` (the caller clamps it); every segment width
+/// (`end - start`) is then `<= wrap_w`. Works purely on char indices, so it
+/// never splits a multi-byte codepoint.
+///
+/// This is the SINGLE source of wrap truth: both the renderer
+/// (`view::agents::editor::draw_field_editor`) and the editor's own visual
+/// Up/Down navigation call it, so what's on screen and what the cursor walks
+/// agree exactly.
+pub fn wrap_segments(chars: &[char], wrap_w: usize) -> Vec<(usize, usize)> {
+    let n = chars.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    while start < n {
+        if n - start <= wrap_w {
+            // The remainder fits on one line.
+            segs.push((start, n));
+            break;
+        }
+        // `limit` is the first char index that does NOT fit on this line; since
+        // `n - start > wrap_w` here, `limit < n`, so `chars[limit]` is in range.
+        // Scan downward for the rightmost space in `start+1 ..= limit` to break
+        // on cleanly (that space ends the line and is consumed on the next row).
+        let limit = start + wrap_w;
+        let mut brk = None;
+        let mut j = limit;
+        while j > start {
+            if chars[j] == ' ' {
+                brk = Some(j);
+                break;
+            }
+            j -= 1;
+        }
+        match brk {
+            Some(j) => {
+                segs.push((start, j));
+                start = j + 1; // consume the breaking space
+            }
+            None => {
+                // No usable space in the window: hard-break at `wrap_w`.
+                segs.push((start, limit));
+                start = limit;
+            }
+        }
+    }
+    segs
+}
+
 /// A 2D text buffer with a char-indexed cursor and vertical scroll offset.
 ///
 /// See the module docs for the invariants the methods preserve.
@@ -33,6 +93,12 @@ pub struct TextEditorState {
     /// Index of the top visible line (the view scrolls vertically by whole
     /// lines). The renderer adjusts this to keep the cursor row on screen.
     pub scroll: usize,
+    /// Last wrap width the renderer drew with, published each frame via
+    /// interior mutability (the renderer borrows the state immutably). Seeded to
+    /// `usize::MAX` so that before the first render each line is a single segment
+    /// → vertical moves fall back to logical-line behaviour. `move_up`/
+    /// `move_down` read this so they navigate by the SAME visual rows on screen.
+    pub wrap_w: std::cell::Cell<usize>,
 }
 
 impl TextEditorState {
@@ -51,6 +117,10 @@ impl TextEditorState {
             row: 0,
             col: 0,
             scroll: 0,
+            // No render has happened yet: a max width makes every line a single
+            // segment, so Up/Down behave like logical-line moves until the first
+            // frame publishes the real wrap width (the safe fallback).
+            wrap_w: std::cell::Cell::new(usize::MAX),
         }
     }
 
@@ -197,20 +267,77 @@ impl TextEditorState {
         self.clamp();
     }
 
-    /// Move the cursor up one line, clamping the column to the new line's length.
+    /// Wrap the cursor's current logical line at the renderer's published width,
+    /// and locate which visual segment holds the cursor.
+    ///
+    /// Returns `(segs, seg_i, visual_col)` where `segs` are the wrapped segments
+    /// of `lines[row]`, `seg_i` is the index of the segment the cursor sits in
+    /// (the LAST segment whose `start <= col`, matching the renderer's cursor
+    /// mapping), and `visual_col = col - segs[seg_i].start` is the cursor's
+    /// column offset within that visual row. Mirrors how `draw_field_editor`
+    /// maps `col` onto a wrapped cell, so vertical moves track the on-screen rows.
+    fn visual_position(&self) -> (Vec<(usize, usize)>, usize, usize) {
+        let wrap_w = self.wrap_w.get().max(1);
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let segs = wrap_segments(&chars, wrap_w);
+        // `segs` is never empty (an empty line yields one `(0, 0)` segment).
+        let mut seg_i = 0;
+        for (i, &(s, _e)) in segs.iter().enumerate() {
+            if s <= self.col {
+                seg_i = i;
+            } else {
+                break;
+            }
+        }
+        let visual_col = self.col - segs[seg_i].0;
+        (segs, seg_i, visual_col)
+    }
+
+    /// Move the cursor up one VISUAL (word-wrapped) row, preserving the column
+    /// offset within the row.
+    ///
+    /// Within a wrapped logical line this steps to the previous segment; from a
+    /// line's first visual row it crosses to the LAST visual row of the line
+    /// above. The target column is the same offset, clamped to the destination
+    /// segment's length so the cursor never lands past it. A no-op at the very
+    /// first visual row of the buffer.
     pub fn move_up(&mut self) {
-        if self.row > 0 {
+        let (segs, seg_i, visual_col) = self.visual_position();
+        if seg_i > 0 {
+            // Stay on this logical line; rise into the previous wrapped segment.
+            let (s, e) = segs[seg_i - 1];
+            self.col = s + visual_col.min(e - s);
+        } else if self.row > 0 {
+            // First visual row of this line → last visual row of the line above.
             self.row -= 1;
-            self.col = self.col.min(self.line_len());
+            let chars: Vec<char> = self.lines[self.row].chars().collect();
+            let prev = wrap_segments(&chars, self.wrap_w.get().max(1));
+            let (s, e) = *prev.last().expect("wrap_segments is never empty");
+            self.col = s + visual_col.min(e - s);
         }
         self.clamp();
     }
 
-    /// Move the cursor down one line, clamping the column to the new line's length.
+    /// Move the cursor down one VISUAL (word-wrapped) row, preserving the column
+    /// offset within the row.
+    ///
+    /// Within a wrapped logical line this steps to the next segment; from a
+    /// line's last visual row it crosses to the FIRST visual row of the line
+    /// below. The target column is the same offset, clamped to the destination
+    /// segment's length. A no-op at the very last visual row of the buffer.
     pub fn move_down(&mut self) {
-        if self.row + 1 < self.lines.len() {
+        let (segs, seg_i, visual_col) = self.visual_position();
+        if seg_i + 1 < segs.len() {
+            // Stay on this logical line; descend into the next wrapped segment.
+            let (s, e) = segs[seg_i + 1];
+            self.col = s + visual_col.min(e - s);
+        } else if self.row + 1 < self.lines.len() {
+            // Last visual row of this line → first visual row of the line below.
             self.row += 1;
-            self.col = self.col.min(self.line_len());
+            let chars: Vec<char> = self.lines[self.row].chars().collect();
+            let next = wrap_segments(&chars, self.wrap_w.get().max(1));
+            let (s, e) = next[0];
+            self.col = s + visual_col.min(e - s);
         }
         self.clamp();
     }

@@ -16,61 +16,6 @@ use crate::view::theme::Palette;
 
 use super::{model_display, truncate};
 
-/// Soft word-wrap one logical line (`chars`) into visual segments of at most
-/// `wrap_w` cells, returning each segment as a `(start, end)` CHAR-index range
-/// into `chars`.
-///
-/// Greedy: a segment grows until the next char would overflow `wrap_w`, then it
-/// breaks at the LAST space that still fits — that space is consumed (it ends a
-/// line and is not re-rendered at the start of the next). A single word longer
-/// than `wrap_w` (no usable space) HARD-breaks exactly at `wrap_w`. An empty
-/// line yields one empty segment `(0, 0)` so it still occupies a visual row.
-///
-/// `wrap_w` must be `>= 1` (the caller clamps it); every segment width
-/// (`end - start`) is then `<= wrap_w`. Works purely on char indices, so it
-/// never splits a multi-byte codepoint.
-fn wrap_segments(chars: &[char], wrap_w: usize) -> Vec<(usize, usize)> {
-    let n = chars.len();
-    if n == 0 {
-        return vec![(0, 0)];
-    }
-    let mut segs = Vec::new();
-    let mut start = 0;
-    while start < n {
-        if n - start <= wrap_w {
-            // The remainder fits on one line.
-            segs.push((start, n));
-            break;
-        }
-        // `limit` is the first char index that does NOT fit on this line; since
-        // `n - start > wrap_w` here, `limit < n`, so `chars[limit]` is in range.
-        // Scan downward for the rightmost space in `start+1 ..= limit` to break
-        // on cleanly (that space ends the line and is consumed on the next row).
-        let limit = start + wrap_w;
-        let mut brk = None;
-        let mut j = limit;
-        while j > start {
-            if chars[j] == ' ' {
-                brk = Some(j);
-                break;
-            }
-            j -= 1;
-        }
-        match brk {
-            Some(j) => {
-                segs.push((start, j));
-                start = j + 1; // consume the breaking space
-            }
-            None => {
-                // No usable space in the window: hard-break at `wrap_w`.
-                segs.push((start, limit));
-                start = limit;
-            }
-        }
-    }
-    segs
-}
-
 /// Render the FULL-SCREEN nano-style text editor over the whole frame.
 ///
 /// `title` is the active field's label (e.g. `"prompt"`, `"description"`,
@@ -91,7 +36,8 @@ fn wrap_segments(chars: &[char], wrap_w: usize) -> Vec<(usize, usize)> {
 /// ```
 ///
 /// ## Wrapping, gutter, and the cursor
-/// Each logical line is SOFT WORD-WRAPPED (see [`wrap_segments`]) to the body
+/// Each logical line is SOFT WORD-WRAPPED (see
+/// [`wrap_segments`](crate::app::mode::editor::wrap_segments)) to the body
 /// width minus a left line-number gutter. The gutter shows the 1-based logical
 /// line number (right-aligned, dim) on the FIRST visual row of each line and a
 /// blank of equal width on every continuation row, so wrapped text stays
@@ -168,6 +114,10 @@ pub(super) fn draw_field_editor(
     let num_w = digits.max(3);
     let gutter_w = num_w + 1; // number columns + a single separator column
     let wrap_w = body_inner_w.saturating_sub(gutter_w).max(1);
+    // Publish the on-screen wrap width back to the editor so its visual Up/Down
+    // navigation wraps each line with the SAME width drawn here (interior
+    // mutability: the renderer only borrows `ed`).
+    ed.wrap_w.set(wrap_w);
 
     // Pre-wrap every logical line ONCE: reused for the cursor's visual row, the
     // total visual-row count, and the render below (so the wrap is computed with
@@ -175,7 +125,7 @@ pub(super) fn draw_field_editor(
     let line_chars: Vec<Vec<char>> = ed.lines.iter().map(|l| l.chars().collect()).collect();
     let per_line: Vec<Vec<(usize, usize)>> = line_chars
         .iter()
-        .map(|chars| wrap_segments(chars, wrap_w))
+        .map(|chars| crate::app::mode::editor::wrap_segments(chars, wrap_w))
         .collect();
 
     // Cursor → absolute VISUAL row + the column offset within its segment.
