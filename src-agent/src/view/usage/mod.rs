@@ -518,7 +518,7 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, pa
     let left_w    = mid_w * 55 / 100;
     let right_w   = mid_w.saturating_sub(left_w);
     let model_rows = if sess_models.is_empty() { 2 } else { 1 + sess_models.len() };
-    let hourly_rows = if hourly.is_empty() { 1 } else { 3 }; // cells + labels + legend
+    let hourly_rows = if hourly.is_empty() { 1 } else { hourly.len().min(24) + 1 }; // bars + legend
     let mid_content = model_rows.max(hourly_rows).max(1);
     let mid_total   = (mid_content + 1) as u16; // +1 label row
 
@@ -663,12 +663,11 @@ fn draw_session_hourly(frame: &mut Frame, hourly: &[SpendBucket], palette: &Pale
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-/// Build a cell-based hourly heatmap for View B (session scope).
+/// Build horizontal bar chart for View B (session scope).
 ///
-/// One row of colored full-block cells — one cell per hour present in `hourly`
-/// — plus a row of hour labels every 2 hours and the standard legend.  The
-/// intensity ramp reuses the same [`heat_color`] + [`percentile_thresholds`]
-/// logic as the global hourly heatmap so the visual language is consistent.
+/// One row per hour (00–23) that has data in the session, each bar extending
+/// rightward, colored by the heat ramp.  Same visual style as the global
+/// Today heatmap.
 fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_width: usize) -> Vec<Line<'static>> {
     if hourly.is_empty() {
         return vec![
@@ -676,60 +675,55 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
         ];
     }
 
-    // Build a lookup by bucket epoch for fast access.
     let map: std::collections::HashMap<i64, &SpendBucket> =
         hourly.iter().map(|b| (b.bucket_epoch, b)).collect();
 
     let nonzero: Vec<f64> = hourly.iter().map(|b| b.cost).filter(|&v| v > 0.0).collect();
-    let (p33, p66, p90)   = percentile_thresholds(&nonzero);
+    let (p33, p66, p90) = percentile_thresholds(&nonzero);
+    let max_val = hourly.iter().map(|b| b.cost).fold(0.0_f64, f64::max);
 
-    // Determine range: first bucket → last bucket (consecutive hours).
+    // Rebuild full 24-hour range from session data so gaps are visible.
     let first = hourly.first().map(|b| b.bucket_epoch).unwrap_or(0);
     let last  = hourly.last().map(|b| b.bucket_epoch).unwrap_or(first);
-    let n_hours = (((last - first) / 3600) + 1) as usize;
-    // Cap to fit within available width (leave a small left margin).
-    let margin_w = 1usize;
-    let n = n_hours.min(max_width.saturating_sub(margin_w));
+    let first_day = first - first % 86400;
+    let n_hours = (((last - first_day) / 3600) + 1).min(24) as usize;
 
-    let margin = " ".repeat(margin_w);
+    let label_w = 3usize; // "HH"
+    let bar_w = max_width.saturating_sub(label_w).max(1);
 
-    // Row 1: colored cells.
-    let mut cells: Vec<Span<'static>> = vec![Span::raw(margin.clone())];
-    // Row 2: hour labels (every 2 hours, or every hour if space).
-    let mut labels: Vec<Span<'static>> = vec![Span::raw(margin.clone())];
-    let label_every = if n <= 12 { 1usize } else { 2 };
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n_hours + 1); // bars + legend
 
-    for i in 0..n {
-        let epoch = first + i as i64 * 3600;
-        let v     = map.get(&epoch).map(|b| b.cost).unwrap_or(0.0);
-        let col   = heat_color(v, p33, p66, p90, false);
-        cells.push(Span::styled(CELL, Style::default().fg(col)));
+    for i in 0..n_hours {
+        let epoch = first_day + i as i64 * 3600;
+        let v = map.get(&epoch).map(|b| b.cost).unwrap_or(0.0);
+        let col = heat_color(v, p33, p66, p90, false);
+        let fill = if max_val <= 0.0 {
+            0usize
+        } else {
+            ((v / max_val) * bar_w as f64).round() as usize
+        };
 
-        let h = ((epoch / 3600) % 24) as usize;
-        if i % label_every == 0 {
-            labels.push(Span::styled(
-                if label_every > 1 {
-                    format!("{h:02}")
-                } else {
-                    // Single-char label when very dense (just the ones digit).
-                    format!("{}", h % 10)
-                },
-                Style::default().fg(palette.dim),
-            ));
-            // Pad label chars to match cell width (CELL is one char wide).
-            for _ in 1..label_every {
-                labels.push(Span::raw(" "));
+        let hour = ((epoch % 86400) / 3600) as usize;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
+
+        spans.push(Span::styled(
+            format!("{hour:02}"),
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY),
+        ));
+
+        for j in 0..bar_w {
+            if j < fill {
+                spans.push(Span::styled(CELL, Style::default().fg(col).bg(HEAT_EMPTY)));
+            } else {
+                spans.push(Span::styled(CELL, Style::default().fg(HEAT_EMPTY).bg(HEAT_EMPTY)));
             }
-        } else if label_every == 1 {
-            // Already pushed one label per cell above.
         }
+
+        lines.push(Line::from(spans));
     }
 
-    vec![
-        Line::from(cells),
-        Line::from(labels),
-        heat_legend(palette),
-    ]
+    lines.push(heat_legend(palette));
+    lines
 }
 
 // ── Heatmap builder ──────────────────────────────────────────────────────────
