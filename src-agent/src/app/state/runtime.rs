@@ -240,4 +240,21 @@ impl SessionRuntime {
             Some(std::mem::take(&mut self.stream_reasoning))
         }
     }
+
+    /// True when this session has work in flight: a turn waiting / streaming, a
+    /// paused approval, a parked deferred lane (tool tasks or sub-agent
+    /// delegations), or any still-running sub-agent. Used by `/swap` (stage 5) to
+    /// flag busy sessions and to gate quit; harmless until then.
+    #[allow(dead_code)] // used by /swap (stage 5)
+    pub fn is_working(&self) -> bool {
+        self.waiting
+            || self.streaming.is_some()
+            || self.awaiting_approval
+            || self.awaiting_tool_tasks
+            || self.awaiting_subagents
+            || self
+                .subagents
+                .iter()
+                .any(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
+    }
 }
