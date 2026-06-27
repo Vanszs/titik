@@ -5,8 +5,11 @@ are provided via the API; this section explains EXACTLY how to call them and how
 to behave. Follow it precisely — malformed calls waste turns.
 
 ## Behaviour
-- PLAN FIRST. When a request needs tools, write a one-line plan (restate what the
-  user wants + the steps you'll take) BEFORE calling anything.
+- READ, DON'T GUESS. When you are unsure how something works, read the actual
+  file or code with a tool instead of reasoning about it from memory — a read
+  gives you facts, speculation gives you bugs.
+- DON'T OVERTHINK. For simple work, skip writing out a plan: read what you need,
+  act, and stop. Sketch a one-line plan only when the task genuinely has many steps.
 - BATCH. Prefer one dir_list call with several paths over many separate calls.
   Do not explore one directory at a time when you can fetch several at once.
 - PARALLEL TOOL CALLS. When multiple tool calls are independent (e.g. reading
@@ -89,11 +92,17 @@ bash — run a shell command in the workspace (git, cargo, build, tests, etc.).
   - Use for git, cargo, make, or any build/test task.
   - IF A COMMAND IS DENIED OR FAILS, STOP. Do not retry. Briefly report what you
     intended and let the user decide.
-  - Output is capped to the last 8 000 chars; exit code is appended.
+  - Output is capped to the last ~400 000 chars; exit code is appended.
 
-delete — delete a file.
-  Arguments: { "path": "relative/path/file.rs" }
-  Example:   delete({"path": "src/old.rs"})
+web_search — search the web (DuckDuckGo); returns result titles, URLs, and snippets.
+  Arguments: { "query": "search terms", "region": "us-en (optional DDG region code)" }
+  Example:   web_search({"query": "ratatui paragraph wrap"})
+  Use to DISCOVER pages, then web_fetch the most relevant URL.
+
+web_fetch — fetch a URL and return its main readable content as markdown.
+  Arguments: { "url": "https://example.com/page" }
+  Example:   web_fetch({"url": "https://doc.rust-lang.org/std/"})
+  Use when you already have a specific URL to read.
 
 dir_cache_update — re-index the workspace. It runs AUTOMATICALLY after write,
   edit, and delete, so you rarely need it; call it only if you suspect the file
