@@ -131,6 +131,59 @@ fn parse_tool_call_json(inner: &str) -> Option<(String, String)> {
     Some((name.to_string(), arguments))
 }
 
+/// Strip any residual inline tool-call markup from assistant CONTENT that the
+/// structured-call path + `extract_text_tool_calls` didn't already remove:
+/// leftover well-formed `<tool_call> ... </tool_call>` spans, and ORPHAN/stray
+/// `<tool_call>` or `</tool_call>` tags a (often weak) model emitted without a
+/// valid JSON body. Keeps surrounding prose; collapses the blank lines a removed
+/// block leaves behind. This is display/commit hygiene — actual call execution is
+/// handled by `extract_text_tool_calls`.
+///
+/// Rules (applied in order):
+/// 1. Remove every complete `<tool_call>...</tool_call>` span (non-greedy, all
+///    occurrences) regardless of whether the inner text is valid JSON.
+/// 2. If an unmatched `<tool_call>` remains (open tag with no following close —
+///    e.g. a call still mid-stream or truncated), remove from that `<tool_call>`
+///    to the END of the string.
+/// 3. Remove any remaining bare/orphan `</tool_call>` or `<tool_call>` tags.
+/// 4. Collapse 3+ consecutive newlines to 2, and trim trailing whitespace.
+pub fn strip_tool_call_tags(content: &str) -> String {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+
+    // Work on a String copy so we can use replace_range without byte-boundary
+    // panics — find() on &str always returns valid char boundaries.
+    let mut s: String = content.to_string();
+
+    // Step 1: Remove all well-formed <tool_call>...</tool_call> spans.
+    // Repeat until no complete pair remains (handles adjacent occurrences).
+    while let Some(open_pos) = s.find(OPEN) {
+        // Search for the matching close AFTER the open tag.
+        let after_open = open_pos + OPEN.len();
+        let Some(rel_close) = s[after_open..].find(CLOSE) else { break };
+        let close_end = after_open + rel_close + CLOSE.len();
+        s.replace_range(open_pos..close_end, "");
+    }
+
+    // Step 2: If a lone <tool_call> remains (open with no matching close),
+    // truncate from that point to the end of the string.
+    if let Some(open_pos) = s.find(OPEN) {
+        s.truncate(open_pos);
+    }
+
+    // Step 3: Remove any remaining orphan </tool_call> (and, defensively, any
+    // stray <tool_call> that somehow survived).
+    while let Some(pos) = s.find(CLOSE) {
+        s.replace_range(pos..pos + CLOSE.len(), "");
+    }
+    while let Some(pos) = s.find(OPEN) {
+        s.replace_range(pos..pos + OPEN.len(), "");
+    }
+
+    // Step 4: Collapse blank-line runs and trim trailing whitespace.
+    collapse_blank_runs(s.trim_end())
+}
+
 /// Collapse any run of 3+ consecutive newlines into exactly 2, leaving other
 /// whitespace untouched. Used to tidy the gap left behind when a `<tool_call>`
 /// span is removed from between blocks of prose.
@@ -358,6 +411,45 @@ mod text_tool_call_tests {
         assert_eq!(calls[0].function.arguments, "{}");
         assert_eq!(cleaned, "");
     }
+    #[test]
+    fn stray_close_tag_is_stripped() {
+        let content = "Some prose.</tool_call> More prose.";
+        let out = strip_tool_call_tags(content);
+        assert!(!out.contains("</tool_call>"), "orphan close tag must be removed");
+        assert!(out.contains("Some prose."), "surrounding prose must survive");
+        assert!(out.contains("More prose."), "trailing prose must survive");
+    }
+
+    #[test]
+    fn well_formed_span_is_stripped() {
+        let content = r#"Before.<tool_call>{"name":"foo","arguments":{}}</tool_call>After."#;
+        let out = strip_tool_call_tags(content);
+        assert!(!out.contains("<tool_call>"), "open tag must be removed");
+        assert!(!out.contains("</tool_call>"), "close tag must be removed");
+        assert_eq!(out, "Before.After.");
+    }
+
+    #[test]
+    fn surrounding_prose_preserved_by_stripper() {
+        let content = "Hello world.
+
+<tool_call>{}</tool_call>
+
+Bye.";
+        let out = strip_tool_call_tags(content);
+        assert!(out.contains("Hello world."), "leading prose must survive");
+        assert!(out.contains("Bye."), "trailing prose must survive");
+        assert!(!out.contains("<tool_call>"), "span must be removed");
+    }
+
+    #[test]
+    fn unmatched_open_truncates_to_end() {
+        let content = r#"Prose here. <tool_call>{"name":"foo"#;
+        let out = strip_tool_call_tags(content);
+        assert_eq!(out.trim(), "Prose here.");
+    }
+
+
 }
 
 #[cfg(test)]

@@ -140,11 +140,17 @@ pub(super) fn render_transcript(
                 logical.push(vec![]);
             }
             // Then the partial answer in the theme fg (one logical line; wraps).
+            // Strip residual tool-call markup so tags don't flash mid-stream; the
+            // "unmatched open → cut to end" rule in the stripper naturally hides a
+            // call that is still being emitted. Render nothing if the result is empty.
             if !partial_content.is_empty() {
-                logical.push(vec![Span::styled(
-                    partial_content.to_string(),
-                    Style::default().fg(palette.fg),
-                )]);
+                let stripped = crate::dto::chat::strip_tool_call_tags(partial_content);
+                if !stripped.is_empty() {
+                    logical.push(vec![Span::styled(
+                        stripped,
+                        Style::default().fg(palette.fg),
+                    )]);
+                }
             }
             lines.extend(render_block(logical, "● ", palette.fg, wrap_w, true));
         }

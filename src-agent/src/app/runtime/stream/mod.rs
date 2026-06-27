@@ -24,7 +24,14 @@ pub(super) const MAX_AGENT_STEPS: usize = 40;
 /// reasoning channel (e.g. deepseek-v4-flash with reasoning on), promote the
 /// reasoning to BE the content so it shows in the foreground and persists.
 /// Returns (content, reasoning_to_attach). Empty content with no reasoning -> ("", None).
+///
+/// Strips residual inline tool-call markup (`<tool_call>…</tool_call>` spans and
+/// orphan tags) BEFORE the empty-content check so the committed assistant message
+/// is never polluted by tags leaked from Hermes/Qwen/ChatML-style models. The
+/// reasoning-promotion fallback is applied on the CLEANED content, so an all-tags
+/// message (empty after stripping) still promotes reasoning correctly.
 pub(super) fn final_answer(content: String, reasoning: Option<String>) -> (String, Option<String>) {
+    let content = crate::dto::chat::strip_tool_call_tags(&content);
     if content.trim().is_empty() {
         match reasoning {
             Some(r) if !r.trim().is_empty() => (r, None), // reasoning becomes the answer

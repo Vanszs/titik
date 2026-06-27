@@ -18,4 +18,4 @@ mod tool;
 pub use attachment::Attachment;
 pub use message::ChatMessage;
 pub use role::{Role, CACHE_SPLIT_MARK, PLAN_NUDGE_MARK};
-pub use tool::{extract_text_tool_calls, sanitize_tool_arguments, FunctionCall, ToolCall};
+pub use tool::{extract_text_tool_calls, sanitize_tool_arguments, strip_tool_call_tags, FunctionCall, ToolCall};
