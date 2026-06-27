@@ -267,11 +267,30 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         KeyCode::Esc => {
             // Interrupt if waiting OR a compaction animation is still running
             // (compact_anim_start remains set during the deferred-apply window).
-            // When idle, do nothing — only /quit exits the app.
             if rest.waiting || rest.compact_anim_start.is_some() {
-                Action::Interrupt
-            } else {
-                Action::None
+                // A live Esc cancels the in-flight turn; clear any pending
+                // idle-Esc so it can't pair with a later one across this turn.
+                rest.last_esc = None;
+                return Action::Interrupt;
+            }
+            // Idle Esc: double-Esc within ~400ms opens the message-rewind
+            // picker ("edit a previous message"); a lone Esc is otherwise a
+            // no-op (only /quit exits the app). Pair the two presses by
+            // recording the first's instant and comparing against it.
+            const DOUBLE_ESC_MS: u128 = 400;
+            let now = std::time::Instant::now();
+            match rest.last_esc.take() {
+                Some(prev) if now.duration_since(prev).as_millis() <= DOUBLE_ESC_MS => {
+                    // Second Esc in time: open the picker. The runtime builds
+                    // the RewindState and refuses to enter with no user message.
+                    Action::OpenRewind
+                }
+                _ => {
+                    // First Esc (or the previous one was too long ago): arm the
+                    // timer and wait for a possible second press.
+                    rest.last_esc = Some(now);
+                    Action::None
+                }
             }
         }
         KeyCode::Enter => {

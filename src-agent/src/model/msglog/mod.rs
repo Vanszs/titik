@@ -41,5 +41,7 @@ pub use summary::SummaryRow;
 
 // Public functions
 pub use blobs::{fetch_blob_content, list_blobs, search_blobs};
-pub use query::{append, fetch_messages_since, max_message_id, totals, user_message_ids};
+pub use query::{
+    append, fetch_messages_since, max_message_id, totals, truncate_after, user_message_ids,
+};
 pub use summary::{read_summary, write_summary};

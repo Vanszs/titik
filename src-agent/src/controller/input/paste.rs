@@ -138,9 +138,9 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
             paste_single_line(text, |c| p.query.push(c));
             p.refilter();
         }
-        // No text entry on the effort picker, loading splash, or usage dashboard
-        // — paste is a no-op in all three.
-        Mode::Effort(_) | Mode::Loading(_) | Mode::Usage(_) => {}
+        // No text entry on the effort picker, loading splash, usage dashboard,
+        // or the message-rewind picker — paste is a no-op in all of them.
+        Mode::Effort(_) | Mode::Loading(_) | Mode::Usage(_) | Mode::MessageRewind(_) => {}
     }
 }
 

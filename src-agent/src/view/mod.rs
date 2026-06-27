@@ -17,6 +17,7 @@ pub mod chat;
 pub mod effort;
 pub mod key_input;
 pub mod loading;
+pub mod message_rewind;
 pub mod markdown;
 pub mod session_picker;
 pub mod settings;
@@ -70,5 +71,6 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Mode::Effort(e) => effort::draw(frame, e, &palette),
         Mode::Loading(s) => loading::draw(frame, s, &palette),
         Mode::Usage(nav) => usage::draw(frame, &state.rest, nav, &palette),
+        Mode::MessageRewind(rw) => message_rewind::draw(frame, rw, &palette),
     }
 }

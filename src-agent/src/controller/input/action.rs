@@ -21,6 +21,20 @@ pub enum Action {
     Interrupt,
     /// Re-send the last user message (Ctrl+R while idle).
     Resend,
+    /// Double-Esc while idle in Chat — open the message-rewind picker. The
+    /// runtime builds the [`RewindState`] from the active conversation's user
+    /// messages and swaps into `Mode::MessageRewind`. A no-op when there is no
+    /// session or no prior user message.
+    OpenRewind,
+    /// Esc/Ctrl+C in the message-rewind picker — discard it and return to Chat
+    /// unchanged (the conversation is untouched).
+    RewindCancel,
+    /// Enter in the message-rewind picker: rewind the conversation to just
+    /// before the highlighted user message (vec index = the inner `usize`) and
+    /// load its text into the composer. The runtime truncates the live
+    /// `Conversation` (and the sqlite archive) at that boundary, persists, and
+    /// drops the message text into the composer WITHOUT auto-sending.
+    RewindToMessage(usize),
     /// Approve the paused risky tool call (`y` in the approval modal): run it
     /// and resume the tool-approval state machine.
     ApproveTool,
