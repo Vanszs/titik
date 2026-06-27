@@ -41,4 +41,15 @@ pub enum AgentEvent {
     Done(String),
     /// The loop aborted on a fatal stream error; `String` is the cause.
     Error(String),
+    /// Accumulated token/cost spend across all steps. Emitted once, immediately
+    /// before [`Done`](AgentEvent::Done), so the orchestrator can merge it into
+    /// the session total and record a ledger row. `model_id` is the resolved
+    /// model the loop ran against. Non-fatal: if no Usage chunk was ever received
+    /// (e.g. the provider omits them) all three counters are 0/0.0.
+    UsageReport {
+        model_id: String,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost: f64,
+    },
 }

@@ -94,6 +94,8 @@ pub fn spawn_subagent(
     let label = truncate_label(task, LABEL_LEN);
     let agent_name = agent.name.clone();
 
+    // Save the model_id before `resolved` is moved into run_agent_loop.
+    let spawned_model_id = resolved.model_id.clone();
     let (tx, rx) = mpsc::unbounded_channel();
     let jh = handle.spawn(run_agent_loop(
         client_arc,
@@ -112,11 +114,15 @@ pub fn spawn_subagent(
         id,
         agent_name,
         label,
+        model_id: spawned_model_id,
         status: SubAgentStatus::Running,
         abort: jh.abort_handle(),
         rx,
         transcript: Vec::new(),
         messages: Vec::new(),
         tool_call_id,
+        usage_tokens_in: 0,
+        usage_tokens_out: 0,
+        usage_cost: 0.0,
     })
 }

@@ -460,6 +460,14 @@ pub(super) fn run_loop(
                                 sa.transcript.push(format!("error: {e}"));
                                 sa.status = SubAgentStatus::Error(e);
                             }
+                            AgentEvent::UsageReport { model_id, tokens_in, tokens_out, cost } => {
+                                // Overwrite with the final report's values; the loop
+                                // emits exactly one UsageReport (just before Done).
+                                sa.model_id = model_id;
+                                sa.usage_tokens_in = tokens_in;
+                                sa.usage_tokens_out = tokens_out;
+                                sa.usage_cost = cost;
+                            }
                         }
                     }
                 }
@@ -474,10 +482,24 @@ pub(super) fn run_loop(
                 // loop, so later ticks skip it).
                 //
                 // `chat_fold` carries the /task chat-fold note; `defer` carries the
-                // (call_id, result) for the task-tool deferred delivery. At most one
-                // is Some (the two origins are mutually exclusive on tool_call_id).
-                let (chat_fold, defer): (Option<String>, Option<(String, String)>) = {
+                // (call_id, result) for the task-tool deferred delivery. `sub_usage`
+                // carries (model_id, tokens_in, tokens_out, cost) to merge+record when
+                // the sub-agent reaches any terminal state. At most one of chat_fold /
+                // defer is Some (the two origins are mutually exclusive on tool_call_id).
+                // sub_usage is Some whenever the status is terminal and usage > 0.
+                let (chat_fold, defer, sub_usage) = {
                     let sa = &state.rest.subagents[i];
+                    // Capture usage once; only carry it if there is something to record.
+                    let usage_tuple = if sa.usage_tokens_out > 0 || sa.usage_cost > 0.0 {
+                        Some((
+                            sa.model_id.clone(),
+                            sa.usage_tokens_in,
+                            sa.usage_tokens_out,
+                            sa.usage_cost,
+                        ))
+                    } else {
+                        None
+                    };
                     match (&sa.tool_call_id, &sa.status) {
                         // task-tool path: deliver the deferred result back to the model.
                         (Some(call_id), status)
@@ -493,7 +515,9 @@ pub(super) fn run_loop(
                                 // Still running: nothing to deliver this tick.
                                 SubAgentStatus::Running => None,
                             };
-                            (None, result.map(|r| (call_id.clone(), r)))
+                            // Only carry usage on a terminal transition (result is Some).
+                            let carry_usage = if result.is_some() { usage_tuple } else { None };
+                            (None, result.map(|r| (call_id.clone(), r)), carry_usage)
                         }
                         // /task command path (tool_call_id == None): on Done, build the
                         // FULL, untruncated report note (injected as an assistant turn
@@ -505,8 +529,9 @@ pub(super) fn run_loop(
                                 sa.id, sa.agent_name
                             )),
                             None,
+                            usage_tuple,
                         ),
-                        _ => (None, None),
+                        _ => (None, None, None),
                     }
                 };
                 if let Some(note) = chat_fold {
@@ -523,6 +548,36 @@ pub(super) fn run_loop(
                         sess.conversation.push_assistant(note, None);
                         let _ = sess.save();
                     }
+                }
+                // Merge sub-agent spend into the session total + record a ledger row.
+                // Done for BOTH paths (chat_fold = /task, defer = task-tool) at the
+                // single point where a terminal status is first observed. Non-fatal:
+                // skipped when no usage was ever reported (provider omits it).
+                if let Some((sub_model_id, sub_ti, sub_to, sub_cost)) = sub_usage {
+                    // Merge into the session counters: cost and tokens_out are
+                    // cumulative (summed); tokens_in is the main-context gauge and
+                    // must NOT be touched (adding sub-agent prompt size would corrupt
+                    // the context-window display).
+                    state.rest.cost += sub_cost;
+                    state.rest.tokens_out += sub_to;
+                    // Record one ledger row per sub-agent completion (best-effort).
+                    let (sess_uuid, pwd_hash) = state
+                        .rest
+                        .session
+                        .as_ref()
+                        .map(|s| (s.id.clone(), s.pwd_hash.clone()))
+                        .unwrap_or_default();
+                    let sa_name = state.rest.subagents[i].agent_name.clone();
+                    crate::model::usage::record_usage(
+                        &sub_model_id,
+                        &format!("sub:{sa_name}"),
+                        &sess_uuid,
+                        &pwd_hash,
+                        sub_ti,
+                        0, // sub-agents never receive cached-tokens data
+                        sub_to,
+                        sub_cost,
+                    );
                 }
                 if let Some(pair) = defer {
                     deferred_results.push(pair);

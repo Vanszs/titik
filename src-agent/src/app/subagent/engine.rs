@@ -79,13 +79,17 @@ fn is_stall(text: &str) -> bool {
     stall_prefixes.iter().any(|p| lower.starts_with(p))
 }
 
-/// One drained stream result: the assistant text, any requested tool calls, and
-/// a fatal error if the stream failed.
+/// One drained stream result: the assistant text, any requested tool calls,
+/// a fatal error if the stream failed, and the optional usage tuple from the
+/// final `StreamEvent::Usage` chunk (prompt_tokens, completion_tokens, cost).
 #[derive(Default)]
 struct StreamOutcome {
     text: String,
     tool_calls: Vec<ToolCall>,
     error: Option<String>,
+    /// Last-seen usage chunk: (prompt_tokens, completion_tokens, cost).
+    /// `None` when the provider emitted no Usage event for this step.
+    usage: Option<(u64, u64, f64)>,
 }
 
 /// Run the autonomous sub-agent loop to completion.
@@ -125,6 +129,13 @@ pub async fn run_agent_loop(
     let mut last_text = String::new();
     // Count how many consecutive stall nudges have been issued so far.
     let mut nudges: usize = 0;
+    // Accumulated token/cost spend across all steps. tokens_in is updated
+    // to the last-seen prompt size (not summed — it is a context-window gauge,
+    // matching the main-model convention). tokens_out and cost are summed
+    // across steps so the total reflects actual spend.
+    let mut acc_tokens_in: u64 = 0;
+    let mut acc_tokens_out: u64 = 0;
+    let mut acc_cost: f64 = 0.0;
 
     for step in 0..max_steps {
         emit(&tx, AgentEvent::Step(step));
@@ -133,6 +144,15 @@ pub async fn run_agent_loop(
         //    Advertise ONLY this agent's allow-list to the model (the execution
         //    gate below stays as a backstop).
         let outcome = stream_step(&client, &resolved, convo.history(), &tools, &tx).await;
+
+        // Fold this step's usage into the running totals (best-effort: a step
+        // with no Usage chunk simply contributes nothing). tokens_in is
+        // overwritten (current context size), tokens_out and cost are summed.
+        if let Some((pt, ct, c)) = outcome.usage {
+            acc_tokens_in = pt;
+            acc_tokens_out += ct;
+            acc_cost += c;
+        }
 
         // A fatal stream error ends the run immediately.
         if let Some(err) = outcome.error {
@@ -172,6 +192,14 @@ pub async fn run_agent_loop(
             convo.push_assistant(assistant_text.clone(), None);
             // Final turn committed: snapshot the full history before finishing.
             emit(&tx, AgentEvent::Snapshot(convo.messages().to_vec()));
+            // Surface accumulated spend before Done so the orchestrator can
+            // merge it into the session total + write the ledger row.
+            emit(&tx, AgentEvent::UsageReport {
+                model_id: resolved.model_id.clone(),
+                tokens_in: acc_tokens_in,
+                tokens_out: acc_tokens_out,
+                cost: acc_cost,
+            });
             emit(&tx, AgentEvent::Done(assistant_text));
             return;
         }
@@ -248,6 +276,13 @@ pub async fn run_agent_loop(
     } else {
         last_text
     };
+    // Surface accumulated spend before Done (budget-exhausted path).
+    emit(&tx, AgentEvent::UsageReport {
+        model_id: resolved.model_id.clone(),
+        tokens_in: acc_tokens_in,
+        tokens_out: acc_tokens_out,
+        cost: acc_cost,
+    });
     emit(&tx, AgentEvent::Done(final_text));
 }
 
@@ -301,9 +336,12 @@ async fn stream_step(
             StreamEvent::Error(e) => {
                 outcome.error = Some(e);
             }
+            // Capture the usage chunk so the caller can accumulate spend.
+            StreamEvent::Usage { prompt_tokens, completion_tokens, cost, .. } => {
+                outcome.usage = Some((prompt_tokens, completion_tokens, cost));
+            }
             // Display-only / accounting events the sub-agent doesn't track.
             StreamEvent::Reasoning(_)
-            | StreamEvent::Usage { .. }
             | StreamEvent::Done
             | StreamEvent::Compacted { .. }
             | StreamEvent::HarnessVerdict { .. }

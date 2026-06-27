@@ -81,6 +81,9 @@ pub struct SubAgent {
     pub agent_name: String,
     /// Compact one-line label (the truncated task) for display in a list.
     pub label: String,
+    /// Resolved model id the loop runs against. Set at spawn time from the
+    /// resolved route; used by the usage ledger row.
+    pub model_id: String,
     /// Lifecycle state, advanced as [`AgentEvent`]s are drained from `rx`.
     pub status: SubAgentStatus,
     /// Abort handle for the spawned loop task; `abort()` kills the sub-agent.
@@ -99,6 +102,13 @@ pub struct SubAgent {
     /// by the model via the `task` tool; `None` means it was spawned by the
     /// user's `/task` slash command.
     pub tool_call_id: Option<String>,
+    /// Last-seen prompt tokens from [`AgentEvent::UsageReport`] (context size,
+    /// not a cumulative sum). Zero until the report arrives.
+    pub usage_tokens_in: u64,
+    /// Cumulative completion tokens across all steps (sum).
+    pub usage_tokens_out: u64,
+    /// Cumulative USD cost across all steps (sum).
+    pub usage_cost: f64,
 }
 
 /// A delegation that has been ACCEPTED but not yet started because all
