@@ -22,6 +22,7 @@ mod effort;
 mod live_picker;
 mod loading;
 mod picker;
+mod quit_confirm;
 mod rewind;
 pub mod settings;
 pub mod agents;
@@ -33,6 +34,7 @@ pub use key_input::KeyInputForm;
 pub use live_picker::{LiveSessionEntry, LiveSessionPicker};
 pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
+pub use quit_confirm::QuitConfirmState;
 pub use rewind::RewindState;
 pub use settings::{
     filter_models, SettingField, SettingsState, PICKER_MAX,
@@ -174,4 +176,14 @@ pub enum Mode {
     /// entry list and the cursor. Boxed to keep `Mode` small, consistent with the
     /// other list/dashboard variants.
     MessageRewind(Box<RewindState>),
+    /// Quit-confirm overlay: shown when the user asks to quit (the `/quit`
+    /// command or the quit keybind) while at least one session still has work in
+    /// flight. Offers three keyed choices — `k` kill all & quit (abort every
+    /// session, release all locks, exit), `d` detach & quit (leave conversations
+    /// persisted on disk and exit without aborting), `Esc` cancel back to Chat.
+    /// When NOTHING is working the quit happens immediately and this mode is
+    /// never entered. The inner [`QuitConfirmState`] only carries the busy-session
+    /// count for the warning text. Boxed for consistency with the other overlay
+    /// variants (it is small, but the box keeps `Mode` uniform + cheap to move).
+    QuitConfirm(Box<QuitConfirmState>),
 }

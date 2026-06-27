@@ -11,7 +11,25 @@ pub enum Action {
     /// Key was recognised but requires no runtime response.
     None,
     /// Exit the application cleanly.
+    ///
+    /// The runtime's handler is the quit CHOKEPOINT: if any session still has
+    /// work in flight it opens the [`crate::app::mode::Mode::QuitConfirm`]
+    /// overlay instead of exiting; otherwise it quits immediately (releasing all
+    /// locks on the way out via the natural exit path).
     Quit,
+    // --- Quit-confirm overlay actions ---
+    /// `k` in the quit-confirm overlay: abort EVERY session's in-flight stream
+    /// (drop each active receiver + clear each current task), then set
+    /// `should_quit`. All on-disk locks are released by the natural exit path.
+    QuitKillAll,
+    /// `d` in the quit-confirm overlay: detach & quit — set `should_quit`
+    /// WITHOUT aborting anything, leaving each session's conversation persisted
+    /// on disk (resumable later). Phase 1 caveat: the in-flight work still dies
+    /// with the process; true headless detach arrives with the daemon.
+    QuitDetach,
+    /// `Esc` in the quit-confirm overlay: dismiss it and return to Chat
+    /// unchanged. Nothing is aborted and the app keeps running.
+    QuitCancel,
     // --- Chat actions ---
     /// User confirmed a non-slash message; inner string is the trimmed input.
     Submit(String),

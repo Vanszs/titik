@@ -307,12 +307,17 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
 
     // Terminal teardown is handled by `_guard`'s Drop at function scope.
 
-    // Clean-exit unlock: release the lock we hold for the active session so the
-    // session is immediately re-enterable. Runs on both the Ok and Err paths
-    // (this is after run_loop returns either way). A crash that skips this is
-    // covered by PID-liveness staleness in `store::is_locked`.
-    if let Some(p) = state.rest.fg_mut().held_lock.take() {
-        crate::model::store::remove_lock(&p);
+    // Clean-exit unlock: release the lock held for EVERY live session so each one
+    // is immediately re-enterable. Multi-session aware — a quit (kill-all OR
+    // detach) can leave several sessions holding locks, so releasing only the
+    // foreground's would strand the rest until PID-liveness staleness kicked in.
+    // Runs on both the Ok and Err paths (this is after run_loop returns either
+    // way). A crash that skips this is covered by PID-liveness staleness in
+    // `store::is_locked`.
+    for s in &mut state.rest.sessions {
+        if let Some(p) = s.held_lock.take() {
+            crate::model::store::remove_lock(&p);
+        }
     }
 
     // drop(rt) LAST: runtime shutdown cancels spawned tasks. Each task owns the

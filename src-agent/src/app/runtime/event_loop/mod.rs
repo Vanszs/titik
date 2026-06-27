@@ -64,29 +64,12 @@ pub(super) fn run_loop(
             dirty = true;
         }
 
-        // 1b. Drain the advisory prompt-classifier (PC) channel. This is fully
-        //     independent of streaming: a BLOCK verdict only raises a toast; the
-        //     turn already proceeded and is never cancelled here. Take() the
-        //     receiver so the match can mutate state.rest; put it back unless the
-        //     PC task has finished (channel closed) or delivered its verdict.
-        if let Some(mut hrx) = state.rest.fg_mut().harness_rx.take() {
-            let mut keep = true;
-            while let Ok(event) = hrx.try_recv() {
-                if let StreamEvent::HarnessVerdict { allow, reason } = event {
-                    if !allow {
-                        let reason = if reason.is_empty() { "flagged".into() } else { reason };
-                        state.rest.set_toast(format!("harness flagged: {reason}"));
-                        dirty = true;
-                    }
-                    // One verdict per turn; stop listening on this channel.
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                state.rest.fg_mut().harness_rx = Some(hrx);
-            }
-        }
+        // NOTE: the advisory prompt-classifier (PC) verdict is now drained
+        // PER-SESSION inside `service_all_sessions` (above), so a BACKGROUND
+        // session's verdict is no longer stuck until it is swapped to the
+        // foreground. Only the foreground session's verdict raises the (global)
+        // toast; background verdicts are drained + parked silently. See
+        // `sessions::service_session`.
 
         // 1b-2. Drain the per-model provider-endpoints channel. Fully independent
         //       of streaming and the harness channel: the background fetch sends

@@ -16,6 +16,10 @@ use crate::service::openrouter::OpenRouterClient;
 
 mod agents;
 mod chat;
+// `pub(in crate::app::runtime)` so the `/quit` COMMAND handler (in the sibling
+// `commands` module) can route through the same `request_quit` chokepoint as the
+// quit keybind, instead of duplicating the working-aware open-or-quit logic.
+pub(in crate::app::runtime) mod quit;
 mod rewind;
 mod session;
 mod settings;
@@ -33,10 +37,21 @@ pub(super) fn apply_action(
         Action::None => {}
 
         Action::Quit => {
-            if state.rest.fg().waiting {
-                crate::app::runtime::stream::abort_current(&mut state.rest);
-            }
-            state.rest.should_quit = true;
+            // Quit chokepoint: quit immediately if nothing is working, else open
+            // the kill-all / detach / cancel confirm overlay.
+            quit::request_quit(state);
+        }
+
+        Action::QuitKillAll => {
+            quit::handle_quit_kill_all(state);
+        }
+
+        Action::QuitDetach => {
+            quit::handle_quit_detach(state);
+        }
+
+        Action::QuitCancel => {
+            quit::handle_quit_cancel(state);
         }
 
         Action::Submit(text) => {

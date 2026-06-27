@@ -6,8 +6,6 @@ use anyhow::Result;
 use crate::app::mode::{AgentsState, Mode, SettingsState};
 use crate::app::state::AppState;
 
-use super::super::stream::abort_current;
-
 /// Handle the `/mode` command: toggle chat ↔ agentic mode.
 pub(super) fn handle_mode(state: &mut AppState) -> Result<()> {
     state.rest.agent_mode = state.rest.agent_mode.toggled();
@@ -76,12 +74,14 @@ pub(super) fn handle_help(state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-/// Handle the `/quit` command: abort any in-flight request and exit.
+/// Handle the `/quit` command: route through the shared quit chokepoint.
+///
+/// Identical behaviour to the quit keybind (`Action::Quit`): if no session is
+/// working, quit immediately; if any session has work in flight, open the
+/// kill-all / detach / cancel confirm overlay. The on-disk locks for every
+/// session are released on the natural exit path.
 pub(super) fn handle_quit(state: &mut AppState) -> Result<()> {
-    if state.rest.fg().waiting {
-        abort_current(&mut state.rest);
-    }
-    state.rest.should_quit = true;
+    super::super::actions::quit::request_quit(state);
     Ok(())
 }
 

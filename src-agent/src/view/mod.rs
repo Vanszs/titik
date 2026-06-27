@@ -20,6 +20,7 @@ pub mod live_session_picker;
 pub mod loading;
 pub mod message_rewind;
 pub mod markdown;
+pub mod quit_confirm;
 pub mod session_picker;
 pub mod settings;
 pub mod theme;
@@ -76,5 +77,6 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Mode::Loading(s) => loading::draw(frame, s, &palette),
         Mode::Usage(nav) => usage::draw(frame, &state.rest, nav, &palette),
         Mode::MessageRewind(rw) => message_rewind::draw(frame, rw, &palette),
+        Mode::QuitConfirm(s) => quit_confirm::draw(frame, s, &palette),
     }
 }

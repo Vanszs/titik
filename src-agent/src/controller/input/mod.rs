@@ -20,6 +20,7 @@ mod key_input;
 mod live_picker;
 mod paste;
 mod picker;
+mod quit_confirm;
 mod rewind;
 mod settings;
 mod usage;
@@ -31,6 +32,7 @@ pub use key_input::handle_key_input;
 pub use live_picker::handle_live_picker;
 pub use paste::handle_paste;
 pub use picker::handle_picker;
+pub use quit_confirm::handle_quit_confirm;
 pub use rewind::handle_rewind;
 pub use settings::handle_settings;
 
@@ -71,6 +73,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Loading(l) => handle_loading(l, key),
         Mode::Usage(nav) => usage::handle_usage(nav, key),
         Mode::MessageRewind(rw) => handle_rewind(rw, &mut state.rest, key),
+        Mode::QuitConfirm(s) => handle_quit_confirm(s, &mut state.rest, key),
     }
 }
 

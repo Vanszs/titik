@@ -5,9 +5,11 @@
 //! and each of its sub-agents' channels, then resumes any round parked on
 //! deferred work. It contains NO rendering / terminal / input code — purely
 //! draining async results + driving turn state — so the same core can later run
-//! headless in a daemon. The foreground-only / global concerns (the harness
-//! verdict, the endpoint/warm/clipboard drains, the loading splash, input, the
-//! redraw, …) stay in [`super::run_loop`].
+//! headless in a daemon. It ALSO drains each session's advisory prompt-classifier
+//! (PC) verdict channel per-session — only the foreground session's verdict
+//! raises the (global) toast, so a background verdict no longer waits to be
+//! swapped into view. The remaining global concerns (the endpoint/warm/clipboard
+//! drains, the loading splash, input, the redraw, …) stay in [`super::run_loop`].
 //!
 //! Multi-session readiness only: there is still exactly ONE session this stage
 //! (no `/new`), so the `idx == 0 == foreground` path here is byte-for-byte the
@@ -148,11 +150,11 @@ fn service_session(
                     break;
                 }
                 // The advisory PC verdict is delivered on the dedicated
-                // `harness_rx` channel (drained in run_loop), and the per-model
-                // provider endpoints on `endpoints_rx` (also in run_loop) — never on
-                // a streaming request's channel. So these arms are unreachable here;
-                // ignore them to keep the match exhaustive without affecting the
-                // stream.
+                // `harness_rx` channel (drained per-session below), and the
+                // per-model provider endpoints on `endpoints_rx` (drained in
+                // run_loop) — never on a streaming request's channel. So these arms
+                // are unreachable here; ignore them to keep the match exhaustive
+                // without affecting the stream.
                 StreamEvent::HarnessVerdict { .. }
                 | StreamEvent::EndpointsLoaded { .. }
                 | StreamEvent::EndpointsError { .. } => {}
@@ -160,6 +162,41 @@ fn service_session(
         }
         if still_streaming {
             state.rest.sessions[idx].active_rx = Some(rx);
+        }
+    }
+
+    // 1.5. Drain THIS session's advisory prompt-classifier (PC) verdict channel.
+    //      Fully independent of streaming: a BLOCK verdict never cancels the turn
+    //      (it already proceeded) — it only raises an advisory toast. This is now
+    //      PER-SESSION so a background session's verdict is drained promptly
+    //      instead of being stuck until the user swaps to it. The toast is a
+    //      GLOBAL/foreground UI surface, so it is shown ONLY for the foreground
+    //      session; a non-foreground session's verdict is drained + parked
+    //      silently (no toast, no mode change) so it can't hijack the screen the
+    //      user is looking at. take() the receiver so the arm can mutate
+    //      `state.rest`; put it back unless the PC task finished / delivered.
+    if let Some(mut hrx) = state.rest.sessions[idx].harness_rx.take() {
+        let is_fg = idx == state.rest.foreground;
+        let mut keep = true;
+        while let Ok(event) = hrx.try_recv() {
+            if let StreamEvent::HarnessVerdict { allow, reason } = event {
+                if !allow {
+                    // Foreground only: surface the advisory toast. Background
+                    // verdicts are drained but parked silently (dirty still set so
+                    // the channel teardown is reflected, but no visible toast).
+                    if is_fg {
+                        let reason = if reason.is_empty() { "flagged".into() } else { reason };
+                        state.rest.set_toast(format!("harness flagged: {reason}"));
+                    }
+                    dirty = true;
+                }
+                // One verdict per turn; stop listening on this channel.
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            state.rest.sessions[idx].harness_rx = Some(hrx);
         }
     }
 
