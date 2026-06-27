@@ -67,7 +67,7 @@ const BB_RULE: Color = Color::Rgb(120, 84, 0);
 /// Numeric value colour: near-white.
 const BB_VALUE: Color = Color::Rgb(230, 230, 230);
 /// Secondary label / separator colour: dim grey.
-const BB_DIM: Color = Color::Rgb(80, 80, 80);
+const BB_DIM: Color = Color::Rgb(173, 173, 173);
 /// Active range-tab highlight background.
 const BB_TAB_BG: Color = Color::Rgb(60, 40, 0);
 
@@ -316,7 +316,7 @@ fn draw_global(frame: &mut Frame, nav: &UsageNavState, area: Rect) {
             ])
             .split(rows[2]);
 
-        let heat_inner = section(frame, &heatmap_title(nav.range), cols[0]);
+        let heat_inner = section(frame, &heatmap_title(nav), cols[0]);
         draw_heatmap(frame, nav, since, heat_inner);
 
         let models_inner = section(frame, "TOP MODELS", cols[2]);
@@ -364,14 +364,17 @@ fn draw_kpi_strip(frame: &mut Frame, totals: &crate::model::usage::RangeTotals, 
 
 // ── Heatmap section ────────────────────────────────────────────────────────────
 
-fn heatmap_title(range: UsageRange) -> String {
-    match range {
-        UsageRange::Today => "HEATMAP (HOURLY)",
-        UsageRange::Week  => "HEATMAP (DAILY)",
-        UsageRange::Month => "HEATMAP (DAILY)",
-        UsageRange::Year  => "HEATMAP (YEARLY)",
+fn heatmap_title(nav: &UsageNavState) -> String {
+    let metric_label = match nav.metric {
+        UsageMetric::Cost   => "COST",
+        UsageMetric::Tokens => "TOKEN USAGE",
+    };
+    match nav.range {
+        UsageRange::Today => format!("{metric_label} (HOURLY)"),
+        UsageRange::Week  => format!("{metric_label} (DAILY)"),
+        UsageRange::Month => format!("{metric_label} (DAILY)"),
+        UsageRange::Year  => "HEATMAP (YEARLY)".to_string(),
     }
-    .to_string()
 }
 
 /// Content-row count a heatmap occupies for the active range (excludes the
@@ -750,65 +753,142 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], max_width: usize) -> Vec
 /// | Year  | 7 rows x 53 cols Github  |
 fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize) -> Vec<Line<'static>> {
     match nav.range {
-        UsageRange::Today => build_heatmap_hourly(since, nav.metric, max_width),
-        UsageRange::Week  => build_heatmap_daily(since, 7,  nav.metric),
-        UsageRange::Month => build_heatmap_daily(since, 30, nav.metric),
+        UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8),
+        UsageRange::Week  => build_bar_chart(since, BucketSize::Day,   7, nav.metric, max_width, 8),
+        UsageRange::Month => build_bar_chart(since, BucketSize::Day,  30, nav.metric, max_width, 8),
         UsageRange::Year  => build_heatmap_yearly(since, nav.metric),
     }
 }
 
-fn build_heatmap_hourly(since: i64, metric: UsageMetric, max_width: usize) -> Vec<Line<'static>> {
-    let buckets = spend_buckets(since, BucketSize::Hour, 24);
+/// Vertical bar chart for Today / Week / Month ranges.
+///
+/// `height` rows of vertical bars (top-to-bottom, origin at bottom), each column
+/// one char wide, colored by the heat ramp.  An x-axis label row is appended below
+/// the bars.  No cheap/expensive legend — bar height already conveys magnitude.
+fn build_bar_chart(
+    since: i64,
+    bucket: BucketSize,
+    n: usize,
+    metric: UsageMetric,
+    max_width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let buckets = spend_buckets(since, bucket, n);
+    let step_secs: i64 = match bucket {
+        BucketSize::Hour => 3600,
+        BucketSize::Day  => 86400,
+        BucketSize::Week => 86400 * 7,
+    };
+
+    // Build ordered epoch list: oldest first, newest on the right.
+    let now  = now_secs();
+    let snap = match bucket {
+        BucketSize::Hour => now - now % 3600,
+        BucketSize::Day  => now - now % 86400,
+        BucketSize::Week => now - now % (86400 * 7),
+    };
+    let epochs: Vec<i64> = (0..n as i64)
+        .rev()
+        .map(|i| snap - i * step_secs)
+        .collect();
+
     let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+    let mut values: Vec<f64> = epochs
+        .iter()
+        .map(|ep| map.get(ep).map(|b| metric_val(b, metric)).unwrap_or(0.0))
+        .collect();
 
-    let now = now_secs();
-    let cur_hour   = now   - now   % 3600;
-    let start_hour = since - since % 3600;
-    let n = (((cur_hour - start_hour) / 3600) + 1).max(1) as usize;
-    let n = n.min(24).min(max_width.saturating_sub(4));
+    // Clamp to max_width columns — keep only the most recent if narrower.
+    let epochs_vis: Vec<i64> = if epochs.len() > max_width {
+        epochs[epochs.len() - max_width..].to_vec()
+    } else {
+        epochs.clone()
+    };
+    if values.len() > max_width {
+        let drop = values.len() - max_width;
+        values.drain(..drop);
+    }
+    let ncols = values.len();
 
-    let nonzero: Vec<f64> = map.values().map(|b| metric_val(b, metric)).filter(|&v| v > 0.0).collect();
+    // Thresholds from non-zero values for heat coloring.
+    let nonzero: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
     let (p33, p66, p90) = percentile_thresholds(&nonzero);
+    let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
 
-    let mut cells: Vec<Span<'static>> = vec![Span::styled("   ", Style::default().fg(BB_DIM))];
-    let mut labels: Vec<Span<'static>> = vec![Span::raw("   ")];
-
-    for i in 0..n {
-        let epoch = start_hour + i as i64 * 3600;
-        let v     = map.get(&epoch).map(|b| metric_val(b, metric)).unwrap_or(0.0);
-        let col   = heat_color(v, p33, p66, p90, epoch > cur_hour);
-        cells.push(Span::styled(CELL, Style::default().fg(col)));
-
-        let h = ((epoch / 3600) % 24) as u8;
-        if h.is_multiple_of(4) {
-            labels.push(Span::styled(format!("{h:02}"), Style::default().fg(BB_DIM)));
-        } else {
-            labels.push(Span::raw(" "));
+    // Build height rows top-to-bottom (row 0 = top, row height-1 = bottom).
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height + 1);
+    for r in 0..height {
+        // row_from_bottom: 0 = bottom row, height-1 = top row.
+        let row_from_bottom = height - 1 - r;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(ncols);
+        for &v in values.iter() {
+            let col_color = heat_color(v, p33, p66, p90, false);
+            let fill_eighths = if max_val <= 0.0 {
+                0usize
+            } else {
+                ((v / max_val) * (height * 8) as f64).round() as usize
+            };
+            // Determine character for this cell.
+            let threshold_low  = row_from_bottom * 8;
+            let threshold_high = row_from_bottom * 8 + 8;
+            let ch = if fill_eighths >= threshold_high {
+                SPARK_CHARS[8]
+            } else if fill_eighths > threshold_low {
+                let partial = fill_eighths - threshold_low;
+                SPARK_CHARS[partial.clamp(1, 8)]
+            } else {
+                ' '
+            };
+            let style = if ch == ' ' {
+                Style::default()
+            } else {
+                Style::default().fg(col_color)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
         }
+        lines.push(Line::from(spans));
     }
 
-    vec![Line::from(cells), Line::from(labels), heat_legend()]
-}
-
-fn build_heatmap_daily(since: i64, days: usize, metric: UsageMetric) -> Vec<Line<'static>> {
-    let buckets = spend_buckets(since, BucketSize::Day, days);
-    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
-
-    let today = { let n = now_secs(); n - n % 86400 };
-
-    let nonzero: Vec<f64> = map.values().map(|b| metric_val(b, metric)).filter(|&v| v > 0.0).collect();
-    let (p33, p66, p90) = percentile_thresholds(&nonzero);
-
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("   ", Style::default().fg(BB_DIM))];
-    for i in 0..days {
-        let epoch = today - (days as i64 - 1 - i as i64) * 86400;
-        let v     = map.get(&epoch).map(|b| metric_val(b, metric)).unwrap_or(0.0);
-        let col   = heat_color(v, p33, p66, p90, false);
-        spans.push(Span::styled(CELL, Style::default().fg(col)));
+    // X-axis label row: 1 char per column, exactly aligned.
+    let mut label_spans: Vec<Span<'static>> = Vec::with_capacity(ncols);
+    for (col, &ep) in epochs_vis.iter().enumerate() {
+        let label_char: char = match bucket {
+            BucketSize::Hour => {
+                let h = ((ep / 3600) % 24) as usize;
+                if h.is_multiple_of(6) {
+                    char::from_digit((h % 10) as u32, 10).unwrap_or(' ')
+                } else {
+                    ' '
+                }
+            }
+            BucketSize::Day => {
+                if ncols <= 7 {
+                    let dow = ((ep / 86400 + 4) % 7) as usize; // 0=Sun
+                    ['S','M','T','W','T','F','S'][dow]
+                } else {
+                    if col % 5 == 0 {
+                        char::from_digit(((col / 5) % 10) as u32, 10).unwrap_or(' ')
+                    } else {
+                        ' '
+                    }
+                }
+            }
+            _ => ' ',
+        };
+        label_spans.push(Span::styled(
+            label_char.to_string(),
+            Style::default().fg(BB_DIM),
+        ));
     }
+    lines.push(Line::from(label_spans));
 
-    vec![Line::from(spans), heat_legend()]
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("no data", Style::default().fg(BB_DIM))));
+    }
+    lines
 }
+
+
 
 fn build_heatmap_yearly(since: i64, metric: UsageMetric) -> Vec<Line<'static>> {
     let buckets = spend_buckets(since, BucketSize::Day, 371);
