@@ -94,6 +94,10 @@ pub(super) fn handle_submit(
     state.rest.awaiting_approval = false;
     state.rest.tool_idx = 0;
     state.rest.tool_results.clear();
+    // Hard-reset the deferred-task lane so a new submit can never inherit
+    // awaiting_tool_tasks=true or stale pending ids from a prior halt path.
+    state.rest.pending_tool_tasks.clear();
+    state.rest.awaiting_tool_tasks = false;
     // Phase label for the comet: a single word the shimmer sweeps across
     // (the elapsed counter is appended by the renderer). No trailing dots —
     // the comet supplies the motion, `· Ns` supplies the elapsed.
@@ -315,6 +319,12 @@ pub(super) fn handle_deny_tool(state: &mut AppState) -> Result<()> {
     state.rest.agent_steps = 0;
     state.rest.waiting = false;
     state.rest.current_task = None;
+    // Clear deferred-task state so the resume gate can't ghost-restart
+    // a killed turn via stale awaiting flags or leftover pending ids.
+    state.rest.pending_subagent_calls.clear();
+    state.rest.awaiting_subagents = false;
+    state.rest.pending_tool_tasks.clear();
+    state.rest.awaiting_tool_tasks = false;
     state.rest.status = "denied — stopped".into();
     Ok(())
 }

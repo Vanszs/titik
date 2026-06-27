@@ -625,10 +625,22 @@ pub(super) fn run_loop(
             // when emptiness is tested. A round runs its deferred tools ONE AT A
             // TIME, so at most one id settles here per resume.
             if let Some(rx) = state.rest.tool_task_rx.as_mut() {
-                while let Ok((id, result)) = rx.try_recv() {
-                    state.rest.pending_tool_tasks.retain(|c| c != &id);
-                    state.rest.tool_results.push((id, result));
-                    dirty = true;
+                // Drain into a local vec first to release the rx borrow before
+                // touching pending_tool_tasks / tool_results on state.rest.
+                let mut received: Vec<(String, String)> = Vec::new();
+                while let Ok(pair) = rx.try_recv() {
+                    received.push(pair);
+                }
+                // Fold only results whose id is still in pending_tool_tasks;
+                // anything else is a stale delivery from a killed/interrupted
+                // turn and must be discarded rather than corrupting the next turn.
+                for (id, result) in received {
+                    if let Some(pos) = state.rest.pending_tool_tasks.iter().position(|c| c == &id) {
+                        state.rest.pending_tool_tasks.remove(pos);
+                        state.rest.tool_results.push((id, result));
+                        dirty = true;
+                    }
+                    // else: stale delivery — drop silently
                 }
             }
 

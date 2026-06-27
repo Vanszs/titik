@@ -465,4 +465,10 @@ pub(crate) fn deny_all_pending(state: &mut AppState, reason: &str) {
     state.rest.approval_reason = None;
     state.rest.waiting = false;
     state.rest.current_task = None;
+    // Clear deferred-task state so a killed WC turn can't ghost-restart
+    // via a stale awaiting_tool_tasks=true or leftover pending ids.
+    state.rest.pending_subagent_calls.clear();
+    state.rest.awaiting_subagents = false;
+    state.rest.pending_tool_tasks.clear();
+    state.rest.awaiting_tool_tasks = false;
 }
