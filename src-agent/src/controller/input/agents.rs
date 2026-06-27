@@ -41,27 +41,54 @@ pub fn handle_agents(s: &mut AgentsState, rest: &mut AppStateRest, key: KeyEvent
     // printable chars insert, arrows/Home/End move the cursor, Enter splits the
     // line, Backspace/Delete remove, and Esc COMMITS the text back into the matching
     // draft and closes (returning to the field list). Everything else is swallowed.
-    if let Some((_field, ed)) = s.editor.as_mut() {
-        match key.code {
-            KeyCode::Esc => {
-                // Commit: write the edited text back into the tagged draft, close.
-                s.commit_editor();
+    if s.editor.is_some() {
+        // Ctrl+X is a two-step "clear the whole field" guard. The pending flag
+        // lives on `s` (not behind the `ed` borrow), so it is read/set BEFORE
+        // borrowing the buffer mutably — that keeps the borrow checker happy and
+        // lets the confirm resolve without `ed` for the cancel path.
+        if s.editor_clear_confirm {
+            // A confirmation is armed: `y`/`Y` wipes the buffer, ANY other key
+            // cancels. Either way the flag clears and the keystroke is consumed.
+            if let KeyCode::Char('y') | KeyCode::Char('Y') = key.code {
+                if let Some((_field, ed)) = s.editor.as_mut() {
+                    ed.lines = vec![String::new()];
+                    ed.row = 0;
+                    ed.col = 0;
+                    ed.scroll = 0;
+                }
             }
-            KeyCode::Enter => ed.newline(),
-            KeyCode::Backspace => ed.backspace(),
-            KeyCode::Delete => ed.delete(),
-            KeyCode::Left => ed.move_left(),
-            KeyCode::Right => ed.move_right(),
-            KeyCode::Up => ed.move_up(),
-            KeyCode::Down => ed.move_down(),
-            KeyCode::Home => ed.home(),
-            KeyCode::End => ed.end(),
-            // Printable char with no Ctrl modifier → insert it.
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ed.insert_char(c);
+            s.editor_clear_confirm = false;
+            return Action::None;
+        }
+        if is_ctrl(&key, 'x') {
+            // First press: arm the confirmation; don't touch the text yet.
+            s.editor_clear_confirm = true;
+            return Action::None;
+        }
+
+        // Normal editing: borrow the buffer and apply the keystroke.
+        if let Some((_field, ed)) = s.editor.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    // Commit: write the edited text back into the tagged draft, close.
+                    s.commit_editor();
+                }
+                KeyCode::Enter => ed.newline(),
+                KeyCode::Backspace => ed.backspace(),
+                KeyCode::Delete => ed.delete(),
+                KeyCode::Left => ed.move_left(),
+                KeyCode::Right => ed.move_right(),
+                KeyCode::Up => ed.move_up(),
+                KeyCode::Down => ed.move_down(),
+                KeyCode::Home => ed.home(),
+                KeyCode::End => ed.end(),
+                // Printable char with no Ctrl modifier → insert it.
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ed.insert_char(c);
+                }
+                // Swallow anything else (other Ctrl combos, Tab, function keys, …).
+                _ => {}
             }
-            // Swallow anything else (other Ctrl combos, Tab, function keys, …).
-            _ => {}
         }
         return Action::None;
     }

@@ -120,7 +120,7 @@ pub fn draw(
     // instead of the normal list/detail dashboard and bail (it owns all input). The
     // title is the active field's label (prompt / description / conditions).
     if let Some((field, ed)) = &st.editor {
-        draw_field_editor(frame, ed, field.label(), palette);
+        draw_field_editor(frame, ed, field.label(), st.editor_clear_confirm, palette);
         return;
     }
 

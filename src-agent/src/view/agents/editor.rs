@@ -16,37 +16,96 @@ use crate::view::theme::Palette;
 
 use super::{model_display, truncate};
 
+/// Soft word-wrap one logical line (`chars`) into visual segments of at most
+/// `wrap_w` cells, returning each segment as a `(start, end)` CHAR-index range
+/// into `chars`.
+///
+/// Greedy: a segment grows until the next char would overflow `wrap_w`, then it
+/// breaks at the LAST space that still fits — that space is consumed (it ends a
+/// line and is not re-rendered at the start of the next). A single word longer
+/// than `wrap_w` (no usable space) HARD-breaks exactly at `wrap_w`. An empty
+/// line yields one empty segment `(0, 0)` so it still occupies a visual row.
+///
+/// `wrap_w` must be `>= 1` (the caller clamps it); every segment width
+/// (`end - start`) is then `<= wrap_w`. Works purely on char indices, so it
+/// never splits a multi-byte codepoint.
+fn wrap_segments(chars: &[char], wrap_w: usize) -> Vec<(usize, usize)> {
+    let n = chars.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    while start < n {
+        if n - start <= wrap_w {
+            // The remainder fits on one line.
+            segs.push((start, n));
+            break;
+        }
+        // `limit` is the first char index that does NOT fit on this line; since
+        // `n - start > wrap_w` here, `limit < n`, so `chars[limit]` is in range.
+        // Scan downward for the rightmost space in `start+1 ..= limit` to break
+        // on cleanly (that space ends the line and is consumed on the next row).
+        let limit = start + wrap_w;
+        let mut brk = None;
+        let mut j = limit;
+        while j > start {
+            if chars[j] == ' ' {
+                brk = Some(j);
+                break;
+            }
+            j -= 1;
+        }
+        match brk {
+            Some(j) => {
+                segs.push((start, j));
+                start = j + 1; // consume the breaking space
+            }
+            None => {
+                // No usable space in the window: hard-break at `wrap_w`.
+                segs.push((start, limit));
+                start = limit;
+            }
+        }
+    }
+    segs
+}
+
 /// Render the FULL-SCREEN nano-style text editor over the whole frame.
 ///
 /// `title` is the active field's label (e.g. `"prompt"`, `"description"`,
 /// `"conditions"`) shown dim in the header — the same editor serves all three
-/// full-size-editable fields.
+/// full-size-editable fields. `clear_confirm` arms the Ctrl+X "clear the whole
+/// field?" prompt in the footer.
 ///
 /// Layout (minimalist, matching the app's header convention):
 ///
 /// ```text
 ///  edit prompt
 /// ─────────────────────────────────────────  ← dim BOTTOM rule
-///   You are a focused subagent…             ← body (clipped, h-scrolled)
-///   …                                        ← real terminal cursor sits here
+///   1 You are a focused subagent that wraps…   ← number gutter, then wrapped body
+///     onto the next visual row.                ← continuation row: blank gutter
+///   2                                          ← empty logical line
 ///
-///  ↑↓←→ move · Enter newline · Esc save & back ← dim footer
+///  ↑↓←→ move · Enter newline · Ctrl+X clear · Esc save & back ← dim footer
 /// ```
 ///
-/// ## Wrapping vs cursor placement
-/// We DELIBERATELY do not soft-wrap. Each logical line is HARD-CLIPPED to the
-/// inner width, and the body scrolls BOTH ways — vertically by whole lines and
-/// horizontally by chars — so the cursor cell is always on screen. This keeps the
-/// real terminal cursor's `(x, y)` EXACT (column maps 1:1 to a screen cell), which
-/// soft-wrapping would make fragile. Correctness over fanciness, per the spec.
-///
-/// The stored `scroll` is treated as a seed: the effective vertical scroll is
-/// recomputed every frame from the cursor and body height, so the view stays
-/// correct without mutating state (the renderer only borrows `ed`).
+/// ## Wrapping, gutter, and the cursor
+/// Each logical line is SOFT WORD-WRAPPED (see [`wrap_segments`]) to the body
+/// width minus a left line-number gutter. The gutter shows the 1-based logical
+/// line number (right-aligned, dim) on the FIRST visual row of each line and a
+/// blank of equal width on every continuation row, so wrapped text stays
+/// aligned. Vertical scroll is by VISUAL rows (not logical lines): the stored
+/// `scroll` is a seed, re-clamped each frame around the cursor's visual row so
+/// the view stays correct without mutating state (the renderer only borrows
+/// `ed`). The real terminal cursor is mapped to its exact wrapped cell by
+/// wrapping the cursor's own line with the SAME algorithm and locating `col`
+/// within its segment — so the mapping is exact even with multi-byte text.
 pub(super) fn draw_field_editor(
     frame: &mut Frame,
     ed: &TextEditorState,
     title: &str,
+    clear_confirm: bool,
     palette: &Palette,
 ) {
     let area = frame.area();
@@ -75,12 +134,20 @@ pub(super) fn draw_field_editor(
         header_inner.inner(Margin { horizontal: 2, vertical: 0 }),
     );
 
-    // --- Footer hint (dim). ---
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} Esc save & back",
+    // --- Footer hint (dim), or the Ctrl+X clear-confirm prompt (accent). ---
+    let footer_line = if clear_confirm {
+        Line::from(Span::styled(
+            "clear entire field? y = yes, any key = cancel",
+            Style::default().fg(palette.accent),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "\u{2191}\u{2193}\u{2190}\u{2192} move \u{b7} Enter newline \u{b7} Ctrl+X clear \u{b7} Esc save & back",
             Style::default().fg(palette.dim),
-        )),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(footer_line),
         outer[2].inner(Margin { horizontal: 2, vertical: 0 }),
     );
 
@@ -89,47 +156,92 @@ pub(super) fn draw_field_editor(
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let inner_w = body.width as usize;
+    let body_inner_w = body.width as usize;
     let body_h = body.height as usize;
 
-    // Vertical scroll: keep the cursor row inside [scroll, scroll + body_h).
-    // Seed from the stored scroll, then clamp it around the cursor.
-    let mut v_scroll = ed.scroll.min(ed.lines.len().saturating_sub(1));
-    if ed.row < v_scroll {
-        v_scroll = ed.row;
-    } else if ed.row >= v_scroll + body_h {
-        v_scroll = ed.row + 1 - body_h;
-    }
+    // --- Gutter geometry. ---
+    // Width = max(3, digits in line count) for the number, plus a 1-col
+    // separator. `wrap_w` is whatever body width is left; clamp to >= 1 so a
+    // narrow terminal can't produce a zero-width wrap (it just overflows and the
+    // Paragraph clips — no panic).
+    let digits = ed.lines.len().to_string().len();
+    let num_w = digits.max(3);
+    let gutter_w = num_w + 1; // number columns + a single separator column
+    let wrap_w = body_inner_w.saturating_sub(gutter_w).max(1);
 
-    // Horizontal scroll: keep the cursor column inside [h_scroll, h_scroll+inner_w).
-    // Recomputed from 0 each frame (no stored horizontal offset) → always exact.
-    let h_scroll = if ed.col >= inner_w {
-        ed.col + 1 - inner_w
-    } else {
-        0
-    };
+    // Pre-wrap every logical line ONCE: reused for the cursor's visual row, the
+    // total visual-row count, and the render below (so the wrap is computed with
+    // a single algorithm everywhere → cursor mapping stays exact).
+    let line_chars: Vec<Vec<char>> = ed.lines.iter().map(|l| l.chars().collect()).collect();
+    let per_line: Vec<Vec<(usize, usize)>> = line_chars
+        .iter()
+        .map(|chars| wrap_segments(chars, wrap_w))
+        .collect();
 
-    // Render the visible window: each logical line hard-clipped to the h-window.
-    let mut lines: Vec<Line> = Vec::with_capacity(body_h);
-    for li in v_scroll..(v_scroll + body_h).min(ed.lines.len()) {
-        let chars: Vec<char> = ed.lines[li].chars().collect();
-        let slice: String = if h_scroll < chars.len() {
-            chars[h_scroll..(h_scroll + inner_w).min(chars.len())]
-                .iter()
-                .collect()
+    // Cursor → absolute VISUAL row + the column offset within its segment.
+    // The visual row is (all segments of the lines above `row`) + the index of
+    // the segment that holds `col` within `row`. `col`'s segment is the LAST one
+    // whose start is <= col; the x offset is `col - seg.start` (a trailing space
+    // that was consumed by the wrap lands at the end of its segment, which is a
+    // sensible cursor cell).
+    let rows_above: usize = per_line[..ed.row].iter().map(|s| s.len()).sum();
+    let cur_segs = &per_line[ed.row];
+    let mut seg_idx = 0;
+    for (i, &(s, _e)) in cur_segs.iter().enumerate() {
+        if s <= ed.col {
+            seg_idx = i;
         } else {
-            String::new()
-        };
-        lines.push(Line::from(Span::styled(slice, Style::default().fg(palette.fg))));
+            break;
+        }
     }
-    frame.render_widget(Paragraph::new(lines), body);
+    let cursor_vrow = rows_above + seg_idx;
+    let cursor_x_off = ed.col - cur_segs[seg_idx].0;
+
+    let total_vrows: usize = per_line.iter().map(|s| s.len()).sum();
+
+    // Vertical scroll in VISUAL-row space: seed from the stored scroll, then
+    // clamp it so the cursor's visual row sits inside [v_scroll, v_scroll+body_h).
+    let mut v_scroll = ed.scroll.min(total_vrows.saturating_sub(1));
+    if cursor_vrow < v_scroll {
+        v_scroll = cursor_vrow;
+    } else if cursor_vrow >= v_scroll + body_h {
+        v_scroll = cursor_vrow + 1 - body_h;
+    }
+
+    // Render the visible window of VISUAL rows. Walk every logical line, emit its
+    // segments as rows, and keep only those in [v_scroll, v_scroll+body_h). The
+    // gutter shows the line number on a line's FIRST visual row, blank after.
+    let mut out_lines: Vec<Line> = Vec::with_capacity(body_h);
+    let mut vrow = 0usize;
+    'outer: for (li, segs) in per_line.iter().enumerate() {
+        for (si, &(s, e)) in segs.iter().enumerate() {
+            if vrow >= v_scroll + body_h {
+                break 'outer;
+            }
+            if vrow >= v_scroll {
+                // Gutter cell: right-aligned number on the first row, else blanks.
+                let gutter = if si == 0 {
+                    format!("{:>width$} ", li + 1, width = num_w)
+                } else {
+                    " ".repeat(gutter_w)
+                };
+                let text: String = line_chars[li][s..e].iter().collect();
+                out_lines.push(Line::from(vec![
+                    Span::styled(gutter, Style::default().fg(palette.dim)),
+                    Span::styled(text, Style::default().fg(palette.fg)),
+                ]));
+            }
+            vrow += 1;
+        }
+    }
+    frame.render_widget(Paragraph::new(out_lines), body);
 
     // --- Real terminal cursor at the exact mapped cell. ---
-    // x = body.x + (col - h_scroll); y = body.y + (row - v_scroll). Both offsets
-    // are non-negative by construction (the scroll math above guarantees the
-    // cursor is inside the window). Clamp to the body rect for safety.
-    let cursor_x = body.x + (ed.col.saturating_sub(h_scroll)) as u16;
-    let cursor_y = body.y + (ed.row.saturating_sub(v_scroll)) as u16;
+    // x = body.x + gutter_w + (col offset within its wrapped segment);
+    // y = body.y + (cursor visual row - v_scroll). Both offsets are non-negative
+    // by construction. Clamp to the body rect so a narrow terminal never panics.
+    let cursor_x = body.x + (gutter_w + cursor_x_off) as u16;
+    let cursor_y = body.y + (cursor_vrow.saturating_sub(v_scroll)) as u16;
     frame.set_cursor_position(Position {
         x: cursor_x.min(body.right().saturating_sub(1)),
         y: cursor_y.min(body.bottom().saturating_sub(1)),

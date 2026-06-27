@@ -41,11 +41,12 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
                 }
             }
             // Multiline verbatim: '\n' is kept (newline in the input, never a
-            // submit); only the bare CR of a CRLF pair is dropped.
-            for c in text.chars() {
-                if c != '\r' {
-                    state.rest.push_char(c);
-                }
+            // submit). NORMALIZE line endings first so bracketed paste that
+            // delivers breaks as CRLF or bare CR still lands as real newlines
+            // (a bare `\r` used to be dropped, collapsing the paste onto one line).
+            let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+            for c in cleaned.chars() {
+                state.rest.push_char(c);
             }
         }
         Mode::KeyInput(form) => {
@@ -103,10 +104,12 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
             //   tool picker (filter) > draft field.
             if let Some((_field, ed)) = a.editor.as_mut() {
                 // Full-screen field editor: insert the WHOLE clipboard at the
-                // cursor, newlines and all (multi-line aware). Drop bare CRs of a
-                // CRLF pair so pasted Windows text doesn't leave stray carriage
-                // returns in the buffer.
-                let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
+                // cursor, newlines and all (multi-line aware). NORMALIZE line
+                // endings first — bracketed paste often delivers line breaks as
+                // CRLF or bare CR, so map both to `\n`; stripping the `\r` (as we
+                // used to) would have deleted bare-CR breaks and collapsed the
+                // whole paste onto one line.
+                let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
                 ed.insert_str(&cleaned);
             } else if a.model_picker.is_some() {
                 // Single-select list — no text entry; swallow the paste.

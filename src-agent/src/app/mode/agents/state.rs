@@ -69,6 +69,11 @@ pub struct AgentsState {
     /// into the matching draft (tagged by the [`AgentEditField`]) and closes
     /// (`= None`). A sub-state of `Mode::Agents`, not a separate mode.
     pub editor: Option<(AgentEditField, crate::app::mode::editor::TextEditorState)>,
+    /// `true` once Ctrl+X is pressed in the full-screen editor, arming a
+    /// "clear the whole field?" confirmation. While armed, `y`/`Y` wipes the
+    /// editor buffer and any other key cancels; either way the flag resets. Set
+    /// back to `false` whenever the editor opens or commits.
+    pub editor_clear_confirm: bool,
 }
 
 impl AgentsState {
@@ -95,6 +100,7 @@ impl AgentsState {
             tool_picker: None,
             model_picker: None,
             editor: None,
+            editor_clear_confirm: false,
         }
     }
 
@@ -348,6 +354,8 @@ impl AgentsState {
             _ => return, // only these three are full-size editable
         };
         self.editor = Some((field, crate::app::mode::editor::TextEditorState::from_text(text)));
+        // A fresh editor starts with no pending clear-confirm.
+        self.editor_clear_confirm = false;
     }
 
     /// Commit the open editor: write its text back into the draft tagged by the
@@ -363,6 +371,9 @@ impl AgentsState {
                 _ => {}
             }
         }
+        // The editor is closing; drop any pending clear-confirm so it can't leak
+        // into the next time the editor is opened.
+        self.editor_clear_confirm = false;
     }
 
     /// Build an [`AgentDef`] from the current drafts (the value the runtime
