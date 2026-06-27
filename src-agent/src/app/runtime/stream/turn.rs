@@ -6,7 +6,7 @@ use crate::app::state::{AppState, AppStateRest};
 use crate::dto::chat::Role;
 use crate::service::openrouter::OpenRouterClient;
 
-use super::{final_answer, MAX_AGENT_STEPS};
+use super::final_answer;
 
 /// Post koma's friendly "this model can't read images" notice into the chat
 /// (assistant message + msglog + save). Shared by the submit-time capability
@@ -236,17 +236,6 @@ pub(crate) fn advance_turn(
         return;
     }
 
-    // 4. Step cap: stop the turn if the model keeps asking for tools forever.
-    if state.rest.agent_steps >= MAX_AGENT_STEPS {
-        if let Some(sess) = state.rest.session.as_mut() {
-            let _ = sess.save();
-        }
-        state.rest.waiting = false;
-        state.rest.current_task = None;
-        state.rest.agent_steps = 0;
-        state.rest.status = "stopped: max tool steps".into();
-        return;
-    }
     state.rest.agent_steps += 1;
 
     // 4b. Workspace check (WC): the deterministic harness gate. When the harness

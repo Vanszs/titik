@@ -14,10 +14,6 @@ pub(crate) use spawn::{spawn_or_queue, try_start_pending, SpawnOutcome};
 #[allow(unused_imports)]
 pub(crate) use spawn::spawn_task;
 
-/// Hard cap on tool-call rounds within a single user turn. Once exceeded the
-/// turn is stopped so a misbehaving model can't loop indefinitely.
-pub(super) const MAX_AGENT_STEPS: usize = 40;
-
 /// Pick the assistant message content + display-reasoning for a FINAL turn.
 /// Normally content is the answer and `reasoning` rides along (rendered gray).
 /// But when the model left content empty and streamed its answer into the
