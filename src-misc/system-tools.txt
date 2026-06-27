@@ -109,6 +109,32 @@ dir_cache_update — re-index the workspace. It runs AUTOMATICALLY after write,
   list is stale.
   Arguments: {}
 
+remember — save a long-term memory for this project (shared across every session
+  opened from the same directory). Pass "description" (a one-line hook shown in
+  the injected memory index) and "content" (the full body). Optionally set "type"
+  and a "slug" id; if "slug" is omitted one is derived from the description.
+  Reusing an existing slug overwrites that memory (use this to edit/swap one).
+  Arguments: { "description": "...", "content": "...", "type": "..." (optional),
+               "slug": "..." (optional) }
+  Example:   remember({"description": "deploy uses make ship", "content": "Run `make ship` to deploy; it builds, tags, and pushes."})
+  Returns the slug; use recall(slug) later to read the full body.
+
+recall — read a saved memory's full body by its "slug" (the id shown next to each
+  entry in the injected memory index). Only the index of one-line hooks is in the
+  prompt, so use this to pull a specific memory's full content on demand.
+  Arguments: { "slug": "deploy-uses-make-ship" }
+  Example:   recall({"slug": "deploy-uses-make-ship"})
+
+forget — delete a saved memory by its "slug" (as listed in the memory index).
+  Arguments: { "slug": "deploy-uses-make-ship" }
+  Example:   forget({"slug": "deploy-uses-make-ship"})
+  No-op if the slug doesn't exist.
+
+The injected "# Memory" block lists every saved memory as a pointer
+(`- [hook](slug.md)`); it is the index only, not the full bodies. Call
+recall(slug) to read one in full, remember(...) to save one, forget(slug) to
+delete one.
+
 ## Editing an existing file
 Prefer edit over write for targeted changes:
   1. read the file to see its exact current content.

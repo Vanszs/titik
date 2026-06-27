@@ -115,15 +115,14 @@ fn slug_path(dir: &Path, slug: &str) -> Option<PathBuf> {
 
 /// A parsed memory file: its frontmatter fields plus the body text.
 ///
-/// `slug` + `description` drive the injected index today; `kind` + `body` are
-/// read by the Stage-2 `recall`/`forget` tools, so they're carried now and
-/// `allow`ed until then.
+/// `slug` + `description` drive the injected index; `body` is returned by the
+/// `recall` tool. `kind` is parsed for completeness but has no reader yet, so it
+/// stays `allow`ed.
 pub struct Memory {
     pub slug: String,
     pub description: String,
     #[allow(dead_code)]
     pub kind: String,
-    #[allow(dead_code)]
     pub body: String,
 }
 
@@ -216,8 +215,7 @@ fn find_frontmatter_end(rest: &str) -> Option<(usize, usize)> {
 /// Read a single memory's BODY by slug, or `None` if it doesn't exist / can't be
 /// read. The slug is sanitized and resolved under `dir` (no traversal).
 ///
-/// Consumed by the Stage-2 `recall` tool; `allow`ed until that lands.
-#[allow(dead_code)]
+/// Consumed by the `recall` tool.
 pub fn read_memory(dir: &Path, slug: &str) -> Option<String> {
     let path = slug_path(dir, slug)?;
     let text = std::fs::read_to_string(&path).ok()?;
@@ -254,8 +252,7 @@ pub fn write_memory(
 /// Remove a memory file `<slug>.md` and refresh the index. Idempotent: a missing
 /// file is not an error. Returns `true` if a file was actually deleted.
 ///
-/// Consumed by the Stage-2 `forget` tool; `allow`ed until that lands.
-#[allow(dead_code)]
+/// Consumed by the `forget` tool.
 pub fn remove_memory(dir: &Path, slug: &str) -> std::io::Result<bool> {
     let path = match slug_path(dir, slug) {
         Some(p) => p,

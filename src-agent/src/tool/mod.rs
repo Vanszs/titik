@@ -86,6 +86,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(dircache::DirCacheUpdate),
         Box::new(pong::Pong),
         Box::new(memory::Remember),
+        Box::new(memory::Forget),
+        Box::new(memory::Recall),
         Box::new(task::Task),
         Box::new(internet::WebFetch),
         Box::new(internet::WebSearch),
@@ -112,7 +114,8 @@ const INTERNAL_ONLY: &[&str] = &[];
 ///   can take long enough to drop frames);
 /// - `bash`, which spawns a subprocess and waits for it to finish;
 /// - `grep` / `glob`, which walk the workspace tree;
-/// - `remember`, which reads + rewrites `MEMORY.md`.
+/// - the memory tools `remember` / `forget` / `recall`, which read + rewrite
+///   the per-project memory index (`MEMORY.md`) and its `<slug>.md` files.
 ///
 /// `process_tools` intercepts any call whose name is in this list (AFTER the
 /// approval/classifier gate has cleared it) and runs it on a plain `std::thread`,
@@ -126,7 +129,8 @@ const INTERNAL_ONLY: &[&str] = &[];
 /// background reindex, and `task` is intercepted by `process_tools` before this
 /// check (it delegates to a sub-agent on its own lane).
 pub const DEFERRED_TOOLS: &[&str] = &[
-    "read", "write", "edit", "delete", "bash", "grep", "glob", "remember",
+    "read", "write", "edit", "delete", "bash", "grep", "glob",
+    "remember", "forget", "recall",
     "web_fetch", "web_search",
 ];
 
