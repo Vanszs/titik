@@ -203,8 +203,16 @@ pub fn build_system_prompt(
         let mem = mem.trim();
         if !mem.is_empty() {
             // Append a named markdown section so the model can distinguish
-            // memory content from the base instructions.
+            // memory content from the base instructions. Only the INDEX (one
+            // pointer bullet per memory) is injected — never the full bodies —
+            // so the prompt stays lean as memory grows. The model pulls a body
+            // on demand with `recall`.
             s.push_str("\n\n# Memory\n");
+            s.push_str(
+                "These are saved memories for this project; only the index is shown here. \
+                 Use recall(<slug>) to read one in full, remember(...) to save a new one, \
+                 and forget(<slug>) to delete one.\n",
+            );
             s.push_str(mem);
         }
     }

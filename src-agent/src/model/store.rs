@@ -152,6 +152,19 @@ pub fn shared_settings_path(pwd_hash: &str) -> Result<PathBuf> {
     Ok(pwd_bucket_dir(pwd_hash)?.join("settings.json"))
 }
 
+/// The shared per-PROJECT memory directory: `<pwd_bucket_dir>/memory/`. Every
+/// session opened from the same working directory shares ONE memory store here
+/// (mirrors [`shared_settings_path`]), so memories saved in one session are
+/// visible from every other session in the same project.
+///
+/// The directory (and its bucket parent) is created on access so callers can
+/// read/write under it without a separate `create_dir_all`.
+pub fn memory_dir(pwd_hash: &str) -> Result<PathBuf> {
+    let dir = pwd_bucket_dir(pwd_hash)?.join("memory");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// A single session's directory under its bucket:
 /// `<pwd_bucket_dir>/<uuid>/`. Holds the per-session behavioural settings,
 /// messages, memory, and agents.

@@ -20,9 +20,15 @@ pub(crate) fn build_tool_ctx(state: &AppState) -> crate::tool::ToolCtx {
         .as_ref()
         .map(|s| s.workdirs())
         .unwrap_or_else(|| vec![workspace.clone()]);
+    // Per-PROJECT memory dir (shared by every session in this working dir), not
+    // the old per-session `<session_dir>/memory`. Falls back to the per-session
+    // path if the bucket dir can't be resolved (it always should).
     let memory_dir = session_ref
         .as_ref()
-        .map(|s| s.path.join("memory"));
+        .map(|s| {
+            crate::model::store::memory_dir(&s.pwd_hash)
+                .unwrap_or_else(|_| s.path.join("memory"))
+        });
     // The active internet tier drives `web_fetch`'s backend choice (Full →
     // scrapion browser, else raw HTTP). No session ⇒ default Simple.
     let internet_mode = session_ref
@@ -85,9 +91,12 @@ fn spawn_task_with_id(
         let config = state.rest.config.clone();
         let settings = sess.settings.clone();
         let awareness = state.rest.awareness_summary.clone().unwrap_or_default();
-        let memory_md =
-            std::fs::read_to_string(session_dir.join("memory").join("MEMORY.md"))
-                .unwrap_or_default();
+        // Sub-agents receive the per-PROJECT memory INDEX (pointers only), the
+        // same text injected into the main system prompt. Empty when absent.
+        let memory_md = crate::model::store::memory_dir(&sess.pwd_hash)
+            .ok()
+            .and_then(|d| crate::model::memory::load_memory_index(&d))
+            .unwrap_or_default();
         (session_dir, config, settings, awareness, memory_md)
     };
 

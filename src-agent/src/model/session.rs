@@ -23,7 +23,7 @@ use anyhow::Result;
 use crate::dto::chat::ChatMessage;
 use crate::model::agent_def::AgentRegistry;
 use crate::model::conversation::Conversation;
-use crate::model::memory::{load_agents, load_memory};
+use crate::model::memory::{load_agents, load_memory_index, migrate_legacy_memory};
 use crate::model::session_registry;
 use crate::model::settings::{LocalConfig, Settings};
 use crate::model::store::shared_settings_path;
@@ -275,7 +275,18 @@ impl Session {
     /// embedded base prompt and the optional memory section, then calls
     /// `Conversation::set_system` to insert or replace `messages[0]`.
     pub fn rebuild_system(&mut self) {
-        let mem = load_memory(&self.path);
+        // Memory is now per-PROJECT (shared across every session in this
+        // working dir). Resolve the project memory dir, run the best-effort
+        // legacy migration (flat per-session MEMORY.md -> index store), then load
+        // ONLY the index (pointer bullets) for injection. Fail-open: any memory
+        // error degrades to "no memory" and never blocks the rebuild.
+        let mem = match crate::model::store::memory_dir(&self.pwd_hash) {
+            Ok(dir) => {
+                migrate_legacy_memory(&dir, &self.path);
+                load_memory_index(&dir)
+            }
+            Err(_) => None,
+        };
         let agents = load_agents(&self.workdir());
 
         // Build the sub-agent roster from the AgentRegistry (visible agents only).
