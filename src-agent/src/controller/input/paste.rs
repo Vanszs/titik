@@ -137,7 +137,7 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         }
         // No text entry on the effort picker, loading splash, or usage dashboard
         // — paste is a no-op in all three.
-        Mode::Effort(_) | Mode::Loading(_) | Mode::Usage => {}
+        Mode::Effort(_) | Mode::Loading(_) | Mode::Usage(_) => {}
     }
 }
 

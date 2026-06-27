@@ -89,6 +89,6 @@ pub(super) fn handle_quit(state: &mut AppState) -> Result<()> {
 ///
 /// Read-only; no waiting guard needed (the dashboard never writes).
 pub(super) fn handle_usage(state: &mut AppState) -> Result<()> {
-    state.mode = Mode::Usage;
+    state.mode = Mode::Usage(Box::default());
     Ok(())
 }

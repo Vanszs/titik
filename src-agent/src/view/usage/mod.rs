@@ -36,6 +36,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::app::mode::UsageNavState;
 use crate::app::state::AppStateRest;
 use crate::model::usage::{daily_costs, top_models, weekly_costs, DailyCost};
 use crate::view::theme::Palette;
@@ -65,7 +66,7 @@ const BAR_MAX_WIDTH: usize = 20;
 
 /// Render the `/usage` dashboard using live counters from `rest` and the
 /// given colour `palette`.
-pub fn draw(frame: &mut Frame, rest: &AppStateRest, palette: &Palette) {
+pub fn draw(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, palette: &Palette) {
     let area = frame.area();
 
     // Outer zones: header | body | footer hint.

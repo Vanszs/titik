@@ -9,6 +9,7 @@
 //! | `Chat`           | Normal conversation view                      |
 //! | `Settings`       | In-app `/settings` dashboard                  |
 //! | `Effort`         | `/effort` reasoning-effort picker overlay     |
+//! | `Usage`          | `/usage` cost and token dashboard             |
 //!
 //! Mode-specific state is stored inline in the variant so the type system
 //! ensures the runtime can only access data that is relevant to the active
@@ -33,6 +34,88 @@ pub use settings::{
     filter_models, SettingField, SettingsState, PICKER_MAX,
     SETTING_CATEGORIES,
 };
+
+// ── Usage dashboard nav state ────────────────────────────────────────────────
+
+/// Which top-level view is active in the `/usage` dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageView {
+    /// View A: global stats across all sessions (heatmap, KPI, top models…).
+    #[default]
+    Global,
+    /// View B: current-session detail (models used, hourly heatmap, totals).
+    Session,
+}
+
+/// Date-range selection for View A's KPI strip and panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageRange {
+    /// Data from midnight UTC today onwards.
+    #[default]
+    Today,
+    /// Last 7 days.
+    Week,
+    /// Last 30 days.
+    Month,
+    /// Last 365 days.
+    Year,
+}
+
+impl UsageRange {
+    /// How far back (in seconds from now) the range extends.
+    #[allow(dead_code)]
+    pub fn since_secs(self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match self {
+            // Floor to midnight UTC so "today" always starts at 00:00:00.
+            Self::Today => now - now % 86400,
+            Self::Week  => now - 7 * 86400,
+            Self::Month => now - 30 * 86400,
+            Self::Year  => now - 365 * 86400,
+        }
+    }
+
+    /// Short label shown in the range tab bar.
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Week  => "week",
+            Self::Month => "month",
+            Self::Year  => "year",
+        }
+    }
+}
+
+/// Which metric drives the heatmap cell intensity and sparkline scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageMetric {
+    /// Intensity proportional to USD cost.
+    #[default]
+    Cost,
+    /// Intensity proportional to token count (in + out).
+    Tokens,
+}
+
+/// Navigation / display state for the `/usage` dashboard.
+///
+/// Boxed in the `Mode::Usage` variant to keep the enum small (consistent with
+/// `Settings` and `Agents`).
+#[derive(Debug, Clone, Default)]
+pub struct UsageNavState {
+    /// Which top-level view (Global / Session) is shown.
+    pub view: UsageView,
+    /// Active date range for View A.
+    pub range: UsageRange,
+    /// Metric that drives heatmap intensity and sparkline scaling.
+    pub metric: UsageMetric,
+}
+
+// ── Mode enum ────────────────────────────────────────────────────────────────
 
 /// The mutually-exclusive UI modes of the application.
 pub enum Mode {
@@ -71,9 +154,9 @@ pub enum Mode {
     /// holds the option list, the cursor, and a one-line capability note. Boxed
     /// to keep `Mode` small and consistent with `Settings`.
     Effort(Box<EffortPickerState>),
-    /// Cost and token usage dashboard (`/usage`): full-screen read-only view
-    /// showing the current session's live counters and (in later stages) DB-backed
-    /// heatmap, top-models table, and weekly breakdown. No inner state is needed
-    /// for the current-session panel — all data comes directly from `AppStateRest`.
-    Usage,
+    /// Cost and token usage dashboard (`/usage`): full-screen Bloomberg-terminal-
+    /// style view with two tabs (Global / Session), range selector (1-4), metric
+    /// toggle (m), and ESC to exit. The inner [`UsageNavState`] holds the active
+    /// view, range, and metric selections. Boxed to keep `Mode` small.
+    Usage(Box<UsageNavState>),
 }
