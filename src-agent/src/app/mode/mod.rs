@@ -21,6 +21,7 @@ mod key_input;
 mod effort;
 mod loading;
 mod picker;
+mod rewind;
 pub mod settings;
 pub mod agents;
 pub mod editor;
@@ -30,6 +31,7 @@ pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
 pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
+pub use rewind::RewindState;
 pub use settings::{
     filter_models, SettingField, SettingsState, PICKER_MAX,
     SETTING_CATEGORIES,
@@ -155,4 +157,12 @@ pub enum Mode {
     /// toggle (m), and ESC to exit. The inner [`UsageNavState`] holds the active
     /// view, range, and metric selections. Boxed to keep `Mode` small.
     Usage(Box<UsageNavState>),
+    /// Message-rewind picker (double-Esc while idle in Chat): a single-select
+    /// list of the conversation's prior USER messages, NEWEST-FIRST, so the top
+    /// row is the last message. Up/Down navigate; Esc cancels back to Chat; Enter
+    /// rewinds the conversation to just before the chosen message and loads its
+    /// text into the composer for editing. The inner [`RewindState`] holds the
+    /// entry list and the cursor. Boxed to keep `Mode` small, consistent with the
+    /// other list/dashboard variants.
+    MessageRewind(Box<RewindState>),
 }

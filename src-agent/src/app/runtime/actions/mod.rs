@@ -16,6 +16,7 @@ use crate::service::openrouter::OpenRouterClient;
 
 mod agents;
 mod chat;
+mod rewind;
 mod session;
 mod settings;
 mod settings_creds;
@@ -121,6 +122,18 @@ pub(super) fn apply_action(
         Action::CloseUsage => {
             state.mode = crate::app::mode::Mode::Chat;
             state.rest.status = "ready".into();
+        }
+
+        Action::OpenRewind => {
+            rewind::handle_open_rewind(state)?;
+        }
+
+        Action::RewindCancel => {
+            rewind::handle_rewind_cancel(state)?;
+        }
+
+        Action::RewindSelect => {
+            rewind::handle_rewind_select(state)?;
         }
     }
     Ok(())

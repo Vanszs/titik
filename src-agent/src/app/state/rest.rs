@@ -65,6 +65,11 @@ pub struct AppStateRest {
     /// threaded UI state, never sent across threads, so `Cell` is fine.
     pub last_max_scroll: std::cell::Cell<u16>,
     pub last_key: Option<String>,
+    /// Instant of the most-recent IDLE Esc press in Chat, used to detect a
+    /// double-Esc (two idle Escs within ~400ms) that opens the message-rewind
+    /// picker. Recorded on the first idle Esc, consumed (compared + cleared) on
+    /// the second. `None` when no idle Esc is pending.
+    pub last_esc: Option<std::time::Instant>,
     pub last_model: Option<String>,
     /// Most-recently used OpenRouter provider slug (empty string = default routing).
     pub last_provider: Option<String>,
@@ -339,6 +344,7 @@ impl AppStateRest {
             follow: true,
             last_max_scroll: std::cell::Cell::new(0),
             last_key: None,
+            last_esc: None,
             last_model: None,
             last_provider: None,
             current_task: None,

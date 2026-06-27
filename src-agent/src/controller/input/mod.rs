@@ -19,6 +19,7 @@ mod clipboard;
 mod key_input;
 mod paste;
 mod picker;
+mod rewind;
 mod settings;
 mod usage;
 
@@ -28,6 +29,7 @@ pub use clipboard::request_clipboard_image;
 pub use key_input::handle_key_input;
 pub use paste::handle_paste;
 pub use picker::handle_picker;
+pub use rewind::handle_rewind;
 pub use settings::handle_settings;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -65,6 +67,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Effort(e) => handle_effort(e, &mut state.rest, key),
         Mode::Loading(l) => handle_loading(l, key),
         Mode::Usage(nav) => usage::handle_usage(nav, key),
+        Mode::MessageRewind(rw) => handle_rewind(rw, &mut state.rest, key),
     }
 }
 
