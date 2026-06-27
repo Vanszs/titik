@@ -614,14 +614,16 @@ pub(super) fn run_loop(
                 dirty = true;
             }
 
-            // --- drain async tool-task results (web_fetch / web_search) ---
-            // Async tools run on a plain std::thread (spawned in `process_tools`)
-            // and send their `(call_id, result)` back over `tool_task_rx`. Fold
-            // each into the PARKED round's `tool_results` and drop its id from
-            // `pending_tool_tasks`, exactly mirroring the sub-agent deferral — so
-            // the unified resume gate below sees the settled set. Done within this
-            // same block (before the gate) so both lanes' results are in place when
-            // emptiness is tested.
+            // --- drain deferred tool-task results (heavy/blocking tools) ---
+            // Deferred tools (read/write/edit/delete/bash/grep/glob/remember/
+            // web_fetch/web_search) run on a plain std::thread (spawned in
+            // `dispatch_deferred`) and send their `(call_id, result)` back over
+            // `tool_task_rx`. Fold each into the PARKED round's `tool_results` and
+            // drop its id from `pending_tool_tasks`, exactly mirroring the sub-agent
+            // deferral — so the resume gate below sees the settled set. Done within
+            // this same block (before the gate) so both lanes' results are in place
+            // when emptiness is tested. A round runs its deferred tools ONE AT A
+            // TIME, so at most one id settles here per resume.
             if let Some(rx) = state.rest.tool_task_rx.as_mut() {
                 while let Ok((id, result)) = rx.try_recv() {
                     state.rest.pending_tool_tasks.retain(|c| c != &id);
@@ -631,13 +633,16 @@ pub(super) fn run_loop(
             }
 
             // --- resume a round parked on deferred work (BOTH lanes) ---
-            // Unpark only when EVERY deferred id — sub-agent delegations AND async
-            // tool tasks — has filled its result (above). `finish_tool_round` then
-            // flushes ALL collected `tool_results` into the conversation and
-            // re-streams, so the MAIN AGENT reacts to each report. Clearing both
-            // awaiting flags drops the parked status; `waiting` stays true through
-            // the re-stream. Gating on both lists means a mixed round (sync tools +
-            // async tools + task delegations) waits for the last pending id of
+            // Unpark only when EVERY deferred id — sub-agent delegations AND
+            // deferred tool tasks — has filled its result (above). The resume
+            // (`resume_after_subagents`) RE-ENTERS `process_tools` at the advanced
+            // `tool_idx` to CONTINUE the round: a deferred heavy tool dispatched the
+            // NEXT call (and may park again), making the lane SEQUENTIAL; once the
+            // round has no further deferred work it falls through to
+            // `finish_tool_round`, which flushes ALL collected `tool_results` and
+            // re-streams so the MAIN AGENT reacts. Clearing both awaiting flags drops
+            // the parked status; `waiting` stays true through the re-stream. Gating
+            // on both lists means a mixed round waits for the last pending id of
             // either kind before resuming — no dangling tool_call ids.
             if (state.rest.awaiting_subagents || state.rest.awaiting_tool_tasks)
                 && state.rest.pending_subagent_calls.is_empty()

@@ -10,7 +10,7 @@ use crate::dto::chat::Role;
 use crate::model::msglog;
 use crate::service::openrouter::OpenRouterClient;
 
-use crate::app::runtime::stream::{abort_current, process_tools, run_tool, start_stream_task};
+use crate::app::runtime::stream::{abort_current, dispatch_deferred, process_tools, run_tool, start_stream_task};
 
 /// Handle `Action::Submit`: push the user message, spawn the stream task, and
 /// optionally kick off the advisory prompt-classifier on a background task.
@@ -164,13 +164,15 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
             .rest
             .pending_subagents
             .retain(|p| p.tool_call_id.is_none());
-        // Abandon any round parked on async tool tasks (web_fetch/web_search) the
-        // same way. The off-thread worker keeps running but its result lands with
-        // no matching pending id, so the next-turn machine reset discards it; it
-        // can't resume a turn the user killed. The channel itself is left intact
-        // for reuse by later async tools. We deliberately do NOT join the worker
-        // here — joining could block the UI thread for the full HTTP timeout, the
-        // exact freeze this fix removes.
+        // Abandon any round parked on a deferred tool task (the heavy/blocking
+        // tools — read/write/edit/delete/bash/grep/glob/remember/web_fetch/
+        // web_search) the same way. The off-thread worker keeps running but its
+        // result lands with no matching pending id, so the next-turn machine reset
+        // discards it; it can't resume a turn the user killed. The channel itself
+        // is left intact for reuse by later deferred tools. We deliberately do NOT
+        // join the worker here — joining could block the UI thread for the full
+        // duration of the tool (e.g. a long bash or HTTP timeout), the exact freeze
+        // this fix removes.
         state.rest.pending_tool_tasks.clear();
         state.rest.awaiting_tool_tasks = false;
         // Take any captured usage unconditionally so a partial turn's
@@ -248,6 +250,18 @@ pub(super) fn handle_approve_tool(
     state.rest.awaiting_approval = false;
     state.rest.approval_reason = None;
     if let Some(call) = state.rest.pending_tool_calls.get(state.rest.tool_idx).cloned() {
+        // The approved call is a risky tool (write/edit/delete/bash) — all of which
+        // are heavy/blocking and live in `DEFERRED_TOOLS`. Run it OFF the UI thread
+        // and PARK rather than running it inline here: an approved large write would
+        // otherwise re-freeze the comet for the whole write. `dispatch_deferred`
+        // advances `tool_idx` and registers the pending id; we return without
+        // re-entering `process_tools` (the resume gate does that once the result
+        // lands). The defensive `else` keeps the old inline path for the unexpected
+        // case of a non-deferred approved tool, so no call is ever left dangling.
+        if crate::tool::DEFERRED_TOOLS.contains(&call.function.name.as_str()) {
+            dispatch_deferred(state, &call);
+            return Ok(());
+        }
         let result = run_tool(state, &call);
         state.rest.tool_results.push((call.id.clone(), result));
         state.rest.tool_idx += 1;

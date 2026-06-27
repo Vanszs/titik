@@ -62,6 +62,20 @@ fn tac_inputs(
 /// advance `tool_idx`, and call back in here). Once every call in the round has
 /// resolved it calls [`finish_tool_round`].
 ///
+/// **Deferred tools.** A call cleared to run whose name is in
+/// [`crate::tool::DEFERRED_TOOLS`] (the heavy/blocking ones — read/write/edit/
+/// delete/bash/grep/glob/remember/web_fetch/web_search) is NOT run inline:
+/// [`dispatch_deferred`] hands it to a background `std::thread` and PARKS the
+/// round. The round's deferred tools run ONE AT A TIME — after dispatching a
+/// deferred call we `return` immediately rather than looping, so the next call
+/// isn't dispatched until this one's result lands (correctness: two writes to the
+/// same file in one round must not race). The event-loop drain folds the result in
+/// and the resume gate RE-ENTERS this function at the advanced `tool_idx`, so the
+/// loop simply continues. The classifier/approval gate above still runs on the UI
+/// thread BEFORE a deferred risky tool is dispatched — deferral happens only after
+/// the call is allowed. Instant tools (pong / dir_list / dir_cache_update) still
+/// run inline.
+///
 /// Each call/string is cloned out of `state.rest` before `run_tool` (which
 /// borrows `state` mutably) so there's no overlapping borrow of the vec. Reached
 /// only from the sync loop, so the `block_on` TAC call is safe.
@@ -135,40 +149,6 @@ pub(crate) fn process_tools(
                         .push((call.id.clone(), format!("error: unknown agent '{agent}'"))),
                 }
             }
-            state.rest.tool_idx += 1;
-            continue;
-        }
-        // Intercept ASYNC tools (web_fetch / web_search) BEFORE the generic
-        // classify/dispatch path. They do blocking HTTP, and `process_tools` runs
-        // on the main UI/event-loop thread, so running them inline would freeze the
-        // TUI for the whole network round-trip. Instead DEFER (mirroring `task`):
-        // run `execute_tool` on a plain background thread and record the call id in
-        // `pending_tool_tasks` so the round parks (below) until the event-loop drain
-        // delivers the result. These tools are read-only and auto-run, so there is
-        // no approval/classifier step to skip — like `task`, they never reach it.
-        if crate::tool::ASYNC_TOOLS.contains(&call.function.name.as_str()) {
-            // Lazily create the result channel once per session, then reuse it.
-            if state.rest.tool_task_tx.is_none() {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                state.rest.tool_task_tx = Some(tx);
-                state.rest.tool_task_rx = Some(rx);
-            }
-            let ctx = super::spawn::build_tool_ctx(state);
-            let call_cloned = call.clone();
-            let id = call.id.clone();
-            let tx = state.rest.tool_task_tx.as_ref().unwrap().clone();
-            state.rest.status = format!("running {}", call.function.name);
-            // Run on a PLAIN std::thread (NOT a tokio task): the tool's internal
-            // `reqwest::blocking` work would panic inside a tokio runtime context,
-            // so the worker must have none. `ToolCtx` is Send + 'static (PathBuf /
-            // Vec / Arc / Option fields, no borrows) so it moves in cleanly, and the
-            // UnboundedSender is Send so it can fire from this off-runtime thread.
-            // This keeps the UI/event-loop thread free to redraw + take input.
-            std::thread::spawn(move || {
-                let result = crate::tool::execute_tool(&ctx, &call_cloned);
-                let _ = tx.send((id, result));
-            });
-            state.rest.pending_tool_tasks.push(call.id.clone());
             state.rest.tool_idx += 1;
             continue;
         }
@@ -251,21 +231,38 @@ pub(crate) fn process_tools(
                 }
             }
         }
-        // Phase label for the comet: name the tool being executed so the
-        // shimmering status surfaces what the agent is doing this round.
+        // The call has cleared the approval/classifier gate (or was non-risky):
+        // dispatch it. Heavy/blocking tools (see `DEFERRED_TOOLS`) run OFF the
+        // UI/event-loop thread so the comet keeps sweeping; truly-instant tools run
+        // inline. `dispatch_deferred` advances `tool_idx` past this call and
+        // registers its id in `pending_tool_tasks`; we then PARK the round
+        // IMMEDIATELY by returning (do NOT keep looping). The deferred tools of a
+        // round therefore run ONE AT A TIME, in order: the event-loop drain delivers
+        // this tool's result, the resume gate re-enters `process_tools`, and the
+        // loop continues at the next call. This sequencing is REQUIRED for
+        // correctness — two writes/edits to the same file in one round would
+        // otherwise race and lose a write.
+        if crate::tool::DEFERRED_TOOLS.contains(&call.function.name.as_str()) {
+            dispatch_deferred(state, &call);
+            return;
+        }
+        // Instant tool: name the tool for the comet phase label and run it inline.
         state.rest.status = format!("running {}", call.function.name);
         let result = run_tool(state, &call);
         state.rest.tool_results.push((call.id.clone(), result));
         state.rest.tool_idx += 1;
     }
-    // PARK on deferred work of EITHER lane: `task`-tool sub-agent delegations
-    // (`pending_subagent_calls`) and/or async tool tasks (`pending_tool_tasks`,
-    // e.g. web_fetch/web_search running off-thread). If anything is still in
-    // flight, DON'T finish the round — the conversation would have dangling
-    // tool_call ids. Mark the round parked and return; the event-loop drains fill
-    // each pending result into `tool_results` as it lands, and once BOTH pending
-    // lists empty the unified resume gate runs `finish_tool_round`. `waiting` stays
-    // true and `awaiting_approval` stays false, so the comet keeps shimmering.
+    // Loop exhausted. PARK if there's still deferred work outstanding from this
+    // round's `task`-tool sub-agent delegations (`pending_subagent_calls`). A
+    // deferred HEAVY tool (`pending_tool_tasks`) parks INSIDE the loop instead —
+    // `dispatch_deferred` + an immediate `return` — so it runs sequentially and
+    // doesn't reach here; the `has_tool_tasks` arm below is kept only as defensive
+    // belt-and-braces. If anything is still in flight, DON'T finish the round — the
+    // conversation would have dangling tool_call ids. Mark the round parked and
+    // return; the event-loop drains fill each pending result into `tool_results` as
+    // it lands, and once BOTH pending lists empty the resume gate re-enters
+    // `process_tools` (which eventually reaches `finish_tool_round`). `waiting`
+    // stays true and `awaiting_approval` stays false, so the comet keeps shimmering.
     let has_subagents = !state.rest.pending_subagent_calls.is_empty();
     let has_tool_tasks = !state.rest.pending_tool_tasks.is_empty();
     if has_subagents || has_tool_tasks {
@@ -292,20 +289,30 @@ pub(crate) fn process_tools(
     finish_tool_round(state, client, handle);
 }
 
-/// Resume a tool round that was PARKED on deferred `task`-tool delegations.
+/// Resume a tool round that was PARKED on deferred work — either `task`-tool
+/// sub-agent delegations (`pending_subagent_calls`) or a deferred heavy tool
+/// (`pending_tool_tasks`).
 ///
-/// Called from the event-loop sub-agent drain once every id in
-/// `pending_subagent_calls` has had its result delivered into `tool_results`. By
-/// then `tool_results` holds one entry per call in the round (non-task calls were
-/// answered inline in [`process_tools`]; task calls were filled by the drain), so
-/// finishing the round flushes them all into the conversation and re-streams —
-/// the main agent now sees every delegated report as a tool result and reacts.
+/// Called from the event-loop resume gate once BOTH deferred lists are empty
+/// (every parked id has had its result folded into `tool_results`). It simply
+/// RE-ENTERS [`process_tools`] at the current `tool_idx` to CONTINUE the round:
+/// - For a deferred heavy tool, exactly one call was dispatched before the park,
+///   so re-entry processes the NEXT call (and may dispatch+park again). The round
+///   advances one deferred tool per resume, in order.
+/// - For `task`-tool delegations the round had already walked every call before
+///   parking (`tool_idx == len`), so re-entry finds the loop exhausted.
+///
+/// In both cases, when `process_tools` reaches the end of the round with no
+/// further deferred work it falls through to [`finish_tool_round`], which flushes
+/// all collected `tool_results` and re-streams — the main agent now sees every
+/// result and reacts. Re-entering (rather than calling `finish_tool_round`
+/// directly) is what makes the deferred lane SEQUENTIAL.
 pub(crate) fn resume_after_subagents(
     state: &mut AppState,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
-    finish_tool_round(state, client, handle);
+    process_tools(state, client, handle);
 }
 
 /// Finish a completed tool round: flush every collected result into the
@@ -376,6 +383,50 @@ fn finish_tool_round(
 pub(crate) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
     let ctx = super::spawn::build_tool_ctx(state);
     crate::tool::execute_tool(&ctx, call)
+}
+
+/// Dispatch a single DEFERRED (heavy/blocking) tool OFF the UI/event-loop thread
+/// and register it as pending, advancing `tool_idx` past it. The caller MUST
+/// `return` right after (parking the round) so the round's deferred tools run
+/// SEQUENTIALLY: this one finishes, the event-loop drain folds its result into
+/// `tool_results` + drops its id, and the resume gate re-enters `process_tools`
+/// to handle the next call.
+///
+/// `pub(crate)` so the `ApproveTool` handler can defer an approved risky tool the
+/// same way (rather than running it inline on the UI thread and re-freezing the
+/// comet during, e.g., a large approved write).
+///
+/// The work runs on a PLAIN `std::thread` (NOT a tokio task): the network tools'
+/// internal `reqwest::blocking` work would panic inside a tokio runtime context,
+/// so the worker must have none. `ToolCtx` is Send + 'static (PathBuf / Vec / Arc
+/// / Option fields, no borrows) so it moves in cleanly, and the `UnboundedSender`
+/// is Send so it can fire from this off-runtime thread. The result channel is
+/// created lazily once per session, then reused.
+pub(crate) fn dispatch_deferred(state: &mut AppState, call: &ToolCall) {
+    // Lazily create the result channel once per session, then reuse it.
+    if state.rest.tool_task_tx.is_none() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.rest.tool_task_tx = Some(tx);
+        state.rest.tool_task_rx = Some(rx);
+    }
+    let ctx = super::spawn::build_tool_ctx(state);
+    let call_cloned = call.clone();
+    let id = call.id.clone();
+    let tx = state.rest.tool_task_tx.as_ref().unwrap().clone();
+    // Phase label for the comet: name the tool running off-thread so the
+    // shimmering status surfaces what the agent is doing while it's parked.
+    state.rest.status = format!("running {}", call.function.name);
+    std::thread::spawn(move || {
+        let result = crate::tool::execute_tool(&ctx, &call_cloned);
+        let _ = tx.send((id, result));
+    });
+    state.rest.pending_tool_tasks.push(call.id.clone());
+    state.rest.tool_idx += 1;
+    // Mark the round PARKED on async tool work so the event-loop resume gate
+    // (which requires this flag set AND `pending_tool_tasks` empty) fires once the
+    // result lands. The caller `return`s right after this, leaving the round
+    // parked; `waiting` stays true so the comet keeps shimmering.
+    state.rest.awaiting_tool_tasks = true;
 }
 
 /// Halt the current turn by answering every still-pending tool call with

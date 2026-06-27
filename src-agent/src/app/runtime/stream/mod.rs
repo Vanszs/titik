@@ -7,7 +7,7 @@ mod run;
 
 pub(super) use turn::{finish_stream, advance_turn};
 pub(crate) use turn::push_image_unsupported_notice;
-pub(super) use tools::{process_tools, run_tool};
+pub(super) use tools::{dispatch_deferred, process_tools, run_tool};
 pub(super) use run::{abort_current, start_stream_task};
 pub(crate) use tools::resume_after_subagents;
 pub(crate) use spawn::{spawn_or_queue, try_start_pending, SpawnOutcome};

@@ -272,31 +272,35 @@ pub struct AppStateRest {
     /// then resumes the round (`finish_tool_round`) so the main agent reacts to the
     /// delegated reports. Keeps the busy/shimmer indicator on while parked.
     pub awaiting_subagents: bool,
-    // --- async tool-task lane (parallel to the sub-agent lane above) ---
-    /// Tool-call ids of ASYNC tools (see [`crate::tool::ASYNC_TOOLS`], e.g.
-    /// `web_fetch` / `web_search`) currently running OFF the UI thread. These tools
-    /// do blocking HTTP, so running them inline on the event-loop thread would
-    /// freeze the TUI for the whole network round-trip. Instead `process_tools`
-    /// spawns the work on a plain `std::thread` and records the call id here; the
-    /// round PARKS (mirroring `pending_subagent_calls`) until the background thread
-    /// sends its result back over `tool_task_rx`, which the event-loop drain folds
-    /// into `tool_results` (removing the id). Empty when no async tool is in flight.
+    // --- deferred tool-task lane (parallel to the sub-agent lane above) ---
+    /// Tool-call ids of DEFERRED tools (see [`crate::tool::DEFERRED_TOOLS`] — the
+    /// heavy/blocking ones: read / write / edit / delete / bash / grep / glob /
+    /// remember / web_fetch / web_search) currently running OFF the UI thread.
+    /// These tools do blocking I/O (fs reads/writes, a subprocess, a tree walk, or
+    /// blocking HTTP), so running them inline on the event-loop thread would freeze
+    /// the TUI for the whole call. Instead `process_tools` spawns the work on a
+    /// plain `std::thread` and records the call id here; the round PARKS (mirroring
+    /// `pending_subagent_calls`) until the background thread sends its result back
+    /// over `tool_task_rx`, which the event-loop drain folds into `tool_results`
+    /// (removing the id). The round's deferred tools run ONE AT A TIME, so this vec
+    /// holds AT MOST ONE id at a time. Empty when no deferred tool is in flight.
     pub pending_tool_tasks: Vec<String>,
-    /// True while a tool round is PARKED waiting on one or more async tool tasks
-    /// (see `pending_tool_tasks`). Set alongside (or instead of) `awaiting_subagents`
-    /// when `process_tools` returns without `finish_tool_round`; cleared by the
-    /// event-loop drain once every async tool has delivered its result, which then
-    /// resumes the round. Keeps the busy/shimmer indicator on while parked.
+    /// True while a tool round is PARKED waiting on a deferred tool task (see
+    /// `pending_tool_tasks`). Set by `dispatch_deferred` (or alongside
+    /// `awaiting_subagents` for a task-tool park) when `process_tools` returns
+    /// without `finish_tool_round`; cleared by the event-loop drain once the
+    /// deferred tool has delivered its result, which then resumes the round.
+    /// Keeps the busy/shimmer indicator on while parked.
     pub awaiting_tool_tasks: bool,
-    /// Receiver for async tool-task results: `(tool_call_id, result_string)`. Lazily
-    /// created (with `tool_task_tx`) the first time an async tool is dispatched in a
-    /// session, then reused. Drained each event-loop tick into `tool_results`. `None`
-    /// until the first async tool runs.
+    /// Receiver for deferred tool-task results: `(tool_call_id, result_string)`.
+    /// Lazily created (with `tool_task_tx`) the first time a deferred tool is
+    /// dispatched in a session, then reused. Drained each event-loop tick into
+    /// `tool_results`. `None` until the first deferred tool runs.
     pub tool_task_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
-    /// Sender half of the async tool-task channel. Cloned into each spawned tool
-    /// thread (the sender is `Send`, so it can fire from a non-tokio thread). Kept
-    /// here so later async tools in the same session reuse the one channel. `None`
-    /// until the first async tool runs.
+    /// Sender half of the deferred tool-task channel. Cloned into each spawned
+    /// tool thread (the sender is `Send`, so it can fire from a non-tokio thread).
+    /// Kept here so later deferred tools in the same session reuse the one channel.
+    /// `None` until the first deferred tool runs.
     pub tool_task_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
     /// Receiver for a background clipboard-image fetch (Ctrl+V). The fetch thread
     /// shells out to `wl-paste` (Wayland) or `xclip` (X11), reads raw PNG bytes, and

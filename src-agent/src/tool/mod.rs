@@ -100,16 +100,35 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
 /// future internal-only tool only needs to be listed here.
 const INTERNAL_ONLY: &[&str] = &[];
 
-/// Tools that MUST run off the UI/event-loop thread. They do blocking I/O —
-/// `web_search` and the simple-tier `web_fetch` do a blocking `reqwest` GET (via
-/// [`internet::http_get_blocking`]); in Full mode `web_fetch` instead drives a
-/// scrapion subprocess — so running them inline in `process_tools` (which
-/// executes on the main event-loop thread) would freeze the TUI for the whole
-/// round-trip (no redraw, no input). `process_tools` intercepts any call whose
-/// name is in this list and runs it on a plain `std::thread`, parking the tool
-/// round until the result lands (the same defer machinery the `task` tool uses
-/// for sub-agents).
-pub const ASYNC_TOOLS: &[&str] = &["web_fetch", "web_search"];
+/// Tools that MUST run off the UI/event-loop thread because they do blocking
+/// I/O — running them inline in `process_tools` (which executes on the main
+/// event-loop thread) would freeze the TUI for the whole call (no redraw, no
+/// input), so the status-bar comet appears to stall. This covers:
+/// - the network tools: `web_search` and the simple-tier `web_fetch` do a
+///   blocking `reqwest` GET (via [`internet::http_get_blocking`]); in Full mode
+///   `web_fetch` instead drives a scrapion subprocess;
+/// - the filesystem tools: `read` / `write` / `edit` / `delete` block on
+///   `fs::read_to_string` / `fs::write` / `fs::remove_file` (a huge file write
+///   can take long enough to drop frames);
+/// - `bash`, which spawns a subprocess and waits for it to finish;
+/// - `grep` / `glob`, which walk the workspace tree;
+/// - `remember`, which reads + rewrites `MEMORY.md`.
+///
+/// `process_tools` intercepts any call whose name is in this list (AFTER the
+/// approval/classifier gate has cleared it) and runs it on a plain `std::thread`,
+/// then PARKS the tool round until the result lands — and crucially runs the
+/// round's deferred tools ONE AT A TIME (park-after-each, resume continues at the
+/// next call), so two writes/edits to the same file in one round can't race.
+///
+/// Truly-instant tools are deliberately NOT listed (they'd pay a needless park
+/// round for nothing): `pong` returns a constant, `dir_list` reads the in-memory
+/// dir cache, `dir_cache_update` returns immediately after kicking off a
+/// background reindex, and `task` is intercepted by `process_tools` before this
+/// check (it delegates to a sub-agent on its own lane).
+pub const DEFERRED_TOOLS: &[&str] = &[
+    "read", "write", "edit", "delete", "bash", "grep", "glob", "remember",
+    "web_fetch", "web_search",
+];
 
 /// Tool names advertised to the MAIN chat model (everything except agent-only
 /// tools). Used by the interactive loop's `stream_complete` call so the main
