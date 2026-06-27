@@ -83,6 +83,14 @@ pub(super) fn apply_action(
             session::handle_picker_select(state, client, handle)?;
         }
 
+        Action::LiveSwitch(idx) => {
+            session::handle_live_switch(idx, state, client)?;
+        }
+
+        Action::LiveSwitchCancel => {
+            session::handle_live_switch_cancel(state)?;
+        }
+
         Action::SaveSettings => {
             settings::handle_save_settings(state)?;
         }

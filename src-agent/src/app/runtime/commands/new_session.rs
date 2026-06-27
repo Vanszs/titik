@@ -5,33 +5,34 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::app::mode::{KeyInputForm, Mode, PickerState};
-use crate::app::state::AppState;
+use crate::app::state::{AppState, SessionRuntime};
 use crate::config::DEFAULT_MODEL;
 use crate::model::store;
 use crate::service::openrouter::OpenRouterClient;
 
-use super::super::stream::abort_current;
-
-/// Handle the `/new` command: start a fresh session.
+/// Handle the `/new` command: SPAWN a fresh PARALLEL session.
 ///
-/// Aborts any in-flight request, clears agentic state, creates a new session,
-/// inherits last-used credentials, and opens KeyInput if no creds are known.
+/// The current foreground session is left UNTOUCHED — it keeps its lock, its
+/// in-flight turn, and all of its execution state, still cooking in the
+/// background in its own `sessions` slot. A brand-new [`Session`] is created
+/// (inheriting last-used creds), given its OWN lock, wrapped in a fresh
+/// [`SessionRuntime`], APPENDED to `state.rest.sessions`, and made the new
+/// foreground. The flat foreground-UI fields (composer, scroll, attachments,
+/// transcript cache, status) are reset for a clean slate on the new tab.
+///
+/// If no creds are known yet, this opens the KeyInput prompt for the new
+/// session; cancelling it pops the just-appended session back off (the
+/// `handle_cancel_key_input` action keys off the `spawn_pending` flag set here).
+///
+/// INVARIANT (this stage): `sessions` is only ever APPENDED to here and never
+/// reordered/removed (in-flight async routes by Vec index), and the previous
+/// foreground's lock is NEVER released — every live session holds its own lock
+/// for its whole lifetime.
 pub(super) fn handle_new(
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
-    abort_current(&mut state.rest);
-    // Halt any in-flight agentic loop before swapping sessions, including
-    // a half-finished approval machine.
-    state.rest.fg_mut().pending_tool_calls.clear();
-    state.rest.fg_mut().agent_steps = 0;
-    state.rest.fg_mut().awaiting_approval = false;
-    state.rest.fg_mut().tool_idx = 0;
-    state.rest.fg_mut().tool_results.clear();
-    // Drop any staged image attachments so they don't leak into the new session.
-    state.rest.pending_attachments.clear();
-    let _ = state.rest.fg_mut().take_stream(); // discard partial; belongs to old session
     let mut sess = match store::create_session() {
         Ok(s) => s,
         Err(e) => {
@@ -49,33 +50,70 @@ pub(super) fn handle_new(
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     sess.settings.provider = state.rest.last_provider.clone().unwrap_or_default();
     let _ = sess.save();
-    state.rest.prev_session = state.rest.fg_mut().session.take();
+
+    // Acquire THIS session's lock immediately — every live session holds its own
+    // lock for its lifetime. Build a fresh runtime that owns the session + lock.
+    store::write_lock(&sess.path);
+    let mut runtime = SessionRuntime::new();
+    runtime.held_lock = Some(sess.path.clone());
+    let no_creds = sess.settings.api_key.is_empty();
+    runtime.session = Some(sess);
+
+    // Remember where to return if the (creds-less) KeyInput below is cancelled,
+    // then APPEND the new runtime and make it the foreground. The old foreground
+    // stays live in its own slot, lock held, still cooking.
+    state.rest.spawn_prev_fg = state.rest.foreground;
+    state.rest.sessions.push(runtime);
+    state.rest.foreground = state.rest.sessions.len() - 1;
+
+    // Reset the FLAT foreground-UI fields (shared on AppStateRest) for a clean
+    // slate on the new tab: empty composer + caret, pinned-to-bottom scroll, no
+    // staged attachments, and a fresh (empty) transcript so the new conversation
+    // renders instead of the previous tab's cached blocks.
+    state.rest.input.clear();
+    state.rest.cursor = 0;
     state.rest.reset_scroll();
-    if sess.settings.api_key.is_empty() {
-        // No creds known yet — fall back to the credential prompt.
-        state.rest.fg_mut().session = Some(sess);
+    state.rest.pending_attachments.clear();
+    state.rest.transcript_cache.borrow_mut().blocks.clear();
+    state.rest.status = "ready".into();
+    // Fresh session → totals are 0 (the shared live counter is reset on switch;
+    // moving it per-session is a known follow-up).
+    let sess_path = state
+        .rest
+        .fg()
+        .session
+        .as_ref()
+        .map(|s| s.path.clone());
+    if let Some(p) = sess_path.as_ref() {
+        state.rest.load_token_totals(p);
+    }
+
+    if no_creds {
+        // No creds known yet — fall back to the credential prompt FOR THE NEW
+        // SESSION. Mark it spawn-pending so an Esc out of KeyInput pops this
+        // freshly-appended session and restores the previous foreground.
         *client = None;
+        state.rest.spawn_pending = true;
         state.mode = Mode::KeyInput(KeyInputForm::prefilled(
             String::new(),
             DEFAULT_MODEL.to_string(),
-            false, // Esc -> CancelKeyInput restores prev_session
+            false, // Esc -> CancelKeyInput (which pops the spawned session)
             false, // not from picker
         ));
     } else {
+        state.rest.spawn_pending = false;
         *client = Some(super::super::build_client());
-        let sess_path = sess.path.clone();
-        state.rest.fg_mut().session = Some(sess);
-        // Fresh session → totals are 0; calling is harmless and keeps the
-        // readout reset when switching sessions.
-        state.rest.load_token_totals(&sess_path);
         // Land in Chat first, THEN warm: `warm_session` is non-blocking and
         // may upgrade the mode to `Mode::Loading` (animated splash) when it
         // has warm work to spawn, so it must run LAST to get the final word.
         // With no warm work it leaves the mode as the Chat we just set.
         state.mode = Mode::Chat;
-        state.rest.status = "ready".into();
-        // Warm the new session: reindex its workspace + (async) fetch the
-        // catalogue and awareness summary so /new is primed like a cold boot.
+        // Warm the new foreground session: reindex its workspace + (async) fetch
+        // the catalogue and awareness summary so /new is primed like a cold boot.
+        // `warm_session` -> `reconcile_session_lock` only ever touches the
+        // foreground (new) session's lock, which already matches its on-disk lock
+        // we just wrote — so it is a no-op for locks and never releases the
+        // previous foreground's lock.
         super::super::warm_session(state, client, handle);
     }
     Ok(())

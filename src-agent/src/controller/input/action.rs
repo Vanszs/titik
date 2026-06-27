@@ -58,6 +58,15 @@ pub enum Action {
     // --- Picker actions ---
     /// Enter on the session picker — open the highlighted session.
     PickerSelect,
+    // --- Live-session picker (`/swap`) actions ---
+    /// Enter on the `/swap` live-session picker: switch the foreground to the
+    /// session at the carried Vec index (`state.rest.sessions[idx]`). The runtime
+    /// sets `foreground = idx` and resets the flat foreground-UI for the
+    /// newly-shown session WITHOUT aborting anything or touching any lock.
+    LiveSwitch(usize),
+    /// Esc/Ctrl+C on the `/swap` live-session picker — discard it and return to
+    /// the (unchanged) Chat view. No session state is touched.
+    LiveSwitchCancel,
     // --- Settings actions ---
     /// Esc on the settings dashboard (while navigating) — apply every draft and
     /// return to Chat. The apply path reads the drafts back out of

@@ -19,6 +19,68 @@ pub(super) fn handle_cancel_key_input(
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,
 ) -> Result<()> {
+    // Edge case (/new parallel spawn): this KeyInput was for a brand-new
+    // PARALLEL session that was already appended to `sessions` and made the
+    // foreground. The user bailed before entering creds — pop that empty
+    // session back off, release its lock, and restore the previous foreground.
+    // We do NOT touch the previous foreground's session/lock here (it never
+    // moved). Returns straight to the (restored) foreground's Chat.
+    if state.rest.spawn_pending {
+        state.rest.spawn_pending = false;
+        // Pop the just-appended session (it is always the LAST entry: KeyInput is
+        // modal, so nothing could have appended after it).
+        if state.rest.sessions.len() > 1 {
+            let mut popped = state.rest.sessions.pop().expect("len > 1 checked");
+            if let Some(lock) = popped.held_lock.take() {
+                store::remove_lock(&lock);
+            }
+        }
+        // Restore the foreground to where /new left from, clamped defensively.
+        state.rest.foreground = state
+            .rest
+            .spawn_prev_fg
+            .min(state.rest.sessions.len().saturating_sub(1));
+        // Rebuild the client for the restored foreground (fresh plan_word at this
+        // boundary); keep it only when that session has a usable Main route.
+        let restored_usable = state
+            .rest
+            .fg()
+            .session
+            .as_ref()
+            .map(|s| s.settings.clone())
+            .is_some_and(|settings| {
+                crate::app::resolve::resolve_role(
+                    &state.rest.config,
+                    &settings,
+                    crate::model::app_config::ModelRole::Main,
+                )
+                .is_some_and(|r| !r.api_key.is_empty())
+            });
+        *client = if restored_usable {
+            Some(build_client())
+        } else {
+            None
+        };
+        // Reset the flat foreground-UI for the restored tab + invalidate the
+        // transcript cache so its conversation (not the popped empty one) renders.
+        state.rest.input.clear();
+        state.rest.cursor = 0;
+        state.rest.reset_scroll();
+        state.rest.pending_attachments.clear();
+        state.rest.transcript_cache.borrow_mut().blocks.clear();
+        if let Some(p) = state.rest.fg().session.as_ref().map(|s| s.path.clone()) {
+            state.rest.load_token_totals(&p);
+        }
+        // The restored foreground already holds its own lock (untouched); no
+        // reconcile needed (and reconcile must not release any other session's lock).
+        state.mode = Mode::Chat;
+        state.rest.status = if client.is_some() {
+            "ready".into()
+        } else {
+            "no active session".into()
+        };
+        return Ok(());
+    }
     // KEYLESS client → build for a fresh plan_word at this session boundary;
     // gate on whether the restored session's MAIN role resolves to a usable
     // route (non-empty key), preserving the no-client-no-send invariant.
@@ -70,6 +132,9 @@ pub(super) fn handle_cancel_key_input_to_picker(
     // instead of pinning a no-client Chat.
     state.rest.fg_mut().session = None;
     state.rest.prev_session = None;
+    // A picker-launched KeyInput is never a /new spawn, but clear the flag
+    // defensively so it can't leak into a later cancel.
+    state.rest.spawn_pending = false;
     *client = None;
     state.rest.reset_scroll();
     state.mode = Mode::SessionPicker(PickerState::new(store::list_sessions()?));
@@ -83,6 +148,73 @@ pub(super) fn handle_cancel_picker_to_chat(state: &mut AppState) -> Result<()> {
     // Esc/Ctrl+C in the /resume-opened session picker: the active
     // session is still in state.rest.fg().session (untouched), so just
     // swap the mode back to Chat without disturbing anything else.
+    state.mode = Mode::Chat;
+    Ok(())
+}
+
+/// Handle `Action::LiveSwitch`: switch the foreground to the live session at
+/// `idx` (`/swap`'s Enter). Sets `foreground = idx` and resets the FLAT
+/// foreground-UI for the newly-shown session, WITHOUT aborting anything and
+/// WITHOUT touching any lock — every live session keeps its own lock, and the
+/// target's in-flight stream (if any) keeps appearing live once it's on screen.
+pub(super) fn handle_live_switch(
+    idx: usize,
+    state: &mut AppState,
+    client: &mut Option<Arc<OpenRouterClient>>,
+) -> Result<()> {
+    // Defensive: ignore an out-of-range index (the snapshot is built from the
+    // live `sessions`, and `sessions` is only ever appended to this stage, so a
+    // stale index can't normally occur — but never panic).
+    if idx >= state.rest.sessions.len() {
+        state.mode = Mode::Chat;
+        state.rest.status = "session unavailable".into();
+        return Ok(());
+    }
+    state.rest.foreground = idx;
+    // Reset the flat foreground-UI for the newly-shown session: empty composer +
+    // caret, pinned-to-bottom scroll, no staged attachments, and a fresh (empty)
+    // transcript cache so the target's conversation renders instead of the
+    // previous tab's cached blocks.
+    state.rest.input.clear();
+    state.rest.cursor = 0;
+    state.rest.reset_scroll();
+    state.rest.pending_attachments.clear();
+    state.rest.transcript_cache.borrow_mut().blocks.clear();
+    // Seed the shared live token counter from the now-foreground session's log
+    // (moving this counter per-session is a known follow-up).
+    if let Some(p) = state.rest.fg().session.as_ref().map(|s| s.path.clone()) {
+        state.rest.load_token_totals(&p);
+    }
+    // KEYLESS client → rebuild for a fresh plan_word at this session boundary,
+    // gated on the target having a usable Main route (preserve no-client-no-send).
+    let usable = state
+        .rest
+        .fg()
+        .session
+        .as_ref()
+        .map(|s| s.settings.clone())
+        .is_some_and(|settings| {
+            crate::app::resolve::resolve_role(
+                &state.rest.config,
+                &settings,
+                crate::model::app_config::ModelRole::Main,
+            )
+            .is_some_and(|r| !r.api_key.is_empty())
+        });
+    *client = if usable { Some(build_client()) } else { None };
+    // Reflect the now-foreground session's live state in the status line.
+    state.rest.status = if state.rest.fg().is_working() {
+        "working".into()
+    } else {
+        "ready".into()
+    };
+    state.mode = Mode::Chat;
+    Ok(())
+}
+
+/// Handle `Action::LiveSwitchCancel`: discard the `/swap` picker and return to
+/// the unchanged Chat view. No session state, foreground, or lock is touched.
+pub(super) fn handle_live_switch_cancel(state: &mut AppState) -> Result<()> {
     state.mode = Mode::Chat;
     Ok(())
 }

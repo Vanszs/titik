@@ -488,5 +488,27 @@ fn service_session(
         }
     }
 
+    // --- background-finish nudge ---
+    // Detect this session's working→ready edge for THIS tick. When a session that
+    // was working last tick is now idle AND it is NOT the foreground (so the user
+    // can't already see it finish), pop an info toast naming it. Borrows are
+    // ordered: read the edge inputs + name into locals FIRST (immutable borrow of
+    // the session), then set the toast on `rest`, then write `was_working` — so no
+    // borrow of `sessions[idx]` overlaps the `rest`-level toast mutation.
+    let now_working = state.rest.sessions[idx].is_working();
+    let edge_finished = state.rest.sessions[idx].was_working
+        && !now_working
+        && idx != state.rest.foreground;
+    if edge_finished {
+        let name = state.rest.sessions[idx]
+            .session
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("session {idx}"));
+        state.rest.set_toast_info(format!("session {name} ready"));
+        dirty = true;
+    }
+    state.rest.sessions[idx].was_working = now_working;
+
     dirty
 }

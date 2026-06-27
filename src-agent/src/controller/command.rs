@@ -15,7 +15,8 @@ use crate::model::settings::InternetMode;
 /// User-facing slash commands shown in the `/` palette, in display order.
 /// (name, one-line description). Source of truth for the palette UI.
 pub const COMMANDS: &[(&str, &str)] = &[
-    ("/new", "Start a new session"),
+    ("/new", "Spawn a new parallel session (current keeps running)"),
+    ("/swap", "Switch between live sessions"),
     ("/resume", "Open the session picker to switch sessions"),
     ("/mode", "Toggle Normal/Auto tool approval"),
     ("/effort", "Set model reasoning/thinking effort"),
@@ -56,8 +57,11 @@ pub fn palette_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 pub enum Command {
     /// Compact the conversation history to save context window space.
     Compact,
-    /// Start a fresh session (discards current chat).
+    /// Spawn a fresh PARALLEL session (the current one keeps running in the
+    /// background); the new session becomes the foreground.
     New,
+    /// Open the live-session picker to switch which running session is on screen.
+    Swap,
     /// Toggle the tool-approval policy between Normal and Auto.
     Mode,
     /// Open the reasoning/thinking-effort picker for the current model.
@@ -110,6 +114,7 @@ pub fn parse(line: &str) -> Command {
     match head_lc.as_str() {
         "compact" => Command::Compact,
         "new" => Command::New,
+        "swap" => Command::Swap,
         "mode" => Command::Mode,
         "effort" => Command::Effort,
         "settings" | "config" => Command::Settings,

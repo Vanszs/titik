@@ -163,6 +163,12 @@ pub struct SessionRuntime {
     /// the submit handler in a later wave; used to estimate prompt-cache warmth.
     #[allow(dead_code)]
     pub last_send_at: Option<Instant>,
+    /// Working-state from the PREVIOUS event-loop tick, for the background-finish
+    /// nudge. The per-session servicer (`service_all_sessions`) records `is_working()`
+    /// here at the end of each tick; on the next tick a `was_working && !is_working`
+    /// transition for a NON-foreground session fires a "session ready" toast. Starts
+    /// `false` so a freshly-created idle session never spuriously nudges.
+    pub was_working: bool,
 }
 
 impl Default for SessionRuntime {
@@ -203,6 +209,7 @@ impl SessionRuntime {
             provider_caches: false,
             summarizing: false,
             last_send_at: None,
+            was_working: false,
         }
     }
 
@@ -243,9 +250,8 @@ impl SessionRuntime {
 
     /// True when this session has work in flight: a turn waiting / streaming, a
     /// paused approval, a parked deferred lane (tool tasks or sub-agent
-    /// delegations), or any still-running sub-agent. Used by `/swap` (stage 5) to
-    /// flag busy sessions and to gate quit; harmless until then.
-    #[allow(dead_code)] // used by /swap (stage 5)
+    /// delegations), or any still-running sub-agent. Used by `/swap` to flag busy
+    /// sessions, by the foreground status line, and by the background-finish nudge.
     pub fn is_working(&self) -> bool {
         self.waiting
             || self.streaming.is_some()

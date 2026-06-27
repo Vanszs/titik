@@ -162,6 +162,9 @@ pub(super) fn handle_save_creds(
         state.rest.load_token_totals(&p);
     }
     state.rest.prev_session = None; // committed; discard fallback
+    // Creds confirmed — a /new-spawned session is no longer pending, so a later
+    // unrelated KeyInput cancel must not pop it (the spawn is now committed).
+    state.rest.spawn_pending = false;
     state.rest.reset_scroll();
     // Land in Chat first, THEN warm: `warm_session` is non-blocking and may
     // upgrade the mode to `Mode::Loading` (animated splash) when it has warm

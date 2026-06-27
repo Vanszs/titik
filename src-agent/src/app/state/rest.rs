@@ -23,6 +23,17 @@ pub struct AppStateRest {
     pub foreground: usize,
     /// Saved (session) before a /new or reconfigure prompt; restored on cancel.
     pub prev_session: Option<crate::model::session::Session>,
+    /// True while a `/new`-spawned PARALLEL session (freshly appended to
+    /// `sessions`, no creds yet) is waiting in the KeyInput credential prompt.
+    /// If the user Escapes that prompt, the cancel handler pops the just-appended
+    /// session back off `sessions`, releases its lock, and restores `foreground`
+    /// to `spawn_prev_fg` (so a brand-new empty session never lingers half-made).
+    /// Cleared once the creds are confirmed or the cancel is handled.
+    pub spawn_pending: bool,
+    /// The `foreground` index to restore if a `/new`-spawned session's KeyInput is
+    /// cancelled (see `spawn_pending`). Set in `handle_new` just before the new
+    /// session is appended + made foreground. Only meaningful while `spawn_pending`.
+    pub spawn_prev_fg: usize,
     pub input: String,
     /// Caret position within `input`, as a CHAR index (0..=char_count). Edits
     /// (insert / backspace) and the Left/Right/Home/End keys move it; the view
@@ -203,6 +214,8 @@ impl AppStateRest {
             sessions: vec![SessionRuntime::new()],
             foreground: 0,
             prev_session: None,
+            spawn_pending: false,
+            spawn_prev_fg: 0,
             input: String::new(),
             cursor: 0,
             pending_attachments: Vec::new(),

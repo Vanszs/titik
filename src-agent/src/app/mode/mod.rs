@@ -19,6 +19,7 @@
 
 mod key_input;
 mod effort;
+mod live_picker;
 mod loading;
 mod picker;
 mod rewind;
@@ -29,6 +30,7 @@ pub mod editor;
 pub use agents::{AgentEditField, AgentScope, AgentSubMode, AgentsState};
 pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
+pub use live_picker::{LiveSessionEntry, LiveSessionPicker};
 pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
 pub use rewind::RewindState;
@@ -123,6 +125,13 @@ pub enum Mode {
     KeyInput(KeyInputForm),
     /// `--resume` session picker: shows saved sessions and a live search bar.
     SessionPicker(PickerState),
+    /// `/swap` live-session picker: a short list of the currently-RUNNING
+    /// sessions (one per [`crate::app::state::SessionRuntime`] in
+    /// `AppStateRest::sessions`), each with a ● working / ○ ready marker and the
+    /// foreground one flagged. Up/Down navigate; Enter switches the foreground to
+    /// the chosen session (no abort, no lock change); Esc cancels back to Chat.
+    /// Boxed to keep `Mode` small, consistent with the other list variants.
+    LiveSessionPicker(Box<LiveSessionPicker>),
     /// Normal chat view: messages are rendered and the user types in the
     /// input bar.  All chat-specific state lives in `AppStateRest`.
     Chat,
