@@ -2,6 +2,7 @@
 //!
 //! Module map:
 //! - `agent_def`    — agent definitions (frontmatter `.md`): load / merge / persist.
+//! - `attachment`   — image-attachment ingest core (copy into images/, mime sniff).
 //! - `conversation` — in-memory chat history + compaction helpers.
 //! - `session`      — a single named session (id, path, settings, conversation).
 //! - `settings`     — per-session `Settings` persisted to `settings.json`.
@@ -12,6 +13,7 @@
 
 pub mod agent_def;
 pub mod app_config;
+pub mod attachment;
 pub mod conversation;
 pub mod memory;
 pub mod msglog;

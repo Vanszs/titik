@@ -1,0 +1,282 @@
+//! Image-attachment ingest core: copy a file into the session's `images/` dir,
+//! sniff its mime type, and return the [`Attachment`] record + `[Image #N]`
+//! marker token.
+//!
+//! ONE ingest core, MANY callers. Every path that wants to attach an image
+//! routes through here so the on-disk layout, the monotonic marker numbering,
+//! and the mime sniff stay identical regardless of entry point:
+//! - path-paste (the user pastes a text path to an image file),
+//! - the `@`-picker image branch (a later slice),
+//! - the send-time `@`-scan backstop (a later slice),
+//! - clipboard bitmaps via raw bytes (a later slice).
+//!
+//! Layout produced: `<images_dir>/NN-basename.ext`, where `NN` is
+//! `(files already in images_dir) + 1`, zero-padded to two digits. The in-text
+//! marker number MATCHES the filename number (marker `[Image #3]` <-> `03-*`).
+
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
+
+use crate::dto::chat::Attachment;
+
+/// The image extensions koma recognises for attachment (lowercased, no dot).
+/// Used by the extension-first mime sniff AND by the paste/`@` callers to decide
+/// whether a path is an image before routing it through ingest.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// Whether `path`'s extension marks it as one of the [`IMAGE_EXTS`] koma ingests.
+/// Pure string check — does NOT touch the filesystem (no existence test).
+pub fn has_image_extension(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .map(|e| IMAGE_EXTS.contains(&e.as_str()))
+        .unwrap_or(false)
+}
+
+/// Atomically increment and return the next image sequence number for `images_dir`.
+///
+/// The counter is persisted in `images/.seq` (a plain text file holding the
+/// last-used integer). On each call: read the current value (0 if absent), add 1,
+/// write back, and return the new value. This is single-writer (the TUI event loop
+/// is single-threaded), so a simple read-modify-write on the `.seq` file is safe
+/// and collision-free even when several images are ingested in a single submit.
+///
+/// The `.seq` file lives inside `images/` so it is cleaned up automatically when
+/// the session directory is removed — no separate teardown needed.
+fn next_image_seq(images_dir: &Path) -> usize {
+    let seq_path = images_dir.join(".seq");
+    let current: usize = std::fs::read_to_string(&seq_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let next = current + 1;
+    // Best-effort write; a failure (e.g. read-only fs) just means the counter
+    // won't persist across this call, producing a duplicate NN — the same risk
+    // as the old read_dir approach, and equally rare.
+    let _ = std::fs::write(&seq_path, next.to_string());
+    next
+}
+
+/// Sniff a mime type from a path's extension first, confirming with the `infer`
+/// crate's magic-byte check when it has an opinion. Returns `None` when the file
+/// is not a recognised image. The extension is authoritative for the chosen
+/// `image/<ext>` string (so `.jpg` stays `image/jpeg`); `infer` only gates
+/// whether the bytes look like an image at all, rejecting a mislabelled file.
+fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    // Magic-byte confirmation: if `infer` recognises the bytes, require that it
+    // sees an image. If it has no opinion (returns None) we trust the extension —
+    // some small/edge images aren't covered, and the extension already matched.
+    if let Some(kind) = infer::get(bytes) {
+        if !kind.mime_type().starts_with("image/") {
+            return None;
+        }
+    }
+    // Canonicalise the extension to a mime subtype (jpg -> jpeg).
+    let subtype = if ext == "jpg" { "jpeg" } else { ext.as_str() };
+    Some(format!("image/{subtype}"))
+}
+
+/// Build the destination filename `NN-basename.ext` for the `nn`-th attachment,
+/// preserving `src`'s original basename + extension. A source with no usable
+/// file name falls back to `image` (keeping any extension).
+fn dest_name(nn: usize, src: &Path) -> String {
+    let base = src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "image".to_string());
+    format!("{nn:02}-{base}")
+}
+
+/// Ingest raw image `bytes` (already in memory) into `images_dir` under
+/// `basename`, returning the [`Attachment`] + its `[Image #N]` marker token.
+///
+/// This is the BYTES form of the ingest core (used by the clipboard-bitmap path
+/// in a later slice); the path form ([`ingest_image_from_path`]) reads the file
+/// then delegates here. Steps:
+/// 1. lazily create `images_dir`,
+/// 2. compute the next monotonic `NN` via [`next_image_seq`] (`.seq` counter file),
+/// 3. sniff the mime (extension + magic bytes); reject non-images,
+/// 4. write `NN-basename.ext`,
+/// 5. return `(Attachment { marker_n, rel_path: "images/NN-…", mime }, "[Image #N]")`.
+pub fn ingest_image_bytes(
+    images_dir: &Path,
+    basename: &str,
+    bytes: &[u8],
+) -> Result<(Attachment, String)> {
+    std::fs::create_dir_all(images_dir)?;
+    let nn = next_image_seq(images_dir);
+    let name_path = Path::new(basename);
+    let mime = sniff_image_mime(name_path, bytes)
+        .ok_or_else(|| anyhow!("not a recognised image: {basename}"))?;
+    let dest = dest_name(nn, name_path);
+    let dest_path = images_dir.join(&dest);
+    std::fs::write(&dest_path, bytes)?;
+    let rel_path = format!("images/{dest}");
+    let marker = format!("[Image #{nn}]");
+    Ok((
+        Attachment {
+            marker_n: nn,
+            rel_path,
+            mime,
+        },
+        marker,
+    ))
+}
+
+/// Ingest raw image `bytes` with an EXPLICIT `mime` string (e.g. `"image/png"`)
+/// and `basename` (e.g. `"pasted.png"`) into `images_dir`.
+///
+/// This is the clipboard-bitmap entry point: the caller already knows the mime
+/// type from the clipboard tool's `--type` argument, so no extension-first sniff
+/// is needed. The magic-byte check via `infer` is still performed as a sanity
+/// guard so corrupt / non-image clipboard data is rejected rather than saved.
+/// On success returns `(Attachment, "[Image #N]")`.
+pub fn ingest_image_from_raw_bytes(
+    images_dir: &Path,
+    bytes: &[u8],
+    mime: &str,
+    basename: &str,
+) -> Result<(Attachment, String)> {
+    // Sanity-check: the bytes must look like an image (magic bytes).
+    if let Some(kind) = infer::get(bytes) {
+        if !kind.mime_type().starts_with("image/") {
+            return Err(anyhow!("clipboard data does not appear to be an image"));
+        }
+    }
+    // If mime is empty or unrecognised, derive from basename extension as a fallback.
+    let effective_mime = if mime.starts_with("image/") {
+        mime.to_string()
+    } else {
+        // Try to derive from basename extension.
+        let ext = Path::new(basename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_else(|| "png".to_string());
+        let sub = if ext == "jpg" { "jpeg".to_string() } else { ext };
+        format!("image/{sub}")
+    };
+    std::fs::create_dir_all(images_dir)?;
+    let nn = next_image_seq(images_dir);
+    let name_path = Path::new(basename);
+    let dest = dest_name(nn, name_path);
+    let dest_path = images_dir.join(&dest);
+    std::fs::write(&dest_path, bytes)?;
+    let rel_path = format!("images/{dest}");
+    let marker = format!("[Image #{nn}]");
+    Ok((
+        Attachment {
+            marker_n: nn,
+            rel_path,
+            mime: effective_mime,
+        },
+        marker,
+    ))
+}
+
+/// Ingest the image file at `src_path` into `images_dir`, returning the
+/// [`Attachment`] + its `[Image #N]` marker token.
+///
+/// The PATH entry point of the ingest core (path-paste, `@`-picker, send-time
+/// `@`-scan). Reads the file off disk, then delegates to [`ingest_image_bytes`]
+/// for the copy + sniff + numbering. Errors (missing file, non-image, write
+/// failure) propagate so the caller can toast and leave the composer untouched.
+pub fn ingest_image_from_path(images_dir: &Path, src_path: &Path) -> Result<(Attachment, String)> {
+    let bytes = std::fs::read(src_path)?;
+    let basename = src_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_string());
+    ingest_image_bytes(images_dir, &basename, &bytes)
+}
+
+/// Scan `text` for `@<path>` tokens that resolve to existing image files on
+/// disk, ingest each one into `images_dir`, rewrite the `@path` token to its
+/// `[Image #N]` marker in the returned text, and collect the produced
+/// [`Attachment`] records.
+///
+/// This is the SEND-TIME `@`-scan backstop (Slice 3). It fires on every submit
+/// and catches hand-typed `@path/to/image.png` tokens that bypassed the
+/// interactive picker. Dedup is automatic — the interactive picker already
+/// rewrote its `@path` to `[Image #N]`, so no `@path` for those remains.
+///
+/// Only `@`-prefixed tokens are considered (NEVER bare filenames in prose).
+/// A token is a run of non-whitespace characters. Tokens that do not have
+/// an image extension, or whose resolved path does not exist, are left
+/// unchanged (silently skipped — not an error).
+///
+/// `workdir` is the session's working directory; relative paths in `@tokens`
+/// are resolved against it.
+pub fn scan_at_image_tokens(
+    text: &str,
+    images_dir: &Path,
+    workdir: &Path,
+) -> (String, Vec<Attachment>) {
+    // Collect (start_byte, end_byte) for each non-whitespace token.
+    let mut tokens: Vec<(usize, usize)> = Vec::new();
+    let mut tok_start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = tok_start.take() {
+                tokens.push((s, i));
+            }
+        } else if tok_start.is_none() {
+            tok_start = Some(i);
+        }
+    }
+    if let Some(s) = tok_start {
+        tokens.push((s, text.len()));
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut attachments: Vec<Attachment> = Vec::new();
+    let mut cursor = 0usize; // byte position we've flushed up to
+
+    for (start, end) in tokens {
+        let token = &text[start..end];
+        if let Some(path_str) = token.strip_prefix('@') {
+            if has_image_extension(path_str) {
+                let src = if Path::new(path_str).is_absolute() {
+                    std::path::PathBuf::from(path_str)
+                } else {
+                    workdir.join(path_str)
+                };
+                if src.exists() {
+                    match ingest_image_from_path(images_dir, &src) {
+                        Ok((att, marker)) => {
+                            // Copy text before this token, then the replacement marker.
+                            result.push_str(&text[cursor..start]);
+                            result.push_str(&marker);
+                            cursor = end;
+                            attachments.push(att);
+                            continue;
+                        }
+                        Err(_) => {
+                            // Ingest failed: leave the @token verbatim.
+                        }
+                    }
+                }
+            }
+        }
+        // Default: copy everything up to and including this token.
+        result.push_str(&text[cursor..end]);
+        cursor = end;
+    }
+    // Flush any trailing whitespace after the last token.
+    if cursor < text.len() {
+        result.push_str(&text[cursor..]);
+    }
+
+    (result, attachments)
+}

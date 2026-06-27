@@ -172,6 +172,31 @@ pub(crate) fn start_stream_task(
                 })
         })
         .unwrap_or(128_000);
+    // Image-attachment send context: the session dir (source of record for image
+    // bytes), whether the resolved Main model can read images, and its id (named
+    // in the strip-warning). Built BEFORE the spawn so the task holds no borrow of
+    // `state`. Capability: when the catalogue is populated, honour
+    // `model_takes_images`; when it's never been fetched (`None`), DEFAULT TO
+    // CAPABLE so a cold cache never wrongly strips an image. `None` (no session /
+    // no resolved Main) means the task sends without image handling.
+    let image_ctx: Option<crate::dto::openrouter::ImageWireCtx> = match (
+        state.rest.session.as_ref(),
+        main.as_ref(),
+    ) {
+        (Some(sess), Some(m)) => {
+            let takes = match state.rest.models_cache.as_deref() {
+                Some(models) => {
+                    crate::service::openrouter::model_takes_images(models, &m.model_id)
+                }
+                None => true, // catalogue not fetched yet → assume capable, never strip
+            };
+            Some(crate::dto::openrouter::ImageWireCtx {
+                session_dir: sess.path.clone(),
+                model_takes_images: takes,
+            })
+        }
+        _ => None,
+    };
     // 2. Usable budget: the window minus the fixed system/tools/memory overhead,
     //    floored so the percentages below never go degenerate on a tiny window.
     let usable = window
@@ -265,6 +290,7 @@ pub(crate) fn start_stream_task(
                         &m.effort,
                         history,
                         &crate::tool::main_tool_names(),
+                        image_ctx,
                         tx,
                     )
                     .await;

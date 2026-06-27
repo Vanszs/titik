@@ -137,6 +137,9 @@ pub(super) fn handle_picker_select(
         // KEYLESS client → fresh plan_word at this session boundary. This
         // branch already gated on a non-empty key above, so build directly.
         *client = Some(build_client());
+        // Drop any staged image attachments from the previous session so they
+        // don't leak into the newly-selected one.
+        state.rest.pending_attachments.clear();
         let sess_path = sess.path.clone();
         state.rest.session = Some(sess);
         // Existing session: seed the running totals from its full sqlite

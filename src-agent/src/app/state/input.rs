@@ -133,6 +133,79 @@ impl AppStateRest {
         std::mem::take(&mut self.input)
     }
 
+    /// Insert the literal marker string `s` (e.g. `"[Image #3]"`) at the caret,
+    /// advancing it past the inserted run. Mirrors [`Self::push_char`]'s caret /
+    /// palette / history discipline so a bulk marker insert behaves like typing.
+    pub fn insert_marker(&mut self, s: &str) {
+        let at = self.byte_at(self.cursor);
+        self.input.insert_str(at, s);
+        self.cursor += s.chars().count();
+        self.palette_sel = 0;
+        self.hist_idx = None;
+    }
+
+    /// Move the staged composer attachments out for the message being submitted,
+    /// leaving `pending_attachments` empty. Called at submit, paired with
+    /// `take_input()`, so the markers and their attachment records travel
+    /// together onto the user message.
+    pub fn take_attachments(&mut self) -> Vec<crate::dto::chat::Attachment> {
+        std::mem::take(&mut self.pending_attachments)
+    }
+
+    /// Ingest the image file at `path` into the active session's `images/` dir,
+    /// stage the produced [`Attachment`](crate::dto::chat::Attachment), and insert
+    /// its `[Image #N]` marker at the caret. Returns `true` on success.
+    ///
+    /// Returns `false` (composer untouched) when there is no active session or the
+    /// ingest fails (missing file / not a recognised image / write error), so the
+    /// caller can fall back to inserting the raw pasted text. The session's images
+    /// dir is `<session.path>/images/`.
+    pub fn try_attach_image_path(&mut self, path: &str) -> bool {
+        let Some(sess) = self.session.as_ref() else {
+            return false;
+        };
+        let images_dir = sess.images_dir();
+        match crate::model::attachment::ingest_image_from_path(
+            &images_dir,
+            std::path::Path::new(path),
+        ) {
+            Ok((att, marker)) => {
+                self.insert_marker(&marker);
+                self.pending_attachments.push(att);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Ingest raw image `bytes` (already read from the clipboard) into the active
+    /// session's `images/` dir with the given `mime` and `basename`, stage the
+    /// produced [`Attachment`](crate::dto::chat::Attachment), and insert its
+    /// `[Image #N]` marker at the caret. Returns `true` on success.
+    ///
+    /// Returns `false` (composer untouched) when there is no active session or the
+    /// ingest fails (not a recognised image / write error). The caller should
+    /// toast any failure independently.
+    pub fn try_attach_image_bytes(&mut self, bytes: Vec<u8>, mime: &str, basename: &str) -> bool {
+        let Some(sess) = self.session.as_ref() else {
+            return false;
+        };
+        let images_dir = sess.images_dir();
+        match crate::model::attachment::ingest_image_from_raw_bytes(
+            &images_dir,
+            &bytes,
+            mime,
+            basename,
+        ) {
+            Ok((att, marker)) => {
+                self.insert_marker(&marker);
+                self.pending_attachments.push(att);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Recall the previous (older) sent user message into the input. `users` is
     /// the session's user messages oldest-first.
     pub fn history_prev(&mut self, users: &[String]) {

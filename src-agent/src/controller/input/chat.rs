@@ -18,20 +18,81 @@ pub fn file_ref_partial(input: &str) -> Option<&str> {
 /// Completing a FILE appends a trailing space (closes the palette).
 /// Completing a FOLDER (trailing `/`) does NOT append a space so the palette
 /// stays open and the user can browse into the subfolder.
+///
+/// When the selected file has a recognised image extension AND the session has
+/// an images directory, the pick is routed through the ingest core instead:
+/// the `@token` is erased, an `[Image #N]` marker is inserted at the caret,
+/// and a trailing space closes the palette — exactly like path-paste.  Non-
+/// image picks and folder picks behave exactly as before.
 fn complete_file_ref(rest: &mut AppStateRest, matches: &[String]) {
     let sel = rest.palette_sel.min(matches.len().saturating_sub(1));
     let entry = &matches[sel];
+
+    // Folders: never attach; keep the palette open at the new depth.
+    if entry.ends_with('/') {
+        let start = rest.input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+        rest.input.truncate(start);
+        rest.input.push('@');
+        rest.input.push_str(entry);
+        rest.palette_sel = 0;
+        rest.cursor_end();
+        return;
+    }
+
+    // Strip a leading workspace prefix `[N]` to get the bare relative path.
+    // Single-workspace entries have no prefix (bare relative path).
+    let (ws_idx, bare) = if let Some(rest_after_bracket) = entry.strip_prefix('[') {
+        if let Some(end) = rest_after_bracket.find(']') {
+            let idx = rest_after_bracket[..end].parse::<usize>().unwrap_or(0);
+            (idx, &rest_after_bracket[end + 1..])
+        } else {
+            (0usize, entry.as_str())
+        }
+    } else {
+        (0usize, entry.as_str())
+    };
+
+    // Image file: ingest through the same core as path-paste.
+    if crate::model::attachment::has_image_extension(bare) {
+        // Resolve the absolute path for this workspace entry.
+        let abs_path: Option<std::path::PathBuf> = rest
+            .session
+            .as_ref()
+            .map(|s| {
+                let dirs = s.workdirs();
+                let root = dirs.get(ws_idx).or_else(|| dirs.first()).cloned()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                root.join(bare)
+            });
+
+        if let Some(abs) = abs_path {
+            // Erase the `@token` from input and park the caret at that position
+            // BEFORE calling insert_marker (which inserts at the current cursor).
+            let start = rest.input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+            rest.input.truncate(start);
+            rest.cursor = rest.input.chars().count(); // char index after truncation
+            rest.palette_sel = 0;
+            rest.hist_idx = None;
+
+            if rest.try_attach_image_path(&abs.to_string_lossy()) {
+                // Marker was inserted; add a trailing space to close the palette.
+                rest.push_char(' ');
+                rest.cursor_end();
+                return;
+            }
+            // Ingest failed (file missing / not an image / write error): fall
+            // through to the normal `@entry ` insertion below.
+        }
+    }
+
+    // Default path: insert `@entry ` (file) into the input.
     let start = rest.input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
     rest.input.truncate(start);
     rest.input.push('@');
     rest.input.push_str(entry);
-    if !entry.ends_with('/') {
-        rest.input.push(' '); // a FILE completion closes the palette
-    }
-    // a FOLDER (trailing '/') gets NO space → palette stays open at the new depth
+    rest.input.push(' '); // a FILE completion always closes the palette
     rest.palette_sel = 0;
-    // The input was rewritten wholesale (truncate + push); park the caret at the
-    // end so it doesn't dangle inside the old, now-replaced @token.
+    // The input was rewritten wholesale; park the caret at the end.
     rest.cursor_end();
 }
 
@@ -157,6 +218,18 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         rest.push_char('\n');
         return Action::None;
     }
+    // Ctrl+V: paste image from the OS clipboard (Wayland / X11). Shells out to
+    // `wl-paste --type image/png` or `xclip` on a background thread (non-blocking);
+    // the result lands in `rest.clipboard_rx` and is drained by the event loop on
+    // the next tick. No-op when a fetch is already in flight or when waiting for a
+    // model response (to avoid attaching images mid-turn).
+    if is_ctrl(&key, 'v') {
+        if !rest.waiting {
+            super::request_clipboard_image(rest);
+            rest.set_toast_info("reading image from clipboard…".to_string());
+        }
+        return Action::None;
+    }
     // Ctrl+E: toggle internet mode (Simple <-> Full), persist, and set status.
     // Session is directly on AppStateRest so this can be done inline, matching
     // the BackTab agent_mode toggle pattern.
@@ -216,6 +289,9 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 let sel = rest.palette_sel.min(cmd_matches.len() - 1);
                 let name = cmd_matches[sel].0;
                 rest.take_input();
+                // Slash command (not submit): discard staged attachments so
+                // they can't leak into the next message.
+                rest.pending_attachments.clear();
                 Action::Slash(command::parse(name))
             } else {
                 // File palette: complete instead of submitting when a file match is selected.
@@ -227,6 +303,8 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                     Action::None
                 } else if rest.input.trim().starts_with('/') {
                     let line = rest.take_input();
+                    // Slash command (not submit): discard staged attachments.
+                    rest.pending_attachments.clear();
                     Action::Slash(command::parse(&line))
                 } else if !rest.input.trim().is_empty() && !rest.waiting {
                     Action::Submit(rest.take_input())

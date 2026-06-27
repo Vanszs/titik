@@ -20,7 +20,7 @@
 //!          -> Session::save() -> messages.json
 //! ```
 
-use crate::dto::chat::{ChatMessage, Role, ToolCall};
+use crate::dto::chat::{Attachment, ChatMessage, Role, ToolCall};
 
 /// In-memory chat history for one session.
 ///
@@ -50,6 +50,20 @@ impl Conversation {
     /// Append a user turn.
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.messages.push(ChatMessage::new(Role::User, content));
+    }
+
+    /// Append a user turn carrying image attachments (path-paste / `@`-picker).
+    /// `attachments` may be empty, in which case this is identical to
+    /// [`Self::push_user`] (the field serialises away entirely). Each attachment
+    /// links to an on-disk image under `<session>/images/` and matches an
+    /// `[Image #N]` marker in `content`.
+    pub fn push_user_with_attachments(
+        &mut self,
+        content: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) {
+        self.messages
+            .push(ChatMessage::new(Role::User, content).with_attachments(attachments));
     }
 
     /// Append an assistant turn (used for both streamed and non-streamed replies).

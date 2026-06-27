@@ -50,6 +50,18 @@ pub struct ModelPricing {
     pub completion: Option<String>,
 }
 
+/// The `architecture` sub-object of a model entry in `GET /models`.
+///
+/// `input_modalities` is the list of input kinds the model accepts (e.g.
+/// `["text","image"]`). A model can take images iff this contains `"image"`
+/// (see [`crate::service::openrouter::model_takes_images`]). Defaults so a model
+/// that omits the field (or the whole `architecture` object) still deserialises.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct Architecture {
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+}
+
 /// One model entry from `GET /models`. Only the fields the effort-capability
 /// derivation needs are modelled; the rest of OpenRouter's rich model record is
 /// ignored. `reasoning` is absent for models with no thinking support.
@@ -77,6 +89,12 @@ pub struct ModelInfo {
     #[allow(dead_code)]
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    /// Input modalities the model accepts. Drives the image-capability gate:
+    /// `architecture.input_modalities` contains `"image"` iff the model can read
+    /// images. `Option` + `#[serde(default)]` so a model record without an
+    /// `architecture` object still deserialises (treated as text-only).
+    #[serde(default)]
+    pub architecture: Option<Architecture>,
 }
 
 /// Top-level envelope of `GET /models`: `{ "data": [ ModelInfo, ... ] }`.

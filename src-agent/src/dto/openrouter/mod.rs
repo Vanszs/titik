@@ -36,12 +36,15 @@ pub use request::{
     ToolDef,
     ToolFunctionDef,
     UsageRequest,
+    ImageWireCtx,
     WireMessage,
     to_wire,
+    to_wire_with_images,
 };
 
 // models
 pub use models::{
+    Architecture,
     EndpointsData,
     EndpointsResponse,
     ModelEndpoint,

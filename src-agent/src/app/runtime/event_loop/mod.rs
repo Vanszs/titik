@@ -595,6 +595,39 @@ pub(super) fn run_loop(
             }
         }
 
+        // 1b-3d. Drain the clipboard-image fetch result (Ctrl+V). The background
+        //        thread sends Ok(bytes) (PNG data) or Err(reason) (tool absent / no image).
+        //        On Ok: ingest into the session images dir + insert marker. On Err: toast.
+        //        One send per Ctrl+V; clear the receiver once drained.
+        if let Some(rx) = state.rest.clipboard_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(bytes)) => {
+                    // Ingest the bytes; basename "pasted.png" + explicit png mime.
+                    let attached = state.rest.try_attach_image_bytes(bytes, "image/png", "pasted.png");
+                    if attached {
+                        state.rest.set_toast_info("image attached from clipboard".to_string());
+                    } else {
+                        state.rest.set_toast("clipboard image: no active session or ingest failed".to_string());
+                    }
+                    state.rest.clipboard_rx = None;
+                    dirty = true;
+                }
+                Ok(Err(reason)) => {
+                    state.rest.set_toast(format!("clipboard image: {reason}"));
+                    state.rest.clipboard_rx = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still waiting — keep the receiver for the next tick.
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread exited without sending (shouldn't happen, but clean up).
+                    state.rest.clipboard_rx = None;
+                    dirty = true;
+                }
+            }
+        }
+
         // 1b-4. Loading splash: workspace step, transition, and animation. While in
         //        `Mode::Loading` the splash is driven entirely from the loop tick.
         if let Mode::Loading(s) = &mut state.mode {

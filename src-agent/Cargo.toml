@@ -27,6 +27,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ignore = "0.4"
 regex = "1"
 globset = "0.4"
+infer = "0.16"
+base64 = "0.22"
 
 [[bin]]
 name = "koma"

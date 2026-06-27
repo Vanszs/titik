@@ -31,16 +31,59 @@ pub(super) fn handle_submit(
     // Prompt-classifier (PC): keep a copy of the user's prompt to
     // classify in the background once the turn is kicked off.
     let pc_prompt = text.clone();
+    // Send-time @-scan backstop (Slice 3): before finalising the user message,
+    // scan the typed text for hand-typed `@path/to/image.png` tokens that were
+    // NOT converted interactively (path-paste / @-picker).  Each such token is
+    // ingested and rewritten to `[Image #N]` in `text`.  This runs BEFORE
+    // `take_attachments()` so the interactive attachments are still on the
+    // composer; the scan's attachments are appended to them afterward.
+    let (text, scan_attachments) =
+        if let Some(sess) = state.rest.session.as_ref() {
+            let images_dir = sess.images_dir();
+            let workdir = sess.workdir();
+            crate::model::attachment::scan_at_image_tokens(&text, &images_dir, &workdir)
+        } else {
+            (text, Vec::new())
+        };
+    // Move the staged composer attachments (from path-paste / @-picker) AND the
+    // scan-backstop attachments onto THIS user message. Ingested bytes are already
+    // on disk under `<session>/images/`; the wire builder re-reads at send time.
+    let mut attachments = state.rest.take_attachments();
+    attachments.extend(scan_attachments);
+    let had_image = !attachments.is_empty();
     let history = {
         let sess = state.rest.session.as_mut().unwrap();
         let _ = msglog::append(&sess.path, Role::User, &text, None);
-        sess.conversation.push_user(text);
+        sess.conversation.push_user_with_attachments(text, attachments);
         if let Err(e) = sess.save() {
             state.rest.status = format!("error: {e}");
             return Ok(());
         }
         sess.conversation.history()
     };
+    // Image-capability guard: if this message carries images and the resolved Main
+    // model can't read them, DON'T spend an API call — post a friendly notice in the
+    // chat and keep the image un-sent (the orange attachment tree still shows it).
+    // Capability mirrors run.rs: cold/None catalogue => assume capable (never wrongly block).
+    if had_image {
+        let main = state.rest.session.as_ref().and_then(|sess| {
+            crate::app::resolve::resolve_role(
+                &state.rest.config,
+                &sess.settings,
+                crate::model::app_config::ModelRole::Main,
+            )
+        });
+        let capable = match (state.rest.models_cache.as_deref(), main.as_ref()) {
+            (Some(models), Some(m)) => crate::service::openrouter::model_takes_images(models, &m.model_id),
+            _ => true,
+        };
+        if !capable {
+            crate::app::runtime::stream::push_image_unsupported_notice(&mut state.rest);
+            state.rest.reset_scroll();
+            state.rest.status = "ready".into();
+            return Ok(());
+        }
+    }
     state.rest.reset_scroll();
     state.rest.begin_stream();
     state.rest.waiting = true;

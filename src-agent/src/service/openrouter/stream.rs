@@ -6,7 +6,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{APP_TITLE, HTTP_REFERER};
 use crate::dto::chat::{ChatMessage, ToolCall};
-use crate::dto::openrouter::{to_wire, ChatRequest, StreamChunk, ToolDef, ToolFunctionDef, UsageRequest};
+use crate::dto::openrouter::{
+    to_wire_with_images, ChatRequest, ImageWireCtx, StreamChunk, ToolDef, ToolFunctionDef,
+    UsageRequest,
+};
 use crate::service::StreamEvent;
 
 use super::helpers::{clean_error, emit, provider_routing_for, reasoning_config, sanitize_tool_acc};
@@ -34,6 +37,7 @@ impl OpenRouterClient {
         effort: &str,
         messages: Vec<ChatMessage>,
         advertise: &[String],
+        image_ctx: Option<ImageWireCtx>,
         tx: UnboundedSender<StreamEvent>,
     ) -> Result<()> {
         // The plan-word steer is now injected into the System message upstream in
@@ -63,8 +67,10 @@ impl OpenRouterClient {
         let body = ChatRequest {
             model: model.to_string(),
             // Wrap into wire messages: the system message gets the single prompt-
-            // caching breakpoint; everything else serialises as a plain string.
-            messages: to_wire(messages),
+            // caching breakpoint; a user message carrying image attachments becomes
+            // a parts array (text + image_url, or text + strip-warning when the
+            // model can't read images); everything else serialises as a plain string.
+            messages: to_wire_with_images(messages, image_ctx.as_ref()),
             stream: true,
             provider: provider_routing_for(provider),
             usage: UsageRequest { include: true },

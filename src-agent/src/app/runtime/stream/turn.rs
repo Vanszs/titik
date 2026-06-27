@@ -8,6 +8,27 @@ use crate::service::openrouter::OpenRouterClient;
 
 use super::{final_answer, MAX_AGENT_STEPS};
 
+/// Post koma's friendly "this model can't read images" notice into the chat
+/// (assistant message + msglog + save). Shared by the submit-time capability
+/// guard and the stream-error interception so the wording lives in one place.
+pub(crate) fn push_image_unsupported_notice(rest: &mut AppStateRest) {
+    let notice = "Sorry, I can't see images on this model. Switch to a vision-capable model, or send your message without the image.".to_string();
+    if let Some(sess) = rest.session.as_mut() {
+        let _ = crate::model::msglog::append(&sess.path, Role::Assistant, &notice, None);
+        sess.conversation.push_assistant(notice, None);
+        let _ = sess.save();
+    }
+}
+
+/// True when a provider error indicates the model/endpoint cannot accept image
+/// input, so we can show the friendly notice instead of a raw error toast.
+fn is_image_input_error(e: &str) -> bool {
+    let e = e.to_lowercase();
+    e.contains("image input")
+        || e.contains("support image")
+        || (e.contains("no endpoints") && e.contains("image"))
+}
+
 /// Finalize a finished stream: commit any buffered assistant text, clear the
 /// waiting flag + task handle, set the status line. `error` is Some on stream
 /// failure; a save error is surfaced only if the stream itself succeeded.
@@ -46,8 +67,25 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
     rest.current_task = None;
     match error.or(save_err) {
         Some(e) => {
-            rest.set_toast(e.clone());
-            rest.status = format!("error: {e}");
+            // If the provider rejected the request because the model can't take
+            // images (e.g. "No endpoints found that support image input") and the
+            // last user message actually carried image attachments, swap the raw
+            // error toast for koma's friendly in-chat notice.
+            let last_user_had_image = rest.session.as_ref().is_some_and(|s| {
+                s.conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::User)
+                    .is_some_and(|m| !m.attachments.is_empty())
+            });
+            if last_user_had_image && is_image_input_error(&e) {
+                push_image_unsupported_notice(rest);
+                rest.status = "ready".into();
+            } else {
+                rest.set_toast(e.clone());
+                rest.status = format!("error: {e}");
+            }
         }
         None => rest.status = "ready".into(),
     }

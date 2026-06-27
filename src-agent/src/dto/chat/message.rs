@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::attachment::Attachment;
 use super::role::Role;
 use super::tool::ToolCall;
 
@@ -22,6 +23,15 @@ pub struct ChatMessage {
     /// entry this message answers. Omitted on every other message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Image attachments carried by this (user) message. Each links to an
+    /// on-disk file under `<session>/images/` and matches an `[Image #N]` marker
+    /// in `content`. Serialised only when non-empty — a message without
+    /// attachments writes BYTE-IDENTICAL `messages.json` to before this field
+    /// existed, and old files (no `attachments` key) deserialise to an empty vec
+    /// via `#[serde(default)]`. The bytes are never inlined here; the wire
+    /// builder re-reads them from disk at send time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     /// Display-only reasoning/thinking text accumulated from the model's
     /// `delta.reasoning` channel during streaming. `#[serde(skip)]` means it is
     /// NEVER serialised — not into a `ChatRequest` body nor `messages.json` — and
@@ -40,6 +50,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            attachments: Vec::new(),
             reasoning: None,
         }
     }
@@ -52,6 +63,7 @@ impl ChatMessage {
             content,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            attachments: Vec::new(),
             reasoning: None,
         }
     }
@@ -63,8 +75,17 @@ impl ChatMessage {
             content,
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
+            attachments: Vec::new(),
             reasoning: None,
         }
+    }
+
+    /// Attach the image attachments collected in the composer onto this message
+    /// (builder style). Used at user-submit time to fold the pending composer
+    /// attachments onto the message before it enters the conversation.
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     /// Attach a display-only reasoning block (builder style). An empty/`None`

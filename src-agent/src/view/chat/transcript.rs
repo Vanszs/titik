@@ -3,7 +3,7 @@
 
 use ratatui::{
     layout::{Margin, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -223,16 +223,26 @@ pub(super) fn render_message_block(
     wrap_w: usize,
 ) -> Vec<Line<'static>> {
     match msg.role {
-        Role::User => render_block(
-            vec![vec![Span::styled(
-                msg.content.to_string(),
-                Style::default().fg(palette.accent),
-            )]],
-            "★ ",
-            palette.accent,
-            wrap_w,
-            true,
-        ),
+        Role::User => {
+            // The typed message (with any `[Image #N]` markers) in the accent
+            // colour, then -- when the message carries image attachments -- a
+            // permanent yellow/orange warn-style card listing them. The card is
+            // ALWAYS yellow (a warn cue): koma can't guarantee the model read the
+            // image, and the model-visible strip warning is injected separately at
+            // send. Styled like a tool-call card (icon + dim text) but in warn.
+            let mut lines = render_block(
+                vec![vec![Span::styled(
+                    msg.content.to_string(),
+                    Style::default().fg(palette.accent),
+                )]],
+                "★ ",
+                palette.accent,
+                wrap_w,
+                true,
+            );
+            lines.extend(render_attachment_card(&msg.attachments));
+            lines
+        }
         Role::Assistant => {
             // If the message contains wanderer lead-in lines (`Word: ...`), the
             // entire block up to and including the LAST such line is rendered
@@ -290,6 +300,52 @@ pub(super) fn render_message_block(
         }
         Role::System => Vec::new(),
     }
+}
+
+/// Render the orange attachment folder-tree lines for a user message that
+/// carries image attachments. Minimalist design: an "images" root line, then
+/// one tree branch per attachment (├─ for non-last, └─ for the last).
+/// Returns an empty `Vec` when there are no attachments.
+///
+/// ALWAYS orange-coloured (fixed Color::Rgb(255, 180, 60)), matching the approval
+/// card in overlays.rs — independent of the theme palette so it always reads as
+/// a warn cue.
+fn render_attachment_card(
+    attachments: &[crate::dto::chat::Attachment],
+) -> Vec<Line<'static>> {
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+    // Fixed orange colour matching the tool-approval card in overlays.rs.
+    let orange = Color::Rgb(255, 180, 60);
+    let style = Style::default().fg(orange);
+    let dim = Style::default().fg(orange).add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Root: "  images"
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("images", style),
+    ]));
+
+    // One line per attachment, using tree connectors.
+    let last_idx = attachments.len().saturating_sub(1);
+    for (i, att) in attachments.iter().enumerate() {
+        let connector = if i == last_idx {
+            Span::styled("\u{2514}\u{2500} ", dim)  // └─
+        } else {
+            Span::styled("\u{251C}\u{2500} ", dim)  // ├─
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            connector,
+            Span::styled(
+                format!("[Image #{}] {}", att.marker_n, att.file_name()),
+                style,
+            ),
+        ]));
+    }
+    lines
 }
 
 /// The fresh per-tool-call lines for an Assistant turn that requested calls.

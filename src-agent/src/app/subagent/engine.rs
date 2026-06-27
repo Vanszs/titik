@@ -282,7 +282,7 @@ async fn stream_step(
             api_key: &api_key,
         };
         let _ = c
-            .stream_complete(conn, &model_id, &provider, &effort, history, &advertise, inner_tx)
+            .stream_complete(conn, &model_id, &provider, &effort, history, &advertise, None, inner_tx)
             .await;
     });
 

@@ -171,6 +171,10 @@ impl Session {
             eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
         }
 
+        // Ensure the image-attachment dir exists so resumed sessions can ingest
+        // pastes immediately and re-read previously attached images. Best-effort.
+        crate::model::store::ensure_session_images_dir(&session.pwd_hash, &session.id);
+
         // Overwrite the stored system message with the live one so that
         // changes to the embedded prompt or MEMORY.md take effect on resume.
         session.rebuild_system();
@@ -213,6 +217,17 @@ impl Session {
         // updates nothing; a DB hiccup must not fail the save.
         let _ = session_registry::touch(&self.id);
         Ok(())
+    }
+
+    /// The images attachment directory for this session: `<session.path>/images/`.
+    ///
+    /// Uses [`crate::model::store::session_images_dir`] as the canonical source,
+    /// falling back to `self.path.join("images")` when the store helper fails
+    /// (e.g. the bucket dir hasn't been created yet). All callers should use this
+    /// method rather than constructing the path inline.
+    pub fn images_dir(&self) -> std::path::PathBuf {
+        crate::model::store::session_images_dir(&self.pwd_hash, &self.id)
+            .unwrap_or_else(|_| self.path.join("images"))
     }
 
     /// The session's working directory: the FIRST non-empty entry of the

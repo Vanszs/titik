@@ -65,6 +65,23 @@ pub fn context_length_for(models: &[ModelInfo], model_id: &str) -> Option<u64> {
         })
 }
 
+/// Whether `model_id` can take image inputs, per a `GET /models` listing.
+///
+/// True iff the model's `architecture.input_modalities` array contains `"image"`.
+/// Mirrors [`context_length_for`]'s find-then-`and_then` shape. A model ABSENT
+/// from the listing (or one with no `architecture` object) yields `false` — but
+/// the SEND path treats a `None`/empty catalogue as "assume capable" upstream
+/// (it only calls this when a populated cache exists), so a never-fetched
+/// catalogue never wrongly strips an image. Pure read, never panics.
+pub fn model_takes_images(models: &[ModelInfo], model_id: &str) -> bool {
+    models
+        .iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| m.architecture.as_ref())
+        .map(|a| a.input_modalities.iter().any(|m| m == "image"))
+        .unwrap_or(false)
+}
+
 impl OpenRouterClient {
     /// Fetch the OpenRouter model catalogue (`GET /models`) on the connection
     /// `conn` (its `endpoint` + `api_key`).

@@ -159,6 +159,23 @@ pub fn session_dir(pwd_hash: &str, uuid: &str) -> Result<PathBuf> {
     Ok(pwd_bucket_dir(pwd_hash)?.join(uuid))
 }
 
+/// A session's image-attachment directory: `<session_dir>/images/`. Holds the
+/// copied-in image bytes for every pasted/picked image attachment
+/// (`images/NN-name.ext`). Lives INSIDE the session dir, so deleting a session
+/// already removes its images — no separate cleanup is needed.
+pub fn session_images_dir(pwd_hash: &str, uuid: &str) -> Result<PathBuf> {
+    Ok(session_dir(pwd_hash, uuid)?.join("images"))
+}
+
+/// Create a session's `images/` dir (and parents) if absent. Best-effort, called
+/// the same place the scratch dir is set up; a failure just means the first
+/// ingest will retry the create.
+pub fn ensure_session_images_dir(pwd_hash: &str, uuid: &str) {
+    if let Ok(dir) = session_images_dir(pwd_hash, uuid) {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+}
+
 /// Path to the SQLite session registry: `~/.simple-coder/session.sqlite`.
 pub fn registry_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("session.sqlite"))
@@ -245,6 +262,9 @@ pub fn create_session() -> Result<Session> {
     if let Err(e) = std::fs::create_dir_all(&scratch) {
         eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
     }
+
+    // Pre-create the image-attachment dir so the first paste-ingest has a home.
+    ensure_session_images_dir(&hash, &uuid);
 
     let workdir_str = workdir.display().to_string();
     let settings = Settings {

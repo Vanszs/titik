@@ -24,6 +24,13 @@ pub struct AppStateRest {
     /// offset only at the `String::insert`/`remove` call site. Reset to the end
     /// on any bulk replace (submit/clear, history recall, completion).
     pub cursor: usize,
+    /// Image attachments staged by the composer (path-paste / `@`-picker) that
+    /// have NOT yet been submitted. Each was produced by the ingest core (its
+    /// bytes are already on disk under `<session>/images/`) and matches an
+    /// `[Image #N]` marker inserted into `input`. On submit, these are MOVED onto
+    /// the user `ChatMessage` and this is cleared; a `/clear` or take_input that
+    /// drops the text also clears them so a stray marker can't outlive its image.
+    pub pending_attachments: Vec<crate::dto::chat::Attachment>,
     /// Bash-style input history: index into the sent-user-message list while
     /// recalling (None = editing live input).
     pub hist_idx: Option<usize>,
@@ -291,6 +298,13 @@ pub struct AppStateRest {
     /// here so later async tools in the same session reuse the one channel. `None`
     /// until the first async tool runs.
     pub tool_task_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    /// Receiver for a background clipboard-image fetch (Ctrl+V). The fetch thread
+    /// shells out to `wl-paste` (Wayland) or `xclip` (X11), reads raw PNG bytes, and
+    /// sends `Ok(bytes)` on success or `Err(reason)` on failure (tool absent, empty
+    /// clipboard, non-image data). Drained each tick in `run_loop`; on `Ok` the bytes
+    /// are ingested as an attachment; on `Err` a toast is shown. `None` when no fetch
+    /// is in flight.
+    pub clipboard_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
 }
 
 impl Default for AppStateRest {
@@ -306,6 +320,7 @@ impl AppStateRest {
             prev_session: None,
             input: String::new(),
             cursor: 0,
+            pending_attachments: Vec::new(),
             hist_idx: None,
             input_stash: String::new(),
             palette_sel: 0,
@@ -375,6 +390,7 @@ impl AppStateRest {
             awaiting_tool_tasks: false,
             tool_task_rx: None,
             tool_task_tx: None,
+            clipboard_rx: None,
         }
     }
 

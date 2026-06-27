@@ -3,6 +3,8 @@
 //! Covers prompt-caching wire types, provider routing, reasoning config,
 //! tool definitions, and the top-level `ChatRequest` POST body.
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
 use crate::dto::chat::ChatMessage;
 
@@ -43,6 +45,36 @@ pub(crate) struct ContentPart {
     cache_control: Option<CacheControl>,
 }
 
+/// The `image_url` object of an [`ImagePart`]. `url` is a `data:<mime>;base64,…`
+/// data-URL built from the on-disk image bytes at send time (the bytes are NOT
+/// stored in the message — see [`crate::dto::chat::Attachment`]).
+#[derive(Serialize)]
+pub(crate) struct ImageUrl {
+    url: String,
+}
+
+/// One `image_url` content part: `{"type":"image_url","image_url":{"url":"data:…"}}`.
+/// Emitted only for a user message whose attachments survive the capability gate
+/// (the current model can read images). `pub(crate)` only for reachability under
+/// the wire types; never named outside this module.
+#[derive(Serialize)]
+pub(crate) struct ImagePart {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    image_url: ImageUrl,
+}
+
+/// One element of a multi-part message `content` array: either a `text` part
+/// (the existing cache-aware [`ContentPart`]) or an `image_url` part. `#[serde(untagged)]`
+/// so each serialises to its own shape inline in the array, matching the
+/// OpenAI/OpenRouter content-parts format.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum WirePart {
+    Text(ContentPart),
+    Image(ImagePart),
+}
+
 /// Message `content` on the wire: either a plain string (no caching, identical
 /// to the old format) or an array of parts (when a `cache_control` breakpoint
 /// must be attached). `#[serde(untagged)]` makes the string serialise as a bare
@@ -55,7 +87,7 @@ pub(crate) struct ContentPart {
 #[serde(untagged)]
 pub(crate) enum WireContent {
     Text(String),
-    Parts(Vec<ContentPart>),
+    Parts(Vec<WirePart>),
 }
 
 /// Serialise-only mirror of [`ChatMessage`] for the request body. Field names /
@@ -97,11 +129,64 @@ pub struct WireMessage {
 /// fresh system message), the whole content is emitted as one cached part — the
 /// original pre-split behaviour.
 pub fn to_wire(messages: Vec<ChatMessage>) -> Vec<WireMessage> {
+    to_wire_with_images(messages, None)
+}
+
+/// Image-attachment context for [`to_wire_with_images`]: where the on-disk images
+/// live + whether the target model can read them. Built by the streaming send
+/// path; the secondary/oneshot paths pass `None` (they never carry attachments).
+pub struct ImageWireCtx {
+    /// The SESSION directory `<…>/<uuid>/`. Each attachment's `rel_path`
+    /// (`images/NN-name.ext`) is resolved against this to read the bytes back.
+    pub session_dir: PathBuf,
+    /// Whether the resolved Main model accepts image inputs (from
+    /// `model_takes_images` over the cached catalogue). When false, image parts
+    /// are silently stripped (the submit-time guard in handle_submit already
+    /// posted a user-facing notice before the wire build runs).
+    pub model_takes_images: bool,
+}
+
+/// Convert a conversation history into wire messages, attaching the prompt-cache
+/// breakpoint to the System message AND — when `image_ctx` is `Some` — rendering
+/// any user-message image attachments as `image_url` content parts (or stripping
+/// them with a model-visible warning when the model can't read images).
+///
+/// The System message gets `WireContent::Parts`; a user message WITH attachments
+/// also becomes `WireContent::Parts` (a text part + one image_url part per
+/// surviving attachment); EVERY message without attachments serialises as
+/// `WireContent::Text` — a plain `"content":"…"` string, byte-identical to the
+/// pre-attachment wire format, so nothing regresses for them.
+///
+/// The System content may carry a [`CACHE_SPLIT_MARK`](crate::dto::chat::CACHE_SPLIT_MARK)
+/// boundary that separates the STABLE cached head (base prompt + plan-word steer)
+/// from the VOLATILE tail (project file listing + awareness summary, which change
+/// across sessions/turns). When present, the content is split once at the mark
+/// (which is stripped, never sent):
+/// - the head becomes a `ContentPart` WITH the `cache_control: ephemeral`
+///   breakpoint — only this byte-stable prefix is cached, so file changes in the
+///   tail never bust the cache,
+/// - the tail becomes a SECOND `ContentPart` WITHOUT `cache_control`, emitted only
+///   when non-empty (an empty tail collapses to the single cached part).
+///
+/// When the System content has NO mark (e.g. secondary/utility calls that build a
+/// fresh system message), the whole content is emitted as one cached part — the
+/// original pre-split behaviour.
+pub fn to_wire_with_images(
+    messages: Vec<ChatMessage>,
+    image_ctx: Option<&ImageWireCtx>,
+) -> Vec<WireMessage> {
     messages
         .into_iter()
         .map(|m| {
             let content = if m.role == crate::dto::chat::Role::System {
                 WireContent::Parts(system_parts(m.content))
+            } else if !m.attachments.is_empty() {
+                // A message carrying image attachments becomes a parts array: the
+                // typed text (marker included) + image_url / warning parts. When
+                // there is no image context (secondary/oneshot path) the text
+                // still rides as a parts array with no images — harmless, but in
+                // practice those paths never carry attachments.
+                WireContent::Parts(attachment_parts(&m.content, &m.attachments, image_ctx))
             } else {
                 WireContent::Text(m.content)
             };
@@ -131,6 +216,59 @@ pub fn to_wire(messages: Vec<ChatMessage>) -> Vec<WireMessage> {
         .collect()
 }
 
+/// Build a user message's content parts: the typed text first, then — per
+/// attachment — either an `image_url` part (model CAN read images) or nothing on
+/// the image rail plus ONE appended warning text part naming every stripped image
+/// (model CANNOT read images, or no context). The text part is always present so
+/// the `[Image #N]` markers the user typed stay visible to the model.
+fn attachment_parts(
+    text: &str,
+    attachments: &[crate::dto::chat::Attachment],
+    image_ctx: Option<&ImageWireCtx>,
+) -> Vec<WirePart> {
+    let mut parts: Vec<WirePart> = Vec::with_capacity(1 + attachments.len());
+    parts.push(WirePart::Text(ContentPart {
+        kind: "text",
+        text: text.to_string(),
+        cache_control: None,
+    }));
+
+    let capable = image_ctx.map(|c| c.model_takes_images).unwrap_or(false);
+    if capable {
+        // SOURCE OF RECORD IS DISK: read each image off disk and base64-encode it
+        // into a data-URL at send time, so resume re-derives it from the file.
+        // An unreadable file is silently skipped (no crash) — the marker still
+        // shows in the text part so the model knows an image was intended.
+        let ctx = image_ctx.expect("capable implies Some");
+        for att in attachments {
+            if let Some(url) = data_url_for(&ctx.session_dir, att) {
+                parts.push(WirePart::Image(ImagePart {
+                    kind: "image_url",
+                    image_url: ImageUrl { url },
+                }));
+            }
+        }
+    } else {
+        // SILENT STRIP: the submit-time guard (handle_submit) already blocks
+        // sending images to a non-vision model and shows a user-facing chat
+        // notice; here we just omit the image parts (safety net for a
+        // cold-cache / capability-flip race).
+        let _ = attachments; // nothing to push
+    }
+    parts
+}
+
+/// Read an attachment's on-disk bytes and build its `data:<mime>;base64,<…>` URL,
+/// or `None` when the file can't be read. `rel_path` (`images/NN-name.ext`) is
+/// resolved against the session dir — the bytes are NEVER taken from the message.
+fn data_url_for(session_dir: &Path, att: &crate::dto::chat::Attachment) -> Option<String> {
+    use base64::Engine;
+    let path = session_dir.join(&att.rel_path);
+    let bytes = std::fs::read(&path).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{};base64,{}", att.mime, b64))
+}
+
 /// Build the System message's wire content parts, splitting the stable cached head
 /// from the volatile tail on [`CACHE_SPLIT_MARK`](crate::dto::chat::CACHE_SPLIT_MARK).
 ///
@@ -138,33 +276,33 @@ pub fn to_wire(messages: Vec<ChatMessage>) -> Vec<WireMessage> {
 ///   tail part included only if non-empty; the mark itself is stripped.
 /// - mark absent (or an empty tail) → a single cached part holding the whole
 ///   content — the original behaviour.
-fn system_parts(content: String) -> Vec<ContentPart> {
+fn system_parts(content: String) -> Vec<WirePart> {
     match content.split_once(crate::dto::chat::CACHE_SPLIT_MARK) {
         Some((head, tail)) if !tail.is_empty() => vec![
-            ContentPart {
+            WirePart::Text(ContentPart {
                 kind: "text",
                 text: head.to_string(),
                 cache_control: Some(CacheControl { kind: "ephemeral" }),
-            },
-            ContentPart {
+            }),
+            WirePart::Text(ContentPart {
                 kind: "text",
                 text: tail.to_string(),
                 cache_control: None,
-            },
+            }),
         ],
         // No mark, or an empty tail: one cached part holding the head (mark
         // stripped). `split_once` returns the head before the mark; with no mark
         // the whole string is the head.
-        Some((head, _)) => vec![ContentPart {
+        Some((head, _)) => vec![WirePart::Text(ContentPart {
             kind: "text",
             text: head.to_string(),
             cache_control: Some(CacheControl { kind: "ephemeral" }),
-        }],
-        None => vec![ContentPart {
+        })],
+        None => vec![WirePart::Text(ContentPart {
             kind: "text",
             text: content,
             cache_control: Some(CacheControl { kind: "ephemeral" }),
-        }],
+        })],
     }
 }
 

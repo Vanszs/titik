@@ -30,4 +30,4 @@ mod catalogue;
 // Re-export the entire public surface so every external path is unchanged.
 pub use types::{Conn, EffortCaps};
 pub use client::OpenRouterClient;
-pub use catalogue::{effort_caps, context_length_for};
+pub use catalogue::{effort_caps, context_length_for, model_takes_images};

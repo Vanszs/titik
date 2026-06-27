@@ -29,6 +29,8 @@ pub(super) fn handle_new(
     state.rest.awaiting_approval = false;
     state.rest.tool_idx = 0;
     state.rest.tool_results.clear();
+    // Drop any staged image attachments so they don't leak into the new session.
+    state.rest.pending_attachments.clear();
     let _ = state.rest.take_stream(); // discard partial; belongs to old session
     let mut sess = match store::create_session() {
         Ok(s) => s,

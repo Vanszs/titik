@@ -29,6 +29,17 @@ fn paste_single_line(text: &str, mut sink: impl FnMut(char)) {
 pub fn handle_paste(state: &mut AppState, text: &str) {
     match &mut state.mode {
         Mode::Chat => {
+            // Image-path paste: if the WHOLE pasted text is a path to an existing
+            // image file, route it through the ingest core — copy it into the
+            // session's images/ dir, stage the attachment, and insert an
+            // `[Image #N]` marker — instead of dumping the raw path into the input.
+            // Non-image / non-path / multi-token pastes fall through to the verbatim
+            // text insert below, exactly as before.
+            if let Some(path) = image_path_paste(text) {
+                if state.rest.try_attach_image_path(&path) {
+                    return;
+                }
+            }
             // Multiline verbatim: '\n' is kept (newline in the input, never a
             // submit); only the bare CR of a CRLF pair is dropped.
             for c in text.chars() {
@@ -127,5 +138,67 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
         // No text entry on the effort picker or the loading splash — paste is a
         // no-op.
         Mode::Effort(_) | Mode::Loading(_) => {}
+    }
+}
+
+/// If the pasted `text` is a path to an existing image file, return the cleaned
+/// path as an owned String. Otherwise return `None` (the paste is treated as
+/// ordinary text).
+///
+/// Cleaning steps:
+/// 1. Strip leading/trailing quotes (if surrounded by matching `"` or `'`).
+/// 2. Strip `file://` prefix if present.
+/// 3. Unescape shell backslash-escapes (`\<char>` → `<char>`), so drag-and-drop
+///    paths with escaped spaces work (e.g., `Screenshot\ 2026` → `Screenshot 2026`).
+///
+/// The extension + on-disk existence checks gate the detection:
+/// - Image extension must be recognized (cf. `has_image_extension`).
+/// - The path must exist as a file on disk.
+///
+/// This means prose mentioning a filename won't hijack the paste (it won't be a
+/// real file), but paths with spaces work as long as they exist.
+fn image_path_paste(text: &str) -> Option<String> {
+    let mut cleaned = text.trim().to_string();
+    
+    // Strip surrounding quotes if present (matching pair: "" or '')
+    if (cleaned.starts_with('"') && cleaned.ends_with('"'))
+        || (cleaned.starts_with('\'') && cleaned.ends_with('\''))
+    {
+        cleaned = cleaned[1..cleaned.len() - 1].to_string();
+    }
+    
+    // Strip file:// scheme if present
+    if let Some(stripped) = cleaned.strip_prefix("file://") {
+        cleaned = stripped.to_string();
+    }
+    
+    // Unescape backslash-escapes: replace \<char> with <char>
+    let mut unescaped = String::new();
+    let mut chars = cleaned.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            } else {
+                unescaped.push(c);
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    cleaned = unescaped;
+    
+    if cleaned.is_empty() {
+        return None;
+    }
+    
+    if !crate::model::attachment::has_image_extension(&cleaned) {
+        return None;
+    }
+    
+    if std::path::Path::new(&cleaned).is_file() {
+        Some(cleaned)
+    } else {
+        None
     }
 }

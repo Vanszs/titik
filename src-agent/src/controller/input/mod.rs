@@ -15,6 +15,7 @@
 mod action;
 mod agents;
 mod chat;
+mod clipboard;
 mod key_input;
 mod paste;
 mod picker;
@@ -22,6 +23,7 @@ mod settings;
 
 pub use action::Action;
 pub use chat::{file_ref_partial, handle_chat};
+pub use clipboard::request_clipboard_image;
 pub use key_input::handle_key_input;
 pub use paste::handle_paste;
 pub use picker::handle_picker;
