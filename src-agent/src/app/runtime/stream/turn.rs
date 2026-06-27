@@ -34,10 +34,10 @@ fn is_image_input_error(e: &str) -> bool {
 /// failure; a save error is surfaced only if the stream itself succeeded.
 pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Option<String>) {
     // Bind session `sess_idx`'s runtime once: the per-session fields (session,
-    // streaming buffers, waiting, task handle) live here, while the cumulative
-    // token/cost totals + config stay on `rest` as disjoint fields. Borrowing
-    // `rest.sessions[sess_idx]` directly (not via `fg_mut()`, a `&mut self` method
-    // that would lock all of `rest`) keeps those disjoint borrows legal.
+    // streaming buffers, waiting, task handle, and now the cumulative token/cost
+    // totals) all live here, while `config` stays on `rest` as a disjoint field.
+    // Borrowing `rest.sessions[sess_idx]` directly (not via `fg_mut()`, a `&mut
+    // self` method that would lock all of `rest`) keeps those disjoint borrows legal.
     let rt = &mut rest.sessions[sess_idx];
     // Take the in-flight usage unconditionally so it can never leak into the
     // next turn, even when the buffer is empty or there's no session to commit.
@@ -49,6 +49,7 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Opt
     let (content, msg_reasoning) = final_answer(buf, reasoning);
     let mut save_err = None;
     if !content.is_empty() {
+        let mut committed = false;
         if let Some(sess) = rt.session.as_mut() {
             let _ = crate::model::msglog::append(
                 &sess.path,
@@ -60,12 +61,16 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Opt
             if let Err(e) = sess.save() {
                 save_err = Some(e.to_string());
             }
-            // tokens_in = current context size (latest prompt), not cumulative.
-            // tokens_out and cost are cumulative (each turn adds new spend).
+            committed = true;
+        }
+        // tokens_in = current context size (latest prompt), not cumulative.
+        // tokens_out and cost are cumulative (each turn adds new spend). Written
+        // to THIS session's own counters (the `sess` borrow above has ended).
+        if committed {
             if let Some((pt, ct, cost)) = usage {
-                rest.tokens_in = pt;        // current context size, not a sum
-                rest.tokens_out += ct;
-                rest.cost += cost;
+                rt.tokens_in = pt;        // current context size, not a sum
+                rt.tokens_out += ct;
+                rt.cost += cost;
             }
         }
         // Record into the global usage ledger (best-effort telemetry, non-fatal).
@@ -84,7 +89,7 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Opt
                     &sess.id,
                     &sess.pwd_hash,
                     pt,
-                    rest.tokens_cached,
+                    rt.tokens_cached,
                     ct,
                     cost,
                 );
@@ -177,9 +182,10 @@ pub(crate) fn advance_turn(
     {
         // Bind session `sess_idx`'s runtime directly (not via `fg_mut()`, a
         // `&mut self` method that would lock all of `rest`) so the per-session
-        // `session` and the cumulative `tokens_*` totals on `state.rest` stay
-        // independently borrowable as disjoint fields.
+        // `session` and this session's own `tokens_*` totals stay independently
+        // borrowable; `state.rest.config` remains a disjoint field of `rest`.
         let rt = &mut state.rest.sessions[sess_idx];
+        let mut committed = false;
         if let Some(sess) = rt.session.as_mut() {
             if !pending.is_empty() {
                 let content = buf.clone().unwrap_or_default();
@@ -200,12 +206,15 @@ pub(crate) fn advance_turn(
                     }
                 }
             }
-            // Counter update: disjoint fields of `state.rest`, accessed after the
-            // session push so the borrows don't overlap problematically.
+            committed = true;
+        }
+        // Counter update on THIS session's own totals, after the `sess` borrow
+        // above ends so the disjoint-field borrows don't overlap.
+        if committed {
             if let Some((pt, ct, cost)) = usage {
-                state.rest.tokens_in = pt; // current context size, not a sum
-                state.rest.tokens_out += ct;
-                state.rest.cost += cost;
+                rt.tokens_in = pt; // current context size, not a sum
+                rt.tokens_out += ct;
+                rt.cost += cost;
             }
         }
         // Record into the global usage ledger (best-effort telemetry, non-fatal).
@@ -224,7 +233,7 @@ pub(crate) fn advance_turn(
                     &sess.id,
                     &sess.pwd_hash,
                     pt,
-                    state.rest.tokens_cached,
+                    rt.tokens_cached,
                     ct,
                     cost,
                 );

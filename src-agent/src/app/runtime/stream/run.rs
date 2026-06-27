@@ -220,7 +220,7 @@ pub(crate) fn start_stream_task(
         Duration::from_secs(120)
     };
     let cache_warm = state.rest.sessions[sess_idx].provider_caches
-        && state.rest.tokens_cached > 0
+        && state.rest.sessions[sess_idx].tokens_cached > 0
         && gap.is_some_and(|g| g < cold_window);
     let engage_pct = if cache_warm {
         super::super::shortsend::ENGAGE_WARM_PCT

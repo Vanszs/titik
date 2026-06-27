@@ -157,9 +157,11 @@ pub(super) fn handle_save_creds(
         .filter(|r| !r.api_key.is_empty())
         .map(|_| build_client())
     });
-    // Seed totals from the (new or picker-prefilled) session's log.
+    // Seed THIS (foreground) session's own counters from its log (new or
+    // picker-prefilled session being confirmed).
     if let Some(p) = state.rest.fg().session.as_ref().map(|s| s.path.clone()) {
-        state.rest.load_token_totals(&p);
+        let fg = state.rest.foreground;
+        state.rest.load_token_totals(fg, &p);
     }
     state.rest.prev_session = None; // committed; discard fallback
     // Creds confirmed — a /new-spawned session is no longer pending, so a later

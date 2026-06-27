@@ -81,10 +81,10 @@ fn service_session(
                     // arrives just before Done.
                     state.rest.sessions[idx].pending_usage = Some((prompt_tokens, completion_tokens, cost));
                     // Cached-prompt-token count for THIS prompt (current context,
-                    // like tokens_in — not cumulative). Set straight away so the
-                    // readout can show the cache hit even on a tool round-trip that
-                    // commits no assistant text.
-                    state.rest.tokens_cached = cached_tokens;
+                    // like tokens_in — not cumulative). Set straight away on THIS
+                    // session so its readout can show the cache hit even on a tool
+                    // round-trip that commits no assistant text.
+                    state.rest.sessions[idx].tokens_cached = cached_tokens;
                     // Latch: once any response reports cache hits we know this
                     // provider supports prompt caching. Never reset.
                     if cached_tokens > 0 {
@@ -365,18 +365,19 @@ fn service_session(
                     let _ = sess.save();
                 }
             }
-            // Merge sub-agent spend into the session total + record a ledger row.
-            // Done for BOTH paths (chat_fold = /task, defer = task-tool) at the
-            // single point where a terminal status is first observed. Non-fatal:
-            // skipped when no usage was ever reported (provider omits it). The
-            // cost/tokens_out counters stay GLOBAL on `rest` (kept as-is this stage).
+            // Merge sub-agent spend into the OWNING session's totals + record a
+            // ledger row. Done for BOTH paths (chat_fold = /task, defer = task-tool)
+            // at the single point where a terminal status is first observed.
+            // Non-fatal: skipped when no usage was ever reported (provider omits it).
+            // The spend credits THIS session (`sessions[idx]`), never a global, so
+            // each tab's counters reflect only its own (and its sub-agents') usage.
             if let Some((sub_model_id, sub_ti, sub_to, sub_cost)) = sub_usage {
-                // Merge into the counters: cost and tokens_out are cumulative
-                // (summed); tokens_in is the main-context gauge and must NOT be
-                // touched (adding sub-agent prompt size would corrupt the
+                // Merge into THIS session's counters: cost and tokens_out are
+                // cumulative (summed); tokens_in is the main-context gauge and must
+                // NOT be touched (adding sub-agent prompt size would corrupt the
                 // context-window display).
-                state.rest.cost += sub_cost;
-                state.rest.tokens_out += sub_to;
+                state.rest.sessions[idx].cost += sub_cost;
+                state.rest.sessions[idx].tokens_out += sub_to;
                 // Record one ledger row per sub-agent completion (best-effort).
                 let (sess_uuid, pwd_hash) = state
                     .rest

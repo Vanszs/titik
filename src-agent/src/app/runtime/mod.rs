@@ -227,8 +227,10 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
                     let _ = sess.save();
                     let sess_path = sess.path.clone();
                     st.rest.fg_mut().session = Some(sess);
-                    // Fresh startup session → totals 0; harmless and explicit.
-                    st.rest.load_token_totals(&sess_path);
+                    // Fresh startup session → seed ITS OWN counters (0 here, since a
+                    // brand-new session has no ledger yet); harmless and explicit.
+                    let fg = st.rest.foreground;
+                    st.rest.load_token_totals(fg, &sess_path);
                 }
                 Err(e) => {
                     // Couldn't create the session dir — fall back to the prompt.

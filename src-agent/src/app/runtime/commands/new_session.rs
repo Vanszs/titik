@@ -76,8 +76,10 @@ pub(super) fn handle_new(
     state.rest.pending_attachments.clear();
     state.rest.transcript_cache.borrow_mut().blocks.clear();
     state.rest.status = "ready".into();
-    // Fresh session → totals are 0 (the shared live counter is reset on switch;
-    // moving it per-session is a known follow-up).
+    // Fresh session → seed ITS OWN counters from its (empty) ledger, i.e. 0. No
+    // global counter to reset: the new session carries its own totals, and the
+    // previous foreground keeps its counters intact in its own slot.
+    let new_fg = state.rest.foreground;
     let sess_path = state
         .rest
         .fg()
@@ -85,7 +87,7 @@ pub(super) fn handle_new(
         .as_ref()
         .map(|s| s.path.clone());
     if let Some(p) = sess_path.as_ref() {
-        state.rest.load_token_totals(p);
+        state.rest.load_token_totals(new_fg, p);
     }
 
     if no_creds {

@@ -68,9 +68,10 @@ pub(super) fn handle_cancel_key_input(
         state.rest.reset_scroll();
         state.rest.pending_attachments.clear();
         state.rest.transcript_cache.borrow_mut().blocks.clear();
-        if let Some(p) = state.rest.fg().session.as_ref().map(|s| s.path.clone()) {
-            state.rest.load_token_totals(&p);
-        }
+        // No token reseed on this switch-back: the restored foreground carries its
+        // OWN per-session counters in its slot (untouched while it sat in the
+        // background), so we just render fg()'s. Reseeding from sqlite here would
+        // clobber a mid-turn `tokens_in` (current context) with the cumulative sum.
         // The restored foreground already holds its own lock (untouched); no
         // reconcile needed (and reconcile must not release any other session's lock).
         state.mode = Mode::Chat;
@@ -180,11 +181,10 @@ pub(super) fn handle_live_switch(
     state.rest.reset_scroll();
     state.rest.pending_attachments.clear();
     state.rest.transcript_cache.borrow_mut().blocks.clear();
-    // Seed the shared live token counter from the now-foreground session's log
-    // (moving this counter per-session is a known follow-up).
-    if let Some(p) = state.rest.fg().session.as_ref().map(|s| s.path.clone()) {
-        state.rest.load_token_totals(&p);
-    }
+    // NO token reseed on /swap: each session now carries its OWN token/cost
+    // counters in its slot, so switching foreground just renders fg()'s — never
+    // the previous tab's, never a sum. (Reseeding from sqlite here would also
+    // clobber the target's mid-turn `tokens_in` with its cumulative ledger sum.)
     // KEYLESS client → rebuild for a fresh plan_word at this session boundary,
     // gated on the target having a usable Main route (preserve no-client-no-send).
     let usable = state
@@ -274,9 +274,10 @@ pub(super) fn handle_picker_select(
         state.rest.pending_attachments.clear();
         let sess_path = sess.path.clone();
         state.rest.fg_mut().session = Some(sess);
-        // Existing session: seed the running totals from its full sqlite
-        // log so the readout reflects prior usage.
-        state.rest.load_token_totals(&sess_path);
+        // Existing session: seed THIS (foreground) session's own counters from its
+        // full sqlite log so the readout reflects prior usage.
+        let fg = state.rest.foreground;
+        state.rest.load_token_totals(fg, &sess_path);
         state.rest.reset_scroll();
         // Land in Chat first, THEN warm: `warm_session` is non-blocking and
         // may upgrade the mode to `Mode::Loading` (animated splash) when it

@@ -52,6 +52,20 @@ pub struct SessionRuntime {
     /// Usage for the in-flight response, captured from the StreamEvent::Usage
     /// chunk and consumed when the assistant message is committed.
     pub pending_usage: Option<(u64, u64, f64)>,
+    /// THIS session's cumulative token/cost totals (summed from its own
+    /// messages.sqlite on open via `load_token_totals`, incremented per response).
+    /// Per-session so each tab tracks only its own usage — switching foreground
+    /// just renders the active session's counters, never the sum. Survive /compact.
+    /// `tokens_in` is the CURRENT context size (latest prompt), not a running sum;
+    /// `tokens_out` and `cost` accumulate.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost: f64,
+    /// Prompt tokens served from the prompt cache on THIS session's LATEST
+    /// response (a cache hit at the discounted rate). Like `tokens_in`, tracks the
+    /// current prompt, not a cumulative sum; set from `StreamEvent::Usage` each
+    /// response, 0 on a cold prefix or a provider that doesn't report cache stats.
+    pub tokens_cached: u64,
     /// Tool calls emitted by the in-flight stream, stashed on
     /// `StreamEvent::ToolCalls` and consumed by `advance_turn` once the stream
     /// finalises. Empty when the model returned a plain (final) answer.
@@ -188,6 +202,10 @@ impl SessionRuntime {
             active_rx: None,
             harness_rx: None,
             pending_usage: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost: 0.0,
+            tokens_cached: 0,
             pending_tool_calls: Vec::new(),
             agent_steps: 0,
             tool_idx: 0,

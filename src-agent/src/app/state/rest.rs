@@ -1,8 +1,8 @@
 //! [`AppStateRest`] struct definition and its constructor/default impl.
 //!
 //! The mode-independent "rest of the world" state: input buffer, status line,
-//! scroll, global usage totals, model-catalogue cache, and the foreground
-//! session set. The per-session EXECUTION state (the active [`Session`], the
+//! scroll, model-catalogue cache, and the foreground session set. The
+//! per-session token/cost counters and EXECUTION state (the active [`Session`], the
 //! streaming machinery, the tool-approval / sub-agent state machines, …) lives
 //! in [`SessionRuntime`]; `sessions` always holds at least one and `foreground`
 //! indexes the active one. Methods are split into sibling submodules (input,
@@ -90,16 +90,6 @@ pub struct AppStateRest {
     pub select_pending: bool,
     /// True while the conversation is dumped to the normal terminal for copying.
     pub select_active: bool,
-    /// Cumulative session token/cost totals (summed from messages.sqlite on
-    /// open, incremented per response). Survive /compact.
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub cost: f64,
-    /// Prompt tokens served from the prompt cache on the LATEST response (a cache
-    /// hit at the discounted rate). Like `tokens_in`, this tracks the current
-    /// prompt, not a cumulative sum; set from `StreamEvent::Usage` each response,
-    /// 0 on a cold prefix or a provider that doesn't report cache stats.
-    pub tokens_cached: u64,
     /// Cache of each committed message's rendered visual lines, reused across
     /// frames so markdown/syntect highlighting doesn't re-run every redraw.
     /// Borrowed mutably by the chat renderer through a shared `&rest` (the UI is
@@ -236,10 +226,6 @@ impl AppStateRest {
             config: AppConfig::default(),
             select_pending: false,
             select_active: false,
-            tokens_in: 0,
-            tokens_out: 0,
-            cost: 0.0,
-            tokens_cached: 0,
             transcript_cache: RefCell::new(TranscriptCache::default()),
             agent_mode: AgentMode::default(),
             launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -274,12 +260,14 @@ impl AppStateRest {
         &mut self.sessions[i]
     }
 
-    /// Load cumulative token/cost totals for `session_dir` from its sqlite log
-    /// (0 if absent). Called when a session becomes active.
-    pub fn load_token_totals(&mut self, session_dir: &std::path::Path) {
+    /// Seed session `sess_idx`'s cumulative token/cost counters from its sqlite
+    /// log (0 if absent). Called when that session is loaded/created so its OWN
+    /// counters reflect prior usage; never touches any other session's totals.
+    pub fn load_token_totals(&mut self, sess_idx: usize, session_dir: &std::path::Path) {
         let (i, o, c) = crate::model::msglog::totals(session_dir).unwrap_or((0, 0, 0.0));
-        self.tokens_in = i;
-        self.tokens_out = o;
-        self.cost = c;
+        let rt = &mut self.sessions[sess_idx];
+        rt.tokens_in = i;
+        rt.tokens_out = o;
+        rt.cost = c;
     }
 }

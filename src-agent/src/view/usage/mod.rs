@@ -570,13 +570,15 @@ fn draw_session_kpi(
         return;
     }
 
-    // Use live rest counters for tokens/cost (ahead of the ledger mid-session);
-    // call count from the DB totals (rest doesn't track a call counter).
+    // Use the FOREGROUND session's live counters for tokens/cost (ahead of the
+    // ledger mid-session, and scoped to the active session); call count from the
+    // DB totals (the runtime doesn't track a call counter).
+    let fg = rest.fg();
     let metrics: &[(&str, String)] = &[
-        ("in",     fmt_tokens_u64(rest.tokens_in)),
-        ("cached", fmt_tokens_u64(rest.tokens_cached)),
-        ("out",    fmt_tokens_u64(rest.tokens_out)),
-        ("cost",   fmt_cost(rest.cost)),
+        ("in",     fmt_tokens_u64(fg.tokens_in)),
+        ("cached", fmt_tokens_u64(fg.tokens_cached)),
+        ("out",    fmt_tokens_u64(fg.tokens_out)),
+        ("cost",   fmt_cost(fg.cost)),
         ("calls",  db_calls.to_string()),
     ];
 

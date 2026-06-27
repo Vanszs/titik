@@ -193,15 +193,22 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
         let buf = state.rest.fg_mut().take_stream();
         if let Some(b) = buf {
             if !b.is_empty() {
+                let mut committed = false;
                 if let Some(sess) = state.rest.fg_mut().session.as_mut() {
                     let content = format!("{b}  [interrupted]");
                     let _ = msglog::append(&sess.path, Role::Assistant, &content, usage);
                     sess.conversation.push_assistant(content, reasoning);
                     let _ = sess.save();
+                    committed = true;
+                }
+                // Update the FOREGROUND session's own counters once the `sess`
+                // borrow above has ended (this is the active tab being interrupted).
+                if committed {
                     if let Some((pt, ct, cost)) = usage {
-                        state.rest.tokens_in = pt;        // current context size, not a sum
-                        state.rest.tokens_out += ct;
-                        state.rest.cost += cost;
+                        let rt = state.rest.fg_mut();
+                        rt.tokens_in = pt;        // current context size, not a sum
+                        rt.tokens_out += ct;
+                        rt.cost += cost;
                     }
                 }
             }
