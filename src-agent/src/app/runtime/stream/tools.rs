@@ -22,13 +22,14 @@ fn tool_is_risky(name: &str) -> bool {
 /// hold a borrow of `state`.
 fn tac_inputs(
     state: &AppState,
+    sess_idx: usize,
     client: &Option<Arc<OpenRouterClient>>,
 ) -> Option<(
     Arc<OpenRouterClient>,
     crate::model::app_config::AppConfig,
     crate::model::settings::Settings,
 )> {
-    match (client.as_ref(), state.rest.fg().session.as_ref()) {
+    match (client.as_ref(), state.rest.sessions[sess_idx].session.as_ref()) {
         (Some(c), Some(sess)) if sess.settings.classifier_enabled => Some((
             Arc::clone(c),
             state.rest.config.clone(),
@@ -81,6 +82,7 @@ fn tac_inputs(
 /// only from the sync loop, so the `block_on` TAC call is safe.
 pub(crate) fn process_tools(
     state: &mut AppState,
+    sess_idx: usize,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
@@ -89,15 +91,15 @@ pub(crate) fn process_tools(
     // (empty when there's no user message) so the per-call `block_on` below holds
     // no borrow of `state`. The most-recent User message is the real request even
     // after the assistant's tool-call + tool-result messages were pushed.
-    let user_intent = state
-        .rest
-        .fg()
+    let user_intent = state.rest.sessions[sess_idx]
         .session
         .as_ref()
         .and_then(|sess| sess.conversation.last_user_content())
         .unwrap_or_default();
-    while state.rest.fg().tool_idx < state.rest.fg().pending_tool_calls.len() {
-        let call = state.rest.fg().pending_tool_calls[state.rest.fg().tool_idx].clone();
+    while state.rest.sessions[sess_idx].tool_idx < state.rest.sessions[sess_idx].pending_tool_calls.len() {
+        let call = state.rest.sessions[sess_idx].pending_tool_calls
+            [state.rest.sessions[sess_idx].tool_idx]
+            .clone();
         // Intercept the model-callable `task` tool BEFORE the generic
         // classify/dispatch path: spawn a background sub-agent (never classify it
         // as risky, never await it inline). UNLIKE the generic path, a SUCCESSFUL
@@ -117,7 +119,7 @@ pub(crate) fn process_tools(
             let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim();
             let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
             if agent.is_empty() || prompt.is_empty() {
-                state.rest.fg_mut().tool_results.push((
+                state.rest.sessions[sess_idx].tool_results.push((
                     call.id.clone(),
                     "error: task requires non-empty 'agent' and 'prompt'".to_string(),
                 ));
@@ -132,6 +134,7 @@ pub(crate) fn process_tools(
                 // the agent (eventually) finishes.
                 match super::spawn::spawn_or_queue(
                     state,
+                    sess_idx,
                     client,
                     handle,
                     &agent,
@@ -140,22 +143,20 @@ pub(crate) fn process_tools(
                 ) {
                     super::spawn::SpawnOutcome::Spawned(_)
                     | super::spawn::SpawnOutcome::Queued(_) => {
-                        state.rest.fg_mut().pending_subagent_calls.push(call.id.clone())
+                        state.rest.sessions[sess_idx].pending_subagent_calls.push(call.id.clone())
                     }
                     // Nothing started or queued (no client/session or unknown
                     // agent) → answer the call now so it isn't left dangling.
-                    super::spawn::SpawnOutcome::Failed => state
-                        .rest
-                        .fg_mut()
+                    super::spawn::SpawnOutcome::Failed => state.rest.sessions[sess_idx]
                         .tool_results
                         .push((call.id.clone(), format!("error: unknown agent '{agent}'"))),
                 }
             }
-            state.rest.fg_mut().tool_idx += 1;
+            state.rest.sessions[sess_idx].tool_idx += 1;
             continue;
         }
         if tool_is_risky(&call.function.name) {
-            match tac_inputs(state, client) {
+            match tac_inputs(state, sess_idx, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.
                 Some((c, config, settings)) => {
                     let verdict = handle.block_on(crate::app::harness::classify_toolcall(
@@ -174,11 +175,11 @@ pub(crate) fn process_tools(
                         // shows the verdict was "ok".
                         if mode == AgentMode::Auto {
                             // Fall through and run it inline (no prompt).
-                            state.rest.fg_mut().approval_reason = None;
+                            state.rest.sessions[sess_idx].approval_reason = None;
                         } else {
-                            state.rest.fg_mut().approval_reason =
+                            state.rest.sessions[sess_idx].approval_reason =
                                 Some(format!("classifier: ok — {}", verdict.reason));
-                            state.rest.fg_mut().awaiting_approval = true;
+                            state.rest.sessions[sess_idx].awaiting_approval = true;
                             state.rest.status =
                                 format!("approve {}? [y/n]", call.function.name);
                             return;
@@ -186,15 +187,15 @@ pub(crate) fn process_tools(
                     } else if verdict.available {
                         // Definite block. Auto records it and continues; Normal asks.
                         if mode == AgentMode::Auto {
-                            state.rest.fg_mut().tool_results.push((
+                            state.rest.sessions[sess_idx].tool_results.push((
                                 call.id.clone(),
                                 format!("blocked by harness: {}", verdict.reason),
                             ));
-                            state.rest.fg_mut().tool_idx += 1;
+                            state.rest.sessions[sess_idx].tool_idx += 1;
                             continue;
                         }
-                        state.rest.fg_mut().approval_reason = Some(verdict.reason);
-                        state.rest.fg_mut().awaiting_approval = true;
+                        state.rest.sessions[sess_idx].approval_reason = Some(verdict.reason);
+                        state.rest.sessions[sess_idx].awaiting_approval = true;
                         state.rest.status = format!("approve {}? [y/n]", call.function.name);
                         return;
                     } else {
@@ -208,8 +209,9 @@ pub(crate) fn process_tools(
                         //       Run inline and surface a toast so the degradation
                         //       is visible.
                         if mode == AgentMode::Normal {
-                            state.rest.fg_mut().approval_reason = Some(verdict.reason.clone());
-                            state.rest.fg_mut().awaiting_approval = true;
+                            state.rest.sessions[sess_idx].approval_reason =
+                                Some(verdict.reason.clone());
+                            state.rest.sessions[sess_idx].awaiting_approval = true;
                             state.rest.status =
                                 format!("approve {}? [y/n]", call.function.name);
                             return;
@@ -225,7 +227,7 @@ pub(crate) fn process_tools(
                 // Classifier disabled → original behaviour: Normal asks, Auto runs.
                 None => {
                     if mode == AgentMode::Normal {
-                        state.rest.fg_mut().awaiting_approval = true;
+                        state.rest.sessions[sess_idx].awaiting_approval = true;
                         state.rest.status = format!("approve {}? [y/n]", call.function.name);
                         return;
                     }
@@ -245,14 +247,14 @@ pub(crate) fn process_tools(
         // correctness — two writes/edits to the same file in one round would
         // otherwise race and lose a write.
         if crate::tool::DEFERRED_TOOLS.contains(&call.function.name.as_str()) {
-            dispatch_deferred(state, &call);
+            dispatch_deferred(state, sess_idx, &call);
             return;
         }
         // Instant tool: name the tool for the comet phase label and run it inline.
         state.rest.status = format!("running {}", call.function.name);
-        let result = run_tool(state, &call);
-        state.rest.fg_mut().tool_results.push((call.id.clone(), result));
-        state.rest.fg_mut().tool_idx += 1;
+        let result = run_tool(state, sess_idx, &call);
+        state.rest.sessions[sess_idx].tool_results.push((call.id.clone(), result));
+        state.rest.sessions[sess_idx].tool_idx += 1;
     }
     // Loop exhausted. PARK if there's still deferred work outstanding from this
     // round's `task`-tool sub-agent delegations (`pending_subagent_calls`). A
@@ -265,19 +267,19 @@ pub(crate) fn process_tools(
     // it lands, and once BOTH pending lists empty the resume gate re-enters
     // `process_tools` (which eventually reaches `finish_tool_round`). `waiting`
     // stays true and `awaiting_approval` stays false, so the comet keeps shimmering.
-    let has_subagents = !state.rest.fg().pending_subagent_calls.is_empty();
-    let has_tool_tasks = !state.rest.fg().pending_tool_tasks.is_empty();
+    let has_subagents = !state.rest.sessions[sess_idx].pending_subagent_calls.is_empty();
+    let has_tool_tasks = !state.rest.sessions[sess_idx].pending_tool_tasks.is_empty();
     if has_subagents || has_tool_tasks {
         if has_subagents {
-            state.rest.fg_mut().awaiting_subagents = true;
+            state.rest.sessions[sess_idx].awaiting_subagents = true;
         }
         if has_tool_tasks {
-            state.rest.fg_mut().awaiting_tool_tasks = true;
+            state.rest.sessions[sess_idx].awaiting_tool_tasks = true;
         }
         // Status: prefer the delegation message when sub-agents are pending (its
         // existing wording is unchanged); otherwise show the fetch is in flight.
         if has_subagents {
-            let n = state.rest.fg().pending_subagent_calls.len();
+            let n = state.rest.sessions[sess_idx].pending_subagent_calls.len();
             state.rest.status = if n == 1 {
                 "delegating… (1 sub-agent)".into()
             } else {
@@ -288,7 +290,7 @@ pub(crate) fn process_tools(
         }
         return;
     }
-    finish_tool_round(state, client, handle);
+    finish_tool_round(state, sess_idx, client, handle);
 }
 
 /// Resume a tool round that was PARKED on deferred work — either `task`-tool
@@ -311,10 +313,11 @@ pub(crate) fn process_tools(
 /// directly) is what makes the deferred lane SEQUENTIAL.
 pub(crate) fn resume_after_subagents(
     state: &mut AppState,
+    sess_idx: usize,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
-    process_tools(state, client, handle);
+    process_tools(state, sess_idx, client, handle);
 }
 
 /// Finish a completed tool round: flush every collected result into the
@@ -325,14 +328,15 @@ pub(crate) fn resume_after_subagents(
 /// (defensive — a turn in flight normally implies both are present).
 fn finish_tool_round(
     state: &mut AppState,
+    sess_idx: usize,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
     // Push the collected tool results into the conversation + log them. Bind the
-    // foreground runtime once so `session` (mut) + `tool_results` (read) are
+    // session runtime once so `session` (mut) + `tool_results` (read) are
     // disjoint field borrows of the same `SessionRuntime`.
     {
-        let rt = state.rest.fg_mut();
+        let rt = &mut state.rest.sessions[sess_idx];
         if let Some(sess) = rt.session.as_mut() {
             for (id, result) in &rt.tool_results {
                 let _ = crate::model::msglog::append(&sess.path, Role::Tool, result, None);
@@ -345,44 +349,42 @@ fn finish_tool_round(
     // Live reload: if `remember` or `forget` ran this round, re-inject the updated
     // MEMORY.md into messages[0] so the model sees the change immediately.
     // (`recall` is read-only and must NOT trigger a rebuild.)
-    let memory_mutated = state
-        .rest
-        .fg()
+    let memory_mutated = state.rest.sessions[sess_idx]
         .pending_tool_calls
         .iter()
         .any(|c| matches!(c.function.name.as_str(), "remember" | "forget"));
     if memory_mutated {
-        if let Some(sess) = state.rest.fg_mut().session.as_mut() {
+        if let Some(sess) = state.rest.sessions[sess_idx].session.as_mut() {
             sess.rebuild_system();
         }
     }
 
     // Round done: clear the per-round machine before the next model call.
-    state.rest.fg_mut().pending_tool_calls.clear();
-    state.rest.fg_mut().tool_idx = 0;
-    state.rest.fg_mut().tool_results.clear();
+    state.rest.sessions[sess_idx].pending_tool_calls.clear();
+    state.rest.sessions[sess_idx].tool_idx = 0;
+    state.rest.sessions[sess_idx].tool_results.clear();
 
     // Continue the turn: hand the updated history back to the model. The
     // streaming buffer is re-armed so the next assistant text accumulates
     // cleanly. `waiting` stays true (the turn isn't finished yet). Compute the
     // history into an owned Option FIRST so no session borrow is held across the
-    // `fg_mut()` writes in the no-session arm.
-    let history = match (state.rest.fg().session.as_ref(), client.as_ref()) {
+    // per-session writes in the no-session arm.
+    let history = match (state.rest.sessions[sess_idx].session.as_ref(), client.as_ref()) {
         (Some(sess), Some(_)) => Some(sess.conversation.history()),
         _ => None,
     };
     let Some(history) = history else {
-        state.rest.fg_mut().waiting = false;
-        state.rest.fg_mut().current_task = None;
-        state.rest.fg_mut().agent_steps = 0;
+        state.rest.sessions[sess_idx].waiting = false;
+        state.rest.sessions[sess_idx].current_task = None;
+        state.rest.sessions[sess_idx].agent_steps = 0;
         state.rest.status = "no active session".into();
         return;
     };
     // The tool round is done; this re-stream is a model wait, so label it the same
     // "thinking" phase the comet sweeps (not a tool run).
     state.rest.status = "thinking".into();
-    state.rest.fg_mut().begin_stream();
-    super::run::start_stream_task(history, state, client, handle);
+    state.rest.sessions[sess_idx].begin_stream();
+    super::run::start_stream_task(history, state, sess_idx, client, handle);
 }
 
 /// Run a single tool call against the session workspace and return its result
@@ -392,8 +394,8 @@ fn finish_tool_round(
 ///
 /// `pub(crate)` so the approve/deny action handlers can run a single tool when
 /// resuming the approval machine.
-pub(crate) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
-    let ctx = super::spawn::build_tool_ctx(state);
+pub(crate) fn run_tool(state: &mut AppState, sess_idx: usize, call: &ToolCall) -> String {
+    let ctx = super::spawn::build_tool_ctx(state, sess_idx);
     crate::tool::execute_tool(&ctx, call)
 }
 
@@ -414,17 +416,20 @@ pub(crate) fn run_tool(state: &mut AppState, call: &ToolCall) -> String {
 /// / Option fields, no borrows) so it moves in cleanly, and the `UnboundedSender`
 /// is Send so it can fire from this off-runtime thread. The result channel is
 /// created lazily once per session, then reused.
-pub(crate) fn dispatch_deferred(state: &mut AppState, call: &ToolCall) {
-    // Lazily create the result channel once per session, then reuse it.
-    if state.rest.fg().tool_task_tx.is_none() {
+pub(crate) fn dispatch_deferred(state: &mut AppState, sess_idx: usize, call: &ToolCall) {
+    // Lazily create THIS session's result channel once, then reuse it. The
+    // spawned thread fires back over session `sess_idx`'s own `tool_task_tx`, so
+    // the result is routed structurally to that session's drain (no id tag
+    // needed) regardless of which session is foreground when it lands.
+    if state.rest.sessions[sess_idx].tool_task_tx.is_none() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        state.rest.fg_mut().tool_task_tx = Some(tx);
-        state.rest.fg_mut().tool_task_rx = Some(rx);
+        state.rest.sessions[sess_idx].tool_task_tx = Some(tx);
+        state.rest.sessions[sess_idx].tool_task_rx = Some(rx);
     }
-    let ctx = super::spawn::build_tool_ctx(state);
+    let ctx = super::spawn::build_tool_ctx(state, sess_idx);
     let call_cloned = call.clone();
     let id = call.id.clone();
-    let tx = state.rest.fg().tool_task_tx.as_ref().unwrap().clone();
+    let tx = state.rest.sessions[sess_idx].tool_task_tx.as_ref().unwrap().clone();
     // Phase label for the comet: name the tool running off-thread so the
     // shimmering status surfaces what the agent is doing while it's parked.
     state.rest.status = format!("running {}", call.function.name);
@@ -432,13 +437,13 @@ pub(crate) fn dispatch_deferred(state: &mut AppState, call: &ToolCall) {
         let result = crate::tool::execute_tool(&ctx, &call_cloned);
         let _ = tx.send((id, result));
     });
-    state.rest.fg_mut().pending_tool_tasks.push(call.id.clone());
-    state.rest.fg_mut().tool_idx += 1;
+    state.rest.sessions[sess_idx].pending_tool_tasks.push(call.id.clone());
+    state.rest.sessions[sess_idx].tool_idx += 1;
     // Mark the round PARKED on async tool work so the event-loop resume gate
     // (which requires this flag set AND `pending_tool_tasks` empty) fires once the
     // result lands. The caller `return`s right after this, leaving the round
     // parked; `waiting` stays true so the comet keeps shimmering.
-    state.rest.fg_mut().awaiting_tool_tasks = true;
+    state.rest.sessions[sess_idx].awaiting_tool_tasks = true;
 }
 
 /// Halt the current turn by answering every still-pending tool call with
@@ -449,17 +454,15 @@ pub(crate) fn dispatch_deferred(state: &mut AppState, call: &ToolCall) {
 /// Shares the shape of [`super::actions`]'s `DenyTool` handler; used by the
 /// harness workspace check (WC) to refuse a turn whose workspace isn't allowed.
 /// Pending calls from `tool_idx` onward are the unanswered ones.
-pub(crate) fn deny_all_pending(state: &mut AppState, reason: &str) {
-    let results = state.rest.fg().tool_results.clone();
-    let pending_ids: Vec<String> = state
-        .rest
-        .fg()
+pub(crate) fn deny_all_pending(state: &mut AppState, sess_idx: usize, reason: &str) {
+    let results = state.rest.sessions[sess_idx].tool_results.clone();
+    let pending_ids: Vec<String> = state.rest.sessions[sess_idx]
         .pending_tool_calls
         .iter()
-        .skip(state.rest.fg().tool_idx)
+        .skip(state.rest.sessions[sess_idx].tool_idx)
         .map(|c| c.id.clone())
         .collect();
-    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
+    if let Some(sess) = state.rest.sessions[sess_idx].session.as_mut() {
         for (id, result) in &results {
             let _ = crate::model::msglog::append(&sess.path, Role::Tool, result, None);
             sess.conversation.push_tool(id.clone(), result.clone());
@@ -470,18 +473,19 @@ pub(crate) fn deny_all_pending(state: &mut AppState, reason: &str) {
         }
         let _ = sess.save();
     }
-    state.rest.fg_mut().pending_tool_calls.clear();
-    state.rest.fg_mut().tool_idx = 0;
-    state.rest.fg_mut().tool_results.clear();
-    state.rest.fg_mut().agent_steps = 0;
-    state.rest.fg_mut().awaiting_approval = false;
-    state.rest.fg_mut().approval_reason = None;
-    state.rest.fg_mut().waiting = false;
-    state.rest.fg_mut().current_task = None;
+    let rt = &mut state.rest.sessions[sess_idx];
+    rt.pending_tool_calls.clear();
+    rt.tool_idx = 0;
+    rt.tool_results.clear();
+    rt.agent_steps = 0;
+    rt.awaiting_approval = false;
+    rt.approval_reason = None;
+    rt.waiting = false;
+    rt.current_task = None;
     // Clear deferred-task state so a killed WC turn can't ghost-restart
     // via a stale awaiting_tool_tasks=true or leftover pending ids.
-    state.rest.fg_mut().pending_subagent_calls.clear();
-    state.rest.fg_mut().awaiting_subagents = false;
-    state.rest.fg_mut().pending_tool_tasks.clear();
-    state.rest.fg_mut().awaiting_tool_tasks = false;
+    rt.pending_subagent_calls.clear();
+    rt.awaiting_subagents = false;
+    rt.pending_tool_tasks.clear();
+    rt.awaiting_tool_tasks = false;
 }

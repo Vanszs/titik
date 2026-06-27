@@ -32,14 +32,13 @@ fn is_image_input_error(e: &str) -> bool {
 /// Finalize a finished stream: commit any buffered assistant text, clear the
 /// waiting flag + task handle, set the status line. `error` is Some on stream
 /// failure; a save error is surfaced only if the stream itself succeeded.
-pub(crate) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
-    // Bind the foreground runtime once: the per-session fields (session,
+pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Option<String>) {
+    // Bind session `sess_idx`'s runtime once: the per-session fields (session,
     // streaming buffers, waiting, task handle) live here, while the cumulative
     // token/cost totals + config stay on `rest` as disjoint fields. Borrowing
-    // `rest.sessions[fgi]` directly (not via `fg_mut()`, a `&mut self` method
+    // `rest.sessions[sess_idx]` directly (not via `fg_mut()`, a `&mut self` method
     // that would lock all of `rest`) keeps those disjoint borrows legal.
-    let fgi = rest.foreground;
-    let rt = &mut rest.sessions[fgi];
+    let rt = &mut rest.sessions[sess_idx];
     // Take the in-flight usage unconditionally so it can never leak into the
     // next turn, even when the buffer is empty or there's no session to commit.
     let usage = rt.pending_usage.take();
@@ -100,7 +99,7 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
             // images (e.g. "No endpoints found that support image input") and the
             // last user message actually carried image attachments, swap the raw
             // error toast for koma's friendly in-chat notice.
-            let last_user_had_image = rest.fg().session.as_ref().is_some_and(|s| {
+            let last_user_had_image = rest.sessions[sess_idx].session.as_ref().is_some_and(|s| {
                 s.conversation
                     .history()
                     .iter()
@@ -132,18 +131,19 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, error: Option<String>) {
 /// the latest prompt size (current context), `tokens_out` / `cost` accumulate.
 pub(crate) fn advance_turn(
     state: &mut AppState,
+    sess_idx: usize,
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) {
     // 1. Take the stashed tool calls + the streamed text + the in-flight usage
     //    out of state up front so nothing leaks into the next model call.
-    let mut pending = state.rest.fg().pending_tool_calls.clone();
-    let mut buf = state.rest.fg_mut().take_stream();
-    let usage = state.rest.fg_mut().pending_usage.take();
+    let mut pending = state.rest.sessions[sess_idx].pending_tool_calls.clone();
+    let mut buf = state.rest.sessions[sess_idx].take_stream();
+    let usage = state.rest.sessions[sess_idx].pending_usage.take();
     // Display-only reasoning streamed this round. Taken unconditionally (so it
     // can never leak into the next round) and folded onto the committed message
     // below; never logged to disk or sent to the API.
-    let reasoning = state.rest.fg_mut().take_reasoning();
+    let reasoning = state.rest.sessions[sess_idx].take_reasoning();
 
     // 1b. Text-format tool-call fallback. Some models (Hermes/Qwen/ChatML on
     //     budget / gpt-oss / GLM routes) emit a tool call as `<tool_call>…JSON…
@@ -164,7 +164,7 @@ pub(crate) fn advance_turn(
                 if !synthesized.is_empty() {
                     buf = Some(cleaned);
                     pending = synthesized.clone();
-                    state.rest.fg_mut().pending_tool_calls = synthesized;
+                    state.rest.sessions[sess_idx].pending_tool_calls = synthesized;
                 }
             }
         }
@@ -175,12 +175,11 @@ pub(crate) fn advance_turn(
     //    accounting stays correct across rounds.
     let mut save_err = None;
     {
-        // Bind the foreground runtime directly (not via `fg_mut()`, a `&mut self`
-        // method that would lock all of `rest`) so the per-session `session` and
-        // the cumulative `tokens_*` totals on `state.rest` stay independently
-        // borrowable as disjoint fields.
-        let fgi = state.rest.foreground;
-        let rt = &mut state.rest.sessions[fgi];
+        // Bind session `sess_idx`'s runtime directly (not via `fg_mut()`, a
+        // `&mut self` method that would lock all of `rest`) so the per-session
+        // `session` and the cumulative `tokens_*` totals on `state.rest` stay
+        // independently borrowable as disjoint fields.
+        let rt = &mut state.rest.sessions[sess_idx];
         if let Some(sess) = rt.session.as_mut() {
             if !pending.is_empty() {
                 let content = buf.clone().unwrap_or_default();
@@ -235,9 +234,9 @@ pub(crate) fn advance_turn(
 
     // 3. No tool calls → the model produced its final answer; the turn is done.
     if pending.is_empty() {
-        state.rest.fg_mut().waiting = false;
-        state.rest.fg_mut().current_task = None;
-        state.rest.fg_mut().agent_steps = 0;
+        state.rest.sessions[sess_idx].waiting = false;
+        state.rest.sessions[sess_idx].current_task = None;
+        state.rest.sessions[sess_idx].agent_steps = 0;
         state.rest.status = match save_err {
             Some(e) => {
                 state.rest.set_toast(e.clone());
@@ -248,7 +247,7 @@ pub(crate) fn advance_turn(
         return;
     }
 
-    state.rest.fg_mut().agent_steps += 1;
+    state.rest.sessions[sess_idx].agent_steps += 1;
 
     // 4b. Workspace check (WC): the deterministic harness gate. When the harness
     //     is enabled and the session workdir is NOT an allowed folder (the launch
@@ -257,9 +256,7 @@ pub(crate) fn advance_turn(
     //     API-valid — no dangling tool_call ids) and the turn is stopped. When
     //     the harness is disabled this is skipped entirely (zero behaviour
     //     change). The check runs once per round, before the plan gate / tools.
-    let wc_blocked = state
-        .rest
-        .fg()
+    let wc_blocked = state.rest.sessions[sess_idx]
         .session
         .as_ref()
         .is_some_and(|sess| {
@@ -271,7 +268,7 @@ pub(crate) fn advance_turn(
                 )
         });
     if wc_blocked {
-        super::tools::deny_all_pending(state, "workspace not in allowed folders");
+        super::tools::deny_all_pending(state, sess_idx, "workspace not in allowed folders");
         state.rest.set_toast("workspace not in allowed folders".into());
         state.rest.status = "stopped: workspace not allowed".into();
         return;
@@ -283,7 +280,7 @@ pub(crate) fn advance_turn(
     //     running safe calls inline and — in Normal mode — pausing on the first
     //     risky one for a `y/n`. `pending` (the local copy) is no longer needed.
     drop(pending);
-    state.rest.fg_mut().tool_idx = 0;
-    state.rest.fg_mut().tool_results.clear();
-    super::tools::process_tools(state, client, handle);
+    state.rest.sessions[sess_idx].tool_idx = 0;
+    state.rest.sessions[sess_idx].tool_results.clear();
+    super::tools::process_tools(state, sess_idx, client, handle);
 }

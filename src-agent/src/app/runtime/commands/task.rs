@@ -37,7 +37,8 @@ pub(super) fn handle_task(
     // (tool_call_id == None), so it just reports started vs queued. Uses the
     // shared `spawn_or_queue` helper so the ctx/registry/awareness/memory inputs
     // + bookkeeping never diverge from the `task` tool.
-    match super::super::stream::spawn_or_queue(state, client, handle, &agent_name, &task_text, None)
+    let fgi = state.rest.foreground;
+    match super::super::stream::spawn_or_queue(state, fgi, client, handle, &agent_name, &task_text, None)
     {
         super::super::stream::SpawnOutcome::Spawned(id) => {
             state

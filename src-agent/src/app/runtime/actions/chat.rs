@@ -102,7 +102,10 @@ pub(super) fn handle_submit(
     // (the elapsed counter is appended by the renderer). No trailing dots —
     // the comet supplies the motion, `· Ns` supplies the elapsed.
     state.rest.status = "thinking".into();
-    start_stream_task(history, state, client, handle);
+    // Active session this submit drives (always foreground; captured into a local
+    // before the call so it isn't read while a `&mut state.rest` is live).
+    let fgi = state.rest.foreground;
+    start_stream_task(history, state, fgi, client, handle);
 
     // Prompt-classifier (PC), advisory + non-blocking: once per turn, if
     // the harness is enabled, classify the user prompt on a background
@@ -237,7 +240,8 @@ pub(super) fn handle_resend(
     state.rest.fg_mut().begin_stream();
     state.rest.fg_mut().waiting = true;
     state.rest.status = "thinking".into();
-    start_stream_task(history, state, client, handle);
+    let fgi = state.rest.foreground;
+    start_stream_task(history, state, fgi, client, handle);
     Ok(())
 }
 
@@ -252,6 +256,9 @@ pub(super) fn handle_approve_tool(
     // resume the machine (which may pause again on the next risky call or
     // finish the round). Clone the call out first so `run_tool`'s mutable
     // borrow of `state` doesn't overlap the `pending_tool_calls` read.
+    // The approval machine drives the foreground session this stage; captured
+    // into a local so the turn-machinery calls below can pass it.
+    let fgi = state.rest.foreground;
     state.rest.fg_mut().awaiting_approval = false;
     state.rest.fg_mut().approval_reason = None;
     if let Some(call) = state.rest.fg().pending_tool_calls.get(state.rest.fg().tool_idx).cloned() {
@@ -264,14 +271,14 @@ pub(super) fn handle_approve_tool(
         // lands). The defensive `else` keeps the old inline path for the unexpected
         // case of a non-deferred approved tool, so no call is ever left dangling.
         if crate::tool::DEFERRED_TOOLS.contains(&call.function.name.as_str()) {
-            dispatch_deferred(state, &call);
+            dispatch_deferred(state, fgi, &call);
             return Ok(());
         }
-        let result = run_tool(state, &call);
+        let result = run_tool(state, fgi, &call);
         state.rest.fg_mut().tool_results.push((call.id.clone(), result));
         state.rest.fg_mut().tool_idx += 1;
     }
-    process_tools(state, client, handle);
+    process_tools(state, fgi, client, handle);
     Ok(())
 }
 

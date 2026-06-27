@@ -55,6 +55,11 @@ pub(super) fn run_loop(
         //    arms can mutate other fields of state.rest without a borrow
         //    conflict; put it back if the stream is still open.
         if let Some(mut rx) = state.rest.fg_mut().active_rx.take() {
+            // The session whose stream this drain is servicing. This stage drains
+            // only the foreground session (multiplexing across sessions is a later
+            // stage); captured into a local so the turn-machinery calls below can
+            // pass it without re-borrowing `state.rest` while a `&mut` is live.
+            let fgi = state.rest.foreground;
             let mut still_streaming = true;
             while let Ok(event) = rx.try_recv() {
                 dirty = true;
@@ -93,14 +98,14 @@ pub(super) fn run_loop(
                         // Drive the turn: commit the assistant message and either
                         // end the turn or run tools + continue (which spawns the
                         // next task into a fresh active_rx).
-                        advance_turn(state, client, handle);
+                        advance_turn(state, fgi, client, handle);
                         still_streaming = false;
                         break;
                     }
                     StreamEvent::Error(e) => {
                         // Surface the error and halt the whole turn (drop any
                         // half-stashed tool calls / step count / approval machine).
-                        finish_stream(&mut state.rest, Some(e));
+                        finish_stream(&mut state.rest, fgi, Some(e));
                         state.rest.fg_mut().agent_steps = 0;
                         state.rest.fg_mut().pending_tool_calls.clear();
                         state.rest.fg_mut().awaiting_approval = false;
@@ -611,7 +616,8 @@ pub(super) fn run_loop(
             // the `pending_subagent_calls.is_empty()` test sees the settled set and
             // can't resume a round that still has a queued delegation outstanding.
             if !state.rest.fg().pending_subagents.is_empty() {
-                super::stream::try_start_pending(state, client, handle);
+                let fgi = state.rest.foreground;
+                super::stream::try_start_pending(state, fgi, client, handle);
                 dirty = true;
             }
 
@@ -664,9 +670,10 @@ pub(super) fn run_loop(
                 && state.rest.fg().pending_subagent_calls.is_empty()
                 && state.rest.fg().pending_tool_tasks.is_empty()
             {
+                let fgi = state.rest.foreground;
                 state.rest.fg_mut().awaiting_subagents = false;
                 state.rest.fg_mut().awaiting_tool_tasks = false;
-                super::stream::resume_after_subagents(state, client, handle);
+                super::stream::resume_after_subagents(state, fgi, client, handle);
                 dirty = true;
             }
         }
