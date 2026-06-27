@@ -86,11 +86,6 @@ const BAR_CHARS: [char; 9] = [
     '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}',
 ];
 
-/// 8-level sparkline chars: empty -> full.
-const SPARK_CHARS: [char; 9] = [
-    ' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█',
-];
-
 /// Max bar width for per-model token bars (chars).
 const BAR_MAX_WIDTH: usize = 20;
 
@@ -381,9 +376,9 @@ fn heatmap_title(nav: &UsageNavState) -> String {
 /// section label row). Drives tight middle-row sizing.
 fn heatmap_content_height(nav: &UsageNavState) -> usize {
     match nav.range {
-        UsageRange::Today => 3, // cells + hour labels + legend
-        UsageRange::Week  => 8, // 7 day rows (Mon–Sun) + legend
-        UsageRange::Year  => 9, // 7 day rows + blank + legend
+        UsageRange::Today => 25, // 24 hourly rows + legend
+        UsageRange::Week  => 8,  // 7 day rows (Mon–Sun) + legend
+        UsageRange::Year  => 9,  // 7 day rows + blank + legend
     }
 }
 
@@ -741,153 +736,91 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
 
 /// Build range-adaptive heatmap lines driven by `nav.range` and `nav.metric`.
 ///
-/// | Range | Grid style               |
-/// |-------|--------------------------|
-/// | Today | 24 hourly cells (1 row)  |
-/// | Week  | 7 daily cells (1 row)    |
-/// | Year  | 7 rows x 53 cols Github  |
+/// | Range | Grid style                   |
+/// |-------|------------------------------|
+/// | Today | 24 hourly horizontal bars    |
+/// | Week  | 7 daily horizontal bars      |
+/// | Year  | 7 rows x 53 cols Github grid |
 fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
     match nav.range {
-        UsageRange::Today => build_bar_chart(since, BucketSize::Hour, 24, nav.metric, max_width, 8, palette),
-        UsageRange::Week  => build_horizontal_bar_chart(since, nav.metric, max_width, palette),
+        UsageRange::Today => build_hourly_horizontal_chart(since, nav.metric, max_width, palette),
+        UsageRange::Week  => build_day_horizontal_chart(since, nav.metric, max_width, palette),
         UsageRange::Year  => build_heatmap_yearly(since, nav.metric, palette),
     }
 }
 
-/// Vertical bar chart for the Today range.
-///
-/// `height` rows of vertical bars (top-to-bottom, origin at bottom), each column
-/// one char wide, colored by the heat ramp.  An x-axis label row is appended below
-/// the bars.  No cheap/expensive legend — bar height already conveys magnitude.
-fn build_bar_chart(
+/// Horizontal bar chart for the Today view: one row per hour (00–23), each bar
+/// extending rightward, colored by the heat ramp.  The current hour is highlighted.
+fn build_hourly_horizontal_chart(
     since: i64,
-    bucket: BucketSize,
-    n: usize,
     metric: UsageMetric,
     max_width: usize,
-    height: usize,
     palette: &Palette,
 ) -> Vec<Line<'static>> {
-    let buckets = spend_buckets(since, bucket, n);
-    let step_secs: i64 = match bucket {
-        BucketSize::Hour => 3600,
-        BucketSize::Day  => 86400,
-        BucketSize::Week => 86400 * 7,
-    };
-
-    // Build ordered epoch list: oldest first, newest on the right.
-    let now  = now_secs();
-    let snap = match bucket {
-        BucketSize::Hour => now - now % 3600,
-        BucketSize::Day  => now - now % 86400,
-        BucketSize::Week => now - now % (86400 * 7),
-    };
-    let epochs: Vec<i64> = (0..n as i64)
-        .rev()
-        .map(|i| snap - i * step_secs)
-        .collect();
-
+    let buckets = spend_buckets(since, BucketSize::Hour, 24);
     let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
-    let mut values: Vec<f64> = epochs
+
+    let now = now_secs();
+    let today = now - now % 86400;
+    let current_hour = ((now % 86400) / 3600) as usize;
+    let epochs: Vec<i64> = (0..24).map(|i| today + i * 3600).collect();
+
+    let values: Vec<f64> = epochs
         .iter()
         .map(|ep| map.get(ep).map(|b| metric_val(b, metric)).unwrap_or(0.0))
         .collect();
 
-    // Clamp to max_width columns — keep only the most recent if narrower.
-    let epochs_vis: Vec<i64> = if epochs.len() > max_width {
-        epochs[epochs.len() - max_width..].to_vec()
-    } else {
-        epochs.clone()
-    };
-    if values.len() > max_width {
-        let drop = values.len() - max_width;
-        values.drain(..drop);
-    }
-    let ncols = values.len();
-
-    // Thresholds from non-zero values for heat coloring.
     let nonzero: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
     let (p33, p66, p90) = percentile_thresholds(&nonzero);
     let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
 
-    // Build height rows top-to-bottom (row 0 = top, row height-1 = bottom).
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height + 1);
-    for r in 0..height {
-        // row_from_bottom: 0 = bottom row, height-1 = top row.
-        let row_from_bottom = height - 1 - r;
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(ncols);
-        for &v in values.iter() {
-            let col_color = heat_color(v, p33, p66, p90, false);
-            let fill_eighths = if max_val <= 0.0 {
-                0usize
+    // Fixed label width "00 " = 3 chars.
+    let label_w = 3usize;
+    let bar_w = max_width.saturating_sub(label_w).max(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(25); // 24 bars + legend
+
+    for (i, (&v, &h)) in values.iter().zip(epochs.iter()).enumerate() {
+        let col = heat_color(v, p33, p66, p90, false);
+        let fill = if max_val <= 0.0 {
+            0usize
+        } else {
+            ((v / max_val) * bar_w as f64).round() as usize
+        };
+
+        let hour = ((h % 86400) / 3600) as usize;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
+
+        // Hour label: current hour gets bold accent, others dim.
+        let label_style = if hour == current_hour {
+            Style::default().fg(palette.accent).bg(HEAT_EMPTY).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.dim).bg(HEAT_EMPTY)
+        };
+        spans.push(Span::styled(
+            format!("{hour:02}"),
+            label_style,
+        ));
+
+        // Bar cells: filled portion colored, rest dark empty cells.
+        for j in 0..bar_w {
+            if j < fill {
+                spans.push(Span::styled(CELL, Style::default().fg(col).bg(HEAT_EMPTY)));
             } else {
-                ((v / max_val) * (height * 8) as f64).round() as usize
-            };
-            // Determine character for this cell.
-            let threshold_low  = row_from_bottom * 8;
-            let threshold_high = row_from_bottom * 8 + 8;
-            let ch = if fill_eighths >= threshold_high {
-                SPARK_CHARS[8]
-            } else if fill_eighths > threshold_low {
-                let partial = fill_eighths - threshold_low;
-                SPARK_CHARS[partial.clamp(1, 8)]
-            } else {
-                ' '
-            };
-            let style = if ch == ' ' {
-                Style::default().bg(HEAT_EMPTY)
-            } else {
-                Style::default().fg(col_color).bg(HEAT_EMPTY)
-            };
-            spans.push(Span::styled(ch.to_string(), style));
+                spans.push(Span::styled(CELL, Style::default().fg(HEAT_EMPTY).bg(HEAT_EMPTY)));
+            }
         }
+
         lines.push(Line::from(spans));
     }
 
-    // X-axis label row: 1 char per column, exactly aligned.
-    // Use HEAT_EMPTY (fixed dim grey) — axis ticks are structural, not themed.
-    let mut label_spans: Vec<Span<'static>> = Vec::with_capacity(ncols);
-    for (col, &ep) in epochs_vis.iter().enumerate() {
-        let label_char: char = match bucket {
-            BucketSize::Hour => {
-                let h = ((ep / 3600) % 24) as usize;
-                if h.is_multiple_of(6) {
-                    char::from_digit((h % 10) as u32, 10).unwrap_or(' ')
-                } else {
-                    ' '
-                }
-            }
-            BucketSize::Day => {
-                if ncols <= 7 {
-                    let dow = ((ep / 86400 + 4) % 7) as usize; // 0=Sun
-                    ['S','M','T','W','T','F','S'][dow]
-                } else {
-                    if col % 5 == 0 {
-                        char::from_digit(((col / 5) % 10) as u32, 10).unwrap_or(' ')
-                    } else {
-                        ' '
-                    }
-                }
-            }
-            _ => ' ',
-        };
-        label_spans.push(Span::styled(
-            label_char.to_string(),
-            Style::default().fg(palette.dim).bg(HEAT_EMPTY),
-        ));
-    }
-    lines.push(Line::from(label_spans));
-
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled("no data", Style::default().fg(palette.dim))));
-    }
+    lines.push(heat_legend(palette));
     lines
 }
 
 /// Horizontal bar chart for the Week view: one row per day (Mon–Sun), each bar
-/// extending rightward, colored by the heat ramp.  A y-axis label row is
-/// prepended to the left of each bar.
-fn build_horizontal_bar_chart(
+/// extending rightward, colored by the heat ramp.  Today is highlighted.
+fn build_day_horizontal_chart(
     since: i64,
     metric: UsageMetric,
     max_width: usize,
@@ -897,10 +830,8 @@ fn build_horizontal_bar_chart(
     let buckets = spend_buckets(since, BucketSize::Day, 7);
     let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
 
-    // Build ordered epochs oldest first (Mon on top).
-    let now  = now_secs();
+    let now = now_secs();
     let snap = now - now % 86400;
-    // snap is today (Sun=6); walk back 6 days to get Monday.
     let today_dow = ((now / 86400 + 4) % 7) as i64; // 0=Sun..6=Sat
     let monday = snap - today_dow * 86400;
     let epochs: Vec<i64> = (0..7).map(|i| monday + i * 86400).collect();
@@ -910,16 +841,14 @@ fn build_horizontal_bar_chart(
         .map(|ep| map.get(ep).map(|b| metric_val(b, metric)).unwrap_or(0.0))
         .collect();
 
-    // Thresholds for heat coloring.
     let nonzero: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
     let (p33, p66, p90) = percentile_thresholds(&nonzero);
     let max_val = values.iter().cloned().fold(0.0_f64, f64::max);
 
-    // Fixed label width "Mon " = 4 chars.
-    let label_w = 4usize;
+    let label_w = 4usize; // "Mon " = 4 chars
     let bar_w = max_width.saturating_sub(label_w).max(1);
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(9); // 7 bars + legend
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8); // 7 bars + legend
 
     for (i, (&v, label)) in values.iter().zip(DAY_LABELS.iter()).enumerate() {
         let col = heat_color(v, p33, p66, p90, false);
@@ -931,7 +860,6 @@ fn build_horizontal_bar_chart(
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
 
-        // Day label: today gets bold accent, others dim.
         let label_style = if i as i64 == today_dow {
             Style::default().fg(palette.accent).bg(HEAT_EMPTY).add_modifier(Modifier::BOLD)
         } else {
@@ -942,7 +870,6 @@ fn build_horizontal_bar_chart(
             label_style,
         ));
 
-        // Bar cells: filled portion colored, rest dark empty cells.
         for j in 0..bar_w {
             if j < fill {
                 spans.push(Span::styled(CELL, Style::default().fg(col).bg(HEAT_EMPTY)));
