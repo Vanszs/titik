@@ -50,6 +50,10 @@ pub fn build_seed(agent: &AgentDef, awareness: &str, memory_md: &str, task: &str
         system.push_str(awareness);
     }
 
+    system.push_str(
+        "\n\n# Reporting back\n         Your final message IS your report to the main agent (delivered as a tool result), not a chat reply.          Keep it CONCISE, structured, and self-contained so it survives the context window: lead with the          answer/outcome, then the key findings (paths + line numbers; include only load-bearing snippets),          then any blockers. Do NOT paste whole files or narrate your search/steps — reference by path:line.          There is a hard ~50k-character ceiling on delivery; stay well under it. If you found a lot, prioritise          the most decision-relevant facts and summarise the rest in a line or two.",
+    );
+
     let mut convo = Conversation::from_messages(Vec::new());
     convo.set_system(system);
     convo.push_user(task);

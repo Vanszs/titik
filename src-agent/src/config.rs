@@ -57,3 +57,10 @@ pub const APP_DIR_NAME: &str = ".koma";
 /// Hard cap on a single tool result's size, in characters. ~100k tokens at
 /// ~4 chars/token. Tool outputs are not truncated below this.
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 400_000;
+
+/// Hard ceiling on a sub-agent's final report before it is delivered to the
+/// main agent as a `task` tool result. Reports above this are truncated (with a
+/// marker) so several sub-agents can't overflow the main model's context window.
+/// ~12.5k tokens at ~4 chars/token. The sub-agent prompt also asks for concise
+/// reports (see subagent::context) — this is the safety net.
+pub const MAX_SUBAGENT_REPORT_CHARS: usize = 50_000;

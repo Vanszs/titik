@@ -92,6 +92,19 @@ struct StreamOutcome {
     usage: Option<(u64, u64, f64)>,
 }
 
+/// Cap a sub-agent's final report so it can't overflow the main agent's context
+/// window when delivered as a tool result. Truncates by CHARACTERS (not bytes,
+/// so it never splits a UTF-8 boundary) and appends a marker.
+fn cap_report(text: String) -> String {
+    let max = crate::config::MAX_SUBAGENT_REPORT_CHARS;
+    if text.chars().count() > max {
+        let cut: String = text.chars().take(max).collect();
+        format!("{cut}\n\n[report truncated at {max} chars for delivery to the main agent — be more concise next time]")
+    } else {
+        text
+    }
+}
+
 /// Run the autonomous sub-agent loop to completion.
 ///
 /// Loops up to `max_steps` model calls. Each step:
@@ -200,7 +213,7 @@ pub async fn run_agent_loop(
                 tokens_out: acc_tokens_out,
                 cost: acc_cost,
             });
-            emit(&tx, AgentEvent::Done(assistant_text));
+            emit(&tx, AgentEvent::Done(cap_report(assistant_text)));
             return;
         }
         convo.push_assistant_with_tools(assistant_text, tool_calls.clone(), None);
@@ -283,7 +296,7 @@ pub async fn run_agent_loop(
         tokens_out: acc_tokens_out,
         cost: acc_cost,
     });
-    emit(&tx, AgentEvent::Done(final_text));
+    emit(&tx, AgentEvent::Done(cap_report(final_text)));
 }
 
 /// Stream a single model reply and drain its events into a [`StreamOutcome`].
