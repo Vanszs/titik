@@ -38,8 +38,8 @@ pub struct ToolCtx {
     /// workdirs in settings). Indexed as [0], [1], etc. in `@`-prefixed paths.
     pub workspaces: Vec<PathBuf>,
     pub dir_cache: Arc<RwLock<DirCache>>,
-    /// The active session's memory directory (`<session_dir>/memory`), where
-    /// `MEMORY.md` lives. `None` when no session is active.
+    /// The per-PROJECT memory directory (`<pwd_bucket_dir>/memory/`), shared across
+    /// every session opened from the same working dir. `None` when no session is active.
     pub memory_dir: Option<PathBuf>,
     /// The session's active internet tier. `web_fetch` reads this to decide
     /// between the simple raw-HTTP path and the Full browser backend (scrapion);

@@ -335,14 +335,15 @@ fn finish_tool_round(
         let _ = sess.save();
     }
 
-    // Live reload: if the `remember` tool ran this round, re-inject the updated
-    // MEMORY.md into messages[0] so the model sees the new fact immediately.
-    let remember_ran = state
+    // Live reload: if `remember` or `forget` ran this round, re-inject the updated
+    // MEMORY.md into messages[0] so the model sees the change immediately.
+    // (`recall` is read-only and must NOT trigger a rebuild.)
+    let memory_mutated = state
         .rest
         .pending_tool_calls
         .iter()
-        .any(|c| c.function.name == "remember");
-    if remember_ran {
+        .any(|c| matches!(c.function.name.as_str(), "remember" | "forget"));
+    if memory_mutated {
         if let Some(sess) = state.rest.session.as_mut() {
             sess.rebuild_system();
         }
