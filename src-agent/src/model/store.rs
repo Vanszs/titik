@@ -194,6 +194,25 @@ pub fn registry_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("session.sqlite"))
 }
 
+/// Path to the daemon's unix-domain socket: `~/.koma/daemon.sock`.
+///
+/// This socket is the koma-daemon's liveness oracle (whoever binds it IS the live
+/// daemon) and the rendezvous point the thin TUI client connects to. Resolved
+/// from the same [`base_dir`] (`~/.koma`) as every other config path.
+pub fn daemon_sock_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("daemon.sock"))
+}
+
+/// Path to the daemon's PID file: `~/.koma/daemon.pid`.
+///
+/// Advisory only — recorded for diagnostics/`kill`. It is NOT the liveness oracle
+/// (PIDs get reused, which would wedge spawn-or-attach); the bound socket at
+/// [`daemon_sock_path`] is. Lives under the same [`base_dir`] (`~/.koma`).
+#[allow(dead_code)] // wired in daemon stage 3+ (pid file written on daemonize)
+pub fn daemon_pid_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("daemon.pid"))
+}
+
 /// List the sessions for the CURRENT working directory, most-recently updated
 /// first.
 ///

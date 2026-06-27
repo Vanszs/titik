@@ -6,6 +6,7 @@
 //! - `--internet-fullmode-uninstall` — remove the Python full-mode environment and exit.
 //! - `--force`                     — modifier for `--internet-fullmode-install`: force a reinstall
 //!   even when the environment is already present.
+//! - `--ipc-selftest`              — round-trip the daemon IPC transport end-to-end, then exit.
 //!
 //! `parse` accepts anything that yields `String` items so it can be called
 //! with `std::env::args()` directly from `main`.
@@ -21,6 +22,9 @@ pub struct Opts {
     pub internet_fullmode_uninstall: bool,
     /// Modifier for `--internet-fullmode-install`: overwrite an existing install.
     pub force: bool,
+    /// When `true`, run the daemon IPC transport self-test then exit
+    /// (`--ipc-selftest` flag).
+    pub ipc_selftest: bool,
 }
 
 /// Parse command-line arguments into [`Opts`].
@@ -35,6 +39,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
             "--internet-fullmode-install"    => opts.internet_fullmode_install = true,
             "--internet-fullmode-uninstall"  => opts.internet_fullmode_uninstall = true,
             "--force"                        => opts.force = true,
+            "--ipc-selftest"                 => opts.ipc_selftest = true,
             _                                => {}
         }
     }

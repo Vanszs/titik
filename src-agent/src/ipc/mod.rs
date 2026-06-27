@@ -11,8 +11,18 @@
 //! See [`proto`] for the protocol types and the critique fixes (stable session
 //! UUIDs, monotonic seq, frame-size cap) that are designed into them from the
 //! start to prevent silent stream corruption later.
+//!
+//! STAGE 2 adds the transport primitives — [`frame`] (the shared length-prefixed
+//! codec), [`server`] (bind = liveness oracle), and [`client`] (connect + frame
+//! helpers) — plus a [`selftest`] that round-trips a real frame end-to-end. The
+//! daemon/client loop wiring that consumes them is still a later stage; the
+//! transport is additive and does not touch the TUI path.
 
+pub mod client;
+pub mod frame;
 pub mod proto;
+pub mod selftest;
+pub mod server;
 
 #[cfg(test)]
 mod roundtrip_tests {

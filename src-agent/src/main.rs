@@ -10,6 +10,7 @@
 //! |---|---|
 //! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
 //! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
+//! | `--ipc-selftest`                        | round-trip the daemon IPC transport then exit |
 //!
 //! Data flow overview:
 //! ```text
@@ -60,6 +61,13 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         };
+    }
+
+    // --- short-circuit: IPC transport self-test (no TUI) ---
+    // Exercises frame.rs + server.rs + client.rs end-to-end; never returns
+    // (always exits the process with OK/FAIL status).
+    if opts.ipc_selftest {
+        ipc::selftest::run();
     }
 
     // --- normal path: launch the TUI ---
