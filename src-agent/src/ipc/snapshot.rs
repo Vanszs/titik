@@ -236,6 +236,9 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         agent_viewer_follow: state.rest.agent_viewer_follow,
         subagents_open: state.rest.subagents_open,
         subagent_sel: state.rest.subagent_sel,
+        // The `@`-file / `/`-command picker highlighted-row index, projected like
+        // `subagent_sel` so the thin client's Up/Down moves the highlighted row.
+        palette_sel: state.rest.palette_sel,
         // Staged composer attachments (path-paste / clipboard-image / @-picker),
         // ingested daemon-side — projected so the client's shadow composer mirrors
         // the daemon's exactly. `Attachment` is serde-clean.
@@ -825,11 +828,15 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
     // full snapshot on a change is cheap-correct — without it the client's viewer/panel
     // would lag until the next structural change. (The viewer's CONTENT updates already
     // force a full snapshot via the per-session `subagents` comparison below.)
+    // The `@` file-picker + `/` command-picker selection index (`palette_sel`) is in
+    // the same boat: it renders from Chat mode, rides no incremental delta, and changes
+    // only on discrete Up/Down, so a full snapshot on change is cheap-correct.
     if prev.global.agent_viewer != next.global.agent_viewer
         || prev.global.agent_viewer_scroll != next.global.agent_viewer_scroll
         || prev.global.agent_viewer_follow != next.global.agent_viewer_follow
         || prev.global.subagents_open != next.global.subagents_open
         || prev.global.subagent_sel != next.global.subagent_sel
+        || prev.global.palette_sel != next.global.palette_sel
     {
         return DiffResult::full();
     }

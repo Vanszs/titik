@@ -130,6 +130,9 @@ mod roundtrip_tests {
             agent_viewer_follow: false,
             subagents_open: true,
             subagent_sel: 2,
+            // Non-default `@`/`/` picker selection index so the round-trip proves
+            // `palette_sel` survives serialize -> deserialize (0 would alias the default).
+            palette_sel: 3,
             // A staged attachment + a populated `@`-file palette so the round-trip
             // proves both new global projections survive serialize -> deserialize.
             pending_attachments: vec![crate::dto::chat::Attachment {

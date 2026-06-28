@@ -642,6 +642,10 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     shadow.rest.agent_viewer_follow = global.agent_viewer_follow;
     shadow.rest.subagents_open = global.subagents_open;
     shadow.rest.subagent_sel = global.subagent_sel;
+    // The `@`-file / `/`-command picker highlighted-row index — mirrored like
+    // `subagent_sel` so Up/Down on either picker moves the highlight on the client
+    // (without this the shadow `palette_sel` stays at 0 and the row never moves).
+    shadow.rest.palette_sel = global.palette_sel;
 
     // Staged composer attachments (ingested daemon-side via path-paste / clipboard /
     // @-picker). The `[Image #N]` marker text already arrives in `input`; mirror the

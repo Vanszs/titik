@@ -496,6 +496,12 @@ pub struct GlobalSnapshot {
     /// `subagents` + `pending_subagents`).
     pub subagents_open: bool,
     pub subagent_sel: usize,
+    /// The `@` file-picker + `/` command-picker highlighted-row index
+    /// ([`crate::app::state::AppStateRest::palette_sel`]). Like `subagent_sel` this
+    /// is rendered FROM Chat mode and rides no incremental delta, so it is projected
+    /// here so Up/Down on either picker moves the highlight on the thin client (its
+    /// shadow `palette_sel` would otherwise stay stuck at 0).
+    pub palette_sel: usize,
     /// The composer's staged-but-unsubmitted image attachments
     /// ([`crate::app::state::AppStateRest::pending_attachments`]). Each was ingested
     /// DAEMON-SIDE (its bytes already under `<session>/images/`) by a path-paste,
