@@ -73,7 +73,17 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         ),
         Mode::Effort(e) => effort::draw(frame, e, &palette),
         Mode::Loading(s) => loading::draw(frame, s, &palette),
-        Mode::Usage(nav) => usage::draw(frame, &state.rest, nav, &palette),
+        Mode::Usage(nav) => {
+            // The dashboard renders from a pre-fetched ledger projection so the SAME
+            // draw path serves the local TUI and the daemon's thin client. The client
+            // receives the projection in the snapshot (`rest.usage_data`); a local TUI
+            // leaves that `None` and collects it live from the ledger here every frame
+            // (unchanged behaviour). See `model::usage::UsageData`.
+            let data = state.rest.usage_data.clone().unwrap_or_else(|| {
+                usage::collect_usage_data(nav, &state.rest)
+            });
+            usage::draw(frame, &state.rest, nav, &data, &palette);
+        }
         Mode::MessageRewind(rw) => message_rewind::draw(frame, rw, &palette),
         Mode::QuitConfirm(s) => quit_confirm::draw(frame, s, &palette),
     }

@@ -423,6 +423,24 @@ pub struct GlobalSnapshot {
     /// otherwise they show `searching models…`. Projected alongside the cache so the
     /// client makes the SAME match decision the daemon would.
     pub models_cache_endpoint: Option<String>,
+    /// The full-screen sub-agent VIEWER state, mirroring
+    /// [`crate::app::state::AppStateRest`]'s `agent_viewer` (`Some(idx)` =
+    /// the viewer is open on the foreground session's `subagents[idx]`, short-
+    /// circuiting the chat draw), `agent_viewer_scroll`, and `agent_viewer_follow`.
+    /// The viewer is rendered FROM Chat mode (not its own `Mode`), so it rides here on
+    /// the global projection rather than in [`ModeSnapshot`]; the client reconstructs
+    /// the same `rest.agent_viewer*` so the unmodified chat renderer takes the
+    /// full-screen viewer branch and draws the reconstructed sub-agent's transcript.
+    pub agent_viewer: Option<usize>,
+    pub agent_viewer_scroll: u16,
+    pub agent_viewer_follow: bool,
+    /// Sub-agents `$` panel open-state + selection
+    /// ([`crate::app::state::AppStateRest`]'s `subagents_open` / `subagent_sel`),
+    /// projected so the client renders the same overlay (it floats over the chat in
+    /// the input controller's modal, reading the foreground session's reconstructed
+    /// `subagents` + `pending_subagents`).
+    pub subagents_open: bool,
+    pub subagent_sel: usize,
 }
 
 // ─── mode payload projections (stage 2: core interactive modes) ──────────────
@@ -675,6 +693,195 @@ pub struct SettingsSnapshot {
     pub model_modal: Option<ModelModalSnapshot>,
 }
 
+// ─── mode payload projections (stage 3: secondary full-screen views) ─────────
+
+/// A serde-safe projection of the `/usage` dashboard ([`crate::app::mode::UsageNavState`]
+/// + its pre-fetched ledger data).
+///
+/// The dashboard's numbers come from the global sqlite usage ledger, which the
+/// thin client has NO access to. So the daemon pre-computes the exact query
+/// results the renderer reads ([`crate::model::usage::UsageData`]) and ships them
+/// here alongside the nav state (active view / range / metric as wire tokens). The
+/// client rebuilds a `UsageNavState` AND seeds `rest.usage_data` from `data`, so
+/// the unmodified `view::usage::draw` renders the same dashboard without a DB. The
+/// `data` is already serde-clean (its query rows are plain scalars/strings).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct UsageSnapshot {
+    /// Active view: `"global"` / `"session"`.
+    pub view: String,
+    /// Active range: `"today"` / `"week"` / `"year"`.
+    pub range: String,
+    /// Heatmap/bar metric: `"cost"` / `"tokens"`.
+    pub metric: String,
+    /// The pre-fetched ledger projection for the active view+range (so the client
+    /// renders the dashboard with zero DB access).
+    pub data: crate::model::usage::UsageData,
+}
+
+/// A serde-safe projection of one message-rewind entry ([`crate::app::mode::RewindState`]'s
+/// `RewindEntry`). `vec_index` is the daemon-side conversation cut position used
+/// only on Enter (forwarded as a key), but is carried so a reconstructed entry is an
+/// exact copy; `content` is the message text the list row previews.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct RewindEntrySnapshot {
+    pub vec_index: usize,
+    pub content: String,
+}
+
+/// A serde-safe projection of the message-rewind picker ([`crate::app::mode::RewindState`]).
+/// Carries the newest-first entry list + the cursor — everything `view::message_rewind`
+/// reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct RewindSnapshot {
+    pub entries: Vec<RewindEntrySnapshot>,
+    pub selected: usize,
+}
+
+/// A serde-safe projection of the `/effort` reasoning-effort picker
+/// ([`crate::app::mode::EffortPickerState`]). All plain data the overlay reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct EffortSnapshot {
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub note: String,
+}
+
+/// A serde-safe projection of one `--resume` session-picker row
+/// ([`crate::model::store::SessionMeta`]).
+///
+/// The live `SessionMeta` carries a `PathBuf` (the daemon-side load target, used on
+/// Enter — forwarded as a key) and a `SystemTime`, neither serde-clean; the picker
+/// view renders only the name + id + message count + lock marker + a relative age, so
+/// the path is dropped and the modified time crosses as seconds-since-epoch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct SessionMetaSnapshot {
+    pub id: String,
+    pub name: String,
+    /// Last-modified time as whole seconds since the Unix epoch (`0` if the live
+    /// time predates the epoch / clock skew).
+    pub modified_secs: u64,
+    pub message_count: usize,
+    pub locked: bool,
+}
+
+/// A serde-safe projection of the `--resume` session picker ([`crate::app::mode::PickerState`]).
+/// Carries the full unfiltered metadata list + the live query + the filtered index
+/// subset + the cursor — everything `view::session_picker` reads (it re-runs no
+/// filtering itself; the daemon's `filtered_idx` is carried so the SAME rows show).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct PickerSnapshot {
+    pub query: String,
+    pub all: Vec<SessionMetaSnapshot>,
+    pub filtered_idx: Vec<usize>,
+    pub selected: usize,
+}
+
+/// A serde-safe projection of a registered model entry, KEYLESS — just the fields
+/// the `/agents` model row + picker resolve a chosen `model_uuid` into a label
+/// (`name @ provider`). Projected (instead of the whole `AppConfig`) so the client
+/// resolves the same labels WITHOUT the daemon's API keys ever crossing the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct CatalogueModelSnapshot {
+    pub uuid: String,
+    pub name: String,
+    pub model_id: String,
+    pub provider_uuid: String,
+}
+
+/// A serde-safe projection of an API-provider connection, KEYLESS — only the
+/// `uuid` + display name (or endpoint fallback) the `/agents` model label needs to
+/// render `... @ <provider>`. The api key is deliberately NOT projected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct CatalogueProviderSnapshot {
+    pub uuid: String,
+    pub name: String,
+    pub endpoint: String,
+}
+
+/// A serde-safe projection of the full-screen nano text editor
+/// ([`crate::app::mode::editor::TextEditorState`]) — the `/agents` field editor.
+/// The live `wrap_w` is a render-published `Cell` (re-seeded on the client), so only
+/// the buffer + cursor + scroll cross.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct TextEditorSnapshot {
+    pub lines: Vec<String>,
+    pub row: usize,
+    pub col: usize,
+    pub scroll: usize,
+}
+
+/// A serde-safe projection of the `/agents` tool multi-select picker
+/// ([`crate::app::mode::agents::ToolPickerState`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ToolPickerSnapshot {
+    pub options: Vec<String>,
+    pub checked: Vec<bool>,
+    pub cursor: usize,
+    pub filter: String,
+}
+
+/// A serde-safe projection of the `/agents` single-select model picker
+/// ([`crate::app::mode::agents::ModelPickerState`]). Each option is its
+/// `(model_uuid_or_none, label)` pair, carried verbatim (row 0 is the
+/// `(None, "(inherit main)")` sentinel).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct AgentModelPickerSnapshot {
+    pub options: Vec<(Option<String>, String)>,
+    pub cursor: usize,
+}
+
+/// A serde-safe projection of the `/agents` dashboard ([`crate::app::mode::AgentsState`]).
+///
+/// The agent LIST rides as `Vec<AgentDef>` (already serde-clean), the working
+/// drafts + sub-mode + field cursor as plain data + wire tokens, and the three
+/// overlays (tool picker / model picker / full-screen field editor) as their own
+/// projections. A KEYLESS model+provider catalogue rides alongside so the client
+/// resolves a chosen `model_uuid` to its `name @ provider` label exactly as the
+/// daemon would, WITHOUT any API key crossing the wire (the client reconstructs a
+/// minimal `AppConfig` from it just for that label lookup).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct AgentsSnapshot {
+    pub agents: Vec<crate::model::agent_def::AgentDef>,
+    pub list_sel: usize,
+    pub in_detail: bool,
+    /// Sub-mode: `"browse"` / `"edit"` / `"create"` / `"delete_confirm"`.
+    pub mode: String,
+    /// Highlighted field: `"name"` / `"description"` / `"conditions"` / `"model"` /
+    /// `"tools"` / `"prompt"`.
+    pub field: String,
+    pub editing: bool,
+    /// Create scope: `"session"` / `"global"`.
+    pub create_scope: String,
+    pub draft_name: String,
+    pub draft_description: String,
+    pub draft_conditions: String,
+    pub draft_model_uuid: Option<String>,
+    pub draft_model_legacy: Option<String>,
+    pub draft_tools: String,
+    pub draft_body: String,
+    pub tool_picker: Option<ToolPickerSnapshot>,
+    pub model_picker: Option<AgentModelPickerSnapshot>,
+    /// The full-screen field editor: `(field_token, editor)` when open.
+    pub editor: Option<(String, TextEditorSnapshot)>,
+    pub editor_clear_confirm: bool,
+    /// Keyless registered-model catalogue (for the model-label lookup).
+    pub catalogue_models: Vec<CatalogueModelSnapshot>,
+    /// Keyless provider catalogue (for the `@ <provider>` part of the label).
+    pub catalogue_providers: Vec<CatalogueProviderSnapshot>,
+}
+
 /// A PURE-DATA projection of the live [`crate::app::mode::Mode`].
 ///
 /// Unlike the old lightweight discriminant, this carries each mode's
@@ -685,20 +892,21 @@ pub struct SettingsSnapshot {
 ///
 /// # Staging (task #122)
 ///
-/// Stage 1 filled `Chat` (payload-free) and `QuitConfirm`. Stage 2 fills the CORE
-/// interactive modes — `KeyInput`, `SessionHub`, `Loading`, `Settings` — with full
-/// payloads so the client reconstructs + renders them. The remaining variants
-/// (`SessionPicker`, `Agents`, `Effort`, `Usage`, `MessageRewind`) stay STUBS: they
-/// tell the client only "this screen is active", and the client falls back to the
-/// safe Chat render for them until their payload lands (never fabricating an empty
-/// modal), exactly as the old tag did.
+/// Stage 1 filled `Chat` (payload-free) and `QuitConfirm`. Stage 2 filled the CORE
+/// interactive modes — `KeyInput`, `SessionHub`, `Loading`, `Settings`. Stage 3
+/// fills the SECONDARY full-screen views — `Usage`, `MessageRewind`, plus the last
+/// remaining stubs `Effort`, `SessionPicker`, `Agents` — so EVERY variant now
+/// carries its render-relevant payload and NOTHING falls back to a blank Chat render.
+/// (The full-screen sub-agent VIEWER + `$` panel are rendered FROM Chat mode, so
+/// their state rides on [`GlobalSnapshot`], not a variant here.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub enum ModeSnapshot {
     /// First-run credentials wizard (`Mode::KeyInput`). Carries the full form state.
     KeyInput(KeyInputSnapshot),
-    /// `--resume` disk session picker (`Mode::SessionPicker`). STUB.
-    SessionPicker,
+    /// `--resume` disk session picker (`Mode::SessionPicker`). Carries the metadata
+    /// list + query + filtered subset + cursor.
+    SessionPicker(PickerSnapshot),
     /// Two-pane session hub (`Mode::SessionHub`). Carries both panes + focus/cursors.
     SessionHub(SessionHubSnapshot),
     /// Normal chat view (`Mode::Chat`). Payload-free: everything Chat renders lives
@@ -708,14 +916,18 @@ pub enum ModeSnapshot {
     Loading(LoadingSnapshot),
     /// `/settings` dashboard (`Mode::Settings`). Carries the full draft + modal state.
     Settings(Box<SettingsSnapshot>),
-    /// `/agents` manager (`Mode::Agents`). STUB.
-    Agents,
-    /// `/effort` reasoning-effort picker (`Mode::Effort`). STUB.
-    Effort,
-    /// `/usage` dashboard (`Mode::Usage`). STUB.
-    Usage,
-    /// Message-rewind picker (`Mode::MessageRewind`). STUB.
-    MessageRewind,
+    /// `/agents` manager (`Mode::Agents`). Carries the full editor state + keyless
+    /// model/provider catalogue. Boxed — it is the largest payload (the agent list +
+    /// drafts + overlays + catalogue), so an unboxed variant would bloat every frame.
+    Agents(Box<AgentsSnapshot>),
+    /// `/effort` reasoning-effort picker (`Mode::Effort`). Carries the options + cursor + note.
+    Effort(EffortSnapshot),
+    /// `/usage` dashboard (`Mode::Usage`). Carries the nav state + pre-fetched ledger
+    /// data so the client renders it with no DB. Boxed — the embedded `UsageData`
+    /// (heatmap buckets + per-model rows) is a large payload.
+    Usage(Box<UsageSnapshot>),
+    /// Message-rewind picker (`Mode::MessageRewind`). Carries the entry list + cursor.
+    MessageRewind(RewindSnapshot),
     /// `/quit` confirm overlay (`Mode::QuitConfirm`). Carries the busy/total session
     /// counts the overlay's warning text reads (the inner `QuitConfirmState`), so the
     /// client renders the EXACT header the daemon would — no longer re-derived from

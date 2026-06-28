@@ -73,28 +73,36 @@ use ratatui::crossterm::event::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+use crate::app::mode::agents::{
+    AgentEditField, AgentScope, AgentSubMode, AgentsState, ModelPickerState, ToolPickerState,
+};
+use crate::app::mode::editor::TextEditorState;
 use crate::app::mode::settings::{
     ModelDraft, ModelModal, PathPicker, PickerMode, ProviderDraft, ProviderModal, RolePickerState,
     SettingsState,
 };
 use crate::app::mode::{
-    CookingEntry, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode, QuitConfirmState,
-    SessionHub, WarmStatus,
+    CookingEntry, EffortPickerState, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode,
+    PickerState, QuitConfirmState, RewindEntry, RewindState, SessionHub, UsageMetric, UsageNavState,
+    UsageRange, UsageView, WarmStatus,
 };
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
-use crate::app::subagent::PendingSubagent;
+use crate::app::subagent::{PendingSubagent, SubAgent, SubAgentStatus};
 use crate::dto::openrouter::{ModelEndpoint, ModelPricing};
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
-    ClientRequest, DaemonEvent, DaemonFrame, KeyInputSnapshot, KeyWire, LoadingSnapshot,
-    ModeSnapshot, ModelModalSnapshot, PathPickerSnapshot, SessionHubSnapshot, SessionSnapshot,
-    SettingsSnapshot, StateDelta, StateSnapshot, WarmStatusWire,
+    AgentModelPickerSnapshot, AgentsSnapshot, ClientRequest, DaemonEvent, DaemonFrame,
+    KeyInputSnapshot, KeyWire, LoadingSnapshot, ModeSnapshot, ModelModalSnapshot, PathPickerSnapshot,
+    PickerSnapshot, RewindSnapshot, SessionHubSnapshot, SessionSnapshot, SettingsSnapshot,
+    StateDelta, StateSnapshot, SubAgentSnapshot, TextEditorSnapshot, ToolPickerSnapshot,
+    UsageSnapshot, WarmStatusWire,
 };
-use crate::model::app_config::{ApiType, ModelRole, ThemeMode};
+use crate::model::app_config::{ApiType, ModelEntry, ModelRole, ProviderConn, ThemeMode};
 use crate::model::conversation::Conversation;
 use crate::model::session::Session;
 use crate::model::settings::{InternetMode, Settings};
 use crate::model::store;
+use crate::model::store::SessionMeta;
 use crate::view;
 
 use super::terminal::TerminalGuard;
@@ -176,7 +184,16 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = render_loop(&mut terminal, &frame_rx, &req_tx);
+    // Run the synchronous render loop with the runtime context entered on THIS thread,
+    // SCOPED so the `EnterGuard` is dropped the instant the loop returns — BEFORE the
+    // teardown's `handle.block_on` below (which panics if called while a runtime
+    // context is entered). The context is needed only so a snapshot rebuild can mint
+    // the inert `AbortHandle` a reconstructed shadow `SubAgent` carries (`tokio::spawn`
+    // needs a runtime in scope — see `shadow_subagent`); the loop itself stays sync.
+    let result = {
+        let _rt_ctx = handle.enter();
+        render_loop(&mut terminal, &frame_rx, &req_tx)
+    };
 
     // Polite detach so the daemon passes the controller seat promptly (the socket
     // close would also trigger it, but this is cleaner). If the `/quit` overlay's
@@ -454,6 +471,23 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     // helper, unknown → Dark); accent is an opaque palette key copied verbatim.
     shadow.rest.config.theme = shadow_theme(&global.theme);
     shadow.rest.config.accent = global.accent;
+    // The shadow `AppConfig`'s registered-model + provider catalogue is populated
+    // ONLY for the `/agents` screen (which resolves a chosen `model_uuid` to a
+    // `name @ provider` label off `rest.config`), from that mode's KEYLESS projection.
+    // Reset it here every snapshot so a stale catalogue from a previous Agents view
+    // never lingers into another screen; the Agents arm below refills it when active.
+    shadow.rest.config.models.clear();
+    shadow.rest.config.providers.clear();
+
+    // Full-screen sub-agent viewer + `$` panel state (rendered FROM Chat mode off the
+    // foreground session's reconstructed `subagents`). Mirror the daemon's
+    // `agent_viewer` index / scroll / follow + the panel open-state + selection so the
+    // unmodified chat renderer takes the same full-screen-viewer / overlay branch.
+    shadow.rest.agent_viewer = global.agent_viewer;
+    shadow.rest.agent_viewer_scroll = global.agent_viewer_scroll;
+    shadow.rest.agent_viewer_follow = global.agent_viewer_follow;
+    shadow.rest.subagents_open = global.subagents_open;
+    shadow.rest.subagent_sel = global.subagent_sel;
 
     // Re-anchor the comet clock from the projected elapsed-ms (authoritative for
     // this snapshot). `work_since = now - elapsed` makes the status shimmer animate
@@ -469,24 +503,64 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     // cache so the next draw rebuilds it against the new messages.
     shadow.rest.transcript_cache.borrow_mut().blocks.clear();
 
-    // Mode: reconstruct from the pure-data `ModeSnapshot`. Chat is payload-free.
-    // KeyInput / SessionHub / Loading / Settings (stage 2) are rebuilt into REAL
-    // mode state so the unmodified `view::draw` renders them faithfully — the client
-    // never mutates them (input is forwarded), it only needs enough to DRAW. The
-    // QuitConfirm overlay is special-cased so the client can ALSO intercept its
-    // lifecycle keys ([d] detach / [k] kill-all) locally (see `render_loop`); its
-    // busy/total counts ride on the snapshot. Every variant still STUBBED
-    // (SessionPicker / Agents / Effort / Usage / MessageRewind) falls back to Chat —
-    // the safe render — rather than fabricate an empty picker/form.
+    // Mode: reconstruct from the pure-data `ModeSnapshot` into REAL mode state so the
+    // unmodified `view::draw` renders every screen faithfully — the client never
+    // mutates these (input is forwarded), it only needs enough to DRAW. Chat is
+    // payload-free. The QuitConfirm overlay is special-cased so the client can ALSO
+    // intercept its lifecycle keys ([d] detach / [k] kill-all) locally (see
+    // `render_loop`). With stage 3 EVERY variant carries its payload, so nothing falls
+    // back to a blank Chat render any more.
+    //
+    // The `/usage` dashboard is special: its numbers come from the daemon's ledger,
+    // which the client cannot read, so the projection carries the pre-fetched data —
+    // seed `rest.usage_data` from it so the unmodified dashboard renders DB-free.
+    // Clear it first so a stale projection never lingers into the next non-Usage mode.
+    shadow.rest.usage_data = None;
     shadow.mode = match global.mode {
         ModeSnapshot::KeyInput(f) => Mode::KeyInput(shadow_key_input(f)),
+        ModeSnapshot::SessionPicker(p) => Mode::SessionPicker(shadow_picker(p)),
         ModeSnapshot::SessionHub(h) => Mode::SessionHub(Box::new(shadow_session_hub(h))),
+        ModeSnapshot::Chat => Mode::Chat,
         ModeSnapshot::Loading(s) => Mode::Loading(shadow_loading(s)),
         ModeSnapshot::Settings(s) => Mode::Settings(Box::new(shadow_settings(*s))),
+        ModeSnapshot::Agents(a) => {
+            // Seed the shadow config's KEYLESS catalogue so the agents view resolves
+            // the model label (`name @ provider`) off `rest.config`, exactly as the
+            // daemon does — without any API key (the reconstructed providers carry an
+            // empty `api_key`; the client only resolves labels, never sends a request).
+            shadow.rest.config.models = a
+                .catalogue_models
+                .iter()
+                .map(|m| ModelEntry {
+                    uuid: m.uuid.clone(),
+                    name: m.name.clone(),
+                    model_id: m.model_id.clone(),
+                    provider_uuid: m.provider_uuid.clone(),
+                    ..ModelEntry::default()
+                })
+                .collect();
+            shadow.rest.config.providers = a
+                .catalogue_providers
+                .iter()
+                .map(|p| ProviderConn {
+                    uuid: p.uuid.clone(),
+                    name: p.name.clone(),
+                    endpoint: p.endpoint.clone(),
+                    ..ProviderConn::default()
+                })
+                .collect();
+            Mode::Agents(Box::new(shadow_agents(*a)))
+        }
+        ModeSnapshot::Effort(e) => Mode::Effort(Box::new(shadow_effort(e))),
+        ModeSnapshot::Usage(u) => {
+            let UsageSnapshot { view, range, metric, data } = *u;
+            shadow.rest.usage_data = Some(data);
+            Mode::Usage(Box::new(shadow_usage_nav(&view, &range, &metric)))
+        }
+        ModeSnapshot::MessageRewind(rw) => Mode::MessageRewind(Box::new(shadow_rewind(rw))),
         ModeSnapshot::QuitConfirm { working, total } => {
             Mode::QuitConfirm(Box::new(QuitConfirmState::new(working, total)))
         }
-        _ => Mode::Chat,
     };
 
     // NOTE: the comet clock (`work_since`) was already set authoritatively from the
@@ -503,13 +577,13 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
 /// Every NON-render field stays at `Default` — the client never advances a turn, so
 /// the tool/sub-agent state machines and channels are never read.
 ///
-/// The QUEUED [`PendingSubagent`]s ARE reconstructed (they are plain data — no live
-/// handles), so once the `$`-panel open-state is itself projected (a later stage) the
-/// panel's "pending" rows render off real shadow data. The RUNNING `subagents` are
-/// still NOT reconstructed: a live [`crate::app::subagent::SubAgent`] holds a tokio
-/// `AbortHandle` + receiver that cannot be minted on the client's sync render thread,
-/// so their reconstruction is deferred (their wire projection is already enriched for
-/// that later stage).
+/// Both the QUEUED [`PendingSubagent`]s and the RUNNING/finished `subagents` are
+/// reconstructed from their plain-data projections, so the `$` panel rows AND the
+/// full-screen sub-agent viewer (both rendered FROM Chat mode) draw off real shadow
+/// data. A live [`crate::app::subagent::SubAgent`] needs a tokio `AbortHandle` +
+/// receiver, which require a runtime in scope — `client_run` enters the runtime
+/// context for the render loop so [`shadow_subagent`] can mint inert ones (the
+/// client never drives a sub-agent; the handle/rx exist only to satisfy the type).
 fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
     let mut rt = SessionRuntime::new();
     rt.id = s.id.clone();
@@ -547,7 +621,66 @@ fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
             tool_call_id: None,
         })
         .collect();
+    // Reconstruct the running/finished sub-agents (plain data + an inert handle/rx)
+    // so the `$` panel list AND the full-screen viewer render off real shadow data.
+    rt.subagents = s.subagents.iter().map(shadow_subagent).collect();
     rt
+}
+
+/// Rebuild a render-only [`SubAgent`] from its projection.
+///
+/// Carries every field the `$` panel + the full-screen viewer read (id, agent name,
+/// label, status, transcript, structured messages). The two runtime-bound fields a
+/// live `SubAgent` requires — the `abort` [`tokio::task::AbortHandle`] and the `rx`
+/// event receiver — are minted INERT here: the client never drains `rx` and never
+/// aborts (it forwards every key to the daemon, which owns the real sub-agent), so a
+/// no-op aborted task's handle + a fresh unused channel satisfy the type without ever
+/// being driven. `tokio::spawn` needs a runtime in scope, which `client_run` enters
+/// for the render loop. The non-rendered bookkeeping (`model_id`, `tool_call_id`,
+/// usage counters) is left empty/zero — the viewer and panel never read it.
+fn shadow_subagent(sa: &SubAgentSnapshot) -> SubAgent {
+    // Inert abort handle: a task that completes immediately; its handle is never used
+    // to abort anything (the daemon owns the real task). Cheap + completes at once.
+    let abort = tokio::spawn(std::future::ready(())).abort_handle();
+    // Fresh receiver the client never drains (the daemon folds real events; a shadow
+    // sub-agent's content arrives wholesale via the next snapshot's `messages`).
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    SubAgent {
+        id: sa.id,
+        agent_name: sa.name.clone(),
+        label: sa.label.clone(),
+        // Not rendered by the panel/viewer; left blank (the wire omits it).
+        model_id: String::new(),
+        status: shadow_subagent_status(&sa.status),
+        abort,
+        rx,
+        transcript: sa.transcript.clone(),
+        messages: sa.messages.clone(),
+        tool_call_id: None,
+        usage_tokens_in: 0,
+        usage_tokens_out: 0,
+        usage_cost: 0.0,
+    }
+}
+
+/// Map a wire sub-agent status string back to a [`SubAgentStatus`].
+///
+/// The daemon flattens the lifecycle enum to a short string (see
+/// `ipc::snapshot::subagent_snapshot`): `"running"` / `"done"` / `"killed"` /
+/// `"error: <detail>"`. The `Done` final-answer payload is NOT carried (the viewer —
+/// the projection's target — renders the transcript + the short status tag, neither of
+/// which uses it), so a reconstructed `Done` carries an empty answer; an `Error`
+/// keeps its detail (the panel's status line shows it). Unknown → `Running` (the
+/// safe "still going" default, never lost).
+fn shadow_subagent_status(status: &str) -> SubAgentStatus {
+    match status {
+        "done" => SubAgentStatus::Done(String::new()),
+        "killed" => SubAgentStatus::Killed,
+        s if s.starts_with("error:") => {
+            SubAgentStatus::Error(s.trim_start_matches("error:").trim().to_string())
+        }
+        _ => SubAgentStatus::Running,
+    }
 }
 
 /// Reconstruct a minimal [`Session`] from a [`SessionSnapshot`] for rendering.
@@ -788,6 +921,172 @@ fn shadow_path_picker(p: PathPickerSnapshot) -> PathPicker {
             None => PickerMode::Add,
             Some(i) => PickerMode::Replace(i),
         },
+    }
+}
+
+// ─── mode reconstruction (stage 3: secondary full-screen views) ──────────────
+
+/// Rebuild the `--resume` session picker ([`PickerState`]) from its projection.
+///
+/// Constructed as a struct literal (NOT `PickerState::new`, which would re-run the
+/// filter against a freshly-discovered local session list): the daemon's `all`
+/// metadata + the `filtered_idx` it computed are carried verbatim so the SAME rows
+/// render. Each row's `PathBuf` (the daemon-side load target) is rebuilt empty — the
+/// client never loads it (Enter is forwarded), and the picker view doesn't render it.
+fn shadow_picker(p: PickerSnapshot) -> PickerState {
+    PickerState {
+        query: p.query,
+        all: p
+            .all
+            .into_iter()
+            .map(|m| SessionMeta {
+                id: m.id,
+                name: m.name,
+                path: std::path::PathBuf::new(), // daemon-side load target; not rendered
+                modified: std::time::UNIX_EPOCH + Duration::from_secs(m.modified_secs),
+                message_count: m.message_count,
+                locked: m.locked,
+            })
+            .collect(),
+        filtered_idx: p.filtered_idx,
+        selected: p.selected,
+    }
+}
+
+/// Rebuild the `/effort` reasoning-effort picker ([`EffortPickerState`]) from its
+/// projection (all plain data the overlay reads).
+fn shadow_effort(e: crate::ipc::proto::EffortSnapshot) -> EffortPickerState {
+    EffortPickerState {
+        options: e.options,
+        selected: e.selected,
+        note: e.note,
+    }
+}
+
+/// Rebuild the `/usage` dashboard nav state ([`UsageNavState`]) from its wire tokens.
+/// The dashboard's DATA is seeded separately into `rest.usage_data` (it crosses on the
+/// same `UsageSnapshot`), so this only restores the view/range/metric selections.
+fn shadow_usage_nav(view: &str, range: &str, metric: &str) -> UsageNavState {
+    UsageNavState {
+        view: match view {
+            "session" => UsageView::Session,
+            _ => UsageView::Global,
+        },
+        range: match range {
+            "week" => UsageRange::Week,
+            "year" => UsageRange::Year,
+            _ => UsageRange::Today,
+        },
+        metric: match metric {
+            "tokens" => UsageMetric::Tokens,
+            _ => UsageMetric::Cost,
+        },
+    }
+}
+
+/// Rebuild the message-rewind picker ([`RewindState`]) from its projection — the
+/// newest-first entry list + the cursor.
+fn shadow_rewind(rw: RewindSnapshot) -> RewindState {
+    RewindState {
+        entries: rw
+            .entries
+            .into_iter()
+            .map(|e| RewindEntry {
+                vec_index: e.vec_index,
+                content: e.content,
+            })
+            .collect(),
+        selected: rw.selected,
+    }
+}
+
+/// Rebuild the `/agents` dashboard ([`AgentsState`]) from its projection.
+///
+/// Restores the agent list, the working drafts + sub-mode + field cursor (from wire
+/// tokens), the three overlays, and a minimal `session_dir` (empty — the client never
+/// saves). The KEYLESS model+provider catalogue is folded into `rest.config` by the
+/// caller's `shadow_settings`-style path? No — it is reconstructed HERE into a private
+/// `AppConfig` the agents view resolves the model label against, so the client renders
+/// `name @ provider` exactly as the daemon would WITHOUT any API key. The reconstructed
+/// state is render-only; key handling is forwarded to the daemon.
+fn shadow_agents(a: AgentsSnapshot) -> AgentsState {
+    AgentsState {
+        agents: a.agents,
+        list_sel: a.list_sel,
+        in_detail: a.in_detail,
+        mode: match a.mode.as_str() {
+            "edit" => AgentSubMode::Edit,
+            "create" => AgentSubMode::Create,
+            "delete_confirm" => AgentSubMode::DeleteConfirm,
+            _ => AgentSubMode::Browse,
+        },
+        field: shadow_agent_field(&a.field),
+        editing: a.editing,
+        create_scope: match a.create_scope.as_str() {
+            "global" => AgentScope::Global,
+            _ => AgentScope::Session,
+        },
+        draft_name: a.draft_name,
+        draft_description: a.draft_description,
+        draft_conditions: a.draft_conditions,
+        draft_model_uuid: a.draft_model_uuid,
+        draft_model_legacy: a.draft_model_legacy,
+        draft_tools: a.draft_tools,
+        draft_body: a.draft_body,
+        // The session dir is the daemon-side save target; the client never saves, and
+        // the view doesn't render it, so an empty path is fine.
+        session_dir: std::path::PathBuf::new(),
+        tool_picker: a.tool_picker.map(shadow_tool_picker),
+        model_picker: a.model_picker.map(shadow_agent_model_picker),
+        editor: a
+            .editor
+            .map(|(field, ed)| (shadow_agent_field(&field), shadow_text_editor(ed))),
+        editor_clear_confirm: a.editor_clear_confirm,
+    }
+}
+
+/// Rebuild the `/agents` tool multi-select picker ([`ToolPickerState`]).
+fn shadow_tool_picker(p: ToolPickerSnapshot) -> ToolPickerState {
+    ToolPickerState {
+        options: p.options,
+        checked: p.checked,
+        cursor: p.cursor,
+        filter: p.filter,
+    }
+}
+
+/// Rebuild the `/agents` single-select model picker ([`ModelPickerState`]).
+fn shadow_agent_model_picker(p: AgentModelPickerSnapshot) -> ModelPickerState {
+    ModelPickerState {
+        options: p.options,
+        cursor: p.cursor,
+    }
+}
+
+/// Rebuild the full-screen nano editor ([`TextEditorState`]) from its projection. The
+/// render-published `wrap_w` cell is re-seeded to `usize::MAX` (its `from_text`
+/// default), so before the first client frame every line is one segment — exactly the
+/// editor's own safe fallback; the next draw publishes the real width.
+fn shadow_text_editor(ed: TextEditorSnapshot) -> TextEditorState {
+    TextEditorState {
+        lines: ed.lines,
+        row: ed.row,
+        col: ed.col,
+        scroll: ed.scroll,
+        wrap_w: std::cell::Cell::new(usize::MAX),
+    }
+}
+
+/// Map an `/agents` field wire token back to an [`AgentEditField`] (unknown →
+/// Description, the editor's default focus — never lost).
+fn shadow_agent_field(f: &str) -> AgentEditField {
+    match f {
+        "name" => AgentEditField::Name,
+        "conditions" => AgentEditField::Conditions,
+        "model" => AgentEditField::Model,
+        "tools" => AgentEditField::Tools,
+        "prompt" => AgentEditField::Body,
+        _ => AgentEditField::Description,
     }
 }
 

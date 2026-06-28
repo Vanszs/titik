@@ -20,21 +20,30 @@
 //! merely calls these, and a future local-TUI consumer could call the exact same
 //! builder, so the wire projection can never drift from a second hand-rolled copy.
 
+use crate::app::mode::agents::{
+    AgentEditField, AgentScope, AgentSubMode, AgentsState, ModelPickerState, ToolPickerState,
+};
+use crate::app::mode::editor::TextEditorState;
 use crate::app::mode::settings::{ModelDraft, ModelModal, PathPicker, PickerMode, ProviderDraft};
 use crate::app::mode::{
-    CookingEntry, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode, SessionHub,
-    SettingsState, WarmStatus,
+    CookingEntry, EffortPickerState, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode,
+    PickerState, RewindState, SessionHub, SettingsState, UsageMetric, UsageNavState, UsageView,
+    WarmStatus,
 };
 use crate::app::state::AppState;
 use crate::app::subagent::SubAgentStatus;
 use crate::model::app_config::{ApiType, ModelRole, ThemeMode};
+use crate::model::store::SessionMeta;
 
 use super::proto::{
-    CookingEntrySnapshot, GlobalSnapshot, HistoryEntrySnapshot, KeyInputSnapshot, LoadingSnapshot,
-    ModeSnapshot, ModelDraftSnapshot, ModelEndpointWire, ModelModalSnapshot, PathPickerSnapshot,
-    PendingSubagentSnapshot, ProviderDraftSnapshot, ProviderModalSnapshot, RolePickerSnapshot,
-    SessionHubSnapshot, SessionSnapshot, SettingsSnapshot, StateDelta, StateSnapshot,
-    SubAgentSnapshot, WarmStatusWire,
+    AgentModelPickerSnapshot, AgentsSnapshot, CatalogueModelSnapshot, CatalogueProviderSnapshot,
+    CookingEntrySnapshot, EffortSnapshot, GlobalSnapshot, HistoryEntrySnapshot, KeyInputSnapshot,
+    LoadingSnapshot, ModeSnapshot, ModelDraftSnapshot, ModelEndpointWire, ModelModalSnapshot,
+    PathPickerSnapshot, PendingSubagentSnapshot, PickerSnapshot, ProviderDraftSnapshot,
+    ProviderModalSnapshot, RewindEntrySnapshot, RewindSnapshot, RolePickerSnapshot,
+    SessionHubSnapshot, SessionMetaSnapshot, SessionSnapshot, SettingsSnapshot, StateDelta,
+    StateSnapshot, SubAgentSnapshot, TextEditorSnapshot, ToolPickerSnapshot, UsageSnapshot,
+    WarmStatusWire,
 };
 
 /// Build a complete, frozen [`StateSnapshot`] from the live [`AppState`].
@@ -180,7 +189,7 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         // helper the Settings draft uses); accent is an opaque palette key, verbatim.
         theme: theme_token(&state.rest.config.theme).to_string(),
         accent: state.rest.config.accent.clone(),
-        mode: mode_snapshot(&state.mode),
+        mode: mode_snapshot(state),
         // Project the toast as (kind, text); the TTL `Instant` is daemon-local and
         // never crosses the wire (the client re-derives its own dismissal timer).
         toast: state.rest.toast.as_ref().map(|(msg, _until, kind)| {
@@ -196,28 +205,43 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         // omnisearch dropdown would never populate. `ModelInfo` is serde-clean.
         models_cache: state.rest.models_cache.clone(),
         models_cache_endpoint: state.rest.models_cache_endpoint.clone(),
+        // Full-screen sub-agent viewer + `$` panel state. These are rendered FROM
+        // Chat mode (the chat renderer takes the viewer branch when `agent_viewer`
+        // is set, and the input controller floats the `$` panel), so they ride on
+        // the global projection — the client mirrors them onto `rest.*` so the
+        // unmodified chat draw reproduces both, off the per-session `subagents` it
+        // also reconstructs.
+        agent_viewer: state.rest.agent_viewer,
+        agent_viewer_scroll: state.rest.agent_viewer_scroll,
+        agent_viewer_follow: state.rest.agent_viewer_follow,
+        subagents_open: state.rest.subagents_open,
+        subagent_sel: state.rest.subagent_sel,
     }
 }
 
 /// Project the (large, non-serde) [`Mode`] into the pure-data [`ModeSnapshot`].
 ///
 /// 1:1 with the `Mode` variants. Stage 1 filled `Chat` + `QuitConfirm`; stage 2
-/// fills the CORE interactive modes — `KeyInput`, `SessionHub`, `Loading`,
-/// `Settings` — copying each live mode's render-relevant fields into its payload
-/// projection. The remaining variants stay STUBS carrying only "this screen is
-/// active" (the client falls back to a safe Chat render for them).
-fn mode_snapshot(mode: &Mode) -> ModeSnapshot {
-    match mode {
+/// filled the CORE interactive modes (`KeyInput`, `SessionHub`, `Loading`,
+/// `Settings`); stage 3 fills the SECONDARY views (`Usage`, `MessageRewind`) and the
+/// last stubs (`Effort`, `SessionPicker`, `Agents`) — so EVERY variant now carries
+/// its render-relevant payload and nothing falls back to a blank Chat render.
+///
+/// Takes the whole `state` (not just the mode) because the `Usage` projection
+/// pre-computes the dashboard's ledger data scoped to the foreground session (see
+/// [`usage_snapshot`]).
+fn mode_snapshot(state: &AppState) -> ModeSnapshot {
+    match &state.mode {
         Mode::KeyInput(f) => ModeSnapshot::KeyInput(key_input_snapshot(f)),
-        Mode::SessionPicker(_) => ModeSnapshot::SessionPicker,
+        Mode::SessionPicker(p) => ModeSnapshot::SessionPicker(picker_snapshot(p)),
         Mode::SessionHub(h) => ModeSnapshot::SessionHub(session_hub_snapshot(h)),
         Mode::Chat => ModeSnapshot::Chat,
         Mode::Loading(s) => ModeSnapshot::Loading(loading_snapshot(s)),
         Mode::Settings(s) => ModeSnapshot::Settings(Box::new(settings_snapshot(s))),
-        Mode::Agents(_) => ModeSnapshot::Agents,
-        Mode::Effort(_) => ModeSnapshot::Effort,
-        Mode::Usage(_) => ModeSnapshot::Usage,
-        Mode::MessageRewind(_) => ModeSnapshot::MessageRewind,
+        Mode::Agents(a) => ModeSnapshot::Agents(Box::new(agents_snapshot(a, state))),
+        Mode::Effort(e) => ModeSnapshot::Effort(effort_snapshot(e)),
+        Mode::Usage(nav) => ModeSnapshot::Usage(Box::new(usage_snapshot(nav, state))),
+        Mode::MessageRewind(rw) => ModeSnapshot::MessageRewind(rewind_snapshot(rw)),
         Mode::QuitConfirm(s) => ModeSnapshot::QuitConfirm {
             working: s.working,
             total: s.total,
@@ -420,6 +444,233 @@ fn path_picker_snapshot(p: &PathPicker) -> PathPickerSnapshot {
     }
 }
 
+// ─── stage 3: secondary full-screen view projections ─────────────────────────
+
+/// Project the `/usage` dashboard ([`UsageNavState`]) + its pre-fetched ledger data
+/// into the wire snapshot.
+///
+/// The dashboard's numbers come from the global sqlite ledger, which the thin
+/// client cannot read. So the daemon runs the SAME collection the local renderer
+/// would (`view::usage::collect_usage_data`, scoped to the active view/range + the
+/// foreground session) and ships the result; the client seeds `rest.usage_data` from
+/// it and renders the unmodified dashboard with no DB. The nav state rides as wire
+/// tokens.
+fn usage_snapshot(nav: &UsageNavState, state: &AppState) -> UsageSnapshot {
+    UsageSnapshot {
+        view: usage_view_token(nav.view).to_string(),
+        range: nav.range.label().to_string(),
+        metric: usage_metric_token(nav.metric).to_string(),
+        // Collect the dashboard's data daemon-side via the SAME helper the local
+        // renderer uses (one source of truth), so the client renders identically.
+        data: crate::view::usage::collect_usage_data(nav, &state.rest),
+    }
+}
+
+/// Wire token for a [`UsageView`].
+fn usage_view_token(v: UsageView) -> &'static str {
+    match v {
+        UsageView::Global => "global",
+        UsageView::Session => "session",
+    }
+}
+
+/// Wire token for a [`UsageMetric`].
+fn usage_metric_token(m: UsageMetric) -> &'static str {
+    match m {
+        UsageMetric::Cost => "cost",
+        UsageMetric::Tokens => "tokens",
+    }
+}
+
+/// Project the message-rewind picker ([`RewindState`]) into its wire snapshot — the
+/// newest-first user-message entries + the cursor.
+fn rewind_snapshot(rw: &RewindState) -> RewindSnapshot {
+    RewindSnapshot {
+        entries: rw
+            .entries
+            .iter()
+            .map(|e| RewindEntrySnapshot {
+                vec_index: e.vec_index,
+                content: e.content.clone(),
+            })
+            .collect(),
+        selected: rw.selected,
+    }
+}
+
+/// Project the `/effort` reasoning-effort picker ([`EffortPickerState`]) into its
+/// wire snapshot (all plain data the overlay reads).
+fn effort_snapshot(e: &EffortPickerState) -> EffortSnapshot {
+    EffortSnapshot {
+        options: e.options.clone(),
+        selected: e.selected,
+        note: e.note.clone(),
+    }
+}
+
+/// Project the `--resume` session picker ([`PickerState`]) into its wire snapshot.
+/// The full metadata list + the live query + the filtered subset + the cursor cross
+/// so the client renders the SAME rows (it re-filters nothing of its own).
+fn picker_snapshot(p: &PickerState) -> PickerSnapshot {
+    PickerSnapshot {
+        query: p.query.clone(),
+        all: p.all.iter().map(session_meta_snapshot).collect(),
+        filtered_idx: p.filtered_idx.clone(),
+        selected: p.selected,
+    }
+}
+
+/// Project one [`SessionMeta`] row. The `PathBuf` (daemon-side load target) is
+/// dropped (not rendered); the `SystemTime` becomes seconds-since-epoch.
+fn session_meta_snapshot(m: &SessionMeta) -> SessionMetaSnapshot {
+    let modified_secs = m
+        .modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    SessionMetaSnapshot {
+        id: m.id.clone(),
+        name: m.name.clone(),
+        modified_secs,
+        message_count: m.message_count,
+        locked: m.locked,
+    }
+}
+
+/// Project the `/agents` dashboard ([`AgentsState`]) into its wire snapshot.
+///
+/// Carries the agent list (`AgentDef` is serde-clean), the working drafts plus the
+/// sub-mode and field cursor (as wire tokens), the three overlays, and a KEYLESS
+/// model/provider catalogue (drawn from the live `AppConfig` and the foreground
+/// session's session models) so the client resolves the model label without any API
+/// key crossing the wire.
+fn agents_snapshot(a: &AgentsState, state: &AppState) -> AgentsSnapshot {
+    let config = &state.rest.config;
+
+    // Keyless registered-model catalogue: the session overrides FIRST (the same
+    // order the model picker lists), then the global catalogue. The label resolver
+    // (`view::agents::model_display`) checks session models then global; folding both
+    // into one keyless list lets the client resolve either source's uuid.
+    let mut catalogue_models: Vec<CatalogueModelSnapshot> = Vec::new();
+    if let Some(session) = state.rest.fg().session.as_ref() {
+        for e in &session.settings.session_models {
+            catalogue_models.push(CatalogueModelSnapshot {
+                uuid: e.uuid.clone(),
+                name: e.name.clone(),
+                model_id: e.model_id.clone(),
+                provider_uuid: e.provider_uuid.clone(),
+            });
+        }
+    }
+    for e in &config.models {
+        catalogue_models.push(CatalogueModelSnapshot {
+            uuid: e.uuid.clone(),
+            name: e.name.clone(),
+            model_id: e.model_id.clone(),
+            provider_uuid: e.provider_uuid.clone(),
+        });
+    }
+
+    // Keyless provider catalogue (uuid + display name + endpoint only — NEVER the
+    // api key). The reconstructed `AppConfig` carries no keys, which is correct: the
+    // client only resolves labels, never makes a request.
+    let catalogue_providers: Vec<CatalogueProviderSnapshot> = config
+        .providers
+        .iter()
+        .map(|p| CatalogueProviderSnapshot {
+            uuid: p.uuid.clone(),
+            name: p.name.clone(),
+            endpoint: p.endpoint.clone(),
+        })
+        .collect();
+
+    AgentsSnapshot {
+        agents: a.agents.clone(),
+        list_sel: a.list_sel,
+        in_detail: a.in_detail,
+        mode: agent_submode_token(a.mode).to_string(),
+        field: agent_field_token(a.field).to_string(),
+        editing: a.editing,
+        create_scope: agent_scope_token(a.create_scope).to_string(),
+        draft_name: a.draft_name.clone(),
+        draft_description: a.draft_description.clone(),
+        draft_conditions: a.draft_conditions.clone(),
+        draft_model_uuid: a.draft_model_uuid.clone(),
+        draft_model_legacy: a.draft_model_legacy.clone(),
+        draft_tools: a.draft_tools.clone(),
+        draft_body: a.draft_body.clone(),
+        tool_picker: a.tool_picker.as_ref().map(tool_picker_snapshot),
+        model_picker: a.model_picker.as_ref().map(agent_model_picker_snapshot),
+        editor: a
+            .editor
+            .as_ref()
+            .map(|(field, ed)| (agent_field_token(*field).to_string(), text_editor_snapshot(ed))),
+        editor_clear_confirm: a.editor_clear_confirm,
+        catalogue_models,
+        catalogue_providers,
+    }
+}
+
+/// Project the `/agents` tool multi-select picker ([`ToolPickerState`]).
+fn tool_picker_snapshot(p: &ToolPickerState) -> ToolPickerSnapshot {
+    ToolPickerSnapshot {
+        options: p.options.clone(),
+        checked: p.checked.clone(),
+        cursor: p.cursor,
+        filter: p.filter.clone(),
+    }
+}
+
+/// Project the `/agents` single-select model picker ([`ModelPickerState`]).
+fn agent_model_picker_snapshot(p: &ModelPickerState) -> AgentModelPickerSnapshot {
+    AgentModelPickerSnapshot {
+        options: p.options.clone(),
+        cursor: p.cursor,
+    }
+}
+
+/// Project the full-screen nano editor ([`TextEditorState`]). The render-published
+/// `wrap_w` cell is re-seeded on the client, so only the buffer + cursor + scroll
+/// cross.
+fn text_editor_snapshot(ed: &TextEditorState) -> TextEditorSnapshot {
+    TextEditorSnapshot {
+        lines: ed.lines.clone(),
+        row: ed.row,
+        col: ed.col,
+        scroll: ed.scroll,
+    }
+}
+
+/// Wire token for an [`AgentSubMode`].
+fn agent_submode_token(m: AgentSubMode) -> &'static str {
+    match m {
+        AgentSubMode::Browse => "browse",
+        AgentSubMode::Edit => "edit",
+        AgentSubMode::Create => "create",
+        AgentSubMode::DeleteConfirm => "delete_confirm",
+    }
+}
+
+/// Wire token for an [`AgentEditField`].
+fn agent_field_token(f: AgentEditField) -> &'static str {
+    match f {
+        AgentEditField::Name => "name",
+        AgentEditField::Description => "description",
+        AgentEditField::Conditions => "conditions",
+        AgentEditField::Model => "model",
+        AgentEditField::Tools => "tools",
+        AgentEditField::Body => "prompt",
+    }
+}
+
+/// Wire token for an [`AgentScope`].
+fn agent_scope_token(s: AgentScope) -> &'static str {
+    match s {
+        AgentScope::Session => "session",
+        AgentScope::Global => "global",
+    }
+}
+
 /// Wire token for a [`ThemeMode`].
 fn theme_token(t: &ThemeMode) -> &'static str {
     match t {
@@ -498,6 +749,23 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
     // instant the mode projection moves. (The per-tick `work_elapsed_ms` is
     // deliberately NOT diffed — see the note where the global fields are compared.)
     if prev.global.mode != next.global.mode {
+        return DiffResult::full();
+    }
+
+    // --- structural: the sub-agent viewer / `$` panel state changed ---
+    // These global flags (the full-screen viewer's open-index + scroll + follow, and
+    // the `$` panel's open-state + selection) are rendered FROM Chat mode, so a change
+    // doesn't move `global.mode` and no incremental delta carries them. They flip only
+    // on discrete user actions (open/scroll the viewer, open/navigate the panel), so a
+    // full snapshot on a change is cheap-correct — without it the client's viewer/panel
+    // would lag until the next structural change. (The viewer's CONTENT updates already
+    // force a full snapshot via the per-session `subagents` comparison below.)
+    if prev.global.agent_viewer != next.global.agent_viewer
+        || prev.global.agent_viewer_scroll != next.global.agent_viewer_scroll
+        || prev.global.agent_viewer_follow != next.global.agent_viewer_follow
+        || prev.global.subagents_open != next.global.subagents_open
+        || prev.global.subagent_sel != next.global.subagent_sel
+    {
         return DiffResult::full();
     }
 

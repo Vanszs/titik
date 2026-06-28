@@ -57,11 +57,36 @@ use ratatui::{
 
 use crate::app::mode::{UsageMetric, UsageNavState, UsageRange, UsageView};
 use crate::app::state::AppStateRest;
-use crate::model::usage::{
-    range_totals, role_split, session_hourly, session_models, session_totals,
-    spend_buckets, top_models_in_range, BucketSize, SpendBucket,
-};
+use crate::model::usage::{BucketSize, SpendBucket, UsageData};
 use crate::view::theme::Palette;
+
+/// Collect the `/usage` dashboard's ledger projection for the current `nav` + the
+/// foreground session in `rest`.
+///
+/// This is the single mapping from the UI nav state (view / range) to the
+/// UI-agnostic [`UsageData::collect`] primitives: it resolves the range's start
+/// epoch + the heatmap's bucket granularity and the foreground session's uuid, then
+/// runs the (non-fatal) ledger queries. Called by the LOCAL TUI's renderer every
+/// frame (live data) AND by the daemon when it builds the snapshot the thin client
+/// renders from — so both sides compute the dashboard identically from one place.
+pub fn collect_usage_data(nav: &UsageNavState, rest: &AppStateRest) -> UsageData {
+    let session_view = nav.view == UsageView::Session;
+    let since = nav.range.since_secs();
+    // Heatmap bucket granularity per range (matches the per-range chart builders):
+    // hourly (24) for Today, daily for Week (7) and Year (≈year of days).
+    let (heat_bucket, heat_n) = match nav.range {
+        UsageRange::Today => (BucketSize::Hour, 24),
+        UsageRange::Week => (BucketSize::Day, 7),
+        UsageRange::Year => (BucketSize::Day, 371),
+    };
+    let uuid = rest
+        .fg()
+        .session
+        .as_ref()
+        .map(|s| s.id.clone())
+        .unwrap_or_default();
+    UsageData::collect(session_view, since, heat_bucket, heat_n, &uuid)
+}
 
 // ── Heatmap ramp (cheap -> expensive) ────────────────────────────────────────
 
@@ -100,7 +125,20 @@ const KPI_LABEL_W: usize = 10;
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Render the `/usage` dashboard every frame while `Mode::Usage` is active.
-pub fn draw(frame: &mut Frame, rest: &AppStateRest, nav: &UsageNavState, palette: &Palette) {
+///
+/// `data` is the pre-fetched ledger projection for THIS frame (see
+/// [`UsageData`]): the renderer reads it instead of querying the sqlite ledger, so
+/// the same draw path serves both the local TUI (which collects `data` live each
+/// frame) and the daemon's thin client (which receives `data` in the snapshot and
+/// has no DB of its own). The active-view counters come from `rest`'s live
+/// foreground session, which `data.session_calls` complements.
+pub fn draw(
+    frame: &mut Frame,
+    rest: &AppStateRest,
+    nav: &UsageNavState,
+    data: &UsageData,
+    palette: &Palette,
+) {
     let area = frame.area();
 
     // Minimum-size guard — nothing below panics on a very small terminal.
@@ -126,8 +164,8 @@ pub fn draw(frame: &mut Frame, rest: &AppStateRest, nav: &UsageNavState, palette
     draw_footer(frame, palette, outer[2]);
 
     match nav.view {
-        UsageView::Global  => draw_global(frame, nav, palette, outer[1]),
-        UsageView::Session => draw_session(frame, rest, nav, palette, outer[1]),
+        UsageView::Global  => draw_global(frame, nav, data, palette, outer[1]),
+        UsageView::Session => draw_session(frame, rest, nav, data, palette, outer[1]),
     }
 }
 
@@ -245,15 +283,16 @@ fn section(frame: &mut Frame, title: &str, palette: &Palette, area: Rect) -> Rec
 
 // ── View A: Global ────────────────────────────────────────────────────────────
 
-fn draw_global(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: Rect) {
+fn draw_global(frame: &mut Frame, nav: &UsageNavState, data: &UsageData, palette: &Palette, area: Rect) {
     if area.height < 3 {
         return;
     }
 
-    let since   = nav.range.since_secs();
-    let totals  = range_totals(since);
-    let models  = top_models_in_range(since, 8);
-    let rsplit  = role_split(since);
+    // Pre-fetched ledger projection for this frame — no DB access here (so the thin
+    // client renders the SAME dashboard from the snapshot's `data`).
+    let totals  = &data.totals;
+    let models  = data.top_models.as_slice();
+    let rsplit  = &data.role_split;
 
     // Pre-measure the side-by-side middle row so it sizes to the TALLER of its
     // two contents — never stretched to fill the screen.
@@ -290,7 +329,7 @@ fn draw_global(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: 
     // KPI — vertical list.
     {
         let inner = section(frame, "KPI", palette, rows[0]);
-        draw_kpi_strip(frame, &totals, palette, inner);
+        draw_kpi_strip(frame, totals, palette, inner);
     }
 
     // Middle: heatmap (left) | top-models (right), sized to the taller content.
@@ -305,16 +344,16 @@ fn draw_global(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: 
             .split(rows[2]);
 
         let heat_inner = section(frame, &heatmap_title(nav), palette, cols[0]);
-        draw_heatmap(frame, nav, since, heat_inner, palette);
+        draw_heatmap(frame, nav, &data.heatmap_buckets, heat_inner, palette);
 
         let models_inner = section(frame, "TOP MODELS", palette, cols[2]);
-        draw_models(frame, &models, &totals, nav, palette, models_inner, right_w);
+        draw_models(frame, models, totals, nav, palette, models_inner, right_w);
     }
 
     // Role split — full-width compact section.
     {
         let inner = section(frame, "ROLE SPLIT", palette, rows[4]);
-        draw_role_split(frame, &rsplit, palette, inner);
+        draw_role_split(frame, rsplit, palette, inner);
     }
 }
 
@@ -382,12 +421,12 @@ fn heatmap_content_height(nav: &UsageNavState) -> usize {
     }
 }
 
-fn draw_heatmap(frame: &mut Frame, nav: &UsageNavState, since: i64, area: Rect, palette: &Palette) {
+fn draw_heatmap(frame: &mut Frame, nav: &UsageNavState, buckets: &[SpendBucket], area: Rect, palette: &Palette) {
     if area.width < 8 || area.height == 0 {
         return;
     }
 
-    let lines = build_heatmap(nav, since, area.width as usize, palette);
+    let lines = build_heatmap(nav, buckets, area.width as usize, palette);
     let visible: Vec<Line<'static>> = lines.into_iter().take(area.height as usize).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
@@ -500,18 +539,19 @@ fn draw_role_split(frame: &mut Frame, split: &crate::model::usage::RoleSplit, pa
 
 // ── View B: Session ───────────────────────────────────────────────────────────
 
-fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, palette: &Palette, area: Rect) {
+fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, data: &UsageData, palette: &Palette, area: Rect) {
     if area.height < 3 {
         return;
     }
 
-    let uuid        = rest.fg().session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
-    let sess_models = session_models(&uuid);
-    let hourly      = session_hourly(&uuid);
-    // DB totals used only for the call count; live rest counters take precedence
-    // for tokens/cost since they may be ahead of the ledger (last call not yet
-    // committed, or session opened without a prior ledger entry).
-    let db_totals   = session_totals(&uuid);
+    // Pre-fetched, session-scoped ledger projection for this frame (no DB access —
+    // the thin client renders from the snapshot's `data`).
+    let sess_models = data.session_models.as_slice();
+    let hourly      = data.session_hourly.as_slice();
+    // DB call count only; live `rest` counters take precedence for tokens/cost since
+    // they may be ahead of the ledger (last call not yet committed, or session opened
+    // without a prior ledger entry).
+    let db_calls    = data.session_calls;
 
     // Pre-measure the side-by-side row so it sizes to the taller content.
     let mid_w     = area.width.saturating_sub(COL_GAP) as usize;
@@ -538,7 +578,7 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, pa
 
     {
         let inner = section(frame, "SESSION TOTALS", palette, rows[0]);
-        draw_session_kpi(frame, rest, db_totals.calls, palette, inner);
+        draw_session_kpi(frame, rest, db_calls, palette, inner);
     }
 
     {
@@ -552,10 +592,10 @@ fn draw_session(frame: &mut Frame, rest: &AppStateRest, _nav: &UsageNavState, pa
             .split(rows[2]);
 
         let models_inner = section(frame, "MODELS USED", palette, cols[0]);
-        draw_session_models(frame, &sess_models, palette, models_inner, left_w);
+        draw_session_models(frame, sess_models, palette, models_inner, left_w);
 
         let hourly_inner = section(frame, "HOURLY HEATMAP", palette, cols[2]);
-        draw_session_hourly(frame, &hourly, palette, hourly_inner, right_w);
+        draw_session_hourly(frame, hourly, palette, hourly_inner, right_w);
     }
 }
 
@@ -734,16 +774,20 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
 
 /// Build range-adaptive heatmap lines driven by `nav.range` and `nav.metric`.
 ///
+/// `buckets` is the pre-fetched spend series for the active range (hourly for
+/// Today, daily for Week/Year — see [`UsageData::collect`]). Each builder maps the
+/// absolute `bucket_epoch`s onto its own time grid, so no DB / `since` is needed.
+///
 /// | Range | Grid style                   |
 /// |-------|------------------------------|
 /// | Today | 24 hourly horizontal bars    |
 /// | Week  | 7 daily horizontal bars      |
 /// | Year  | 7 rows x 53 cols Github grid |
-fn build_heatmap(nav: &UsageNavState, since: i64, max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
+fn build_heatmap(nav: &UsageNavState, buckets: &[SpendBucket], max_width: usize, palette: &Palette) -> Vec<Line<'static>> {
     match nav.range {
-        UsageRange::Today => build_hourly_horizontal_chart(since, nav.metric, max_width, palette),
-        UsageRange::Week  => build_day_horizontal_chart(since, nav.metric, max_width, palette),
-        UsageRange::Year  => build_heatmap_yearly(since, nav.metric, palette),
+        UsageRange::Today => build_hourly_horizontal_chart(buckets, nav.metric, max_width, palette),
+        UsageRange::Week  => build_day_horizontal_chart(buckets, nav.metric, max_width, palette),
+        UsageRange::Year  => build_heatmap_yearly(buckets, nav.metric, palette),
     }
 }
 
@@ -762,13 +806,14 @@ const METRIC_LABEL_W: usize = 9;
 /// extending rightward, colored by the heat ramp.  The current hour is highlighted.
 /// Cost/token value is right-aligned at the end of each row.
 fn build_hourly_horizontal_chart(
-    since: i64,
+    buckets: &[SpendBucket],
     metric: UsageMetric,
     max_width: usize,
     palette: &Palette,
 ) -> Vec<Line<'static>> {
-    let buckets = spend_buckets(since, BucketSize::Hour, 24);
-    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+    // Index the pre-fetched buckets by epoch (cloned — the series is tiny: ≤24/7/371
+    // rows — so an owned map keeps the existing `&SpendBucket` value shape downstream).
+    let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now = now_secs();
     let today = now - now % 86400;
@@ -839,14 +884,13 @@ fn build_hourly_horizontal_chart(
 /// Horizontal bar chart for the Week view: one row per day (Mon–Sun), each bar
 /// extending rightward, colored by the heat ramp.  Today is highlighted.
 fn build_day_horizontal_chart(
-    since: i64,
+    buckets: &[SpendBucket],
     metric: UsageMetric,
     max_width: usize,
     palette: &Palette,
 ) -> Vec<Line<'static>> {
     const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let buckets = spend_buckets(since, BucketSize::Day, 7);
-    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+    let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now = now_secs();
     let snap = now - now % 86400;
@@ -911,9 +955,8 @@ fn build_day_horizontal_chart(
 }
 
 
-fn build_heatmap_yearly(since: i64, metric: UsageMetric, palette: &Palette) -> Vec<Line<'static>> {
-    let buckets = spend_buckets(since, BucketSize::Day, 371);
-    let map: HashMap<i64, SpendBucket> = buckets.into_iter().map(|b| (b.bucket_epoch, b)).collect();
+fn build_heatmap_yearly(buckets: &[SpendBucket], metric: UsageMetric, palette: &Palette) -> Vec<Line<'static>> {
+    let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now        = now_secs();
     let today      = now - now % 86400;

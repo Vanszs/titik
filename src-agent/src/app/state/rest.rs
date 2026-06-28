@@ -190,6 +190,15 @@ pub struct AppStateRest {
     /// are ingested as an attachment; on `Err` a toast is shown. `None` when no fetch
     /// is in flight.
     pub clipboard_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+    /// Pre-fetched `/usage` dashboard data, supplied ONLY on the daemon's thin attach
+    /// client (which has no sqlite ledger of its own). `None` on a local TUI: the
+    /// `/usage` renderer then collects the data live from the ledger every frame
+    /// (unchanged behaviour). `Some(_)` on the client: rebuilt from each
+    /// [`crate::ipc::proto::ModeSnapshot::Usage`] payload so the renderer draws the
+    /// SAME dashboard without DB access (mirrors how `models_cache` feeds the
+    /// omnisearch dropdowns remotely). Read only while in `Mode::Usage`; left `None`
+    /// otherwise so it never lingers.
+    pub usage_data: Option<crate::model::usage::UsageData>,
 }
 
 impl Default for AppStateRest {
@@ -246,6 +255,7 @@ impl AppStateRest {
             agent_viewer_scroll: 0,
             agent_viewer_follow: true,
             clipboard_rx: None,
+            usage_data: None,
         }
     }
 

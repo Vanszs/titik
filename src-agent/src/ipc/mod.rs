@@ -119,6 +119,13 @@ mod roundtrip_tests {
             toast: Some(("info".to_string(), "saved".to_string())),
             models_cache: None,
             models_cache_endpoint: None,
+            // Non-default sub-agent viewer + `$` panel state so the round-trip proves
+            // these stage-3 global flags survive serialize -> deserialize.
+            agent_viewer: Some(1),
+            agent_viewer_scroll: 7,
+            agent_viewer_follow: false,
+            subagents_open: true,
+            subagent_sel: 2,
         }
     }
 
@@ -282,5 +289,136 @@ mod roundtrip_tests {
     #[test]
     fn max_frame_bytes_is_64_mib() {
         assert_eq!(MAX_FRAME_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// Each stage-3 `ModeSnapshot` payload (the secondary full-screen views + the
+    /// last filled stubs) survives serialize -> deserialize, so a remote client
+    /// reconstructs the same screen the daemon projected.
+    #[test]
+    fn mode_snapshot_stage3_variants_roundtrip() {
+        use crate::model::usage::{ModelCostRange, RangeTotals, RoleSplit, SpendBucket, UsageData};
+
+        // Usage: nav tokens + a populated ledger projection (both views' fields).
+        let usage = ModeSnapshot::Usage(Box::new(UsageSnapshot {
+            view: "global".to_string(),
+            range: "week".to_string(),
+            metric: "tokens".to_string(),
+            data: UsageData {
+                totals: RangeTotals {
+                    cost: 1.25,
+                    tokens_in: 1000,
+                    tokens_cached: 100,
+                    tokens_out: 400,
+                    calls: 7,
+                },
+                top_models: vec![ModelCostRange {
+                    model_id: "openai/gpt-4o".to_string(),
+                    total_cost: 1.0,
+                    tokens_in: 800,
+                    tokens_cached: 80,
+                    tokens_out: 300,
+                    call_count: 5,
+                }],
+                role_split: RoleSplit {
+                    main_cost: 0.9,
+                    main_calls: 4,
+                    sub_cost: 0.35,
+                    sub_calls: 3,
+                },
+                heatmap_buckets: vec![SpendBucket {
+                    bucket_epoch: 1_700_000_000,
+                    cost: 0.5,
+                    tokens: 600,
+                }],
+                session_models: vec![],
+                session_hourly: vec![],
+                session_calls: 7,
+            },
+        }));
+        roundtrip(&usage);
+
+        // MessageRewind: newest-first entries + cursor.
+        roundtrip(&ModeSnapshot::MessageRewind(RewindSnapshot {
+            entries: vec![
+                RewindEntrySnapshot { vec_index: 4, content: "latest".to_string() },
+                RewindEntrySnapshot { vec_index: 2, content: "earlier".to_string() },
+            ],
+            selected: 1,
+        }));
+
+        // Effort: options + cursor + note.
+        roundtrip(&ModeSnapshot::Effort(EffortSnapshot {
+            options: vec!["default".to_string(), "high".to_string()],
+            selected: 1,
+            note: "model supports effort".to_string(),
+        }));
+
+        // SessionPicker: metadata list + query + filtered subset + cursor.
+        roundtrip(&ModeSnapshot::SessionPicker(PickerSnapshot {
+            query: "auth".to_string(),
+            all: vec![SessionMetaSnapshot {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "auth-refactor".to_string(),
+                modified_secs: 1_700_000_500,
+                message_count: 12,
+                locked: false,
+            }],
+            filtered_idx: vec![0],
+            selected: 0,
+        }));
+
+        // Agents: the largest payload — list + drafts + overlays + keyless catalogue.
+        let agents = ModeSnapshot::Agents(Box::new(AgentsSnapshot {
+            agents: vec![crate::model::agent_def::AgentDef {
+                name: "explore".to_string(),
+                description: "scout the codebase".to_string(),
+                ..crate::model::agent_def::AgentDef::default()
+            }],
+            list_sel: 0,
+            in_detail: true,
+            mode: "edit".to_string(),
+            field: "prompt".to_string(),
+            editing: false,
+            create_scope: "session".to_string(),
+            draft_name: "explore".to_string(),
+            draft_description: "scout the codebase".to_string(),
+            draft_conditions: String::new(),
+            draft_model_uuid: Some("model-uuid".to_string()),
+            draft_model_legacy: None,
+            draft_tools: "read, grep".to_string(),
+            draft_body: "You are a scout.".to_string(),
+            tool_picker: Some(ToolPickerSnapshot {
+                options: vec!["read".to_string(), "grep".to_string()],
+                checked: vec![true, false],
+                cursor: 0,
+                filter: String::new(),
+            }),
+            model_picker: Some(AgentModelPickerSnapshot {
+                options: vec![(None, "(inherit main)".to_string())],
+                cursor: 0,
+            }),
+            editor: Some((
+                "prompt".to_string(),
+                TextEditorSnapshot {
+                    lines: vec!["You are a scout.".to_string()],
+                    row: 0,
+                    col: 3,
+                    scroll: 0,
+                },
+            )),
+            editor_clear_confirm: false,
+            catalogue_models: vec![CatalogueModelSnapshot {
+                uuid: "model-uuid".to_string(),
+                name: "GPT-4o".to_string(),
+                model_id: "openai/gpt-4o".to_string(),
+                provider_uuid: "prov-uuid".to_string(),
+            }],
+            catalogue_providers: vec![CatalogueProviderSnapshot {
+                uuid: "prov-uuid".to_string(),
+                name: "OpenRouter".to_string(),
+                endpoint: "https://openrouter.ai/api/v1".to_string(),
+            }],
+        }));
+        roundtrip(&agents);
     }
 }

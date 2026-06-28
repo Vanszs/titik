@@ -35,7 +35,7 @@ pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
 pub use session_hub::{CookingEntry, HistoryEntry, HubPane, SessionHub};
 pub use quit_confirm::QuitConfirmState;
-pub use rewind::RewindState;
+pub use rewind::{RewindEntry, RewindState};
 pub use settings::{
     filter_models, SettingField, SettingsState, PICKER_MAX,
     SETTING_CATEGORIES,
