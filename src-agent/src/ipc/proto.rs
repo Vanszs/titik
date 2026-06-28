@@ -118,6 +118,9 @@ pub enum ClientRequest {
     /// Ask the daemon to shut down entirely (abort all sessions, release all
     /// locks, remove the socket, exit).
     QuitDaemon,
+    /// Client publishes the on-screen editor wrap width so the daemon's editor
+    /// navigation wraps by the same visual rows.
+    EditorWrapW(usize),
 }
 
 // ─── key projection ──────────────────────────────────────────────────────────

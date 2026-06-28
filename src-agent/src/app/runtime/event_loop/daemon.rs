@@ -564,6 +564,19 @@ impl DaemonHub {
                 self.send_to(idx, DaemonEvent::Ack);
             }
 
+            // The client reports the on-screen editor wrap width so the daemon's
+            // TextEditorState can navigate soft-wrapped rows with the same visual
+            // width the client renders. Only meaningful when the daemon is in the
+            // agents full-screen editor; a no-op Ack otherwise.
+            ClientRequest::EditorWrapW(n) => {
+                if let Mode::Agents(ref a) = state.mode {
+                    if let Some((_, ref ed)) = a.editor {
+                        ed.wrap_w.set(n);
+                    }
+                }
+                self.send_to(idx, DaemonEvent::Ack);
+            }
+
             // Read-only / already-handled variants never reach here (handle_request
             // dispatches them); treat any residual as a no-op Ack so the match is
             // exhaustive without a spurious error.

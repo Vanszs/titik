@@ -440,6 +440,12 @@ fn render_loop(
     // the screen isn't a blank "ready".
     shadow.rest.status = "attaching…".into();
 
+    // Tracks the last wrap width we sent to the daemon for the agents editor, so we
+    // only send `EditorWrapW` when it changes and always re-send on a fresh editor open
+    // (the daemon's newly-opened editor starts at usize::MAX). Reset to None whenever
+    // the shadow is NOT in the agents full-screen editor so each fresh open re-sends.
+    let mut last_sent_wrap_w: Option<usize> = None;
+
     // Per-connection seq tracking (critique #1). `expected` is the seq the NEXT
     // frame should carry. `0` means "not yet seeded" — the first frame seeds it.
     let mut expected: u64 = 0;
@@ -537,6 +543,26 @@ fn render_loop(
         // unchanged frame flushes ~nothing; painting every frame is what lets the
         // local animations advance smoothly without any dirty-tracking.
         terminal.draw(|f| view::draw(f, &shadow))?;
+
+        // --- (c-bis) forward the agents editor wrap width to the daemon ---
+        // The shadow's agents editor publishes its wrap_w via interior mutability
+        // during draw. The daemon's editor starts at usize::MAX (never rendered),
+        // so we send the client-side value whenever it changes. Reset last_sent_wrap_w
+        // when not in the agents editor so each fresh editor open triggers a resend
+        // (the daemon's freshly-opened editor is back at usize::MAX).
+        if let Mode::Agents(ref a) = shadow.mode {
+            if let Some((_, ref ed)) = a.editor {
+                let w = ed.wrap_w.get();
+                if last_sent_wrap_w != Some(w) {
+                    last_sent_wrap_w = Some(w);
+                    let _ = req_tx.send(ClientRequest::EditorWrapW(w));
+                }
+            } else {
+                last_sent_wrap_w = None;
+            }
+        } else {
+            last_sent_wrap_w = None;
+        }
 
         // --- (d) poll + handle terminal input (ZERO timeout, never blocks) ---
         // Drain EVERY buffered event this frame so fast typing / paste never lag.
