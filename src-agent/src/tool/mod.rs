@@ -23,6 +23,7 @@ pub mod dircache;
 pub mod fs;
 pub mod git_cred;
 pub mod git_operator;
+pub mod git_worktree;
 pub mod internet;
 pub mod memory;
 pub mod pong;
@@ -102,6 +103,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(internet::WebSearch),
         Box::new(git_cred::GitCred),
         Box::new(git_operator::GitOperator),
+        Box::new(git_worktree::GitWorktree),
     ]
 }
 

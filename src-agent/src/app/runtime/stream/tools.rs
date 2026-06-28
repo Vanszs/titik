@@ -206,6 +206,71 @@ pub(crate) fn process_tools(
             state.rest.sessions[sess_idx].tool_idx += 1;
             continue;
         }
+        // Intercept the model-callable `git_worktree` tool BEFORE the generic
+        // dispatch path. `enter` and `exit` mutate session state (cwd + allowed
+        // roots), which a read-only `ToolCtx` can't do. The tool's `run` does the
+        // pure validation/resolution and returns a sentinel-tagged string; here we
+        // apply the state change via `apply_workspace_change` (same primitive as `cd`).
+        //
+        // `enter` result: starts with `GIT_WT_ENTER_PREFIX` + canonical path.
+        //   → push the path into `settings.workdir` (if not already present),
+        //     persist, then call `apply_workspace_change`.
+        // `exit` result: exactly `GIT_WT_EXIT_PREFIX`.
+        //   → resolve the primary workdir (first `settings.workdir` entry) and
+        //     call `apply_workspace_change` to return there.
+        // Anything else (list/create/remove output, or an `error:` string):
+        //   → pass through to the model verbatim.
+        //
+        // Borrow structure mirrors the `cd` arm: extract the path string + run
+        // `sess.save()` in a scoped block so the `state` borrow is fully released
+        // before calling `apply_workspace_change` (which also borrows `state` mutably).
+        if call.function.name == "git_worktree" {
+            let result = run_tool(state, sess_idx, &call);
+            let final_result =
+                if let Some(target) =
+                    result.strip_prefix(crate::tool::git_worktree::GIT_WT_ENTER_PREFIX)
+                {
+                    // `enter` succeeded: target is the canonical path string.
+                    let new_cwd = std::path::PathBuf::from(target);
+                    let target_str = target.to_string();
+                    // Push the new root into settings.workdir if not already there,
+                    // then persist. Scoped so the mutable sess borrow ends before
+                    // we call apply_workspace_change (which also borrows state mut).
+                    {
+                        if let Some(sess) = state.rest.sessions[sess_idx].session.as_mut() {
+                            if !sess.settings.workdir.contains(&target_str) {
+                                sess.settings.workdir.push(target_str.clone());
+                            }
+                            let _ = sess.save();
+                        }
+                    }
+                    super::spawn::apply_workspace_change(
+                        state, sess_idx, new_cwd.clone(), client, handle,
+                    );
+                    format!("entered worktree: {}", new_cwd.display())
+                } else if result.starts_with(crate::tool::git_worktree::GIT_WT_EXIT_PREFIX) {
+                    // `exit`: return to the primary workdir (first workdir entry).
+                    // Extract the primary path in a scoped borrow, then call
+                    // apply_workspace_change outside it.
+                    let primary = {
+                        state.rest.sessions[sess_idx]
+                            .session
+                            .as_ref()
+                            .map(|sess| sess.workdir())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    };
+                    super::spawn::apply_workspace_change(
+                        state, sess_idx, primary.clone(), client, handle,
+                    );
+                    format!("exited to {}", primary.display())
+                } else {
+                    // list/create/remove output, or an error: — pass through.
+                    result
+                };
+            state.rest.sessions[sess_idx].tool_results.push((call.id.clone(), final_result));
+            state.rest.sessions[sess_idx].tool_idx += 1;
+            continue;
+        }
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, sess_idx, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.
