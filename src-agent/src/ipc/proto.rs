@@ -315,6 +315,21 @@ pub struct SessionSnapshot {
     pub cwd: String,
     /// Committed conversation messages (already serde via `ChatMessage`).
     pub messages: Vec<ChatMessage>,
+    /// Per-message display-only reasoning, index-aligned with `messages`.
+    ///
+    /// `ChatMessage::reasoning` is `#[serde(skip)]` (it must NEVER ride the API
+    /// request body nor `messages.json`), so the committed thinking block would
+    /// vanish over the wire — the live `stream_reasoning` buffer clears at turn
+    /// finalize and the client has nothing to fall back to, so the thinking block
+    /// disappears the instant the turn completes. This parallel side-channel
+    /// carries that reasoning to the client WITHOUT un-skipping the field: the
+    /// daemon copies each message's `reasoning` here at projection time, and the
+    /// client folds it back onto its reconstructed messages after deserialise.
+    /// Each entry is `None` for a message that had no reasoning (the common case),
+    /// keeping the wire cost negligible. Empty (or shorter than `messages`) is
+    /// tolerated by the client as "no committed reasoning".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed_reasoning: Vec<Option<String>>,
     /// In-progress assistant content buffer, or `None` when not streaming.
     pub streaming: Option<String>,
     /// In-progress reasoning/thinking buffer (display-only; empty if none).

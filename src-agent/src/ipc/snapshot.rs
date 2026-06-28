@@ -85,6 +85,18 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
         .as_ref()
         .map(|s| s.conversation.messages().to_vec())
         .unwrap_or_default();
+    // Parallel display-only reasoning, index-aligned with `messages`. The field is
+    // `#[serde(skip)]` on `ChatMessage` (kept out of the API body + disk), so it
+    // would not survive serialisation otherwise — carry it here so the client keeps
+    // showing a turn's thinking block after the turn finalises. Only built when at
+    // least one message actually has reasoning, so the common case ships an empty
+    // vec (which `skip_serializing_if` then omits from the wire entirely).
+    let committed_reasoning: Vec<Option<String>> =
+        if messages.iter().any(|m| m.reasoning.is_some()) {
+            messages.iter().map(|m| m.reasoning.clone()).collect()
+        } else {
+            Vec::new()
+        };
     let name = rt
         .session
         .as_ref()
@@ -102,6 +114,7 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
             .map(|_| rt.effective_cwd().display().to_string())
             .unwrap_or_default(),
         messages,
+        committed_reasoning,
         streaming: rt.streaming.clone(),
         stream_reasoning: rt.stream_reasoning.clone(),
         tokens_in: rt.tokens_in,
@@ -870,6 +883,9 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
         // Any of these moving is either hard to fold incrementally or rare enough
         // that a full resync is the honest, cheap-correct answer.
         let structural = p.messages != n.messages
+            // Committed reasoning rides the message list; a change (new turn's
+            // thinking block committed) has no incremental delta, so resync.
+            || p.committed_reasoning != n.committed_reasoning
             || p.tokens_in != n.tokens_in
             || p.tokens_out != n.tokens_out
             || p.tokens_cached != n.tokens_cached

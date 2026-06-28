@@ -54,6 +54,9 @@ mod roundtrip_tests {
             name: "demo".to_string(),
             cwd: "/work/demo".to_string(),
             messages: vec![ChatMessage::new(Role::User, "hi")],
+            // Index-aligned with `messages`; a populated entry proves the
+            // display-only reasoning side-channel survives the round-trip.
+            committed_reasoning: vec![Some("pondering".to_string())],
             streaming: Some("partial".to_string()),
             stream_reasoning: "thinking".to_string(),
             tokens_in: 100,

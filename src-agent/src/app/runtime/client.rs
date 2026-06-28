@@ -873,12 +873,26 @@ fn shadow_session(s: &SessionSnapshot) -> Session {
         ..Default::default()
     };
 
+    // Re-attach the display-only reasoning the wire carried out-of-band. The
+    // `ChatMessage::reasoning` field is `#[serde(skip)]`, so every deserialised
+    // message arrives with `reasoning: None`; without this fold-back a committed
+    // turn's thinking block would never render on the client (it would only show
+    // while the live `stream_reasoning` buffer streamed, then vanish on finalize).
+    // The side-channel is index-aligned with `messages`; a missing/short entry
+    // (the common no-reasoning case ships an empty vec) leaves `reasoning` at None.
+    let mut messages = s.messages.clone();
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if let Some(Some(reasoning)) = s.committed_reasoning.get(i) {
+            msg.reasoning = Some(reasoning.clone());
+        }
+    }
+
     Session::new(
         s.id.clone(),
         std::path::PathBuf::new(),
         String::new(),
         settings,
-        Conversation::from_messages(s.messages.clone()),
+        Conversation::from_messages(messages),
     )
 }
 
