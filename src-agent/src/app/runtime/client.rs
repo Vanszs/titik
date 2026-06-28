@@ -73,11 +73,12 @@ use ratatui::crossterm::event::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::app::mode::Mode;
+use crate::app::mode::{Mode, QuitConfirmState};
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
-    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, SessionSnapshot, StateDelta, StateSnapshot,
+    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, ModeTag, SessionSnapshot, StateDelta,
+    StateSnapshot,
 };
 use crate::model::conversation::Conversation;
 use crate::model::session::Session;
@@ -231,9 +232,21 @@ fn render_loop(
             while event::poll(Duration::ZERO)? {
                 match event::read()? {
                     Event::Key(key) => {
-                        // The ONE locally-interpreted gesture: Ctrl-C detaches the
-                        // client (leaves the daemon running). Everything else is
-                        // forwarded verbatim for the daemon to interpret.
+                        // The `/quit` overlay's choices are CLIENT-process decisions, so
+                        // when the shadow is in QuitConfirm (mirrored from the daemon's
+                        // mode) the client intercepts its keys locally instead of
+                        // forwarding them (daemon stage 12). `Detach`/`Kill` ask the loop
+                        // to exit the client.
+                        if matches!(shadow.mode, Mode::QuitConfirm(_)) {
+                            match handle_quit_confirm_key(&key, req_tx) {
+                                QuitConfirmKey::ExitClient => return Ok(()),
+                                QuitConfirmKey::Stay => {}
+                            }
+                            continue;
+                        }
+                        // Outside the overlay: the ONE locally-interpreted gesture is
+                        // Ctrl-C, which detaches the client (leaves the daemon running).
+                        // Everything else is forwarded verbatim for the daemon.
                         if is_detach(&key) {
                             return Ok(());
                         }
@@ -394,11 +407,25 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     // cache so the next draw rebuilds it against the new messages.
     shadow.rest.transcript_cache.borrow_mut().blocks.clear();
 
-    // Mode: only Chat carries a payload-free, fully-projected screen today. Every
-    // other ModeTag's modal payload is NOT projected over the wire yet (a later
-    // task), so render Chat as the safe, correct fallback rather than fabricate an
-    // empty picker/form. The foreground chat — the manual-test target — is exact.
-    shadow.mode = Mode::Chat;
+    // Mode: Chat is the payload-free, fully-projected screen. The ONE other mode the
+    // client reconstructs is QuitConfirm (daemon stage 12): when the daemon enters the
+    // `/quit` overlay (the user typed `/quit` or hit the quit keybind, forwarded as
+    // keys), the client mirrors it so the EXISTING overlay view renders AND the client
+    // can intercept the lifecycle keys ([d] detach / [k] kill-all) locally — those are
+    // client-process decisions, not pure daemon mutations (see `render_loop`). Its
+    // counts are display-only, so derive them from the shadow sessions rather than
+    // projecting them over the wire (a slightly stale count is harmless — same note as
+    // `QuitConfirmState`). Every OTHER ModeTag's modal payload is still not projected,
+    // so those fall back to Chat (the safe, correct render) rather than fabricate an
+    // empty picker/form.
+    shadow.mode = match global.mode {
+        ModeTag::QuitConfirm => {
+            let total = shadow.rest.sessions.len();
+            let working = shadow.rest.sessions.iter().filter(|s| s.waiting).count();
+            Mode::QuitConfirm(Box::new(QuitConfirmState::new(working, total)))
+        }
+        _ => Mode::Chat,
+    };
 
     // Reconcile the derived "comet" animation clock from the foreground session's
     // working flag (the daemon owns its own clock; the client re-derives one purely
@@ -596,6 +623,78 @@ fn reconcile_work_clock(shadow: &mut AppState) {
 fn is_detach(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// What a key handled inside the mirrored `/quit` overlay tells the render loop to do.
+enum QuitConfirmKey {
+    /// Tear down the client process (the request to act on it was already queued).
+    ExitClient,
+    /// Stay attached and keep rendering (cancel, or a swallowed stray key).
+    Stay,
+}
+
+/// Handle a key while the shadow mirrors the daemon's `/quit` confirm overlay
+/// (daemon stage 12). The overlay's three choices are CLIENT-process-lifecycle
+/// decisions, so — unlike every other key, which is forwarded for the daemon to
+/// interpret — the client acts on them itself:
+///
+///   `[d]` DETACH & keep — reset the daemon's overlay back to Chat (a forwarded
+///         `Esc` = the daemon's own cancel, so a later reattach lands in Chat, not
+///         the stale overlay), send [`ClientRequest::Detach`] (the daemon passes the
+///         controller seat and keeps EVERY session cooking headless), then exit ONLY
+///         the client.
+///   `[k]` KILL ALL & quit — send [`ClientRequest::QuitDaemon`]; the daemon latches
+///         its shutdown flag, tombstones every session, releases all locks, unlinks
+///         its socket, and self-exits via its graceful teardown. Then exit the client.
+///         (No `Esc` first: the daemon is shutting down wholesale, so its mode is moot.)
+///   `Esc` / `Ctrl-C` cancel — forward an `Esc` so the daemon's `handle_quit_confirm`
+///         runs `QuitCancel` and returns to Chat; the resulting snapshot flips the
+///         shadow back. The client stays attached.
+///
+/// Every other key is swallowed (the overlay has no text entry — mirrors the daemon's
+/// own `handle_quit_confirm`, which returns `Action::None` for anything else).
+///
+/// Requests share the ordered outbound queue, so the `[d]` pair is delivered
+/// Esc-then-Detach in sequence, guaranteeing the daemon leaves the overlay before the
+/// client drops.
+fn handle_quit_confirm_key(key: &KeyEvent, req_tx: &Sender<ClientRequest>) -> QuitConfirmKey {
+    // Ctrl-C in the overlay means "cancel", NOT the global detach — match the daemon's
+    // `handle_quit_confirm`, which treats Ctrl-C like Esc.
+    if is_detach(key) {
+        send_overlay_cancel(req_tx);
+        return QuitConfirmKey::Stay;
+    }
+    match key.code {
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            // Reset the daemon overlay → Chat first, then detach. Ordered queue keeps
+            // the sequence, so a reattaching client sees Chat rather than the overlay.
+            send_overlay_cancel(req_tx);
+            let _ = req_tx.send(ClientRequest::Detach);
+            QuitConfirmKey::ExitClient
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') => {
+            // Tell the daemon to shut down entirely; it tombstones every session,
+            // releases locks, unlinks the socket, and self-exits gracefully.
+            let _ = req_tx.send(ClientRequest::QuitDaemon);
+            QuitConfirmKey::ExitClient
+        }
+        KeyCode::Esc => {
+            send_overlay_cancel(req_tx);
+            QuitConfirmKey::Stay
+        }
+        // No text entry: swallow every other key (don't forward) so nothing leaks.
+        _ => QuitConfirmKey::Stay,
+    }
+}
+
+/// Forward a bare `Esc` so the daemon's `/quit` overlay cancels back to Chat. Used by
+/// both the explicit cancel and the detach reset (so the daemon never lingers in
+/// QuitConfirm with no input source after the client leaves).
+fn send_overlay_cancel(req_tx: &Sender<ClientRequest>) {
+    let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::empty(),
+    ))));
 }
 
 // ─── transport bridge tasks (mirror crate::ipc::conn, client-side) ───────────
