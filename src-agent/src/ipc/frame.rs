@@ -31,7 +31,7 @@
 
 use std::io::{self, ErrorKind};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use super::proto::MAX_FRAME_BYTES;
@@ -39,14 +39,20 @@ use super::proto::MAX_FRAME_BYTES;
 /// Number of bytes in the big-endian u32 length prefix.
 const PREFIX_LEN: usize = 4;
 
-/// Write one length-prefixed frame to `stream`: a 4-byte big-endian u32 payload
-/// length followed by `bytes`.
+/// Write one length-prefixed frame to any async writer: a 4-byte big-endian u32
+/// payload length followed by `bytes`.
+///
+/// Generic over the sink so the per-client connection task (daemon stage 5) can
+/// write to an `OwnedWriteHalf` of a split [`UnixStream`] while the matching read
+/// half is concurrently read by a sibling task — a single non-split stream can't
+/// be `&mut`-borrowed for read and write at once. [`write_frame`] is the
+/// `UnixStream` convenience used by the client/self-test.
 ///
 /// Rejects a payload larger than [`MAX_FRAME_BYTES`] with `InvalidInput` BEFORE
 /// writing anything, so the two sides agree on the same cap in both directions.
-/// Issues two writes (prefix, then payload); `UnixStream` is a stream socket, so
+/// Issues two writes (prefix, then payload); a unix socket is a stream socket, so
 /// the reader reassembles regardless of how these land on the wire.
-pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+pub async fn write_frame_to<W: AsyncWrite + Unpin>(sink: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -59,10 +65,17 @@ pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()
     }
     // Cast is safe: bounded by MAX_FRAME_BYTES (well under u32::MAX).
     let prefix = (bytes.len() as u32).to_be_bytes();
-    stream.write_all(&prefix).await?;
-    stream.write_all(bytes).await?;
-    stream.flush().await?;
+    sink.write_all(&prefix).await?;
+    sink.write_all(bytes).await?;
+    sink.flush().await?;
     Ok(())
+}
+
+/// Write one length-prefixed frame to `stream`. Thin [`UnixStream`] wrapper over
+/// the generic [`write_frame_to`] — the codec is identical; this is the form the
+/// client and self-test use on a non-split stream.
+pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+    write_frame_to(stream, bytes).await
 }
 
 /// Reassembles whole frames from a byte stream that may deliver them split across
@@ -131,14 +144,20 @@ impl FrameReader {
     }
 }
 
-/// Read exactly one complete frame from `stream`, blocking until it fully arrives.
+/// Read exactly one complete frame from any async reader, blocking until it fully
+/// arrives.
+///
+/// Generic over the source so the per-client connection task (daemon stage 5) can
+/// read from an `OwnedReadHalf` of a split [`UnixStream`] while a sibling task
+/// writes the matching write half. [`read_frame`] is the `UnixStream` convenience
+/// used by the client/self-test.
 ///
 /// Pulls from `reader`'s already-buffered bytes first (a previous read may have
-/// delivered more than one frame), then loops reading from the socket and feeding
+/// delivered more than one frame), then loops reading from the source and feeding
 /// the reader until a whole frame pops out. Returns `Err(UnexpectedEof)` if the
 /// peer closes mid-frame, and propagates the [`FrameReader::next_frame`] cap error.
-pub async fn read_frame(
-    stream: &mut UnixStream,
+pub async fn read_frame_from<R: AsyncRead + Unpin>(
+    src: &mut R,
     reader: &mut FrameReader,
 ) -> io::Result<Vec<u8>> {
     loop {
@@ -148,7 +167,7 @@ pub async fn read_frame(
             return Ok(frame);
         }
         let mut chunk = [0u8; 8192];
-        let n = stream.read(&mut chunk).await?;
+        let n = src.read(&mut chunk).await?;
         if n == 0 {
             return Err(io::Error::new(
                 ErrorKind::UnexpectedEof,
@@ -157,6 +176,13 @@ pub async fn read_frame(
         }
         reader.push(&chunk[..n]);
     }
+}
+
+/// Read exactly one complete frame from `stream`. Thin [`UnixStream`] wrapper over
+/// the generic [`read_frame_from`] — the reassembly logic is identical; this is
+/// the form the client and self-test use on a non-split stream.
+pub async fn read_frame(stream: &mut UnixStream, reader: &mut FrameReader) -> io::Result<Vec<u8>> {
+    read_frame_from(stream, reader).await
 }
 
 #[cfg(test)]

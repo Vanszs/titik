@@ -57,20 +57,25 @@ use std::time::Duration;
 
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
+use crate::controller::command::Command;
+use crate::controller::input::{handle_key, Action};
 use crate::ipc::proto::{ClientRequest, DaemonEvent, DaemonFrame, StateSnapshot};
 use crate::ipc::snapshot::{build_snapshot, diff};
 use crate::service::openrouter::OpenRouterClient;
 
+use super::super::actions::apply_action;
 use super::global::{has_running_subagents, service_global};
 use super::sessions::service_all_sessions;
 
 /// One inbound message on the sync-loop bridge, tagged with the client it came
-/// from. A per-client tokio task (later stage) emits a [`HubInbound::Register`]
-/// first (handing the loop its frame sender), then one [`HubInbound::Request`] per
-/// framed [`ClientRequest`] it reads off the socket, and finally drops its sender
-/// (which the loop reads as that client disconnecting).
-#[allow(dead_code)] // accept loop that produces these lands in daemon stage 5
-pub(in crate::app::runtime) enum HubInbound {
+/// from. The per-client connection task (stage 5, [`crate::ipc::conn`]) emits a
+/// [`HubInbound::Register`] first (handing the loop its frame sender), then one
+/// [`HubInbound::Request`] per framed [`ClientRequest`] it reads off the socket,
+/// and finally a [`HubInbound::Disconnect`] on socket EOF/error.
+// `pub(crate)` (not `pub(in crate::app::runtime)`) so the per-client connection
+// task in `crate::ipc::conn` — which lives OUTSIDE this module tree — can build and
+// send these. Re-exported as `crate::app::runtime::HubInbound`.
+pub(crate) enum HubInbound {
     /// A new connection: enrol this client's frame channel (NOT yet attached — it
     /// goes live only when its `Attach` is handled, critique #2).
     Register {
@@ -82,6 +87,11 @@ pub(in crate::app::runtime) enum HubInbound {
         client_id: u64,
         req: ClientRequest,
     },
+    /// The per-client task observed socket EOF/error and is exiting; deregister
+    /// this client. Distinct from a protocol-level [`ClientRequest::Detach`]: that
+    /// is the client politely leaving while its socket stays up momentarily, this
+    /// is the transport going away. Both deregister + pass the controller seat.
+    Disconnect { client_id: u64 },
 }
 
 /// One enrolled client in the hub registry.
@@ -130,23 +140,34 @@ pub(in crate::app::runtime) struct DaemonHub {
     /// Enrolled clients the loop fans [`DaemonFrame`]s out to. Each owns its own
     /// monotonic seq + diff baseline.
     clients: Vec<HubClient>,
+    /// Set by a controller's [`ClientRequest::QuitDaemon`]; the [`daemon_loop`]
+    /// observes it via [`should_shutdown`](Self::should_shutdown) and returns, so
+    /// the shared teardown (release locks, drop runtime, unlink socket) runs.
+    shutdown: bool,
 }
 
 impl DaemonHub {
-    /// Build an empty hub plus the paired message-sender the accept loop will clone
+    /// Build an empty hub plus the paired message-sender the accept loop clones
     /// into each per-client task. The caller (the daemon runner) holds the returned
     /// [`Sender`] for the daemon's lifetime so `msg_rx` never observes a premature
     /// `Disconnected` before any client has connected.
-    #[allow(dead_code)] // accept loop that clones the sender lands in daemon stage 5
     pub(in crate::app::runtime) fn new() -> (Self, Sender<HubInbound>) {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         (
             Self {
                 msg_rx,
                 clients: Vec::new(),
+                shutdown: false,
             },
             msg_tx,
         )
+    }
+
+    /// Whether a controller asked the daemon to quit ([`ClientRequest::QuitDaemon`]).
+    /// The [`daemon_loop`] checks this each tick and breaks so the shared teardown
+    /// runs.
+    pub(in crate::app::runtime) fn should_shutdown(&self) -> bool {
+        self.shutdown
     }
 
     /// Send one event to a single client as a fresh seq-tagged frame, advancing
@@ -164,34 +185,54 @@ impl DaemonHub {
         }
     }
 
-    /// Drop any client whose frame channel has closed (its per-client task ended).
-    /// Detecting closure on the SENDER side isn't directly possible, so closed
-    /// channels are pruned lazily: a send that errored leaves the client in place
-    /// here, but an explicit `Detach` (or a future task-exit signal) removes it. For
-    /// now this prunes nothing extra — closure is observed via `Detach`/`msg_rx`.
-    fn sweep_dead(&mut self) {
-        // Placeholder for stage 5's task-exit reaping; intentionally a no-op now so
-        // the call site reads clearly. (A `Sender` cannot probe receiver liveness.)
+    /// Deregister the client at `idx` and pass the controller seat if it held it.
+    ///
+    /// Shared by `Detach` (polite leave) and `Disconnect` (socket EOF). Single-
+    /// writer (DECISIONS): if the removed client was the controller, the FIRST
+    /// remaining client is promoted so a daemon never ends up writer-less while a
+    /// client is still attached (which would silently reject every mutation). No
+    /// snapshot is re-sent on promotion — the promoted client already holds a live
+    /// shadow; it simply gains mutate rights.
+    fn deregister(&mut self, idx: usize) {
+        let was_controller = self.clients[idx].is_controller;
+        self.clients.remove(idx);
+        if was_controller && !self.clients.iter().any(|c| c.is_controller) {
+            if let Some(first) = self.clients.first_mut() {
+                first.is_controller = true;
+            }
+        }
     }
 
     /// Handle every inbound bridge message queued this tick, building+sending a
     /// snapshot for each attaching/resyncing client IN THE SAME TICK (critique #2).
-    /// Returns nothing; frames are pushed onto the relevant clients' channels.
-    fn drain_inbound(&mut self, state: &AppState) {
+    /// Mutating requests are applied against `state`/`client` via the SAME action
+    /// handlers the local TUI uses. Returns nothing; frames are pushed onto the
+    /// relevant clients' channels.
+    fn drain_inbound(
+        &mut self,
+        state: &mut AppState,
+        client: &mut Option<Arc<OpenRouterClient>>,
+        handle: &tokio::runtime::Handle,
+    ) {
         loop {
             match self.msg_rx.try_recv() {
-                Ok(msg) => self.handle_inbound(msg, state),
+                Ok(msg) => self.handle_inbound(msg, state, client, handle),
                 Err(TryRecvError::Empty) => break,
                 // No client has ever connected (the runner still holds the paired
                 // sender) or every task dropped its sender — nothing to drain.
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        self.sweep_dead();
     }
 
     /// Apply one bridge message against the registry / emit its reply.
-    fn handle_inbound(&mut self, msg: HubInbound, state: &AppState) {
+    fn handle_inbound(
+        &mut self,
+        msg: HubInbound,
+        state: &mut AppState,
+        client: &mut Option<Arc<OpenRouterClient>>,
+        handle: &tokio::runtime::Handle,
+    ) {
         match msg {
             HubInbound::Register {
                 client_id,
@@ -210,14 +251,29 @@ impl DaemonHub {
                 });
             }
             HubInbound::Request { client_id, req } => {
-                self.handle_request(client_id, req, state);
+                self.handle_request(client_id, req, state, client, handle);
+            }
+            HubInbound::Disconnect { client_id } => {
+                // Transport gone: deregister + pass the controller seat. Unknown id
+                // (already removed via Detach) is a harmless no-op.
+                if let Some(idx) = self.clients.iter().position(|c| c.id == client_id) {
+                    self.deregister(idx);
+                }
             }
         }
     }
 
-    /// Route one [`ClientRequest`] from `client_id`. Read-only requests are honoured
-    /// for any client; mutating requests are rejected for observers (single-writer).
-    fn handle_request(&mut self, client_id: u64, req: ClientRequest, state: &AppState) {
+    /// Route one [`ClientRequest`] from `client_id`. Read-only requests
+    /// (Attach / Resync / ListSessions / Detach) are honoured for any client;
+    /// mutating requests are rejected for observers (single-writer).
+    fn handle_request(
+        &mut self,
+        client_id: u64,
+        req: ClientRequest,
+        state: &mut AppState,
+        client: &mut Option<Arc<OpenRouterClient>>,
+        handle: &tokio::runtime::Handle,
+    ) {
         let Some(idx) = self.clients.iter().position(|c| c.id == client_id) else {
             // A request from a client we never registered — ignore (no panic). A
             // well-behaved task always Registers before any Request.
@@ -250,10 +306,9 @@ impl DaemonHub {
                 self.clients[idx].last_snapshot = Some(snap);
             }
             ClientRequest::Detach => {
-                // Drop the client from the registry. If the controller detaches, the
-                // controller seat is vacated; promoting the next observer to writer
-                // is a lifecycle-stage concern (DECISIONS) — left to stage 5.
-                self.clients.remove(idx);
+                // Polite leave: drop the client + pass the controller seat to the
+                // next attached client (single-writer controller-passing, DECISIONS).
+                self.deregister(idx);
             }
 
             // --- mutating (single-writer: observers are rejected) ---
@@ -261,30 +316,105 @@ impl DaemonHub {
                 if !self.clients[idx].is_controller {
                     self.send_to(
                         idx,
-                        DaemonEvent::Error("read-only observer: mutation rejected".into()),
+                        DaemonEvent::Error(
+                            "read-only: another client controls this daemon".into(),
+                        ),
                     );
                     return;
                 }
-                self.handle_controller_mutation(idx, req, state);
+                self.handle_controller_mutation(idx, req, state, client, handle);
             }
         }
     }
 
-    /// Handle a MUTATING request from the controller. The actual state mutation
-    /// (foreground switch, input submit, key routing, approval, new/quit session)
-    /// lands in daemon stage 5; this stage validates the request shape and replies,
-    /// but does NOT yet mutate `state` — so it can already enforce the locked
-    /// invariant (critique #5: an unknown session UUID is an Error + no-op, never a
-    /// panic, never a wrong-index switch). Known/valid requests get an `Ack` stub.
-    fn handle_controller_mutation(&mut self, idx: usize, req: ClientRequest, state: &AppState) {
+    /// Handle a MUTATING request from the controller by translating it to the SAME
+    /// [`Action`] / slash-command the local TUI uses and funnelling it through
+    /// [`apply_action`] — so the daemon never forks the submit / key / approval /
+    /// new-session logic. UUID-keyed control resolves the id to an index FIRST and
+    /// rejects an unknown id with an `Error` + no-op (critique #5: never a panic,
+    /// never a wrong-index switch). Each applied request gets an `Ack`; errors get an
+    /// `Error`. `apply_action`'s `Result` is surfaced as an `Error` frame rather than
+    /// propagated, so one bad request can never abort the daemon loop.
+    fn handle_controller_mutation(
+        &mut self,
+        idx: usize,
+        req: ClientRequest,
+        state: &mut AppState,
+        client: &mut Option<Arc<OpenRouterClient>>,
+        handle: &tokio::runtime::Handle,
+    ) {
         match req {
-            // UUID-keyed control: reject an unknown id with Error (critique #5).
-            ClientRequest::SwitchForeground { session_id }
-            | ClientRequest::QuitSession { session_id } => {
+            // UUID-keyed foreground switch: resolve the id to an index, reject an
+            // unknown id (critique #5), else reuse the local /swap path (LiveSwitch)
+            // and clear that session's sticky finished-unseen marker (critique #3 —
+            // foregrounding a session counts as "seen").
+            ClientRequest::SwitchForeground { session_id } => {
+                match state.rest.sessions.iter().position(|s| s.id == session_id) {
+                    Some(target) => {
+                        let result = apply_action(Action::LiveSwitch(target), state, client, handle);
+                        // LiveSwitch sets `foreground = target`; clear the marker on
+                        // the now-foreground session (index unchanged by the switch).
+                        if let Some(s) = state.rest.sessions.get_mut(target) {
+                            s.finished_unseen = false;
+                        }
+                        self.ack_or_error(idx, result);
+                    }
+                    None => self.send_to(
+                        idx,
+                        DaemonEvent::Error(format!("unknown session id: {session_id}")),
+                    ),
+                }
+            }
+
+            // Submit composed text to the foreground session — identical to the local
+            // Enter-on-composer path (`Action::Submit` carries the text directly).
+            ClientRequest::SubmitInput { text } => {
+                let result = apply_action(Action::Submit(text), state, client, handle);
+                self.ack_or_error(idx, result);
+            }
+
+            // Forward a key to the foreground session through the EXACT local input
+            // pipeline: KeyWire -> crossterm KeyEvent -> controller::handle_key ->
+            // Action -> apply_action. So the daemon reuses the same per-mode key
+            // handling (chat / pickers / forms) as the local TUI.
+            ClientRequest::SendKey(key) => {
+                let action = handle_key(state, key.to_key_event());
+                let result = apply_action(action, state, client, handle);
+                self.ack_or_error(idx, result);
+            }
+
+            // Answer the foreground session's pending tool-approval prompt via the
+            // local approve/deny handlers.
+            ClientRequest::ApproveTool { approve } => {
+                let action = if approve {
+                    Action::ApproveTool
+                } else {
+                    Action::DenyTool
+                };
+                let result = apply_action(action, state, client, handle);
+                self.ack_or_error(idx, result);
+            }
+
+            // Spawn a fresh parallel session via the local `/new` command. The
+            // requested `name` / `working_dir` are not yet honoured (the `/new` path
+            // inherits last-used creds + the launch dir); wiring them is a later
+            // refinement, so they are accepted-and-ignored rather than rejected.
+            ClientRequest::NewSession { .. } => {
+                let result = apply_action(Action::Slash(Command::New), state, client, handle);
+                self.ack_or_error(idx, result);
+            }
+
+            // Quit (close) a single session. Per-session close does not exist yet
+            // (every live session holds its lock for its whole lifetime; `sessions`
+            // is append-only this phase), so validate the id then reply a clear
+            // Error — never a misleading Ack, never a panic.
+            ClientRequest::QuitSession { session_id } => {
                 let known = state.rest.sessions.iter().any(|s| s.id == session_id);
                 if known {
-                    // Real switch/quit is stage 5; acknowledge the (validated) id.
-                    self.send_to(idx, DaemonEvent::Ack);
+                    self.send_to(
+                        idx,
+                        DaemonEvent::Error("QuitSession not yet supported".into()),
+                    );
                 } else {
                     self.send_to(
                         idx,
@@ -292,12 +422,33 @@ impl DaemonHub {
                     );
                 }
             }
-            // Other mutations (SubmitInput / SendKey / ApproveTool / NewSession /
-            // QuitDaemon): the real handlers are stage 5. Acknowledge so the wire
-            // contract is satisfied; no state is touched yet.
-            _ => {
+
+            // Ask the daemon to shut down: latch the flag the loop polls, then Ack.
+            // The actual teardown (release locks, drop runtime, unlink socket) runs
+            // once `daemon_loop` observes `should_shutdown()` and returns.
+            ClientRequest::QuitDaemon => {
+                self.shutdown = true;
                 self.send_to(idx, DaemonEvent::Ack);
             }
+
+            // Read-only / already-handled variants never reach here (handle_request
+            // dispatches them); treat any residual as a no-op Ack so the match is
+            // exhaustive without a spurious error.
+            ClientRequest::Attach { .. }
+            | ClientRequest::Detach
+            | ClientRequest::Resync
+            | ClientRequest::ListSessions => {
+                self.send_to(idx, DaemonEvent::Ack);
+            }
+        }
+    }
+
+    /// Reply `Ack` on success or `Error(msg)` on a handler error — so a failing
+    /// action surfaces to the client instead of aborting the daemon loop.
+    fn ack_or_error(&mut self, idx: usize, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => self.send_to(idx, DaemonEvent::Ack),
+            Err(e) => self.send_to(idx, DaemonEvent::Error(format!("{e:#}"))),
         }
     }
 
@@ -356,13 +507,18 @@ impl DaemonHub {
     }
 }
 
-/// The headless daemon loop. Runs forever (no self-exit this stage): each tick
-/// services every session + every global concern, drives the hub (drain inbound +
-/// stream deltas), then sleeps on the adaptive cadence. No terminal, no input, no
-/// draw.
+/// The headless daemon loop. Each tick services every session + every global
+/// concern, drives the hub (drain inbound requests + apply mutations + stream
+/// deltas), then sleeps on the adaptive cadence. No terminal, no input, no draw.
 ///
-/// `client` is `&mut` only to match `service_*`'s signature (a debounced catalogue
-/// fetch can replace the keyless client); the daemon never reads it.
+/// Returns when a controller sends [`ClientRequest::QuitDaemon`] (the hub latches a
+/// shutdown flag checked each tick) so the caller's teardown runs; otherwise it
+/// runs until the process is signalled. The broader "self-exit on zero sessions AND
+/// no client" lifecycle rule is a later stage.
+///
+/// `client` is `&mut` both to match `service_*`'s signature (a debounced catalogue
+/// fetch can replace the keyless client) AND so a controller's mutating request can
+/// rebuild it at a session boundary (e.g. `/new`, `/swap`).
 pub(in crate::app::runtime) fn daemon_loop(
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,
@@ -383,10 +539,18 @@ pub(in crate::app::runtime) fn daemon_loop(
 
         // 3. Drive the hub: handle inbound client messages (register / attach /
         //    detach / resync / control) — atomically snapshotting each attaching
-        //    client in THIS tick — then stream this tick's render-state changes to
-        //    every attached client as seq-tagged frames.
-        hub.drain_inbound(state);
+        //    client in THIS tick AND applying a controller's mutating requests
+        //    against state/client via the shared action handlers — then stream this
+        //    tick's render-state changes to every attached client as seq'd frames.
+        hub.drain_inbound(state, client, handle);
         hub.stream_deltas(state);
+
+        // 3b. A controller's QuitDaemon latches the hub shutdown flag; honour it so
+        //     the caller's teardown (release locks, drop runtime, unlink socket)
+        //     runs. Checked AFTER streaming so the QuitDaemon Ack is flushed first.
+        if hub.should_shutdown() {
+            break;
+        }
 
         // 4. Adaptive sleep — the SAME cadence the TUI input poll uses, minus the
         //    terminal: 8ms while there is live work (so background streams flush at
@@ -409,19 +573,35 @@ pub(in crate::app::runtime) fn daemon_loop(
 
 #[cfg(test)]
 mod tests {
-    //! Hub emission proof (daemon stage 4): drive the hub with NO socket and assert
-    //! the seq'd frame stream — a Snapshot on attach, then a Delta on the next
-    //! state change with `seq = N+1`. This stands in for the accept loop (stage 5)
-    //! so the emission path is covered now.
+    //! Hub drive proof: exercise the hub with NO socket and assert (a) the seq'd
+    //! frame stream — a Snapshot on attach, then a Delta on the next state change
+    //! with `seq = N+1` (stage 4), and (b) that a controller's mutating request is
+    //! actually applied through the shared action path, single-writer is enforced,
+    //! the controller seat passes on detach, and QuitDaemon latches shutdown
+    //! (stage 5). These stand in for the accept loop so the full drive path is
+    //! covered without a real socket.
 
     use super::*;
-    use crate::ipc::proto::StateDelta;
+    use crate::ipc::proto::{key_mods, KeyCodeWire, KeyWire, StateDelta};
+
+    /// A keyless client + a current-thread tokio runtime — the minimal context the
+    /// mutating-request path needs. `client = None` means a `Submit`/`Resend`-style
+    /// action short-circuits to "no active session" (still `Ok`, so still `Ack`),
+    /// while a `SendKey` editing the composer mutates `state` with no client at all.
+    fn ctx() -> (Option<Arc<OpenRouterClient>>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build test runtime");
+        (None, rt)
+    }
 
     /// Attaching a client yields a `Snapshot{seq=1}`; a subsequent status change
     /// yields a `Delta{seq=2}` carrying the new global status.
     #[test]
     fn attach_then_change_emits_snapshot_then_seqd_delta() {
         let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
         let (mut hub, _runner_tx) = DaemonHub::new();
 
         // Stand in for a per-client task: a channel whose receiver we inspect.
@@ -433,7 +613,9 @@ mod tests {
                 client_id: 1,
                 frame_tx,
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         hub.handle_inbound(
             HubInbound::Request {
@@ -442,7 +624,9 @@ mod tests {
                     foreground_id: None,
                 },
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
 
         // Attach must have produced exactly a Snapshot at seq 1.
@@ -484,6 +668,8 @@ mod tests {
     #[test]
     fn structural_change_emits_full_snapshot() {
         let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
         let (mut hub, _runner_tx) = DaemonHub::new();
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<DaemonFrame>();
 
@@ -492,7 +678,9 @@ mod tests {
                 client_id: 7,
                 frame_tx,
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         hub.handle_inbound(
             HubInbound::Request {
@@ -501,7 +689,9 @@ mod tests {
                     foreground_id: None,
                 },
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         let _snap = frame_rx.try_recv().expect("attach snapshot");
 
@@ -523,7 +713,9 @@ mod tests {
     /// and the controller (first client) is acknowledged.
     #[test]
     fn observer_mutation_is_rejected_controller_acked() {
-        let state = AppState::new(Mode::Chat);
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
         let (mut hub, _runner_tx) = DaemonHub::new();
         let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<DaemonFrame>();
         let (obs_tx, obs_rx) = std::sync::mpsc::channel::<DaemonFrame>();
@@ -534,23 +726,30 @@ mod tests {
                 client_id: 1,
                 frame_tx: ctl_tx,
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         hub.handle_inbound(
             HubInbound::Register {
                 client_id: 2,
                 frame_tx: obs_tx,
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
 
-        // Controller submits input -> Ack (stub; real mutation is stage 5).
+        // Controller submits input -> Ack (applied; with no client it lands as a
+        // "no active session" status, still Ok -> Ack).
         hub.handle_inbound(
             HubInbound::Request {
                 client_id: 1,
                 req: ClientRequest::SubmitInput { text: "hi".into() },
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         assert!(matches!(
             ctl_rx.try_recv().expect("controller reply").event,
@@ -563,7 +762,9 @@ mod tests {
                 client_id: 2,
                 req: ClientRequest::SubmitInput { text: "nope".into() },
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         assert!(matches!(
             obs_rx.try_recv().expect("observer reply").event,
@@ -575,7 +776,9 @@ mod tests {
     /// (critique #5), never a panic.
     #[test]
     fn unknown_session_uuid_errors_not_panics() {
-        let state = AppState::new(Mode::Chat);
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
         let (mut hub, _runner_tx) = DaemonHub::new();
         let (tx, rx) = std::sync::mpsc::channel::<DaemonFrame>();
         hub.handle_inbound(
@@ -583,7 +786,9 @@ mod tests {
                 client_id: 1,
                 frame_tx: tx,
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         hub.handle_inbound(
             HubInbound::Request {
@@ -592,11 +797,204 @@ mod tests {
                     session_id: "does-not-exist".into(),
                 },
             },
-            &state,
+            &mut state,
+            &mut client,
+            &h,
         );
         assert!(matches!(
             rx.try_recv().expect("reply").event,
             DaemonEvent::Error(_)
+        ));
+    }
+
+    /// A controller's `SendKey` is routed through the SAME local input pipeline:
+    /// a printable char in Chat mode edits the shared composer. Proves the daemon
+    /// drives real state via `handle_key` + `apply_action`, not a stub.
+    #[test]
+    fn controller_sendkey_edits_composer() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 1,
+                frame_tx: tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::SendKey(KeyWire {
+                    code: KeyCodeWire::Char('z'),
+                    mods: 0,
+                }),
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        assert_eq!(state.rest.input, "z", "key reached the composer via apply_action");
+        assert!(matches!(
+            rx.try_recv().expect("reply").event,
+            DaemonEvent::Ack
+        ));
+    }
+
+    /// When the controller detaches, the seat passes to the next remaining client,
+    /// which can then mutate (single-writer controller-passing, DECISIONS).
+    #[test]
+    fn controller_seat_passes_on_detach() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (c1_tx, _c1_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+        let (c2_tx, c2_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        // 1 = controller, 2 = observer.
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 1,
+                frame_tx: c1_tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 2,
+                frame_tx: c2_tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // Controller detaches -> seat passes to client 2.
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::Detach,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // Client 2's mutating request is now honoured (Ack), not rejected.
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 2,
+                req: ClientRequest::SendKey(KeyWire {
+                    code: KeyCodeWire::Char('q'),
+                    mods: key_mods::CONTROL, // Ctrl+Q is a no-op key here, still Ack
+                }),
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        assert!(matches!(
+            c2_rx.try_recv().expect("promoted controller reply").event,
+            DaemonEvent::Ack
+        ));
+    }
+
+    /// `QuitDaemon` from the controller latches the shutdown flag the loop polls.
+    #[test]
+    fn quit_daemon_latches_shutdown() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 1,
+                frame_tx: tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        assert!(!hub.should_shutdown(), "shutdown not latched before QuitDaemon");
+
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::QuitDaemon,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        assert!(hub.should_shutdown(), "QuitDaemon latches shutdown");
+        assert!(matches!(
+            rx.try_recv().expect("reply").event,
+            DaemonEvent::Ack
+        ));
+    }
+
+    /// A `Disconnect` (socket EOF) deregisters the client and passes the controller
+    /// seat, exactly like `Detach`.
+    #[test]
+    fn disconnect_deregisters_and_passes_seat() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (c1_tx, _c1_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+        let (c2_tx, c2_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 1,
+                frame_tx: c1_tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 2,
+                frame_tx: c2_tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // Controller's socket dies.
+        hub.handle_inbound(
+            HubInbound::Disconnect { client_id: 1 },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // Client 2 is now the controller and may mutate.
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 2,
+                req: ClientRequest::SubmitInput { text: "x".into() },
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        assert!(matches!(
+            c2_rx.try_recv().expect("promoted controller reply").event,
+            DaemonEvent::Ack
         ));
     }
 }

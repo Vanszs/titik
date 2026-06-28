@@ -23,3 +23,4 @@ pub mod subagent;
 
 pub use runtime::run;
 pub use runtime::run_daemon;
+pub use runtime::run_daemon_selftest;

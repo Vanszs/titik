@@ -27,7 +27,13 @@ mod settings_creds;
 
 /// Apply one `Action` (the decoded result of a keystroke) by mutating state and,
 /// where needed, spawning/aborting the request task.
-pub(super) fn apply_action(
+///
+/// `pub(in crate::app::runtime)` (not just `pub(super)`) so the headless daemon
+/// loop (`event_loop::daemon`) can drive the SAME action handlers the local TUI
+/// uses: a daemon client's `SubmitInput` / `SendKey` / `ApproveTool` / `NewSession`
+/// / `SwitchForeground` request is translated to the corresponding `Action` and
+/// funnelled through here, so the daemon never forks the turn/submit/approval logic.
+pub(in crate::app::runtime) fn apply_action(
     action: Action,
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,

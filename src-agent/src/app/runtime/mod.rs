@@ -44,6 +44,10 @@ use terminal::TerminalGuard;
 use event_loop::run_loop;
 use event_loop::daemon::{daemon_loop, DaemonHub};
 
+// Re-export the sync-loop <-> per-client-task bridge message so the per-client
+// connection task in `crate::ipc::conn` (outside this module tree) can name it.
+pub(crate) use event_loop::daemon::HubInbound;
+
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Make the on-disk lock match the active session.
@@ -363,15 +367,13 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
 /// Headless entry point: run the koma-daemon event loop with NO terminal.
 ///
 /// Shares [`build_startup`] with the TUI [`run`] (same dirs / runtime / state /
-/// client / warm), then — instead of the terminal + `run_loop` — ignores SIGPIPE
-/// and enters [`daemon_loop`]. The loop runs forever this stage (no socket, no
-/// self-exit); it is stopped with Ctrl-C, after which the shared teardown releases
-/// every session lock and drops the runtime.
-///
-/// NOTE: `daemon_loop` currently never returns (it loops forever), so the teardown
-/// below is reached only via a future self-exit stage. Ctrl-C terminates the
-/// process directly (PID-liveness staleness reclaims any held locks). The teardown
-/// is wired now so the lifecycle stage has nothing to retrofit.
+/// client / warm), then — instead of the terminal + `run_loop` — ignores SIGPIPE,
+/// binds the unix socket, spawns the per-client accept loop, and enters
+/// [`daemon_loop`]. The accept loop runs on the tokio runtime (async socket I/O);
+/// `daemon_loop` runs synchronously on this thread and drains the bridge each tick
+/// (critique #6). It returns when a controller sends `QuitDaemon` (or the process is
+/// signalled); the shared teardown then releases every session lock, drops the
+/// runtime, and unlinks the socket.
 pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
     // Critique #10: writing to a dead client must never kill the daemon. Ignore
     // SIGPIPE process-wide BEFORE any socket IO so a broken-pipe write returns
@@ -386,19 +388,203 @@ pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
     // Shared, terminal-independent startup — identical to the TUI path.
     let (rt, handle, mut state, mut client) = build_startup(&opts)?;
 
-    // Sync-loop <-> per-client-task bridge (critique #1). The accept loop that
-    // feeds `req_rx` lands in a later stage; the runner holds the paired sender so
-    // `req_rx` never goes `Disconnected` before a client connects. `#[allow]` on
-    // the binding: in this stage nothing ever sends on `_req_tx` yet.
-    let (mut hub, _req_tx) = DaemonHub::new();
+    // Sync-loop <-> per-client-task bridge (critique #1/#6). The runner holds the
+    // paired `req_tx` (which the accept loop clones into each connection task) for
+    // the daemon's lifetime so `req_rx` never observes a premature `Disconnected`
+    // before any client connects.
+    let (mut hub, req_tx) = DaemonHub::new();
 
-    // Enter the headless loop. NO terminal, NO input — just service_all_sessions +
-    // service_global + the request-bridge drain on the adaptive cadence. Runs
-    // forever this stage (lifecycle/self-exit is a later stage).
+    // Bind the unix listener (this process becomes the live daemon — bind is the
+    // liveness oracle) and spawn the accept loop onto the tokio runtime. Each
+    // accepted connection gets a per-client task bridging its socket to `req_tx`.
+    // `UnixListener::bind` + `handle.spawn` need a tokio reactor in scope, so enter
+    // the runtime context for them. The socket path is unlinked at teardown below.
+    let sock_path = crate::model::store::daemon_sock_path()?;
+    {
+        let _enter = handle.enter();
+        let listener = crate::ipc::server::bind(&sock_path)?;
+        handle.spawn(crate::ipc::server::accept_loop(listener, req_tx));
+    }
+
+    // Enter the headless loop: service_all_sessions + service_global + the request-
+    // bridge drain (apply mutations) + delta streaming on the adaptive cadence.
+    // Returns when a controller's QuitDaemon latches the hub shutdown flag.
     daemon_loop(&mut state, &mut client, &handle, &mut hub);
 
-    // Reached only via a future self-exit stage (the loop is currently infinite).
+    // Clean shutdown (QuitDaemon, or a future self-exit): release locks, drop the
+    // runtime LAST, and remove the socket so the next spawn binds fresh.
     shutdown_runtime(&mut state, rt);
+    let _ = std::fs::remove_file(&sock_path);
 
+    Ok(())
+}
+
+/// End-to-end daemon self-test (`koma --daemon-selftest`): drive the FULL stage-5
+/// stack — bind + accept loop + per-client tasks + the real [`daemon_loop`] hub —
+/// over a real unix socket, with NO terminal and NO network/session.
+///
+/// It proves a client request reaches the daemon and DRIVES it: a client connects,
+/// `Attach`es (and gets a full `Snapshot`), sends `SubmitInput` (which the daemon
+/// applies through the SAME `Action::Submit` path the TUI uses — here, with no
+/// active session, that lands as the `"no active session"` status line), and then
+/// observes a `StatusChanged` `Delta` carrying exactly that new status — i.e. the
+/// resulting state change folds back to the client. Finally `QuitDaemon` makes the
+/// real loop return so the driver thread joins cleanly.
+///
+/// A dedicated socket path keeps it from colliding with a live daemon. The hub +
+/// `daemon_loop` run on a std thread (the loop is synchronous); the client side runs
+/// on a private tokio runtime here. Prints `OK` / `FAIL` and exits 0 / 1 — it never
+/// returns normally (a short-circuit CLI mode, like the IPC self-test).
+pub fn run_daemon_selftest() -> ! {
+    let code = match daemon_selftest_inner() {
+        Ok(()) => {
+            println!("koma daemon-selftest: OK");
+            0
+        }
+        Err(e) => {
+            eprintln!("koma daemon-selftest: FAIL: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// The fallible body of [`run_daemon_selftest`].
+fn daemon_selftest_inner() -> Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    use crate::ipc::frame::{read_frame, write_frame, FrameReader};
+    use crate::ipc::proto::{ClientRequest, DaemonEvent, DaemonFrame, StateDelta};
+
+    // Ignore SIGPIPE for parity with the real daemon (a dead client write must not
+    // kill us). SAFETY: SIG_IGN on SIGPIPE is async-signal-safe and touches no Rust
+    // state — the same call `run_daemon` makes.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let handle = rt.handle().clone();
+
+    // Dedicated socket so the test never disturbs a live daemon. `UnixListener::bind`
+    // needs a tokio reactor, so enter the runtime context for the bind + spawn.
+    let sock_path = crate::model::store::base_dir()?.join("daemon-selftest.sock");
+    let (mut hub, req_tx) = DaemonHub::new();
+    {
+        let _enter = handle.enter();
+        let listener = crate::ipc::server::bind(&sock_path)?;
+        handle.spawn(crate::ipc::server::accept_loop(listener, req_tx));
+    }
+
+    // Drive the REAL `daemon_loop` on a std thread (it is synchronous). A fresh
+    // headless state with one foreground session and NO client (so `SubmitInput`
+    // exercises the no-session branch, which still mutates the status line).
+    let loop_handle = handle.clone();
+    let driver = std::thread::spawn(move || {
+        let mut state = AppState::new(Mode::Chat);
+        let mut client: Option<Arc<OpenRouterClient>> = None;
+        daemon_loop(&mut state, &mut client, &loop_handle, &mut hub);
+    });
+
+    // Client side: connect, attach, submit, observe, quit.
+    let result: Result<()> = rt.block_on(async {
+        let mut stream = crate::ipc::client::connect(&sock_path).await?;
+        let mut reader = FrameReader::new();
+
+        // Attach -> expect a full Snapshot.
+        let attach = serde_json::to_vec(&ClientRequest::Attach { foreground_id: None })?;
+        write_frame(&mut stream, &attach).await?;
+        let snap_frame: DaemonFrame =
+            serde_json::from_slice(&read_frame(&mut stream, &mut reader).await?)?;
+        anyhow::ensure!(
+            matches!(snap_frame.event, DaemonEvent::Snapshot(_)),
+            "attach reply was not a Snapshot: {:?}",
+            snap_frame.event
+        );
+
+        // SubmitInput -> the daemon applies Action::Submit; with no active session
+        // it sets status = "no active session". Read frames until that status
+        // change folds back as a Delta (skipping the request's own Ack, which may
+        // interleave). Bounded so a missing delta fails the test instead of hanging.
+        let submit = serde_json::to_vec(&ClientRequest::SubmitInput { text: "hi".into() })?;
+        write_frame(&mut stream, &submit).await?;
+
+        let mut saw_status = false;
+        for _ in 0..50 {
+            let buf = tokio::time::timeout(Duration::from_secs(5), async {
+                read_frame(&mut stream, &mut reader).await
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the SubmitInput status delta"))??;
+            let frame: DaemonFrame = serde_json::from_slice(&buf)?;
+
+            match frame.event {
+                DaemonEvent::Delta(StateDelta::StatusChanged { session_id, text }) => {
+                    anyhow::ensure!(session_id.is_none(), "expected a GLOBAL status delta");
+                    anyhow::ensure!(
+                        text == "no active session",
+                        "unexpected status text after SubmitInput: {text:?}"
+                    );
+                    saw_status = true;
+                    break;
+                }
+                // A full resync is also a valid carrier of the change; accept it.
+                DaemonEvent::Snapshot(s) => {
+                    if s.global.status == "no active session" {
+                        saw_status = true;
+                        break;
+                    }
+                }
+                // Ack for the request / unrelated deltas: keep reading.
+                _ => {}
+            }
+        }
+        anyhow::ensure!(saw_status, "never observed the SubmitInput status change");
+
+        // QuitDaemon -> the real loop latches shutdown and returns; expect an Ack.
+        let quit = serde_json::to_vec(&ClientRequest::QuitDaemon)?;
+        write_frame(&mut stream, &quit).await?;
+        // Drain a couple frames to find the Ack (deltas may interleave). Best-effort.
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(5), async {
+                read_frame(&mut stream, &mut reader).await
+            })
+            .await
+            {
+                Ok(Ok(buf)) => {
+                    let f: DaemonFrame = serde_json::from_slice(&buf)?;
+                    if matches!(f.event, DaemonEvent::Ack) {
+                        break;
+                    }
+                }
+                // Socket closed (daemon already tore down) is acceptable post-quit.
+                _ => break,
+            }
+        }
+        drop(stream);
+        Ok(())
+    });
+
+    // The driver thread exits once `daemon_loop` observes the QuitDaemon shutdown
+    // flag. Join it (bounded) so a wedged loop surfaces as a test failure. Use a
+    // small channel to time-box the join.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _ = driver.join();
+        let _ = done_tx.send(());
+    });
+    let joined = matches!(
+        done_rx.recv_timeout(Duration::from_secs(10)),
+        Ok(()) | Err(RecvTimeoutError::Disconnected)
+    );
+
+    // Clean up the socket regardless (best-effort).
+    let _ = std::fs::remove_file(&sock_path);
+
+    result?;
+    anyhow::ensure!(joined, "daemon_loop did not return after QuitDaemon");
     Ok(())
 }

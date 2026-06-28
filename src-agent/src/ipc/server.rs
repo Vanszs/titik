@@ -13,9 +13,13 @@
 //! lands in a later stage; this module only provides the primitives.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::app::runtime::HubInbound;
+use crate::ipc::conn;
 use crate::model::store;
 
 /// Bind the daemon's unix-domain listener at `path` (typically
@@ -56,8 +60,36 @@ pub fn bind_default() -> anyhow::Result<UnixListener> {
 /// Await the next client connection on `listener`, returning just the stream
 /// (the peer's anonymous unix address is not needed — clients are identified by
 /// the [`super::proto::ClientRequest::Attach`] handshake, not their socket addr).
-#[allow(dead_code)] // wired in daemon stage 3+ (accept loop)
 pub async fn accept(listener: &UnixListener) -> std::io::Result<UnixStream> {
     let (stream, _addr) = listener.accept().await?;
     Ok(stream)
+}
+
+/// The daemon's accept loop (daemon stage 5): accept connections forever and spawn
+/// a per-client [`conn`] task for each, handing it a clone of the hub's request
+/// channel `hub_tx`.
+///
+/// Each accepted stream gets a fresh, monotonically increasing `client_id` (the
+/// stable handle the hub keys its registry on — index-agnostic, like the session
+/// UUIDs). The loop OWNS the `listener` (so it lives as long as the loop) and runs
+/// as a tokio task spawned by the daemon runner; the synchronous `daemon_loop` runs
+/// on the main thread in parallel and never blocks on accept.
+///
+/// A transient `accept` error (e.g. EMFILE) is logged-by-ignoring and retried —
+/// one bad accept must not tear down the whole daemon's listener. The loop only
+/// ends when the runtime is dropped at shutdown.
+pub async fn accept_loop(listener: UnixListener, hub_tx: Sender<HubInbound>) {
+    let next_id = AtomicU64::new(1);
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let client_id = next_id.fetch_add(1, Ordering::Relaxed);
+                conn::spawn(stream, client_id, hub_tx.clone());
+            }
+            // Transient accept failure: don't kill the listener, just try again.
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
 }

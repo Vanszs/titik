@@ -7,6 +7,7 @@
 //! - `--force`                     — modifier for `--internet-fullmode-install`: force a reinstall
 //!   even when the environment is already present.
 //! - `--ipc-selftest`              — round-trip the daemon IPC transport end-to-end, then exit.
+//! - `--daemon-selftest`           — drive the full daemon stack (bind/accept/per-client/loop) end-to-end, then exit.
 //! - `--daemon`                    — run the headless koma-daemon event loop (no terminal).
 //! - `--attach`                    — run as a thin client that attaches to a running daemon.
 //!
@@ -27,6 +28,10 @@ pub struct Opts {
     /// When `true`, run the daemon IPC transport self-test then exit
     /// (`--ipc-selftest` flag).
     pub ipc_selftest: bool,
+    /// When `true`, run the END-TO-END daemon self-test (bind + accept loop +
+    /// per-client tasks + real `daemon_loop`: a client attaches, submits, observes
+    /// the resulting delta, then quits the daemon) then exit (`--daemon-selftest`).
+    pub daemon_selftest: bool,
     /// When `true`, run the headless koma-daemon event loop with no terminal
     /// (`--daemon` flag). Owns the agent runtime; a TUI attaches as a client.
     pub daemon: bool,
@@ -48,6 +53,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
             "--internet-fullmode-uninstall"  => opts.internet_fullmode_uninstall = true,
             "--force"                        => opts.force = true,
             "--ipc-selftest"                 => opts.ipc_selftest = true,
+            "--daemon-selftest"              => opts.daemon_selftest = true,
             "--daemon"                       => opts.daemon = true,
             "--attach"                       => opts.attach = true,
             _                                => {}

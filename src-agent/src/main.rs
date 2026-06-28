@@ -71,6 +71,14 @@ fn main() -> anyhow::Result<()> {
         ipc::selftest::run();
     }
 
+    // --- short-circuit: END-TO-END daemon self-test (no TUI) ---
+    // Drives the full stage-5 stack (bind + accept loop + per-client tasks + the
+    // real daemon_loop hub) over a real socket: a client attaches, submits, sees
+    // the resulting delta, then quits the daemon. Never returns (OK/FAIL exit).
+    if opts.daemon_selftest {
+        app::run_daemon_selftest();
+    }
+
     // --- headless path: run the koma-daemon event loop (no TUI) ---
     // Owns the agent runtime with no terminal; a TUI attaches as a thin client in
     // a later stage. Stays in this branch (loops forever) until Ctrl-C.
