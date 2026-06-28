@@ -21,6 +21,7 @@ mod event_loop;
 mod stream;
 mod actions;
 mod client;
+mod client_shadow;
 mod manage;
 // `pub(crate)` so the shared `commands::internet::internet_feedback` helper is
 // reachable from the controller's Ctrl+E handler (outside this module tree).
