@@ -45,11 +45,18 @@
 //! [`crate::ipc::proto::DaemonEvent::Error`]; read-only requests (Attach / Resync /
 //! Detach / ListSessions) are honoured for everyone.
 //!
-//! # Lifecycle (later stage)
+//! # Lifecycle (daemon stage 10)
 //!
-//! There is NO self-exit yet: the loop runs forever and is stopped with Ctrl-C.
-//! The "live while >=1 session OR a client; self-exit on zero sessions AND no
-//! client" rule is wired alongside the accept loop in a later stage.
+//! The loop self-exits when EVERY session is CLOSED (tombstoned via
+//! [`ClientRequest::QuitSession`] or a forwarded `/quit` kill-all) AND no client is
+//! enrolled, sustained for [`SELF_EXIT_GRACE_TICKS`] consecutive ticks (~1s grace, so
+//! a momentary lull never reaps it). A session is closed by TOMBSTONE — a `closed`
+//! marker on its [`crate::app::state::SessionRuntime`] slot, NEVER a `Vec::remove`:
+//! `service_session` indexes the sessions Vec by position ~40x/tick, so a remove would
+//! shift every later index and silently cross-wire in-flight async. Right before the
+//! exit unlinks the socket it ACCEPT-DRAINs (re-checks "no client" after draining the
+//! bridge) so a client connecting during the grace window aborts the exit. SIGTERM/
+//! SIGINT and a controller's `QuitDaemon` remain as the explicit stop paths.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -169,6 +176,30 @@ impl DaemonHub {
     /// runs.
     pub(in crate::app::runtime) fn should_shutdown(&self) -> bool {
         self.shutdown
+    }
+
+    /// Number of clients currently ENROLLED (registered, attached or not). The
+    /// self-exit grace timer (daemon stage 10) treats ANY enrolled client — even one
+    /// mid-`Attach` handshake — as "a client is present", so a daemon never reaps
+    /// itself out from under a just-connected client. A registered-but-not-yet-
+    /// attached client is the exact accept-drain race the exit re-check guards.
+    pub(in crate::app::runtime) fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Drain any inbound bridge messages queued RIGHT NOW (e.g. a `Register` from a
+    /// client that connected during the self-exit grace window) WITHOUT streaming —
+    /// used by the exit re-check (accept-drain, critique #3) so a connection that
+    /// landed between the last tick and the unlink is observed before the daemon
+    /// commits to exiting. After this returns, [`client_count`](Self::client_count)
+    /// reflects any such late client and the exit is aborted.
+    pub(in crate::app::runtime) fn drain_inbound_only(
+        &mut self,
+        state: &mut AppState,
+        client: &mut Option<Arc<OpenRouterClient>>,
+        handle: &tokio::runtime::Handle,
+    ) {
+        self.drain_inbound(state, client, handle);
     }
 
     /// Send one event to a single client as a fresh seq-tagged frame, advancing
@@ -405,22 +436,26 @@ impl DaemonHub {
                 self.ack_or_error(idx, result);
             }
 
-            // Quit (close) a single session. Per-session close does not exist yet
-            // (every live session holds its lock for its whole lifetime; `sessions`
-            // is append-only this phase), so validate the id then reply a clear
-            // Error — never a misleading Ack, never a panic.
+            // Quit (close) a single session by stable UUID (daemon stage 10). Resolve
+            // the id (reject an unknown one with an Error + no-op, critique #5), then
+            // TOMBSTONE that session: `close()` aborts its in-flight stream + sub-
+            // agents, drops its receivers, and releases its on-disk lock — but the slot
+            // STAYS in `sessions` so no index shifts (a `Vec::remove` would cross-wire
+            // the other sessions' index-routed async). If the closed session was the
+            // foreground, repoint foreground onto a still-live session so render/service
+            // never touch a tombstone. The daemon self-exits later (grace-timed) once
+            // EVERY session is closed AND no client is attached.
             ClientRequest::QuitSession { session_id } => {
-                let known = state.rest.sessions.iter().any(|s| s.id == session_id);
-                if known {
-                    self.send_to(
-                        idx,
-                        DaemonEvent::Error("QuitSession not yet supported".into()),
-                    );
-                } else {
-                    self.send_to(
+                match state.rest.sessions.iter().position(|s| s.id == session_id) {
+                    Some(target) => {
+                        state.rest.sessions[target].close();
+                        repoint_foreground_off_closed(state);
+                        self.send_to(idx, DaemonEvent::Ack);
+                    }
+                    None => self.send_to(
                         idx,
                         DaemonEvent::Error(format!("unknown session id: {session_id}")),
-                    );
+                    ),
                 }
             }
 
@@ -508,19 +543,94 @@ impl DaemonHub {
     }
 }
 
+/// Number of consecutive QUALIFYING ticks (all sessions quiesced AND no client)
+/// required before the daemon self-exits (daemon stage 10). At the idle 100ms
+/// cadence this is ~1s of sustained quiet — a grace window so a momentary lull
+/// (a session closed but a client about to attach, or a `/new` mid-flight) does
+/// NOT reap the daemon. The counter resets to 0 the instant a session is live-
+/// working again or a client is enrolled.
+const SELF_EXIT_GRACE_TICKS: u32 = 10;
+
+/// True when every session is CLOSED (tombstoned) — the "nothing left to run" half
+/// of the self-exit condition (daemon stage 10). The documented contract
+/// ([`crate::ipc::proto::ClientRequest::Detach`]) is that the daemon self-exits only
+/// when ZERO sessions AND no client remain; in the tombstone model a closed session
+/// IS the daemon's notion of a removed session (the slot lingers only so positions
+/// never shift), so "zero sessions" == "every session closed".
+///
+/// It deliberately does NOT use `sessions.is_empty()`: the Vec still HOLDS tombstoned
+/// slots, so an empty check would never fire. It also does NOT self-exit on a merely
+/// IDLE-but-live session — a user who detached a still-open session expects it to
+/// persist for the next attach; only an explicit close (per-session quit or kill-all)
+/// tombstones it. An empty `sessions` (defensive — there is always >=1) counts as
+/// all-closed.
+fn all_sessions_closed(state: &AppState) -> bool {
+    state.rest.sessions.iter().all(|s| s.closed)
+}
+
+/// Repoint `foreground` off a CLOSED (tombstoned) session onto a still-live one
+/// (daemon stage 10, item 5). If the current foreground is not closed, this is a
+/// no-op. Otherwise it picks the FIRST non-closed session as the new foreground so
+/// render / `service_session` never touch a tombstone. If NO session is live (every
+/// one is closed) it leaves `foreground` as-is: the daemon is about to self-exit
+/// anyway, and `service_session` skips the closed foreground regardless, so a
+/// tombstone foreground is harmless in that terminal window. Never goes out of
+/// range (only ever set to a valid EXISTING index — we never reorder/remove the
+/// Vec, so this can't cross-wire index-routed async).
+fn repoint_foreground_off_closed(state: &mut AppState) {
+    let fg = state.rest.foreground;
+    // Current foreground still live → nothing to do.
+    if !state.rest.sessions.get(fg).map(|s| s.closed).unwrap_or(false) {
+        return;
+    }
+    if let Some(live) = state.rest.sessions.iter().position(|s| !s.closed) {
+        state.rest.foreground = live;
+    }
+    // else: every session closed → leave fg; the daemon self-exits and
+    // service_session skips the closed foreground meanwhile.
+}
+
+/// Close (tombstone) EVERY session — the daemon-side "kill all" used by the `/quit`
+/// `[k]` path (daemon stage 10, item 4). Each session's `close()` aborts its stream
+/// and sub-agents, drops receivers, and releases its lock; the slots stay in place so
+/// no index shifts. Foreground is repointed afterwards — it lands on a tombstone since
+/// all are closed, which is harmless: the grace-timed self-exit then fires because
+/// `all_sessions_closed` is now true and no further live work can start.
+fn close_all_sessions(state: &mut AppState) {
+    for s in &mut state.rest.sessions {
+        s.close();
+    }
+    repoint_foreground_off_closed(state);
+}
+
 /// The headless daemon loop. Each tick services every session + every global
 /// concern, drives the hub (drain inbound requests + apply mutations + stream
 /// deltas), then sleeps on the adaptive cadence. No terminal, no input, no draw.
 ///
-/// Returns on EITHER shutdown trigger so the caller's teardown (release every
-/// session lock, drop the runtime, unlink socket + pidfile) runs:
+/// Returns on ANY shutdown trigger so the caller's teardown (release every session
+/// lock, drop the runtime, unlink socket + pidfile) runs:
 /// 1. a controller sends [`ClientRequest::QuitDaemon`] (the hub latches its own
 ///    flag, observed via [`DaemonHub::should_shutdown`]), or
 /// 2. the process receives SIGTERM/SIGINT — the signal task (installed in
 ///    [`super::super::run_daemon`]) flips `shutting_down`, which this loop polls
 ///    each tick. The loop stays SYNCHRONOUS: the async signal task only sets the
-///    atomic; no awaiting happens in the loop body. The broader "self-exit on zero
-///    sessions AND no client" lifecycle rule is a later stage.
+///    atomic; no awaiting happens in the loop body, or
+/// 3. SELF-EXIT (daemon stage 10): every session is CLOSED (tombstoned) AND no
+///    client is enrolled, sustained for [`SELF_EXIT_GRACE_TICKS`] CONSECUTIVE ticks
+///    (a ~1s grace window so a momentary lull never reaps the daemon). The grace
+///    counter resets the instant any session is live OR a client is enrolled. Right
+///    before committing to the self-exit the loop does an ACCEPT-DRAIN re-check
+///    (critique #3): it drains the bridge once more and re-tests "no client", so a
+///    client that connected DURING the grace window aborts the exit rather than being
+///    left with a half-open socket.
+///
+/// `/quit` kill-all (item 4): the QuitConfirm `[k]` key is handled on the CLIENT and
+/// forwarded as `SendKey`; the daemon runs it through `handle_key` -> `QuitKillAll`
+/// -> `handle_quit_kill_all`, which sets `state.rest.should_quit`. This loop observes
+/// that flag, CLOSES every session (tombstone), and clears it — which makes
+/// [`all_sessions_closed`] true so the grace-timed self-exit (3) fires and tears down
+/// cleanly. It does NOT break immediately: letting self-exit drive the exit keeps the
+/// teardown path single and flushes a final closed-state snapshot to the client.
 ///
 /// `shutting_down` is the process-level (signal-driven) stop flag; it is ORed with
 /// the hub's client-driven `QuitDaemon` flag so either path tears down identically.
@@ -536,10 +646,15 @@ pub(in crate::app::runtime) fn daemon_loop(
     hub: &mut DaemonHub,
     shutting_down: &Arc<AtomicBool>,
 ) {
+    // Consecutive qualifying ticks toward self-exit (all closed AND no client). Reset
+    // to 0 whenever a session is live or a client is enrolled (daemon stage 10).
+    let mut quiesce_ticks: u32 = 0;
+
     loop {
         // 1. Service EVERY session: drain each session's stream / tool-task /
         //    sub-agent channels and advance its turn. Identical to the TUI loop —
-        //    the `dirty` return is irrelevant headless (nothing is drawn).
+        //    the `dirty` return is irrelevant headless (nothing is drawn). Closed
+        //    sessions are skipped inside `service_session`.
         let _ = service_all_sessions(state, client, handle);
 
         // 2. Service every GLOBAL concern (endpoint/warm/clipboard drains, the
@@ -551,13 +666,29 @@ pub(in crate::app::runtime) fn daemon_loop(
         // 3. Drive the hub: handle inbound client messages (register / attach /
         //    detach / resync / control) — atomically snapshotting each attaching
         //    client in THIS tick AND applying a controller's mutating requests
-        //    against state/client via the shared action handlers — then stream this
-        //    tick's render-state changes to every attached client as seq'd frames.
+        //    against state/client via the shared action handlers (including
+        //    `QuitSession`, which tombstones one session). Stream AFTER the kill-all
+        //    handling below so a closed-state snapshot reflects the tombstones.
         hub.drain_inbound(state, client, handle);
+
+        // 3a. Kill-all (item 4): a forwarded QuitConfirm `[k]` set `should_quit` via
+        //     `handle_quit_kill_all`. In the DAEMON that means "close every session"
+        //     (NOT an abrupt loop break — that is the LOCAL TUI's behaviour, where the
+        //     run_loop breaks on `should_quit`). Tombstone them all and clear the flag;
+        //     `all_sessions_closed` is now true, so the grace-timed self-exit below
+        //     drives a single clean teardown. Foreground is repointed inside
+        //     `close_all_sessions`. (Detach `[d]` leaves sessions live and is a CLIENT-
+        //     side exit — it never reaches here as a daemon close.)
+        if state.rest.should_quit {
+            close_all_sessions(state);
+            state.rest.should_quit = false;
+        }
+
+        // 3b. Stream this tick's render-state changes to every attached client as
+        //     seq'd frames (after kill-all so a tombstoned set folds back).
         hub.stream_deltas(state);
 
-        // 3b. Honour EITHER shutdown trigger so the caller's teardown (release every
-        //     session lock, drop the runtime, unlink socket + pidfile) runs:
+        // 3c. Honour the EXPLICIT shutdown triggers so the caller's teardown runs:
         //       - the hub's client-driven QuitDaemon flag, or
         //       - the process-level signal flag (SIGTERM/SIGINT) the signal task set.
         //     Checked AFTER streaming so a pending QuitDaemon Ack is flushed first.
@@ -567,12 +698,42 @@ pub(in crate::app::runtime) fn daemon_loop(
             break;
         }
 
+        // 3d. SELF-EXIT grace timer (daemon stage 10, items 2+3). Qualify this tick
+        //     only when EVERY session is closed AND no client is enrolled. Any live
+        //     session or any enrolled client resets the counter (so a lull mid-`/new`,
+        //     or a still-attached client, never trips it). Once the counter reaches
+        //     the grace threshold, ACCEPT-DRAIN re-check: drain the bridge one more
+        //     time and re-test "no client" — a client that connected during the grace
+        //     window (its `Register` now sitting on the bridge) aborts the exit, so we
+        //     never reap the daemon out from under a just-connected client and leave it
+        //     a half-open socket. Only if STILL client-less do we break for teardown
+        //     (which unlinks the socket); the re-check + break is the atomic
+        //     "no-client-then-unlink" the critique requires.
+        if all_sessions_closed(state) && hub.client_count() == 0 {
+            quiesce_ticks = quiesce_ticks.saturating_add(1);
+            if quiesce_ticks >= SELF_EXIT_GRACE_TICKS {
+                // Final accept-drain: observe any connection that landed during grace.
+                hub.drain_inbound_only(state, client, handle);
+                if hub.client_count() == 0 {
+                    break; // no client raced in → commit to self-exit + teardown
+                }
+                // A client connected during grace: abort the exit, serve it. Reset the
+                // counter and flush it a snapshot next loop (its Attach was queued).
+                quiesce_ticks = 0;
+            }
+        } else {
+            // Live session or enrolled client → not quiescing; restart the grace clock.
+            quiesce_ticks = 0;
+        }
+
         // 4. Adaptive sleep — the SAME cadence the TUI input poll uses, minus the
         //    terminal: 8ms while there is live work (so background streams flush at
         //    >=60fps and animations advance), 100ms when fully idle so a quiet
         //    daemon burns no CPU. The busy branch keeps in-flight turns + delta
         //    emission prompt; a quiet daemon with an attached idle client still
-        //    wakes every 100ms to notice the next change.
+        //    wakes every 100ms to notice the next change. A closed foreground reads
+        //    `waiting == false` (see `SessionRuntime::close`), so a fully-tombstoned
+        //    daemon naps at the idle cadence through its grace window.
         let busy = state.rest.fg().waiting
             || state.rest.catalogue_pending.is_some()
             || matches!(state.mode, Mode::Loading(_))
@@ -1011,5 +1172,205 @@ mod tests {
             c2_rx.try_recv().expect("promoted controller reply").event,
             DaemonEvent::Ack
         ));
+    }
+
+    // ─── daemon stage 10: tombstone close + self-exit ────────────────────────
+
+    use crate::app::state::SessionRuntime;
+
+    /// Append a fresh (live) session to `state` and return its stable id. Mirrors a
+    /// `/new`-spawned parallel session for the close/foreground tests, but bypasses
+    /// the credential flow (these tests only exercise tombstoning, not turns).
+    fn push_session(state: &mut AppState) -> String {
+        let rt = SessionRuntime::new();
+        let id = rt.id.clone();
+        state.rest.sessions.push(rt);
+        id
+    }
+
+    /// `QuitSession` on a known id TOMBSTONES that session (sets `closed`, keeps the
+    /// slot so no index shifts) and Acks; the other session stays live.
+    #[test]
+    fn quit_session_tombstones_keeps_slot_and_acks() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        // Two sessions: index 0 (initial) + index 1 (appended). Close index 1.
+        let id1 = push_session(&mut state);
+        let id0 = state.rest.sessions[0].id.clone();
+        let len_before = state.rest.sessions.len();
+
+        hub.handle_inbound(
+            HubInbound::Register { client_id: 1, frame_tx: tx },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::QuitSession { session_id: id1.clone() },
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        assert!(matches!(rx.try_recv().expect("reply").event, DaemonEvent::Ack));
+        // Slot count unchanged (no Vec::remove — tombstone in place).
+        assert_eq!(state.rest.sessions.len(), len_before, "tombstone keeps the slot");
+        // The targeted session is closed; the other stays live.
+        let s1 = state.rest.sessions.iter().find(|s| s.id == id1).expect("slot kept");
+        assert!(s1.closed, "quit session is tombstoned");
+        let s0 = state.rest.sessions.iter().find(|s| s.id == id0).expect("other slot");
+        assert!(!s0.closed, "the other session stays live");
+    }
+
+    /// `QuitSession` on an unknown id is an Error + no-op (no session is closed).
+    #[test]
+    fn quit_session_unknown_id_errors_no_close() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        hub.handle_inbound(
+            HubInbound::Register { client_id: 1, frame_tx: tx },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::QuitSession { session_id: "nope".into() },
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        assert!(matches!(rx.try_recv().expect("reply").event, DaemonEvent::Error(_)));
+        assert!(
+            state.rest.sessions.iter().all(|s| !s.closed),
+            "no session closed on unknown id"
+        );
+    }
+
+    /// Closing the FOREGROUND session repoints `foreground` onto a still-live one so
+    /// service/render never touch a tombstone (item 5).
+    #[test]
+    fn quit_foreground_repoints_to_live_session() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        // Session 1 appended; make IT the foreground, then close it.
+        let id1 = push_session(&mut state);
+        state.rest.foreground = 1;
+
+        hub.handle_inbound(
+            HubInbound::Register { client_id: 1, frame_tx: tx },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::QuitSession { session_id: id1 },
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // Foreground moved off the tombstone to the live session 0.
+        assert_eq!(state.rest.foreground, 0, "foreground repointed to the live session");
+        assert!(!state.rest.fg().closed, "foreground is a live session");
+    }
+
+    /// A CLOSED session is SKIPPED by `service_all_sessions`: the tombstone-skip guard
+    /// short-circuits BEFORE any drain, so a Token queued on its `active_rx` is never
+    /// consumed (the buffer stays empty) and the receiver is left in place untouched.
+    /// Here the `closed` flag is set DIRECTLY (not via `close()`, which would drop the
+    /// receiver + buffer) so the test isolates the servicer's skip, not `close()`'s
+    /// teardown.
+    #[test]
+    fn closed_session_is_skipped_by_servicer() {
+        let mut state = AppState::new(Mode::Chat);
+        let (client, rt) = ctx();
+        let h = rt.handle().clone();
+
+        // Arm session 0 with a live receiver carrying one Token + an empty streaming
+        // buffer, then tombstone it WITHOUT tearing it down.
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::service::StreamEvent>();
+        ev_tx
+            .send(crate::service::StreamEvent::Token("hi".into()))
+            .expect("queue a token");
+        state.rest.sessions[0].active_rx = Some(ev_rx);
+        state.rest.sessions[0].begin_stream(); // streaming = Some("")
+        state.rest.sessions[0].closed = true;
+
+        // Service: a skipped session drains nothing — the token is NOT appended and
+        // the receiver is still parked on the session.
+        let _ = service_all_sessions(&mut state, &client, &h);
+
+        assert_eq!(
+            state.rest.sessions[0].streaming.as_deref(),
+            Some(""),
+            "closed session was skipped: its streaming buffer stayed empty"
+        );
+        assert!(
+            state.rest.sessions[0].active_rx.is_some(),
+            "closed session was skipped: its receiver was never taken/drained"
+        );
+        // Keep the sender alive past the asserts so the channel isn't dropped early.
+        drop(ev_tx);
+    }
+
+    /// `close_all_sessions` tombstones every session; `all_sessions_closed` then
+    /// reports true (the trigger half of the self-exit condition).
+    #[test]
+    fn close_all_then_all_closed_true() {
+        let mut state = AppState::new(Mode::Chat);
+        let _id1 = push_session(&mut state);
+        let _id2 = push_session(&mut state);
+        assert!(!all_sessions_closed(&state), "not closed before kill-all");
+
+        close_all_sessions(&mut state);
+
+        assert!(all_sessions_closed(&state), "every session closed after kill-all");
+        assert!(
+            state.rest.sessions.iter().all(|s| !s.is_working()),
+            "no tombstone reads as working"
+        );
+    }
+
+    /// The forwarded `/quit` kill-all path: `handle_quit_kill_all` sets `should_quit`;
+    /// one daemon-loop turn of that flag (simulated here) closes every session and
+    /// clears the flag, so `all_sessions_closed` becomes true.
+    #[test]
+    fn should_quit_flag_drives_close_all() {
+        let mut state = AppState::new(Mode::Chat);
+        let _id1 = push_session(&mut state);
+
+        // Stand in for a forwarded QuitConfirm [k]: set the flag the loop observes.
+        state.rest.should_quit = true;
+
+        // The loop's 3a step, inlined:
+        if state.rest.should_quit {
+            close_all_sessions(&mut state);
+            state.rest.should_quit = false;
+        }
+
+        assert!(!state.rest.should_quit, "flag cleared by the daemon close path");
+        assert!(all_sessions_closed(&state), "kill-all flag closed every session");
     }
 }

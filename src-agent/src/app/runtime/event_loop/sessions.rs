@@ -58,6 +58,16 @@ fn service_session(
     client: &Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> bool {
+    // TOMBSTONE skip (daemon stage 10): a CLOSED session is inert — `close()` already
+    // aborted its stream + sub-agents, dropped every receiver, and released its lock.
+    // Do NOT drain it, advance its turn, fire its background-finish nudge, or touch
+    // `was_working`; just leave the slot in place (removing it would shift indices and
+    // cross-wire the OTHER sessions' in-flight async). Nothing changed, so report
+    // not-dirty.
+    if state.rest.sessions[idx].closed {
+        return false;
+    }
+
     let mut dirty = false;
 
     // 1. Drain this session's stream events. take() the receiver so the match

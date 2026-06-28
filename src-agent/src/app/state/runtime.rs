@@ -200,6 +200,17 @@ pub struct SessionRuntime {
     /// foregrounds / views the session (the switch handler in a later stage, or here
     /// the moment this session IS the foreground). Starts `false`.
     pub finished_unseen: bool,
+    /// TOMBSTONE marker (daemon stage 10). When a session is closed
+    /// (`ClientRequest::QuitSession` or a daemon-side kill-all), it is NOT removed
+    /// from [`super::AppStateRest::sessions`] — `service_all_sessions` indexes that
+    /// Vec by POSITION ~40x per session per tick, so a `Vec::remove` would shift every
+    /// later index and silently cross-wire in-flight async (see `ipc::proto`
+    /// critique #2). Instead the slot stays put and this flag latches `true`; the
+    /// per-session servicer SKIPS a closed session (no drain, no turn advance, no
+    /// nudge) and the self-exit grace timer treats it as quiesced. Never un-set — a
+    /// tombstone is permanent for the daemon's lifetime. Starts `false`; the local
+    /// TUI never sets it (it has no per-session close).
+    pub closed: bool,
 }
 
 impl Default for SessionRuntime {
@@ -250,6 +261,7 @@ impl SessionRuntime {
             last_send_at: None,
             was_working: false,
             finished_unseen: false,
+            closed: false,
         }
     }
 
@@ -322,12 +334,65 @@ impl SessionRuntime {
         self.awaiting_subagents = false;
     }
 
+    /// TOMBSTONE this session (daemon stage 10): tear down ALL of its in-flight work
+    /// and latch [`closed`](Self::closed) so the per-session servicer skips it from
+    /// now on, WITHOUT removing it from the sessions Vec (a `Vec::remove` would shift
+    /// every later index and cross-wire index-routed async — see `ipc::proto`
+    /// critique #2). After this returns the slot is inert: `is_working()` is false,
+    /// no receiver is live, no lock is held.
+    ///
+    /// Steps (a superset of `abort_current` + `abort_running_subagents`, applied to
+    /// THIS session rather than the foreground):
+    /// - abort the in-flight stream task + drop its receiver (late events vanish),
+    /// - drop the advisory prompt-classifier channel,
+    /// - abort every running sub-agent + drop queued model delegations,
+    /// - clear `waiting` and the parked-lane flags so nothing reads as busy,
+    /// - RELEASE this session's on-disk `session.lock` (so a closed session frees its
+    ///   lock immediately, not only at daemon teardown — another process may reopen
+    ///   it); the path is unlinked here and dropped from `held_lock`.
+    ///
+    /// Idempotent: closing an already-closed session is a harmless no-op (everything
+    /// is already torn down). Does NOT touch foreground — the caller repoints
+    /// foreground off a tombstone (only it knows the session set).
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        // In-flight stream task: abort + drop the receiver so late events vanish.
+        if let Some(h) = self.current_task.take() {
+            h.abort();
+        }
+        self.active_rx = None;
+        self.harness_rx = None;
+        self.waiting = false;
+        self.awaiting_approval = false;
+        self.approval_reason = None;
+        self.awaiting_tool_tasks = false;
+        // Sub-agents: kill running, drop model-delegated queued work, clear the
+        // parked-delegation bookkeeping. (Unlike a turn-halt, a CLOSE also drops
+        // user-initiated /task entries — the session is going away entirely.)
+        self.abort_running_subagents();
+        self.pending_subagents.clear();
+        // Release this session's on-disk lock right away (unlink + forget the path).
+        if let Some(path) = self.held_lock.take() {
+            crate::model::store::remove_lock(&path);
+        }
+        self.closed = true;
+    }
+
     /// True when this session has work in flight: a turn waiting / streaming, a
     /// paused approval, a parked deferred lane (tool tasks or sub-agent
     /// delegations), or any still-running sub-agent. Used by the session hub's
     /// cooking pane to flag busy sessions, by the foreground status line, and by
     /// the background-finish nudge.
+    ///
+    /// A CLOSED (tombstoned) session is NEVER working: `close()` already tore down
+    /// every lane, but short-circuit here so a stray flag can't keep a tombstone
+    /// reading as busy (the self-exit grace timer treats `!is_working()` as quiesced).
     pub fn is_working(&self) -> bool {
+        if self.closed {
+            return false;
+        }
         self.waiting
             || self.streaming.is_some()
             || self.awaiting_approval
