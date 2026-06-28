@@ -153,6 +153,13 @@ pub(in crate::app::runtime) struct DaemonHub {
     /// observes it via [`should_shutdown`](Self::should_shutdown) and returns, so
     /// the shared teardown (release locks, drop runtime, unlink socket) runs.
     shutdown: bool,
+    /// This daemon's build fingerprint, captured ONCE at construction (task #142) and
+    /// reported to each newly-attached client via [`DaemonEvent::Hello`]. Stored — not
+    /// recomputed per attach — so it reflects the binary AS-OF daemon startup: by the
+    /// time a client attaches the on-disk file may already be a rebuilt binary, and the
+    /// gap between that fresh on-disk fingerprint and this stored one is exactly the
+    /// stale-daemon skew the handshake exists to catch.
+    version: String,
 }
 
 impl DaemonHub {
@@ -160,6 +167,12 @@ impl DaemonHub {
     /// into each per-client task. The caller (the daemon runner) holds the returned
     /// [`Sender`] for the daemon's lifetime so `msg_rx` never observes a premature
     /// `Disconnected` before any client has connected.
+    ///
+    /// The build fingerprint is snapshotted HERE (`DaemonHub::new` runs once, in
+    /// `run_daemon`, as this process becomes the live daemon and before it serves any
+    /// client), so the value reported in every `Hello` is the binary the daemon
+    /// actually started from — even after the on-disk file is later overwritten by a
+    /// rebuild.
     pub(in crate::app::runtime) fn new() -> (Self, Sender<HubInbound>) {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         (
@@ -167,6 +180,7 @@ impl DaemonHub {
                 msg_rx,
                 clients: Vec::new(),
                 shutdown: false,
+                version: crate::model::store::build_fingerprint(),
             },
             msg_tx,
         )
@@ -364,6 +378,15 @@ impl DaemonHub {
                         }
                     }
                 }
+                // Build-skew handshake (task #142): emit the daemon's startup
+                // fingerprint as the FIRST frame this client receives, BEFORE its
+                // initial Snapshot. A client built from different code restarts this
+                // stale daemon instead of rendering its frames. Sent on every attach
+                // (incl. a re-attach) — it is one tiny frame and the client simply
+                // re-verifies it; the seq it carries stays monotonic with the Snapshot
+                // that follows. Cloning the stored string keeps `&mut self` free for the
+                // `send_to` below.
+                self.send_to(idx, DaemonEvent::Hello { version: self.version.clone() });
                 // ATOMIC attach (critique #2): build the full snapshot, send it, and
                 // flip the client to attached + seed ITS OWN baseline IN THIS TICK.
                 // Only this client's baseline is (re)seeded (blocker #2) — never a
@@ -1032,22 +1055,31 @@ mod tests {
             &h,
         );
 
-        // Attach must have produced exactly a Snapshot at seq 1.
+        // Attach now produces the build-skew Hello at seq 1 (task #142), THEN the
+        // initial Snapshot at seq 2.
+        let f0 = frame_rx.try_recv().expect("hello frame on attach");
+        assert_eq!(f0.seq, 1, "first frame seq");
+        assert!(
+            matches!(f0.event, DaemonEvent::Hello { .. }),
+            "attach emits Hello first, got {:?}",
+            f0.event
+        );
         let f1 = frame_rx.try_recv().expect("snapshot frame on attach");
-        assert_eq!(f1.seq, 1, "first frame seq");
+        assert_eq!(f1.seq, 2, "snapshot follows hello");
         assert!(
             matches!(f1.event, DaemonEvent::Snapshot(_)),
-            "attach emits a Snapshot, got {:?}",
+            "attach emits a Snapshot after Hello, got {:?}",
             f1.event
         );
 
         // Mutate render state: change the global status line.
         state.rest.status = "streaming".into();
 
-        // One delta-stream pass must emit a single StatusChanged delta at seq 2.
+        // One delta-stream pass must emit a single StatusChanged delta at seq 3 (one
+        // past the Snapshot, which was one past the Hello).
         hub.stream_deltas(&state);
         let f2 = frame_rx.try_recv().expect("delta frame after change");
-        assert_eq!(f2.seq, 2, "delta seq is N+1");
+        assert_eq!(f2.seq, 3, "delta seq is N+1");
         match f2.event {
             DaemonEvent::Delta(StateDelta::StatusChanged { session_id, text }) => {
                 assert_eq!(session_id, None, "global status delta");
@@ -1097,6 +1129,9 @@ mod tests {
             &mut client,
             &h,
         );
+        // Drain the attach frames: Hello (seq 1, task #142) then the initial Snapshot
+        // (seq 2), so the channel is empty before the structural change below.
+        let _hello = frame_rx.try_recv().expect("attach hello");
         let _snap = frame_rx.try_recv().expect("attach snapshot");
 
         // Enter tool-approval on the foreground session — a structural change vs the
@@ -1105,12 +1140,64 @@ mod tests {
 
         hub.stream_deltas(&state);
         let f = frame_rx.try_recv().expect("frame after structural change");
-        assert_eq!(f.seq, 2);
+        assert_eq!(f.seq, 3);
         assert!(
             matches!(f.event, DaemonEvent::Snapshot(_)),
             "structural change must resync with a full Snapshot, got {:?}",
             f.event
         );
+    }
+
+    /// Build-skew handshake (task #142): an attaching client's VERY FIRST frame is a
+    /// `Hello` carrying the hub's stored fingerprint, ahead of the initial Snapshot.
+    #[test]
+    fn attach_emits_hello_then_snapshot() {
+        let mut state = AppState::new(Mode::Chat);
+        let (mut client, rt) = ctx();
+        let h = rt.handle().clone();
+        let (mut hub, _runner_tx) = DaemonHub::new();
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+
+        hub.handle_inbound(
+            HubInbound::Register {
+                client_id: 1,
+                frame_tx,
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+        hub.handle_inbound(
+            HubInbound::Request {
+                client_id: 1,
+                req: ClientRequest::Attach {
+                    foreground_id: None,
+                    cwd: None,
+                },
+            },
+            &mut state,
+            &mut client,
+            &h,
+        );
+
+        // First frame: Hello at seq 1, carrying the hub's (current process) fingerprint.
+        let f0 = frame_rx.try_recv().expect("hello frame on attach");
+        assert_eq!(f0.seq, 1);
+        match f0.event {
+            DaemonEvent::Hello { version } => {
+                assert_eq!(
+                    version,
+                    crate::model::store::build_fingerprint(),
+                    "Hello carries the hub's stored fingerprint"
+                );
+            }
+            other => panic!("expected Hello first, got {other:?}"),
+        }
+
+        // Second frame: the initial Snapshot at seq 2.
+        let f1 = frame_rx.try_recv().expect("snapshot frame after hello");
+        assert_eq!(f1.seq, 2);
+        assert!(matches!(f1.event, DaemonEvent::Snapshot(_)));
     }
 
     /// An observer (second client) is rejected when it sends a mutating request,

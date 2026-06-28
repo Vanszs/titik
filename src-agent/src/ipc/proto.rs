@@ -267,6 +267,18 @@ pub struct DaemonFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub enum DaemonEvent {
+    /// Build-skew handshake (task #142): the VERY FIRST frame the daemon sends a
+    /// newly-attached client, carrying the daemon's [`crate::model::store::build_fingerprint`]
+    /// AS COMPUTED AT DAEMON STARTUP (not re-read at attach time — the on-disk file may
+    /// already be the new build). The client computes its OWN fingerprint fresh on
+    /// connect and compares: equal → proceed; different → the binary changed since the
+    /// daemon started (a rebuild), so the client restarts the stale daemon and reconnects
+    /// rather than silently rendering its stale frames. Emitted right BEFORE the initial
+    /// `Snapshot` in the attach handler, so it always arrives first (lowest seq) and the
+    /// client can verify it before painting anything. A daemon predating this variant
+    /// simply never sends it; the client then can't confirm a skew and proceeds (it never
+    /// restarts on a mere absence — see the client handshake).
+    Hello { version: String },
     /// A full state projection — sent on attach and on resync. The client rebuilds
     /// its entire shadow from this. Boxed because a `StateSnapshot` is by far the
     /// largest event payload (it carries every session + the full mode projection,

@@ -158,33 +158,53 @@ const WRITER_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 /// local TUI's toasts.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
-/// Attach to a running daemon and run the thin render+forward client.
+/// How long the pre-render build-skew handshake waits for the daemon's first
+/// [`DaemonEvent::Hello`] frame before giving up and proceeding UNVERIFIED (task
+/// #142). Generous relative to the daemon's sub-ms attach reply, but bounded so a
+/// wedged / pre-Hello daemon can never hang the client before it even paints. On a
+/// timeout the client renders against whatever daemon answered (it never restarts on
+/// a mere absence — only on a CONFIRMED mismatch).
+const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One live daemon connection: the bridge channels + writer join handle the render
+/// loop and teardown drive, plus the frames the pre-render handshake already pulled
+/// off the wire and the daemon version it observed.
+struct Connection {
+    /// Incoming daemon frames (reader task -> render loop).
+    frame_rx: Receiver<DaemonFrame>,
+    /// Outgoing client requests (render loop -> writer task).
+    req_tx: Sender<ClientRequest>,
+    /// Writer task handle, joined at teardown so the final `Detach`/`QuitDaemon`
+    /// flushes before the runtime is dropped.
+    writer_handle: tokio::task::JoinHandle<()>,
+    /// Frames the handshake read off `frame_rx` while hunting for `Hello` (normally
+    /// none — `Hello` is the first frame — but any that arrived first are carried here
+    /// so the render loop applies them BEFORE its own drain and no frame/seq is lost).
+    prebuffered: Vec<DaemonFrame>,
+    /// The daemon's reported build fingerprint, or `None` if no `Hello` arrived within
+    /// the handshake window (a daemon predating the handshake, or a slow one).
+    daemon_version: Option<String>,
+}
+
+/// Connect to the daemon, spawn the I/O bridge, send `Attach`, and run the pre-render
+/// build-skew handshake (task #142): read frames until the daemon's first
+/// [`DaemonEvent::Hello`] (bounded by [`HELLO_HANDSHAKE_TIMEOUT`]), recording its
+/// reported fingerprint. Returns a live [`Connection`]; the CALLER compares
+/// `daemon_version` to its own fingerprint and decides whether to restart+reconnect.
 ///
-/// Connects to the daemon socket (an `Err` means no daemon is up — surfaced to the
-/// caller, which prints it), spawns the reader/writer bridge tasks, sends
-/// [`ClientRequest::Attach`], then enters the synchronous render loop. Returns when
-/// the user detaches (Ctrl-C) or the daemon's socket closes; the terminal is
-/// restored by [`TerminalGuard`]'s drop and the runtime is dropped last.
-pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
-    // The client needs the config dirs only to resolve the socket path; it owns no
-    // sessions and writes no config. In particular it touches NO session lock here
-    // or anywhere downstream (lock ownership belongs to the daemon — see the
-    // module header): the only `store` calls are these two lock-free path helpers.
-    store::ensure_dirs()?;
-    let sock_path = store::daemon_sock_path()?;
-
-    // A small multi-thread runtime drives the two socket tasks. The render loop runs
-    // on THIS thread (synchronous), exactly like the local TUI's `run_loop`.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let handle = rt.handle().clone();
-
+/// The handshake is synchronous and runs BEFORE any terminal setup so a stale-daemon
+/// restart happens cleanly on the normal screen. Frames that arrive ahead of `Hello`
+/// (defensive — the daemon emits `Hello` first) are stashed in `prebuffered` for the
+/// render loop to apply first, so the seq stream the loop sees stays gap-free.
+fn connect_attach_and_handshake(
+    handle: &tokio::runtime::Handle,
+    sock_path: &std::path::Path,
+) -> Result<Connection> {
     // Connect first so a missing daemon fails BEFORE we touch the terminal (no
     // alt-screen flash on "no daemon"). The connected stream is split into the two
     // task halves below.
     let stream = handle
-        .block_on(async { crate::ipc::client::connect(&sock_path).await })
+        .block_on(async { crate::ipc::client::connect(sock_path).await })
         .map_err(|e| {
             anyhow::anyhow!("could not reach koma daemon at {}: {e}", sock_path.display())
         })?;
@@ -205,11 +225,11 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
         handle.spawn(writer_task(write_half, req_rx))
     };
 
-    // Send the Attach handshake; the daemon answers with the initial full Snapshot
-    // (drained in the loop's first incoming pass). Carry THIS client's launch cwd so
-    // the daemon does pwd-aware session selection (stage 3): launching from a NEW dir
-    // foregrounds/loads/creates a session for THAT dir, not the daemon's last one.
-    // `current_dir` failing is non-fatal — `None` just keeps the daemon's foreground.
+    // Send the Attach handshake; the daemon answers with a `Hello` (build-skew
+    // fingerprint) FOLLOWED by the initial full Snapshot. Carry THIS client's launch
+    // cwd so the daemon does pwd-aware session selection (stage 3): launching from a
+    // NEW dir foregrounds/loads/creates a session for THAT dir, not the daemon's last
+    // one. `current_dir` failing is non-fatal — `None` just keeps the daemon's foreground.
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
@@ -217,6 +237,135 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
         foreground_id: None,
         cwd,
     });
+
+    // Pre-render handshake: pull frames until the daemon's `Hello` (bounded). `Hello`
+    // is normally the very first frame, so this typically reads exactly one. Any
+    // non-`Hello` frame seen first is buffered for the render loop (so nothing is lost
+    // and the seq stays monotonic). A timeout / closed socket ends the wait with
+    // `daemon_version = None` — the caller proceeds unverified rather than restarting.
+    let mut prebuffered: Vec<DaemonFrame> = Vec::new();
+    let mut daemon_version: Option<String> = None;
+    let deadline = Instant::now() + HELLO_HANDSHAKE_TIMEOUT;
+    // Loop until the Hello arrives, the socket closes, or the window elapses
+    // (`checked_duration_since` returns `None` once `deadline` is in the past).
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match frame_rx.recv_timeout(remaining) {
+            Ok(frame) => match frame.event {
+                DaemonEvent::Hello { version } => {
+                    daemon_version = Some(version);
+                    break;
+                }
+                // A non-Hello frame arrived first: keep it for the render loop to apply
+                // before its own drain, then keep waiting for the Hello.
+                _ => prebuffered.push(frame),
+            },
+            // Timed out, or the reader task dropped its sender (socket closed): stop
+            // waiting. `None` daemon_version => unverified; the caller won't restart.
+            Err(_) => break,
+        }
+    }
+
+    Ok(Connection {
+        frame_rx,
+        req_tx,
+        writer_handle,
+        prebuffered,
+        daemon_version,
+    })
+}
+
+/// Attach to a running daemon and run the thin render+forward client.
+///
+/// Connects to the daemon socket (an `Err` means no daemon is up — surfaced to the
+/// caller, which prints it), spawns the reader/writer bridge tasks, sends
+/// [`ClientRequest::Attach`], runs the build-skew handshake (task #142), then enters
+/// the synchronous render loop. Returns when the user detaches (Ctrl-C) or the
+/// daemon's socket closes; the terminal is restored by [`TerminalGuard`]'s drop and
+/// the runtime is dropped last.
+///
+/// # Build-skew auto-restart (task #142)
+///
+/// The koma daemon outlives a rebuild, so a freshly-built client can attach to a
+/// daemon still running OLD code and silently render its stale frames (this already
+/// caused a phantom `/agents` bug). On connect the client compares its OWN build
+/// fingerprint ([`store::build_fingerprint`], computed fresh now) against the
+/// daemon's reported one (the `Hello` value, which the daemon captured AT ITS
+/// STARTUP). On a mismatch it restarts the stale daemon via the SAME machinery
+/// `koma daemon restart` uses ([`super::manage::restart_daemon`]) and reconnects.
+///
+/// LOOP GUARD: the auto-restart fires AT MOST ONCE per launch. If the freshly-spawned
+/// daemon STILL mismatches (it shouldn't — it was just built from the current binary),
+/// the client prints an error and renders against it anyway rather than restart-looping
+/// forever. A daemon that sends no `Hello` (predates the handshake, or is slow) is
+/// never restarted on that absence alone — only a CONFIRMED mismatch triggers a restart.
+pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
+    // The client needs the config dirs only to resolve the socket path; it owns no
+    // sessions and writes no config. In particular it touches NO session lock here
+    // or anywhere downstream (lock ownership belongs to the daemon — see the
+    // module header): the only `store` calls are these two lock-free path helpers.
+    store::ensure_dirs()?;
+    let sock_path = store::daemon_sock_path()?;
+
+    // A small multi-thread runtime drives the two socket tasks. The render loop runs
+    // on THIS thread (synchronous), exactly like the local TUI's `run_loop`.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let handle = rt.handle().clone();
+
+    // THIS client's build fingerprint, read fresh now (the on-disk binary as it exists
+    // at launch). Compared below to each daemon's reported `Hello` to detect a daemon
+    // running stale code.
+    let my_fingerprint = store::build_fingerprint();
+
+    // Connect + attach + handshake, restarting a version-skewed daemon AT MOST ONCE
+    // (the loop guard). On a confirmed mismatch we restart the stale daemon and
+    // reconnect; on the (unexpected) second mismatch we give up and render against it.
+    let mut conn = connect_attach_and_handshake(&handle, &sock_path)?;
+    let mut already_restarted = false;
+    while conn
+        .daemon_version
+        .as_deref()
+        .is_some_and(|v| v != my_fingerprint)
+    {
+        if already_restarted {
+            // The just-restarted daemon STILL reports a different fingerprint. This
+            // shouldn't happen (it was spawned from the current binary); don't loop
+            // forever — warn and render against it.
+            eprintln!(
+                "koma: daemon still reports a different build after a restart; \
+                 continuing against it"
+            );
+            break;
+        }
+        eprintln!("koma: daemon running stale code — restarting...");
+        already_restarted = true;
+
+        // Tear down the stale connection's bridge before restarting: drop our request
+        // sender (the writer drains + exits) and let the reader task observe the
+        // daemon's death as EOF. Both old tasks self-terminate; the runtime persists
+        // for the reconnect below.
+        drop(conn.req_tx);
+        drop(conn.frame_rx);
+
+        // Reuse the EXACT `koma daemon restart` path (kill escalation + spawn-and-
+        // confirm). A failure here is fatal — we can't recover a usable daemon.
+        super::manage::restart_daemon()
+            .map_err(|e| anyhow::anyhow!("failed to restart the stale koma daemon: {e:#}"))?;
+
+        // Reconnect to the freshly-spawned daemon and re-handshake.
+        conn = connect_attach_and_handshake(&handle, &sock_path)?;
+    }
+
+    // Unpack the connection we settled on (fresh-built match, an unverified daemon, or
+    // a post-restart daemon we chose to accept).
+    let Connection {
+        frame_rx,
+        req_tx,
+        writer_handle,
+        prebuffered,
+        daemon_version: _,
+    } = conn;
 
     // Terminal setup — identical to the local TUI (`run`). Guard first so a failure
     // anywhere after still restores the terminal.
@@ -233,7 +382,7 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     // needs a runtime in scope — see `shadow_subagent`); the loop itself stays sync.
     let result = {
         let _rt_ctx = handle.enter();
-        render_loop(&mut terminal, &frame_rx, &req_tx)
+        render_loop(&mut terminal, &frame_rx, &req_tx, prebuffered)
     };
 
     // Polite detach so the daemon passes the controller seat promptly (the socket
@@ -282,6 +431,7 @@ fn render_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     frame_rx: &Receiver<DaemonFrame>,
     req_tx: &Sender<ClientRequest>,
+    prebuffered: Vec<DaemonFrame>,
 ) -> Result<()> {
     // The shadow is a real AppState reconstructed purely from frames. It starts in
     // a neutral Chat with a single empty session; the first Snapshot replaces it.
@@ -297,6 +447,28 @@ fn render_loop(
     // While true, every frame except a fresh Snapshot is dropped: a gap was seen and
     // a Resync was sent, so the shadow is stale until the full snapshot rebuilds it.
     let mut awaiting_resync = false;
+
+    // Apply any frames the pre-render handshake pulled off the wire while hunting for
+    // `Hello` (task #142) BEFORE the live drain, through the SAME `apply_frame` path so
+    // seq seeding + snapshot/delta handling are identical. Normally empty (the daemon
+    // sends `Hello` first), so usually a no-op; when non-empty these are the lowest-seq
+    // frames and must be folded first to keep the seq stream gap-free. An `EnterSelect`
+    // can't occur this early (it needs a forwarded `/select` first), so a throwaway
+    // `select_requested` here is never acted on.
+    {
+        let mut select_requested = false;
+        for frame in prebuffered {
+            apply_frame(
+                frame,
+                &mut shadow,
+                &mut expected,
+                &mut seeded,
+                &mut awaiting_resync,
+                &mut select_requested,
+                req_tx,
+            );
+        }
+    }
 
     loop {
         // Pace to ~60fps: stamp the frame start, do the work, sleep the remainder.
@@ -660,6 +832,11 @@ fn apply_frame(
             *select_requested = true;
             false
         }
+        // The build-skew handshake frame (task #142) is consumed BEFORE the render
+        // loop, in the pre-render handshake (see `client_run`). If one still reaches
+        // here (a re-attach mid-session re-emits it), it is non-visual: the version was
+        // already verified at connect time, so just advance the seq and render nothing.
+        DaemonEvent::Hello { .. } => false,
         // Non-visual control replies. (A future refinement could toast an Error.)
         DaemonEvent::Ack | DaemonEvent::Error(_) => false,
     }

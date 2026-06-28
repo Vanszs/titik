@@ -619,17 +619,27 @@ fn daemon_selftest_inner() -> Result<()> {
         let mut stream = crate::ipc::client::connect(&sock_path).await?;
         let mut reader = FrameReader::new();
 
-        // Attach -> expect a full Snapshot.
+        // Attach -> expect a `Hello` (build-skew handshake, task #142) FOLLOWED by a
+        // full Snapshot. Read frames until the Snapshot, tolerating the leading Hello
+        // (and any interleaved control frame) so the test mirrors a real client.
         let attach =
             serde_json::to_vec(&ClientRequest::Attach { foreground_id: None, cwd: None })?;
         write_frame(&mut stream, &attach).await?;
-        let snap_frame: DaemonFrame =
-            serde_json::from_slice(&read_frame(&mut stream, &mut reader).await?)?;
-        anyhow::ensure!(
-            matches!(snap_frame.event, DaemonEvent::Snapshot(_)),
-            "attach reply was not a Snapshot: {:?}",
-            snap_frame.event
-        );
+        let mut saw_snapshot = false;
+        for _ in 0..8 {
+            let frame: DaemonFrame =
+                serde_json::from_slice(&read_frame(&mut stream, &mut reader).await?)?;
+            match frame.event {
+                DaemonEvent::Snapshot(_) => {
+                    saw_snapshot = true;
+                    break;
+                }
+                // The leading Hello (or any other control frame) is expected before
+                // the Snapshot — keep reading.
+                _ => continue,
+            }
+        }
+        anyhow::ensure!(saw_snapshot, "attach reply never produced a Snapshot");
 
         // SubmitInput -> the daemon applies Action::Submit; with no active session
         // it sets status = "no active session". Read frames until that status

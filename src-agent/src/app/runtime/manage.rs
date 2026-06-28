@@ -65,6 +65,21 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 /// process to die / the socket to disappear.
 const SIGNAL_GRACE: Duration = Duration::from_secs(2);
 
+/// Stop any running daemon, then spawn a fresh one — the PUBLIC restart primitive
+/// the thin client uses to recover from a build-skew (task #142).
+///
+/// This is the EXACT `koma daemon restart` path: it delegates straight to
+/// [`cmd_restart`], reusing its full graceful→SIGTERM→SIGKILL stop escalation AND its
+/// [`ensure_daemon_and_connect`] spawn-and-confirm (poll-connect until the new daemon
+/// accepts), so the auto-restart never reinvents the kill or the spawn. It returns
+/// `Ok(())` once a fresh daemon is confirmed accepting (or surfaces the spawn error);
+/// the caller then reconnects to the new daemon. Like the CLI verb it prints a couple
+/// of plain status lines, which is harmless here — the client's handshake runs BEFORE
+/// the alt-screen is entered, so the lines scroll away when the TUI opens.
+pub fn restart_daemon() -> Result<()> {
+    cmd_restart()
+}
+
 /// Entry point for `koma daemon <verb>` — dispatch to the matching handler.
 ///
 /// Called from `main` (short-circuited BEFORE the TUI). Each handler prints its

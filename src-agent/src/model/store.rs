@@ -221,6 +221,57 @@ pub fn write_daemon_pid() -> Result<()> {
     Ok(())
 }
 
+/// A stable identity string for the CURRENTLY-RUNNING executable, used as the
+/// daemon<->client build-skew handshake (task #142).
+///
+/// The koma daemon is long-lived and survives a rebuild: after `cargo build`
+/// overwrites the on-disk binary, a freshly-built client attaching to the OLD
+/// still-running daemon renders STALE behaviour (this already produced a phantom
+/// `/agents` bug). The fingerprint lets a client detect that skew — the daemon
+/// reports the value it computed AT STARTUP, and a client that computes a
+/// DIFFERENT value now knows the binary changed since the daemon launched (a
+/// rebuild) and can restart it instead of silently talking to stale code.
+///
+/// Identity = the running file's on-disk fingerprint, NOT a content hash (cheap +
+/// std-only, yet flips on every rebuild because `cargo` rewrites the file):
+/// `CARGO_PKG_VERSION` + the executable's byte length + its mtime. Any two
+/// builds differ in length and/or mtime, so the string differs across every
+/// rebuild while staying identical for a single running binary.
+///
+/// ROBUST BY CONTRACT — never panics and always returns *something*: if
+/// [`std::env::current_exe`] or its [`std::fs::metadata`] can't be resolved (an
+/// exotic platform, a deleted/replaced exe), it degrades to JUST the crate
+/// version. That fallback is coarser (it won't catch a same-version rebuild) but
+/// is strictly better than aborting the attach — a missing fingerprint must never
+/// take the client down.
+pub fn build_fingerprint() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Best-effort: the running file's length + mtime. Either step failing drops us
+    // to the version-only fallback below (never a panic).
+    let detail = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::metadata(&exe).ok())
+        .map(|meta| {
+            let len = meta.len();
+            // mtime as a stable string. `modified()` can be unsupported on some
+            // platforms; fall back to a marker so two runs on such a platform still
+            // compare equal (version+len then carry the signal).
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos().to_string())
+                .unwrap_or_else(|| "no-mtime".to_string());
+            format!("{len}:{mtime}")
+        });
+
+    match detail {
+        Some(d) => format!("{version}+{d}"),
+        None => version.to_string(),
+    }
+}
+
 /// List the sessions for the CURRENT working directory, most-recently updated
 /// first.
 ///
