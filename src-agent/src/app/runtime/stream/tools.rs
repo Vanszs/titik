@@ -180,6 +180,32 @@ pub(crate) fn process_tools(
             state.rest.sessions[sess_idx].tool_idx += 1;
             continue;
         }
+        // Intercept the model-callable `git_cred` tool BEFORE the generic
+        // dispatch path. A `select` result tagged with `GIT_CRED_SELECT_PREFIX`
+        // must be applied to session settings (persisted) here on the main thread
+        // rather than in a side-effect-free `ToolCtx`; a `list` result (or any
+        // `error:`) has no such prefix and is surfaced to the model verbatim.
+        // `git_cred` is INSTANT (only stat calls) so it runs inline, never via
+        // the deferred lane.
+        if call.function.name == "git_cred" {
+            let result = run_tool(state, sess_idx, &call);
+            let final_result =
+                if let Some(key) = result.strip_prefix(crate::tool::git_cred::GIT_CRED_SELECT_PREFIX) {
+                    // Apply the selection: write into settings and persist.
+                    let key = key.to_string();
+                    if let Some(sess) = state.rest.sessions[sess_idx].session.as_mut() {
+                        sess.settings.git_ssh_key = Some(key.clone());
+                        let _ = sess.save();
+                    }
+                    format!("selected ssh key: {key}")
+                } else {
+                    // list output or error: — pass through unchanged.
+                    result
+                };
+            state.rest.sessions[sess_idx].tool_results.push((call.id.clone(), final_result));
+            state.rest.sessions[sess_idx].tool_idx += 1;
+            continue;
+        }
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, sess_idx, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.

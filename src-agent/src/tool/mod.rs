@@ -21,6 +21,7 @@ use serde_json::Value;
 pub mod cd;
 pub mod dircache;
 pub mod fs;
+pub mod git_cred;
 pub mod internet;
 pub mod memory;
 pub mod pong;
@@ -46,6 +47,11 @@ pub struct ToolCtx {
     /// between the simple raw-HTTP path and the Full browser backend (scrapion);
     /// defaults to `Simple` when no session is available.
     pub internet_mode: crate::model::settings::InternetMode,
+    /// The bare filename of the SSH identity key selected for this session
+    /// (e.g. `"id_ed25519"`). Set by `git_cred action="select"`; read by
+    /// `git_operator` to inject `-i ~/.ssh/<key>` into git commands. `None`
+    /// means no key has been selected yet.
+    pub ssh_key: Option<String>,
 }
 
 /// Parse a `[N]` workspace-index prefix from the start of a path string.
@@ -93,6 +99,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(task::Task),
         Box::new(internet::WebFetch),
         Box::new(internet::WebSearch),
+        Box::new(git_cred::GitCred),
     ]
 }
 

@@ -40,12 +40,18 @@ pub(crate) fn build_tool_ctx(state: &AppState, sess_idx: usize) -> crate::tool::
         .as_ref()
         .map(|s| s.settings.internet_mode)
         .unwrap_or_default();
+    // The SSH identity key selected for this session (bare filename, never path
+    // or contents). Populated from settings so git_operator can inject it.
+    let ssh_key = session_ref
+        .as_ref()
+        .and_then(|s| s.settings.git_ssh_key.clone());
     crate::tool::ToolCtx {
         workspace,
         workspaces,
         dir_cache: rt.dir_cache.clone(),
         memory_dir,
         internet_mode,
+        ssh_key,
     }
 }
 
