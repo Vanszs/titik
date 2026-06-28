@@ -743,13 +743,20 @@ fn all_idle_or_parked_detached(state: &AppState, client_attached: bool) -> bool 
 ///    client that connected DURING the grace window aborts the exit rather than being
 ///    left with a half-open socket.
 ///
-/// `/quit` kill-all (item 4): the QuitConfirm `[k]` key is handled on the CLIENT and
-/// forwarded as `SendKey`; the daemon runs it through `handle_key` -> `QuitKillAll`
-/// -> `handle_quit_kill_all`, which sets `state.rest.should_quit`. This loop observes
-/// that flag, CLOSES every session (tombstone), and clears it — which makes
-/// [`all_sessions_closed`] true so the grace-timed self-exit (3) fires and tears down
-/// cleanly. It does NOT break immediately: letting self-exit drive the exit keeps the
-/// teardown path single and flushes a final closed-state snapshot to the client.
+/// `/quit` kill-all (item 4): the CLIENT (`--attach`) and the LOCAL TUI reach this
+/// the SAME end (every session tombstoned, daemon torn down) via DIFFERENT paths:
+///   - CLIENT: `handle_quit_confirm_key`'s `[k]` does NOT forward a `SendKey`; it
+///     sends [`ClientRequest::QuitDaemon`] directly. The hub latches its shutdown
+///     flag (observed via [`DaemonHub::should_shutdown`], trigger 1 above), so the
+///     daemon tears down through the shared graceful path — no `should_quit` round
+///     trip is involved on the client `[k]` path.
+///   - LOCAL TUI: there is no IPC; the forwarded-key story does not apply. The kill-
+///     all key runs through `handle_key` -> `QuitKillAll` -> `handle_quit_kill_all`,
+///     which sets `state.rest.should_quit`. This loop observes that flag, CLOSES every
+///     session (tombstone), and clears it — which makes [`all_sessions_closed`] true so
+///     the grace-timed self-exit (3) fires and tears down cleanly. It does NOT break
+///     immediately: letting self-exit drive the exit keeps the teardown path single and
+///     flushes a final closed-state snapshot to any attached client.
 ///
 /// `shutting_down` is the process-level (signal-driven) stop flag; it is ORed with
 /// the hub's client-driven `QuitDaemon` flag so either path tears down identically.

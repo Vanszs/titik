@@ -92,6 +92,13 @@ use super::terminal::TerminalGuard;
 /// daemon conn's `FRAME_POLL` so a typed key reaches the daemon within one tick.
 const REQ_POLL: Duration = Duration::from_millis(4);
 
+/// Upper bound on how long the client teardown waits for the writer task to flush
+/// its final queued frame(s) (the shutdown `QuitDaemon`/`Detach`) before the tokio
+/// runtime is dropped. The writer drains-and-returns the instant its channel closes
+/// (well under one `REQ_POLL`), so this is only a safety ceiling against a wedged
+/// socket — exit must never hang on a misbehaving daemon write half.
+const WRITER_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Local TTL for a toast reconstructed from a [`StateDelta::Toast`]. The daemon's
 /// toast `Instant` is daemon-local and never crosses the wire (see `ipc::snapshot`);
 /// the client re-derives its own dismissal timer here, matching the ~4s feel of the
@@ -135,13 +142,15 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     let (req_tx, req_rx) = std::sync::mpsc::channel::<ClientRequest>();
 
     // Split + spawn the two I/O tasks on the runtime (a tokio reactor must be in
-    // scope for `into_split` + `spawn`).
-    {
+    // scope for `into_split` + `spawn`). The writer's `JoinHandle` is kept so the
+    // teardown can WAIT for it to flush its final frame(s) (the shutdown
+    // `QuitDaemon`/`Detach`) before the runtime is dropped — see below.
+    let writer_handle = {
         let _enter = handle.enter();
         let (read_half, write_half) = stream.into_split();
         handle.spawn(reader_task(read_half, frame_tx));
-        handle.spawn(writer_task(write_half, req_rx));
-    }
+        handle.spawn(writer_task(write_half, req_rx))
+    };
 
     // Send the Attach handshake; the daemon answers with the initial full Snapshot
     // (drained in the loop's first incoming pass).
@@ -158,10 +167,26 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
 
     let result = render_loop(&mut terminal, &frame_rx, &req_tx);
 
-    // Best-effort polite detach so the daemon passes the controller seat promptly
-    // (the socket close would also trigger it, but this is cleaner). Then drop the
-    // runtime LAST so the two tasks are cancelled after the loop has stopped.
+    // Polite detach so the daemon passes the controller seat promptly (the socket
+    // close would also trigger it, but this is cleaner). If the `/quit` overlay's
+    // `[k]` kill-all path ran, a `QuitDaemon` was ALSO queued ahead of this — both
+    // MUST reach the daemon or it is left orphaned (socket open, no controller).
     let _ = req_tx.send(ClientRequest::Detach);
+
+    // Deterministic flush of the final frame(s) before the runtime dies. Dropping
+    // `req_tx` closes the outbound channel, which the writer observes as
+    // `Disconnected`: it then drains EVERY remaining queued request to the socket
+    // and returns (see `writer_task`). We must wait for that drain — previously the
+    // runtime was dropped immediately, cancelling the writer mid-`poll.tick()` sleep
+    // and LOSING the queued `QuitDaemon`/`Detach` (an orphaned daemon). Drop the
+    // sender, then JOIN the writer (bounded, so a wedged socket can't hang exit).
+    drop(req_tx);
+    let _ = handle.block_on(async {
+        tokio::time::timeout(WRITER_FLUSH_TIMEOUT, writer_handle).await
+    });
+
+    // Writer is done (or the bound elapsed) — its final frames are flushed to the
+    // socket. Drop the runtime LAST so the reader task is cancelled after exit.
     drop(rt);
 
     result
@@ -735,6 +760,18 @@ async fn reader_task(
 /// it is held), then the batch is written — the same collect-then-write that keeps
 /// the future `Send` despite `std::sync::mpsc::Receiver` being `!Sync` (see
 /// `conn::write_loop`).
+///
+/// # Drain-on-close (final-frame guarantee)
+///
+/// When `try_recv` reports `Disconnected` the loop has dropped `req_tx` at teardown,
+/// after queuing the shutdown frame(s) (`Detach`, and — on `/quit` `[k]` — a
+/// `QuitDaemon` ahead of it). Those frames may still be sitting in the channel, so
+/// this task does NOT bail on close: it collects EVERY remaining request in the same
+/// pass (the `Disconnected` arm only stops the collect, it does not discard what was
+/// already drained) and writes the full batch — `write_frame_to` flushes each frame —
+/// BEFORE returning. The teardown joins this task (bounded) so the runtime is not
+/// dropped until this final flush completes, which is what guarantees the daemon
+/// actually receives `QuitDaemon` instead of being orphaned.
 async fn writer_task(
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     req_rx: Receiver<ClientRequest>,
@@ -744,6 +781,9 @@ async fn writer_task(
         poll.tick().await;
 
         // Collect every queued request WITHOUT awaiting while `req_rx` is borrowed.
+        // On `Disconnected` keep everything drained so far (the final shutdown
+        // frames) and write them below — closing the channel must never drop a
+        // queued request, only end the polling loop after this last flush.
         let mut batch: Vec<ClientRequest> = Vec::new();
         let mut closed = false;
         loop {
@@ -758,6 +798,7 @@ async fn writer_task(
         }
 
         // Write the batch (does not touch `req_rx`). Stop on a dead socket.
+        // `write_frame_to` flushes each frame, so a successful write is on the wire.
         for req in &batch {
             let bytes = match serde_json::to_vec(req) {
                 Ok(b) => b,
@@ -769,6 +810,9 @@ async fn writer_task(
                 return; // dead socket
             }
         }
+        // Channel closed AND the final drained batch is flushed: the shutdown
+        // frame(s) are on the wire, so it is safe to return (the teardown join then
+        // completes and the runtime is dropped).
         if closed {
             break;
         }
