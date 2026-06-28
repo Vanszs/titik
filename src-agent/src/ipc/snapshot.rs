@@ -204,6 +204,17 @@ impl DiffResult {
 /// the correctness-first stance the stage calls for: a full snapshot is always a
 /// valid update, so when in doubt we send one rather than risk a wrong shadow.
 pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
+    // --- structural: the global mode changed (e.g. Chat -> QuitConfirm) ---
+    // The per-mode modal payloads are not carried by any incremental delta, so a
+    // mode transition can't be folded — and crucially, an idle session has no other
+    // structural change to coincidentally trigger a full snapshot. Without this the
+    // client shadow stays in the old mode (e.g. never enters QuitConfirm), so its
+    // key-interception branch never fires. A full snapshot rebuilds the overlay and
+    // is always a valid update, so force one the instant the mode tag moves.
+    if prev.global.mode != next.global.mode {
+        return DiffResult::full();
+    }
+
     // --- structural: the session SET (count or id order) changed ---
     // A different length or a reordered/replaced id list can't be expressed by the
     // per-session deltas (which address sessions by id and assume the set is
