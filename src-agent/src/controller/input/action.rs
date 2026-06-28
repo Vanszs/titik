@@ -74,17 +74,25 @@ pub enum Action {
     /// --resume startup picker has no session, so it Quits instead.
     CancelPickerToChat,
     // --- Picker actions ---
-    /// Enter on the session picker — open the highlighted session.
+    /// Enter on the `--resume` startup session picker — open the highlighted
+    /// session (non-destructive: append-or-swap).
     PickerSelect,
-    // --- Live-session picker (`/swap`) actions ---
-    /// Enter on the `/swap` live-session picker: switch the foreground to the
-    /// session at the carried Vec index (`state.rest.sessions[idx]`). The runtime
-    /// sets `foreground = idx` and resets the flat foreground-UI for the
-    /// newly-shown session WITHOUT aborting anything or touching any lock.
+    // --- Session hub (`/resume`) actions ---
+    /// Enter on the hub's COOKING pane: switch the foreground to the live session
+    /// at the carried Vec index (`state.rest.sessions[idx]`). The runtime sets
+    /// `foreground = idx` and resets the flat foreground-UI for the newly-shown
+    /// session WITHOUT aborting anything or touching any lock. Also emitted by the
+    /// daemon's UUID-keyed `SwitchForeground` request (resolved to an index).
     LiveSwitch(usize),
-    /// Esc/Ctrl+C on the `/swap` live-session picker — discard it and return to
-    /// the (unchanged) Chat view. No session state is touched.
-    LiveSwitchCancel,
+    /// Enter on the hub's HISTORY pane: load the on-disk session at the carried
+    /// history-row index into a NEW appended tab (non-destructive — the current
+    /// foreground keeps cooking). The runtime reads the row's path back out of the
+    /// hub state, then runs the same load path as the `--resume` picker (swap if it
+    /// turns out to be live, refuse if locked by another process, else load).
+    HubOpenHistory(usize),
+    /// Esc/Ctrl+C on the session hub — close it and return to the (unchanged) Chat
+    /// view. No session state is touched.
+    CloseSessionHub,
     // --- Settings actions ---
     /// Esc on the settings dashboard (while navigating) — apply every draft and
     /// return to Chat. The apply path reads the drafts back out of

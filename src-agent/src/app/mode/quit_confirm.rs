@@ -2,8 +2,8 @@
 //!
 //! Shown ALWAYS when the user asks to quit (the `/quit` command or the quit
 //! keybind), regardless of whether any session has work in flight. The user may
-//! want to KEEP idle sessions on disk (detach) so they appear in the /swap list
-//! on the next launch — so we always ask.
+//! want to KEEP idle sessions on disk (detach) so they reappear in the session
+//! hub's history pane on the next launch — so we always ask.
 //!
 //! It is a fixed snapshot built when the confirm opens: `working` is the count
 //! of busy sessions and `total` is the total session count at that moment

@@ -139,13 +139,13 @@ pub fn handle_paste(state: &mut AppState, text: &str) {
             p.refilter();
         }
         // No text entry on the effort picker, loading splash, usage dashboard,
-        // the message-rewind picker, the `/swap` live-session picker, or the
-        // quit-confirm overlay — paste is a no-op in all of them.
+        // the message-rewind picker, the session hub, or the quit-confirm overlay
+        // — paste is a no-op in all of them.
         Mode::Effort(_)
         | Mode::Loading(_)
         | Mode::Usage(_)
         | Mode::MessageRewind(_)
-        | Mode::LiveSessionPicker(_)
+        | Mode::SessionHub(_)
         | Mode::QuitConfirm(_) => {}
     }
 }

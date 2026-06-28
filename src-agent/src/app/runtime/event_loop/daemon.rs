@@ -345,7 +345,7 @@ impl DaemonHub {
     ) {
         match req {
             // UUID-keyed foreground switch: resolve the id to an index, reject an
-            // unknown id (critique #5), else reuse the local /swap path (LiveSwitch)
+            // unknown id (critique #5), else reuse the local foreground-switch path (LiveSwitch)
             // and clear that session's sticky finished-unseen marker (critique #3 —
             // foregrounding a session counts as "seen").
             ClientRequest::SwitchForeground { session_id } => {
@@ -518,7 +518,7 @@ impl DaemonHub {
 ///
 /// `client` is `&mut` both to match `service_*`'s signature (a debounced catalogue
 /// fetch can replace the keyless client) AND so a controller's mutating request can
-/// rebuild it at a session boundary (e.g. `/new`, `/swap`).
+/// rebuild it at a session boundary (e.g. `/new`, a foreground switch).
 pub(in crate::app::runtime) fn daemon_loop(
     state: &mut AppState,
     client: &mut Option<Arc<OpenRouterClient>>,

@@ -324,8 +324,9 @@ impl SessionRuntime {
 
     /// True when this session has work in flight: a turn waiting / streaming, a
     /// paused approval, a parked deferred lane (tool tasks or sub-agent
-    /// delegations), or any still-running sub-agent. Used by `/swap` to flag busy
-    /// sessions, by the foreground status line, and by the background-finish nudge.
+    /// delegations), or any still-running sub-agent. Used by the session hub's
+    /// cooking pane to flag busy sessions, by the foreground status line, and by
+    /// the background-finish nudge.
     pub fn is_working(&self) -> bool {
         self.waiting
             || self.streaming.is_some()

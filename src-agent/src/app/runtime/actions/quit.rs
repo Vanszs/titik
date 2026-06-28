@@ -5,7 +5,8 @@
 //! keybind both route here) is [`request_quit`]:
 //!   - ALWAYS opens the confirm overlay so the user picks kill-all vs detach vs
 //!     cancel — even when nothing is working, the user may want to detach idle
-//!     sessions so they remain in the /swap list on the next launch.
+//!     sessions so they persist on disk and reappear in the session hub's history
+//!     pane on the next launch.
 //!   - Only exception: zero sessions (should never happen normally); in that
 //!     case quit immediately.
 //!
@@ -20,8 +21,9 @@ use crate::app::state::AppState;
 ///
 /// Always opens the [`Mode::QuitConfirm`] overlay so the user must choose
 /// kill-all, detach, or cancel — even when nothing is working, the user may
-/// want to detach idle sessions so they remain in the /swap list on the next
-/// launch. The overlay header adapts its wording to the working-vs-idle state.
+/// want to detach idle sessions so they persist on disk and reappear in the
+/// session hub's history pane on the next launch. The overlay header adapts its
+/// wording to the working-vs-idle state.
 ///
 /// Only exception: zero sessions (normally impossible), in which case quit
 /// immediately.

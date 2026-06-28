@@ -16,7 +16,6 @@ mod effort;
 pub(crate) mod internet;
 mod misc;
 mod new_session;
-mod swap;
 mod task;
 
 /// Apply a parsed slash command. Like [`apply_action`], it mutates state and
@@ -30,7 +29,6 @@ pub(super) fn apply_slash(
     match cmd {
         Command::Compact => compact::handle_compact(state, client, handle)?,
         Command::New => new_session::handle_new(state, client, handle)?,
-        Command::Swap => swap::handle_swap(state)?,
         Command::Mode => misc::handle_mode(state)?,
         Command::Effort => effort::handle_effort(state, client)?,
         Command::Rename(name) => new_session::handle_rename(state, name)?,

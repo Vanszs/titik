@@ -17,11 +17,11 @@ mod agents;
 mod chat;
 mod clipboard;
 mod key_input;
-mod live_picker;
 mod paste;
 mod picker;
 mod quit_confirm;
 mod rewind;
+mod session_hub;
 mod settings;
 mod usage;
 
@@ -29,11 +29,11 @@ pub use action::Action;
 pub use chat::{file_ref_partial, handle_chat};
 pub use clipboard::request_clipboard_image;
 pub use key_input::handle_key_input;
-pub use live_picker::handle_live_picker;
 pub use paste::handle_paste;
 pub use picker::handle_picker;
 pub use quit_confirm::handle_quit_confirm;
 pub use rewind::handle_rewind;
+pub use session_hub::handle_session_hub;
 pub use settings::handle_settings;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -66,7 +66,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
         Mode::Chat => handle_chat(&mut state.rest, key),
         Mode::KeyInput(form) => handle_key_input(form, &mut state.rest, key),
         Mode::SessionPicker(p) => handle_picker(p, &mut state.rest, key),
-        Mode::LiveSessionPicker(p) => handle_live_picker(p, &mut state.rest, key),
+        Mode::SessionHub(h) => handle_session_hub(h, &mut state.rest, key),
         Mode::Settings(s) => handle_settings(s, &mut state.rest, key),
         Mode::Agents(a) => agents::handle_agents(a, &mut state.rest, key),
         Mode::Effort(e) => handle_effort(e, &mut state.rest, key),

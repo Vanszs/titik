@@ -7,7 +7,7 @@
 //!   `Esc` / `Ctrl+C` → cancel back to Chat ([`Action::QuitCancel`])
 //!
 //! The overlay carries its own snapshot state (the busy-session count), so
-//! `_rest` is unused — mirroring [`super::handle_live_picker`].
+//! `_rest` is unused — mirroring [`super::handle_session_hub`].
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use crate::app::mode::QuitConfirmState;

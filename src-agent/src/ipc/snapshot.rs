@@ -152,7 +152,7 @@ fn mode_tag(mode: &Mode) -> ModeTag {
     match mode {
         Mode::KeyInput(_) => ModeTag::KeyInput,
         Mode::SessionPicker(_) => ModeTag::SessionPicker,
-        Mode::LiveSessionPicker(_) => ModeTag::LiveSessionPicker,
+        Mode::SessionHub(_) => ModeTag::SessionHub,
         Mode::Chat => ModeTag::Chat,
         Mode::Loading(_) => ModeTag::Loading,
         Mode::Settings(_) => ModeTag::Settings,

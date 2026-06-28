@@ -3,7 +3,7 @@
 //! The module is split into focused submodules by concern:
 //! - [`chat`]     — Submit, Interrupt, Resend, ApproveTool, DenyTool
 //! - [`settings`] — SaveCreds, SaveSettings, SaveEffort, EffortCancel, FetchModelEndpoints
-//! - [`session`]  — CancelKeyInput, CancelKeyInputToPicker, CancelPickerToChat, PickerSelect, SkipLoading
+//! - [`session`]  — CancelKeyInput, CancelKeyInputToPicker, CancelPickerToChat, PickerSelect, LiveSwitch, HubOpenHistory, CloseSessionHub, SkipLoading
 //! - [`agents`]   — CreateAgent, SaveAgent, DeleteAgent, CloseAgents
 
 use std::sync::Arc;
@@ -108,8 +108,12 @@ pub(in crate::app::runtime) fn apply_action(
             session::handle_live_switch(idx, state, client)?;
         }
 
-        Action::LiveSwitchCancel => {
-            session::handle_live_switch_cancel(state)?;
+        Action::HubOpenHistory(idx) => {
+            session::handle_hub_open_history(idx, state, client, handle)?;
+        }
+
+        Action::CloseSessionHub => {
+            session::handle_close_session_hub(state)?;
         }
 
         Action::SaveSettings => {

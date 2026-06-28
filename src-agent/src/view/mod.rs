@@ -16,11 +16,11 @@ pub mod agents;
 pub mod chat;
 pub mod effort;
 pub mod key_input;
-pub mod live_session_picker;
 pub mod loading;
 pub mod message_rewind;
 pub mod markdown;
 pub mod quit_confirm;
+pub mod session_hub;
 pub mod session_picker;
 pub mod settings;
 pub mod theme;
@@ -62,9 +62,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         }
         Mode::KeyInput(form) => key_input::draw(frame, form, cache, cache_endpoint, &palette),
         Mode::SessionPicker(p) => session_picker::draw(frame, p, &palette),
-        Mode::LiveSessionPicker(p) => {
-            live_session_picker::draw(frame, p, state.rest.foreground, &palette)
-        }
+        Mode::SessionHub(h) => session_hub::draw(frame, h, &palette),
         Mode::Settings(s) => settings::draw(frame, s, cache, cache_endpoint, &palette),
         Mode::Agents(a) => agents::draw(
             frame,

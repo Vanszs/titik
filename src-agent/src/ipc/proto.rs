@@ -349,7 +349,7 @@ pub struct GlobalSnapshot {
 pub enum ModeTag {
     KeyInput,
     SessionPicker,
-    LiveSessionPicker,
+    SessionHub,
     Chat,
     Loading,
     Settings,

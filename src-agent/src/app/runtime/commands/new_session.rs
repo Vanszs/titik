@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::app::mode::{KeyInputForm, Mode, PickerState};
+use crate::app::mode::{
+    CookingEntry, HistoryEntry, HubPane, KeyInputForm, Mode, SessionHub,
+};
 use crate::app::state::{AppState, SessionRuntime};
 use crate::config::DEFAULT_MODEL;
 use crate::model::store;
@@ -121,23 +123,84 @@ pub(super) fn handle_new(
     Ok(())
 }
 
-/// Handle the `/resume` command: open the session picker.
+/// Handle the `/resume` command: open the unified two-pane session hub.
 ///
-/// Unlike CancelKeyInputToPicker we do NOT clear the current session/client —
-/// if the user Escapes the picker they return to the active chat unchanged.
+/// Builds BOTH panes from a fresh snapshot at open time:
+/// - COOKING — every live [`SessionRuntime`] in `state.rest.sessions` (its Vec
+///   index, name, working flag, and whether it is the current foreground).
+/// - HISTORY — the on-disk sessions from `store::list_sessions()` MINUS any whose
+///   path is already live (dedup: a live session shows ONLY in cooking).
+///
+/// Focus defaults to the cooking pane (always non-empty) with the cursor on the
+/// current foreground row. We do NOT clear the current session/client — Esc out of
+/// the hub returns to the active chat unchanged.
 pub(super) fn handle_resume(state: &mut AppState) -> Result<()> {
     if state.rest.fg().waiting {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
-    match store::list_sessions() {
-        Ok(sessions) => {
-            state.mode = Mode::SessionPicker(PickerState::new(sessions));
-        }
-        Err(e) => {
-            state.rest.status = format!("error listing sessions: {e}");
-        }
+    // Don't open the hub mid /new-KeyInput confirmation (mirror the picker-select
+    // guard): the session tail is unstable until the new session's creds resolve.
+    if state.rest.spawn_pending {
+        return Ok(());
     }
+
+    // COOKING pane: one row per live session, in `sessions` order.
+    let cooking: Vec<CookingEntry> = state
+        .rest
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, rt)| CookingEntry {
+            idx,
+            name: rt
+                .session
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "(no session)".to_string()),
+            working: rt.is_working(),
+            is_foreground: idx == state.rest.foreground,
+        })
+        .collect();
+
+    // Set of LIVE on-disk paths, used to dedup the history pane. A live session's
+    // path is its canonical identity, matching the `SessionMeta.path` listing.
+    let live_paths: std::collections::HashSet<std::path::PathBuf> = state
+        .rest
+        .sessions
+        .iter()
+        .filter_map(|rt| rt.session.as_ref().map(|s| s.path.clone()))
+        .collect();
+
+    // HISTORY pane: on-disk sessions MINUS the live ones (dedup).
+    let history: Vec<HistoryEntry> = match store::list_sessions() {
+        Ok(metas) => metas
+            .into_iter()
+            .filter(|m| !live_paths.contains(&m.path))
+            .map(|m| HistoryEntry {
+                path: m.path,
+                name: m.name,
+                last_active: m.modified,
+            })
+            .collect(),
+        Err(e) => {
+            // A listing failure shouldn't block the hub — the cooking pane is still
+            // useful. Surface the error and show an empty history pane.
+            state.rest.status = format!("error listing sessions: {e}");
+            Vec::new()
+        }
+    };
+
+    // Default the cooking cursor to the current foreground's row; focus cooking.
+    let cooking_selected = state.rest.foreground.min(cooking.len().saturating_sub(1));
+
+    state.mode = Mode::SessionHub(Box::new(SessionHub {
+        cooking,
+        history,
+        focus: HubPane::Cooking,
+        cooking_selected,
+        history_selected: 0,
+    }));
     Ok(())
 }
 

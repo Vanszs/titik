@@ -19,11 +19,11 @@
 
 mod key_input;
 mod effort;
-mod live_picker;
 mod loading;
 mod picker;
 mod quit_confirm;
 mod rewind;
+mod session_hub;
 pub mod settings;
 pub mod agents;
 pub mod editor;
@@ -31,9 +31,9 @@ pub mod editor;
 pub use agents::{AgentEditField, AgentScope, AgentSubMode, AgentsState};
 pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
-pub use live_picker::{LiveSessionEntry, LiveSessionPicker};
 pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
+pub use session_hub::{CookingEntry, HistoryEntry, HubPane, SessionHub};
 pub use quit_confirm::QuitConfirmState;
 pub use rewind::RewindState;
 pub use settings::{
@@ -126,14 +126,20 @@ pub enum Mode {
     /// and tracks which field is focused.
     KeyInput(KeyInputForm),
     /// `--resume` session picker: shows saved sessions and a live search bar.
+    /// Opened by the `--resume` startup flag and by Esc-out of a picker-launched
+    /// KeyInput. The `/resume` COMMAND now opens [`Mode::SessionHub`] instead.
     SessionPicker(PickerState),
-    /// `/swap` live-session picker: a short list of the currently-RUNNING
-    /// sessions (one per [`crate::app::state::SessionRuntime`] in
+    /// Unified two-pane session hub (`/resume`): merges the old `/swap` live picker
+    /// and the disk picker into one overlay. The TOP "cooking" pane lists the
+    /// currently-LIVE sessions (one per [`crate::app::state::SessionRuntime`] in
     /// `AppStateRest::sessions`), each with a ● working / ○ ready marker and the
-    /// foreground one flagged. Up/Down navigate; Enter switches the foreground to
-    /// the chosen session (no abort, no lock change); Esc cancels back to Chat.
-    /// Boxed to keep `Mode` small, consistent with the other list variants.
-    LiveSessionPicker(Box<LiveSessionPicker>),
+    /// foreground one flagged `(current)`; the BOTTOM "history" pane lists the
+    /// on-disk sessions MINUS any already live (dedup). Tab toggles the focused
+    /// pane; Up/Down move the selection within it; Enter on cooking switches the
+    /// foreground (no abort, no lock change), Enter on history loads that session
+    /// into a NEW appended tab; Esc closes back to Chat. Boxed to keep `Mode`
+    /// small, consistent with the other list variants.
+    SessionHub(Box<SessionHub>),
     /// Normal chat view: messages are rendered and the user types in the
     /// input bar.  All chat-specific state lives in `AppStateRest`.
     Chat,

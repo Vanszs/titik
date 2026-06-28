@@ -43,7 +43,7 @@
 //! Each terminal key is forwarded VERBATIM as [`ClientRequest::SendKey`]; the
 //! daemon runs the SAME `controller::input::handle_key` + `apply_action` pipeline
 //! the local TUI uses, so every high-level gesture — submitting a typed message,
-//! `/swap` (remote foreground switch), `/new` — works through forwarded keys with
+//! `/resume` (the session hub / foreground switch), `/new` — works through forwarded keys with
 //! no client-side command parsing to drift from the daemon. The ONE key the client
 //! interprets locally is the detach gesture (Ctrl-C): it sends
 //! [`ClientRequest::Detach`] and exits the client, leaving the daemon (and every

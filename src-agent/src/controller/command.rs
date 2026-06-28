@@ -16,8 +16,7 @@ use crate::model::settings::InternetMode;
 /// (name, one-line description). Source of truth for the palette UI.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Spawn a new parallel session (current keeps running)"),
-    ("/swap", "Switch between live sessions"),
-    ("/resume", "Open the session picker to switch sessions"),
+    ("/resume", "Open the session hub (live + past sessions)"),
     ("/mode", "Toggle Normal/Auto tool approval"),
     ("/effort", "Set model reasoning/thinking effort"),
     ("/internet", "Toggle internet mode (simple | full)"),
@@ -60,8 +59,6 @@ pub enum Command {
     /// Spawn a fresh PARALLEL session (the current one keeps running in the
     /// background); the new session becomes the foreground.
     New,
-    /// Open the live-session picker to switch which running session is on screen.
-    Swap,
     /// Toggle the tool-approval policy between Normal and Auto.
     Mode,
     /// Open the reasoning/thinking-effort picker for the current model.
@@ -76,7 +73,8 @@ pub enum Command {
     Task(String),
     /// Toggle or set internet mode. `None` = toggle; `Some(mode)` = set explicitly.
     Internet(Option<InternetMode>),
-    /// Open the session picker to switch to a different session (alias: `/sessions`).
+    /// Open the unified session hub — live (cooking) + past (history) sessions in
+    /// one two-pane overlay (alias: `/sessions`).
     Resume,
     /// Dump the conversation to the normal terminal for native copy/paste.
     Select,
@@ -114,7 +112,6 @@ pub fn parse(line: &str) -> Command {
     match head_lc.as_str() {
         "compact" => Command::Compact,
         "new" => Command::New,
-        "swap" => Command::Swap,
         "mode" => Command::Mode,
         "effort" => Command::Effort,
         "settings" | "config" => Command::Settings,

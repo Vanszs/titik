@@ -2,7 +2,7 @@
 //!
 //! Shown always when the user asks to quit — regardless of whether any session
 //! has work in flight. Flat, boxless layout (top+bottom rules only, matching the
-//! `/swap` picker + the repo border convention) — top to bottom:
+//! session-hub + session-picker views + the repo border convention) — top to bottom:
 //!
 //! 1. Top+bottom rule title bar — ` quit ` on the TOP rule.
 //! 2. An adaptive header line:
