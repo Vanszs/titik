@@ -22,13 +22,26 @@ pub(crate) fn push_image_unsupported_notice(rest: &mut AppStateRest) {
 
 /// True when a provider error indicates the model/endpoint cannot accept image
 /// input, so we can show the friendly notice instead of a raw error toast.
+///
+/// Only matches definitive rejection patterns (HTTP 400 — permanent, model-
+/// level incapability). Transient provider failures (502/503) on vision-
+/// capable models — often containing "multimodal" — are NOT matched so the
+/// actual error surfaces and the user can retry.
 fn is_image_input_error(e: &str) -> bool {
     let e = e.to_lowercase();
+    // Definitive model-capability rejections (HTTP 400 — permanent).
     e.contains("image input")
         || e.contains("support image")
         || (e.contains("no endpoints") && e.contains("image"))
-        || e.contains("multimodal")
-        || (e.contains("corrupt") && (e.contains("image") || e.contains("media")))
+        || (e.contains("does not support") && e.contains("image"))
+        || (e.contains("cannot") && e.contains("image") && e.contains("input"))
+        // OpenRouter typed image errors (HTTP 400 — bad image data, not bad model).
+        || e.contains("invalid_image")
+        || e.contains("unsupported_image_format")
+        || e.contains("image_too_large")
+        || e.contains("image_too_small")
+        || e.contains("image_not_found")
+        || e.contains("image_download_failed")
 }
 
 /// Finalize a finished stream: commit any buffered assistant text, clear the
