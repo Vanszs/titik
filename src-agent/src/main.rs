@@ -170,16 +170,9 @@ fn main() -> anyhow::Result<()> {
     // mode, which the client now renders (#122) — the user enters creds via the client,
     // forwarded to the daemon. So a first-ever `koma` (no prior creds) reaches a usable
     // KeyInput screen through the client, not a crash.
-    if opts.resume {
-        if let Err(e) = app::ensure_daemon_running_with_resume(true) {
-            eprintln!("error: could not start the koma daemon: {e:#} — try `koma --local`");
-            std::process::exit(1);
-        }
-    } else {
-        if let Err(e) = app::ensure_daemon_running() {
-            eprintln!("error: could not start the koma daemon: {e:#} — try `koma --local`");
-            std::process::exit(1);
-        }
+    if let Err(e) = app::ensure_daemon_running(opts.resume) {
+        eprintln!("error: could not start the koma daemon: {e:#} — try `koma --local`");
+        std::process::exit(1);
     }
     app::client_run(opts)
 }

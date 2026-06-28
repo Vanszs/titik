@@ -125,9 +125,20 @@ pub fn daemon_alive() -> bool {
 
 /// Spawn a DETACHED `koma --daemon` child and return its PID.
 ///
-/// When `resume` is `true`, the `--resume` flag is forwarded to the spawned
-/// daemon so `build_startup()` opens the session picker instead of eagerly
-/// creating an empty session.
+/// The child is fully detached so it survives this short-lived CLI process:
+/// - `pre_exec(setsid)` puts it in its own session (no controlling terminal), so a
+///   closed terminal can't SIGHUP it and it is not in our process group.
+/// - stdio is redirected to `/dev/null` (the daemon is headless; it must not write to
+///   our terminal or hold our fds open).
+///
+/// We do NOT `wait()` on the child: this CLI exits almost immediately, at which point
+/// the now-orphaned daemon is reparented to and reaped by init — so it never lingers
+/// as a zombie. The returned PID is advisory (for messaging); liveness is still the
+/// socket, via [`daemon_alive`] / the poll-connect in [`ensure_daemon_and_connect`].
+///
+/// When `resume` is `true`, the `--resume` flag is forwarded to the spawned daemon
+/// so `build_startup()` opens the session picker instead of eagerly creating a
+/// session.
 fn spawn_daemon(resume: bool) -> Result<u32> {
     // Re-launch THIS binary with `--daemon`. `current_exe` is the running koma binary,
     // so a renamed/installed binary still respawns itself correctly.
@@ -202,21 +213,13 @@ fn probe_or_clear(path: &Path) -> Result<bool> {
 ///
 /// Bounded by the spawn timeout, so it can never hang forever waiting on a daemon that
 /// fails to come up.
-pub fn ensure_daemon_running() -> Result<()> {
-    ensure_daemon_running_inner(false)
-}
-
-/// Like [`ensure_daemon_running`], but when `resume` is `true` the spawned
-/// daemon receives `--resume` so it opens the session picker instead of
-/// eagerly creating a session.
-pub fn ensure_daemon_running_with_resume(resume: bool) -> Result<()> {
-    ensure_daemon_running_inner(resume)
-}
-
-fn ensure_daemon_running_inner(resume: bool) -> Result<()> {
+///
+/// When `resume` is `true`, the spawned daemon receives `--resume` so
+/// `build_startup()` opens the session picker instead of eagerly creating a session.
+pub fn ensure_daemon_running(resume: bool) -> Result<()> {
     let path = store::daemon_sock_path()?;
     if probe_or_clear(&path)? {
-        return Ok(()); // already live — attach to it
+        return Ok(()); // already live — attach to the existing one
     }
     // Nothing live → spawn a detached daemon and wait until it accepts.
     spawn_and_wait_until_alive(&path, resume)

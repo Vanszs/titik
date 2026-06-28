@@ -62,7 +62,7 @@ pub use client::client_run;
 // the `--local` guard uses to REFUSE running a second writer against a live daemon;
 // `ensure_daemon_running` is the default path's "connect if up, else spawn a detached
 // daemon and wait until it accepts" primitive (the thin client then attaches itself).
-pub use manage::{daemon_alive, ensure_daemon_running, ensure_daemon_running_with_resume, print_daemon_usage, run_daemon_subcommand};
+pub use manage::{daemon_alive, ensure_daemon_running, print_daemon_usage, run_daemon_subcommand};
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
