@@ -156,22 +156,11 @@ pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {
         state.rest.fg_mut().approval_reason = None;
         state.rest.fg_mut().tool_idx = 0;
         state.rest.fg_mut().tool_results.clear();
-        // Abandon any round parked on deferred task-tool delegations so a
-        // sub-agent that finishes AFTER this interrupt can't resume a turn
-        // the user killed. The orphaned sub-agents keep running in the
-        // background; their terminal delivery finds no matching pending id
-        // and is dropped (no chat fold, no re-stream).
-        state.rest.fg_mut().pending_subagent_calls.clear();
-        state.rest.fg_mut().awaiting_subagents = false;
-        // Also drop any QUEUED `task`-tool delegations that belonged to this
-        // killed turn (their call ids were just cleared above, so they'd never
-        // resume anything). User-initiated `/task` queue entries (tool_call_id
-        // == None) are turn-independent and stay queued.
-        state
-            .rest
-            .fg_mut()
-            .pending_subagents
-            .retain(|p| p.tool_call_id.is_none());
+        // Kill every running sub-agent spawned by this turn and drop the
+        // pending queue.  abort_running_subagents also clears
+        // pending_subagent_calls and awaiting_subagents, so the halt path is
+        // complete — no orphaned background task can deliver a late result.
+        state.rest.fg_mut().abort_running_subagents();
         // Abandon any round parked on a deferred tool task (the heavy/blocking
         // tools — read/write/edit/delete/bash/grep/glob/remember/web_fetch/
         // web_search) the same way. The off-thread worker keeps running but its
@@ -335,10 +324,9 @@ pub(super) fn handle_deny_tool(state: &mut AppState) -> Result<()> {
     state.rest.fg_mut().agent_steps = 0;
     state.rest.fg_mut().waiting = false;
     state.rest.fg_mut().current_task = None;
-    // Clear deferred-task state so the resume gate can't ghost-restart
-    // a killed turn via stale awaiting flags or leftover pending ids.
-    state.rest.fg_mut().pending_subagent_calls.clear();
-    state.rest.fg_mut().awaiting_subagents = false;
+    // Kill every running sub-agent and drop the pending queue so the resume
+    // gate can't ghost-restart a killed turn via stale flags or orphaned tasks.
+    state.rest.fg_mut().abort_running_subagents();
     state.rest.fg_mut().pending_tool_tasks.clear();
     state.rest.fg_mut().awaiting_tool_tasks = false;
     state.rest.status = "denied — stopped".into();

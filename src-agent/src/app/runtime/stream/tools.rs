@@ -482,10 +482,9 @@ pub(crate) fn deny_all_pending(state: &mut AppState, sess_idx: usize, reason: &s
     rt.approval_reason = None;
     rt.waiting = false;
     rt.current_task = None;
-    // Clear deferred-task state so a killed WC turn can't ghost-restart
-    // via a stale awaiting_tool_tasks=true or leftover pending ids.
-    rt.pending_subagent_calls.clear();
-    rt.awaiting_subagents = false;
+    // Kill every running sub-agent and drop the pending queue so a killed WC
+    // turn can't ghost-restart via orphaned tasks or stale awaiting flags.
+    rt.abort_running_subagents();
     rt.pending_tool_tasks.clear();
     rt.awaiting_tool_tasks = false;
 }

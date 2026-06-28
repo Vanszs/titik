@@ -277,6 +277,37 @@ impl SessionRuntime {
         }
     }
 
+    /// Kill every still-running sub-agent that belongs to THIS session and drop
+    /// the entire pending (queued-but-never-started) queue.
+    ///
+    /// Called from every turn-halt path (interrupt, deny-tool, deny-all-pending)
+    /// so that "stop means stop" — no orphaned background tokio tasks continue
+    /// running after the user has cancelled the turn.
+    ///
+    /// - Running sub-agents: `abort.abort()` kills the tokio task; status is
+    ///   flipped to `Killed` immediately so the `$` panel reflects it without
+    ///   waiting for a terminal event that will never arrive.
+    /// - Queued (pending) sub-agents: dropped wholesale — they never ran, so
+    ///   there is nothing to abort.
+    /// - `pending_subagent_calls` / `awaiting_subagents`: cleared here so the
+    ///   caller does NOT need to do it separately (keeps the three halt paths
+    ///   consistent).
+    ///
+    /// This method ONLY touches the session it is called on — it is always
+    /// invoked via `state.rest.fg_mut()`, so background sessions are not
+    /// affected.
+    pub fn abort_running_subagents(&mut self) {
+        for sub in &mut self.subagents {
+            if matches!(sub.status, crate::app::subagent::SubAgentStatus::Running) {
+                sub.abort.abort();
+                sub.status = crate::app::subagent::SubAgentStatus::Killed;
+            }
+        }
+        self.pending_subagents.clear();
+        self.pending_subagent_calls.clear();
+        self.awaiting_subagents = false;
+    }
+
     /// True when this session has work in flight: a turn waiting / streaming, a
     /// paused approval, a parked deferred lane (tool tasks or sub-agent
     /// delegations), or any still-running sub-agent. Used by `/swap` to flag busy
