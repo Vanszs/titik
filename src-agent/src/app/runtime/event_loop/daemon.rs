@@ -323,7 +323,7 @@ impl DaemonHub {
                 // already-attached client still owes; that client diffs against its
                 // own untouched baseline.
                 let snap = build_snapshot(state);
-                self.send_to(idx, DaemonEvent::Snapshot(snap.clone()));
+                self.send_to(idx, DaemonEvent::Snapshot(Box::new(snap.clone())));
                 self.clients[idx].attached = true;
                 self.clients[idx].last_snapshot = Some(snap);
             }
@@ -334,7 +334,7 @@ impl DaemonHub {
                 // it was just sent; other clients' baselines are untouched (blocker
                 // #2), so one client's resync never disturbs another's delta stream.
                 let snap = build_snapshot(state);
-                self.send_to(idx, DaemonEvent::Snapshot(snap.clone()));
+                self.send_to(idx, DaemonEvent::Snapshot(Box::new(snap.clone())));
                 self.clients[idx].attached = true;
                 self.clients[idx].last_snapshot = Some(snap);
             }
@@ -530,7 +530,7 @@ impl DaemonHub {
             if result.needs_full {
                 // Structural change: resend this client a full Snapshot + advance
                 // its baseline. `next` is shared across the loop, so clone per send.
-                self.send_to(i, DaemonEvent::Snapshot(next.clone()));
+                self.send_to(i, DaemonEvent::Snapshot(Box::new(next.clone())));
                 self.clients[i].last_snapshot = Some(next.clone());
             } else if !result.deltas.is_empty() {
                 for d in result.deltas {

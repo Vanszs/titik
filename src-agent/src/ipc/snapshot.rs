@@ -20,13 +20,21 @@
 //! merely calls these, and a future local-TUI consumer could call the exact same
 //! builder, so the wire projection can never drift from a second hand-rolled copy.
 
-use crate::app::mode::Mode;
+use crate::app::mode::settings::{ModelDraft, ModelModal, PathPicker, PickerMode, ProviderDraft};
+use crate::app::mode::{
+    CookingEntry, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode, SessionHub,
+    SettingsState, WarmStatus,
+};
 use crate::app::state::AppState;
 use crate::app::subagent::SubAgentStatus;
+use crate::model::app_config::{ApiType, ModelRole, ThemeMode};
 
 use super::proto::{
-    GlobalSnapshot, ModeSnapshot, PendingSubagentSnapshot, SessionSnapshot, StateDelta,
-    StateSnapshot, SubAgentSnapshot,
+    CookingEntrySnapshot, GlobalSnapshot, HistoryEntrySnapshot, KeyInputSnapshot, LoadingSnapshot,
+    ModeSnapshot, ModelDraftSnapshot, ModelEndpointWire, ModelModalSnapshot, PathPickerSnapshot,
+    PendingSubagentSnapshot, ProviderDraftSnapshot, ProviderModalSnapshot, RolePickerSnapshot,
+    SessionHubSnapshot, SessionSnapshot, SettingsSnapshot, StateDelta, StateSnapshot,
+    SubAgentSnapshot, WarmStatusWire,
 };
 
 /// Build a complete, frozen [`StateSnapshot`] from the live [`AppState`].
@@ -87,6 +95,12 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
         waiting: rt.waiting,
         awaiting_approval: rt.awaiting_approval,
         approval_reason: rt.approval_reason.clone(),
+        // The pending tool-call round + its cursor: the approval overlay (Chat
+        // mode, when `awaiting_approval`) renders `pending_tool_calls[tool_idx]`,
+        // so both must cross. Carried even when not awaiting (cheap, small) so a
+        // snapshot taken just before the park already has them.
+        pending_tool_calls: rt.pending_tool_calls.clone(),
+        tool_idx: rt.tool_idx,
         // `is_working()` is the render-relevant busy signal (stream / wait / parked
         // lane / running sub-agent) — mirror it at snapshot time, never the raw
         // `waiting` alone, so the client's "● working" dot matches the daemon.
@@ -159,6 +173,13 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
             .rest
             .work_since
             .map(|since| since.elapsed().as_millis() as u64),
+        // Global theme + accent from the live `AppConfig`. `view::draw` builds the
+        // outer palette (`theme::palette(&state.rest.config)`) for EVERY mode before
+        // rendering, so these must cross or the client frames every screen at the
+        // default Dark/green palette. Theme rides as a wire token (reusing the same
+        // helper the Settings draft uses); accent is an opaque palette key, verbatim.
+        theme: theme_token(&state.rest.config.theme).to_string(),
+        accent: state.rest.config.accent.clone(),
         mode: mode_snapshot(&state.mode),
         // Project the toast as (kind, text); the TTL `Instant` is daemon-local and
         // never crosses the wire (the client re-derives its own dismissal timer).
@@ -169,24 +190,30 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
             };
             (kind, msg.clone())
         }),
+        // The on-demand model catalogue + the endpoint it was fetched for. Both
+        // feed the Settings model-modal omnisearch AND the KeyInput step-1 search;
+        // a remote client has no fetch path of its own, so without these its
+        // omnisearch dropdown would never populate. `ModelInfo` is serde-clean.
+        models_cache: state.rest.models_cache.clone(),
+        models_cache_endpoint: state.rest.models_cache_endpoint.clone(),
     }
 }
 
 /// Project the (large, non-serde) [`Mode`] into the pure-data [`ModeSnapshot`].
 ///
-/// 1:1 with the `Mode` variants. This stage fills the payloads for the two already-
-/// projected screens — `Chat` (payload-free) and `QuitConfirm` (its busy/total
-/// counts, copied straight off the inner `QuitConfirmState`) — and leaves every
-/// other variant a STUB carrying only "this screen is active"; their modal payloads
-/// are projected in a later stage when the client renders them (see [`ModeSnapshot`]).
+/// 1:1 with the `Mode` variants. Stage 1 filled `Chat` + `QuitConfirm`; stage 2
+/// fills the CORE interactive modes — `KeyInput`, `SessionHub`, `Loading`,
+/// `Settings` — copying each live mode's render-relevant fields into its payload
+/// projection. The remaining variants stay STUBS carrying only "this screen is
+/// active" (the client falls back to a safe Chat render for them).
 fn mode_snapshot(mode: &Mode) -> ModeSnapshot {
     match mode {
-        Mode::KeyInput(_) => ModeSnapshot::KeyInput,
+        Mode::KeyInput(f) => ModeSnapshot::KeyInput(key_input_snapshot(f)),
         Mode::SessionPicker(_) => ModeSnapshot::SessionPicker,
-        Mode::SessionHub(_) => ModeSnapshot::SessionHub,
+        Mode::SessionHub(h) => ModeSnapshot::SessionHub(session_hub_snapshot(h)),
         Mode::Chat => ModeSnapshot::Chat,
-        Mode::Loading(_) => ModeSnapshot::Loading,
-        Mode::Settings(_) => ModeSnapshot::Settings,
+        Mode::Loading(s) => ModeSnapshot::Loading(loading_snapshot(s)),
+        Mode::Settings(s) => ModeSnapshot::Settings(Box::new(settings_snapshot(s))),
         Mode::Agents(_) => ModeSnapshot::Agents,
         Mode::Effort(_) => ModeSnapshot::Effort,
         Mode::Usage(_) => ModeSnapshot::Usage,
@@ -195,6 +222,227 @@ fn mode_snapshot(mode: &Mode) -> ModeSnapshot {
             working: s.working,
             total: s.total,
         },
+    }
+}
+
+/// Project the first-run wizard form ([`KeyInputForm`]) into its wire snapshot.
+fn key_input_snapshot(f: &KeyInputForm) -> KeyInputSnapshot {
+    KeyInputSnapshot {
+        step: f.step,
+        field: f.field,
+        endpoint: f.endpoint.clone(),
+        api_key: f.api_key.clone(),
+        model: f.model.clone(),
+        query: f.query.clone(),
+        result_sel: f.result_sel,
+        first_run: f.first_run,
+        from_picker: f.from_picker,
+    }
+}
+
+/// Project the loading splash ([`LoadingState`]) into its wire snapshot. The live
+/// `started` `Instant` becomes elapsed-ms (re-anchored on the client).
+fn loading_snapshot(s: &LoadingState) -> LoadingSnapshot {
+    LoadingSnapshot {
+        elapsed_ms: s.started.elapsed().as_millis() as u64,
+        frame: s.frame,
+        workspace: warm_status_wire(&s.workspace),
+        awareness: warm_status_wire(&s.awareness),
+    }
+}
+
+/// Project one [`WarmStatus`] into its serde mirror.
+fn warm_status_wire(s: &WarmStatus) -> WarmStatusWire {
+    match s {
+        WarmStatus::Pending => WarmStatusWire::Pending,
+        WarmStatus::Running => WarmStatusWire::Running,
+        WarmStatus::Done(d) => WarmStatusWire::Done(d.clone()),
+        WarmStatus::Skipped => WarmStatusWire::Skipped,
+        WarmStatus::Failed => WarmStatusWire::Failed,
+    }
+}
+
+/// Project the two-pane session hub ([`SessionHub`]) into its wire snapshot.
+fn session_hub_snapshot(h: &SessionHub) -> SessionHubSnapshot {
+    SessionHubSnapshot {
+        cooking: h.cooking.iter().map(cooking_entry_snapshot).collect(),
+        history: h.history.iter().map(history_entry_snapshot).collect(),
+        focus_cooking: matches!(h.focus, HubPane::Cooking),
+        cooking_selected: h.cooking_selected,
+        history_selected: h.history_selected,
+    }
+}
+
+/// Project one COOKING row. The live `idx` is a daemon-side sessions index (used
+/// on Enter, forwarded as a key) and is not rendered, so it is dropped.
+fn cooking_entry_snapshot(e: &CookingEntry) -> CookingEntrySnapshot {
+    CookingEntrySnapshot {
+        name: e.name.clone(),
+        working: e.working,
+        is_foreground: e.is_foreground,
+    }
+}
+
+/// Project one HISTORY row. The live `path` is the daemon-side load target (used on
+/// Enter) and not rendered; the `SystemTime` becomes seconds-since-epoch.
+fn history_entry_snapshot(e: &HistoryEntry) -> HistoryEntrySnapshot {
+    let last_active_secs = e
+        .last_active
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    HistoryEntrySnapshot {
+        name: e.name.clone(),
+        last_active_secs,
+    }
+}
+
+/// Project the `/settings` dashboard ([`SettingsState`]) into its wire snapshot —
+/// the biggest mode projection. Every draft + list + modal + picker the view reads
+/// is copied so the client can rebuild a real `SettingsState` and render it through
+/// the unmodified settings view.
+fn settings_snapshot(st: &SettingsState) -> SettingsSnapshot {
+    SettingsSnapshot {
+        cat: st.cat,
+        field: st.field,
+        in_detail: st.in_detail,
+        editing: st.editing,
+        api_key: st.api_key.clone(),
+        model: st.model.clone(),
+        provider: st.provider.clone(),
+        name: st.name.clone(),
+        theme: theme_token(&st.theme).to_string(),
+        accent: st.accent.clone(),
+        workdir: st.workdir.clone(),
+        awareness_enabled: st.awareness_enabled,
+        awareness_inherit: st.awareness_inherit,
+        awareness_model: st.awareness_model.clone(),
+        awareness_provider: st.awareness_provider.clone(),
+        classifier_enabled: st.classifier_enabled,
+        classifier_model: st.classifier_model.clone(),
+        classifier_provider: st.classifier_provider.clone(),
+        allowed_folders: st.allowed_folders.clone(),
+        short_send_enabled: st.short_send_enabled,
+        sliding_cache: st.sliding_cache,
+        internet_mode: st.internet_mode.as_str().to_string(),
+        cwd: st.cwd.display().to_string(),
+        list_editing: st.list_editing,
+        list_sel: st.list_sel,
+        picker: st.picker.as_ref().map(path_picker_snapshot),
+        providers: st.providers.iter().map(provider_draft_snapshot).collect(),
+        prov_sel: st.prov_sel,
+        prov_delete_armed: st.prov_delete_armed,
+        prov_modal: st.prov_modal.as_ref().map(|m| ProviderModalSnapshot {
+            name: m.name.clone(),
+            endpoint: m.endpoint.clone(),
+            api_type: api_type_token(m.api_type).to_string(),
+            api_key: m.api_key.clone(),
+            field: m.field,
+        }),
+        models: st.models.iter().map(model_draft_snapshot).collect(),
+        model_sel: st.model_sel,
+        model_delete_armed: st.model_delete_armed,
+        model_modal: st.model_modal.as_ref().map(model_modal_snapshot),
+    }
+}
+
+/// Project one [`ProviderDraft`] row.
+fn provider_draft_snapshot(p: &ProviderDraft) -> ProviderDraftSnapshot {
+    ProviderDraftSnapshot {
+        uuid: p.uuid.clone(),
+        name: p.name.clone(),
+        endpoint: p.endpoint.clone(),
+        api_type: api_type_token(p.api_type).to_string(),
+        api_key: p.api_key.clone(),
+    }
+}
+
+/// Project one [`ModelDraft`] row (roles → wire tokens).
+fn model_draft_snapshot(m: &ModelDraft) -> ModelDraftSnapshot {
+    ModelDraftSnapshot {
+        uuid: m.uuid.clone(),
+        name: m.name.clone(),
+        model_id: m.model_id.clone(),
+        provider_idx: m.provider_idx,
+        roles: m.roles.iter().map(|r| role_token(*r).to_string()).collect(),
+        route: m.route.clone(),
+        session_only: m.session_only,
+    }
+}
+
+/// Project the add/edit-model modal ([`ModelModal`]) — endpoints ride as the serde
+/// mirror, the role picker as its snapshot.
+fn model_modal_snapshot(m: &ModelModal) -> ModelModalSnapshot {
+    ModelModalSnapshot {
+        editing_idx: m.editing_idx,
+        uuid: m.uuid.clone(),
+        name: m.name.clone(),
+        provider_idx: m.provider_idx,
+        model_id: m.model_id.clone(),
+        field: m.field,
+        roles: m.roles.iter().map(|r| role_token(*r).to_string()).collect(),
+        role_picker: m.role_picker.as_ref().map(|rp| RolePickerSnapshot {
+            checked: rp.checked.clone(),
+            cursor: rp.cursor,
+        }),
+        query: m.query.clone(),
+        result_sel: m.result_sel,
+        route: m.route.clone(),
+        route_sel: m.route_sel,
+        endpoints: m.endpoints.as_ref().map(|eps| {
+            eps.iter()
+                .map(|ep| ModelEndpointWire {
+                    name: ep.name.clone(),
+                    provider_name: ep.provider_name.clone(),
+                    price_prompt: ep.pricing.as_ref().and_then(|p| p.prompt.clone()),
+                    price_completion: ep.pricing.as_ref().and_then(|p| p.completion.clone()),
+                    uptime_last_30m: ep.uptime_last_30m,
+                })
+                .collect()
+        }),
+        endpoints_loading: m.endpoints_loading,
+        endpoints_for: m.endpoints_for.clone(),
+    }
+}
+
+/// Project the FS directory picker overlay ([`PathPicker`]). The matches are the
+/// daemon's already-computed `read_dir` results, carried verbatim so the client
+/// renders the same list without touching any filesystem.
+fn path_picker_snapshot(p: &PathPicker) -> PathPickerSnapshot {
+    PathPickerSnapshot {
+        query: p.query.clone(),
+        matches: p.matches.clone(),
+        sel: p.sel,
+        replace_idx: match p.mode {
+            PickerMode::Add => None,
+            PickerMode::Replace(i) => Some(i),
+        },
+    }
+}
+
+/// Wire token for a [`ThemeMode`].
+fn theme_token(t: &ThemeMode) -> &'static str {
+    match t {
+        ThemeMode::Dark => "dark",
+        ThemeMode::Light => "light",
+    }
+}
+
+/// Wire token for an [`ApiType`].
+fn api_type_token(t: ApiType) -> &'static str {
+    match t {
+        ApiType::OpenAiCompatible => "openai",
+        ApiType::AnthropicCompatible => "anthropic",
+    }
+}
+
+/// Wire token for a [`ModelRole`].
+fn role_token(r: ModelRole) -> &'static str {
+    match r {
+        ModelRole::Main => "main",
+        ModelRole::Awareness => "awareness",
+        ModelRole::Safeguard => "safeguard",
+        ModelRole::Compactor => "compactor",
     }
 }
 
@@ -253,6 +501,18 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
         return DiffResult::full();
     }
 
+    // --- structural: the on-demand model catalogue changed ---
+    // The omnisearch cache (and the endpoint it was fetched for) feeds the Settings
+    // model modal + the KeyInput search dropdowns. It changes only when a fetch
+    // lands (infrequent) and no incremental delta carries it, so a change forces a
+    // full snapshot — the screen that reads it (Settings/KeyInput) then re-renders
+    // with the populated dropdown instead of a stale `searching models…`.
+    if prev.global.models_cache != next.global.models_cache
+        || prev.global.models_cache_endpoint != next.global.models_cache_endpoint
+    {
+        return DiffResult::full();
+    }
+
     // --- structural: the session SET (count or id order) changed ---
     // A different length or a reordered/replaced id list can't be expressed by the
     // per-session deltas (which address sessions by id and assume the set is
@@ -281,6 +541,10 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
             || p.cost != n.cost
             || p.awaiting_approval != n.awaiting_approval
             || p.approval_reason != n.approval_reason
+            // The pending tool-call set / cursor moving changes what the approval
+            // overlay draws; no incremental delta carries it, so resync wholesale.
+            || p.pending_tool_calls != n.pending_tool_calls
+            || p.tool_idx != n.tool_idx
             || p.name != n.name
             || p.subagents != n.subagents
             || p.pending_subagents != n.pending_subagents;

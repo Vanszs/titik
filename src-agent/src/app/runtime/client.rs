@@ -73,17 +73,27 @@ use ratatui::crossterm::event::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::app::mode::{Mode, QuitConfirmState};
+use crate::app::mode::settings::{
+    ModelDraft, ModelModal, PathPicker, PickerMode, ProviderDraft, ProviderModal, RolePickerState,
+    SettingsState,
+};
+use crate::app::mode::{
+    CookingEntry, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode, QuitConfirmState,
+    SessionHub, WarmStatus,
+};
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
 use crate::app::subagent::PendingSubagent;
+use crate::dto::openrouter::{ModelEndpoint, ModelPricing};
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
-    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, ModeSnapshot, SessionSnapshot, StateDelta,
-    StateSnapshot,
+    ClientRequest, DaemonEvent, DaemonFrame, KeyInputSnapshot, KeyWire, LoadingSnapshot,
+    ModeSnapshot, ModelModalSnapshot, PathPickerSnapshot, SessionHubSnapshot, SessionSnapshot,
+    SettingsSnapshot, StateDelta, StateSnapshot, WarmStatusWire,
 };
+use crate::model::app_config::{ApiType, ModelRole, ThemeMode};
 use crate::model::conversation::Conversation;
 use crate::model::session::Session;
-use crate::model::settings::Settings;
+use crate::model::settings::{InternetMode, Settings};
 use crate::model::store;
 use crate::view;
 
@@ -368,9 +378,10 @@ fn apply_frame(
     match frame.event {
         DaemonEvent::Snapshot(snap) => {
             // A full Snapshot is always a valid rebuild — it clears any pending
-            // resync and reseeds the shadow wholesale.
+            // resync and reseeds the shadow wholesale. (`snap` is boxed on the wire
+            // to keep the `DaemonEvent` enum small; unbox it for `apply_snapshot`.)
             *awaiting_resync = false;
-            apply_snapshot(shadow, snap);
+            apply_snapshot(shadow, *snap);
             true
         }
         DaemonEvent::Delta(delta) => {
@@ -428,6 +439,21 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     shadow.rest.toast = global.toast.map(|(kind, text)| {
         (text, Instant::now() + TOAST_TTL, toast_kind(&kind))
     });
+    // The on-demand model catalogue + the endpoint it was fetched for. The Settings
+    // model modal + KeyInput step-1 search render their omnisearch dropdowns from
+    // these; without them a remote client's dropdown would sit on `searching
+    // models…` forever (it has no fetch path of its own).
+    shadow.rest.models_cache = global.models_cache;
+    shadow.rest.models_cache_endpoint = global.models_cache_endpoint;
+
+    // Global theme + accent. `view::draw` frames every screen via
+    // `theme::palette(&shadow.rest.config)` BEFORE dispatching to a mode renderer, so
+    // without these the shadow's `config` stays at `AppConfig::default()` (Dark/green)
+    // and a Light-theme or non-green daemon renders every label/border/highlight in
+    // the wrong palette. Theme decodes from its wire token (reusing the Settings
+    // helper, unknown → Dark); accent is an opaque palette key copied verbatim.
+    shadow.rest.config.theme = shadow_theme(&global.theme);
+    shadow.rest.config.accent = global.accent;
 
     // Re-anchor the comet clock from the projected elapsed-ms (authoritative for
     // this snapshot). `work_since = now - elapsed` makes the status shimmer animate
@@ -443,18 +469,20 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     // cache so the next draw rebuilds it against the new messages.
     shadow.rest.transcript_cache.borrow_mut().blocks.clear();
 
-    // Mode: reconstruct from the pure-data `ModeSnapshot`. Chat is the payload-free,
-    // fully-projected screen. QuitConfirm (daemon stage 12) is the ONE other mode the
-    // client reconstructs: when the daemon enters the `/quit` overlay (forwarded keys),
-    // the client mirrors it so the EXISTING overlay view renders AND the client can
-    // intercept the lifecycle keys ([d] detach / [k] kill-all) locally — those are
-    // client-process decisions, not pure daemon mutations (see `render_loop`). Its
-    // busy/total counts now ride on the snapshot (the daemon's exact `QuitConfirmState`),
-    // so the header reads the same as the daemon's instead of being re-derived here.
-    // Every OTHER `ModeSnapshot` variant is still a STUB (its modal payload is not
-    // projected until a later stage), so those fall back to Chat — the safe, correct
-    // render — rather than fabricate an empty picker/form.
+    // Mode: reconstruct from the pure-data `ModeSnapshot`. Chat is payload-free.
+    // KeyInput / SessionHub / Loading / Settings (stage 2) are rebuilt into REAL
+    // mode state so the unmodified `view::draw` renders them faithfully — the client
+    // never mutates them (input is forwarded), it only needs enough to DRAW. The
+    // QuitConfirm overlay is special-cased so the client can ALSO intercept its
+    // lifecycle keys ([d] detach / [k] kill-all) locally (see `render_loop`); its
+    // busy/total counts ride on the snapshot. Every variant still STUBBED
+    // (SessionPicker / Agents / Effort / Usage / MessageRewind) falls back to Chat —
+    // the safe render — rather than fabricate an empty picker/form.
     shadow.mode = match global.mode {
+        ModeSnapshot::KeyInput(f) => Mode::KeyInput(shadow_key_input(f)),
+        ModeSnapshot::SessionHub(h) => Mode::SessionHub(Box::new(shadow_session_hub(h))),
+        ModeSnapshot::Loading(s) => Mode::Loading(shadow_loading(s)),
+        ModeSnapshot::Settings(s) => Mode::Settings(Box::new(shadow_settings(*s))),
         ModeSnapshot::QuitConfirm { working, total } => {
             Mode::QuitConfirm(Box::new(QuitConfirmState::new(working, total)))
         }
@@ -498,6 +526,12 @@ fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
     rt.waiting = s.working;
     rt.awaiting_approval = s.awaiting_approval;
     rt.approval_reason = s.approval_reason.clone();
+    // The pending tool-call round + cursor so the Chat-mode approval overlay (gated
+    // on `awaiting_approval`) renders the real paused call — name, args, payload
+    // preview — exactly as the local TUI does. `ToolCall` is plain data; the client
+    // never executes it (the y/n is forwarded as `ApproveTool`).
+    rt.pending_tool_calls = s.pending_tool_calls.clone();
+    rt.tool_idx = s.tool_idx;
     rt.finished_unseen = s.finished_unseen;
     // Reconstruct the queued delegations (plain data) so the remote `$` panel can
     // list the same "pending" rows the local TUI shows. FIFO order is preserved.
@@ -540,6 +574,255 @@ fn shadow_session(s: &SessionSnapshot) -> Session {
         settings,
         Conversation::from_messages(s.messages.clone()),
     )
+}
+
+// ─── mode reconstruction (stage 2: core interactive modes) ───────────────────
+//
+// Each rebuilds a REAL mode-state value from its wire projection so the unmodified
+// `view::draw` renders it. The client never mutates these (input is forwarded to
+// the daemon); they only need to be faithful enough to DRAW. None hold a channel /
+// `Instant`-clock that must keep ticking except `Loading::started`, which is
+// re-anchored from the projected elapsed-ms so its footer counter matches.
+
+/// Rebuild the first-run wizard form ([`KeyInputForm`]) from its projection.
+fn shadow_key_input(f: KeyInputSnapshot) -> KeyInputForm {
+    KeyInputForm {
+        step: f.step,
+        field: f.field,
+        endpoint: f.endpoint,
+        api_key: f.api_key,
+        model: f.model,
+        query: f.query,
+        result_sel: f.result_sel,
+        first_run: f.first_run,
+        from_picker: f.from_picker,
+    }
+}
+
+/// Rebuild the loading splash ([`LoadingState`]) from its projection. The footer's
+/// elapsed clock is re-anchored (`now - elapsed`) so it continues from the daemon's
+/// phase rather than resetting to 0 on each snapshot.
+fn shadow_loading(s: LoadingSnapshot) -> LoadingState {
+    LoadingState {
+        started: Instant::now() - Duration::from_millis(s.elapsed_ms),
+        frame: s.frame,
+        workspace: shadow_warm_status(s.workspace),
+        awareness: shadow_warm_status(s.awareness),
+    }
+}
+
+/// Map a [`WarmStatusWire`] back to a [`WarmStatus`].
+fn shadow_warm_status(w: WarmStatusWire) -> WarmStatus {
+    match w {
+        WarmStatusWire::Pending => WarmStatus::Pending,
+        WarmStatusWire::Running => WarmStatus::Running,
+        WarmStatusWire::Done(d) => WarmStatus::Done(d),
+        WarmStatusWire::Skipped => WarmStatus::Skipped,
+        WarmStatusWire::Failed => WarmStatus::Failed,
+    }
+}
+
+/// Rebuild the two-pane session hub ([`SessionHub`]) from its projection.
+///
+/// The COOKING rows' live `idx` (the daemon's `sessions` index, used on Enter) is
+/// not projected and not rendered, so reconstructed rows carry `0` for it; the
+/// HISTORY rows' live `path` is likewise daemon-only, rebuilt as an empty path. The
+/// client never acts on these — Enter is forwarded for the daemon to resolve.
+fn shadow_session_hub(h: SessionHubSnapshot) -> SessionHub {
+    SessionHub {
+        cooking: h
+            .cooking
+            .into_iter()
+            .map(|c| CookingEntry {
+                idx: 0, // daemon-side index; not rendered, resolved on the daemon
+                name: c.name,
+                working: c.working,
+                is_foreground: c.is_foreground,
+            })
+            .collect(),
+        history: h
+            .history
+            .into_iter()
+            .map(|e| HistoryEntry {
+                path: std::path::PathBuf::new(), // daemon-side load target; not rendered
+                name: e.name,
+                last_active: std::time::UNIX_EPOCH
+                    + Duration::from_secs(e.last_active_secs),
+            })
+            .collect(),
+        focus: if h.focus_cooking {
+            HubPane::Cooking
+        } else {
+            HubPane::History
+        },
+        cooking_selected: h.cooking_selected,
+        history_selected: h.history_selected,
+    }
+}
+
+/// Rebuild the `/settings` dashboard ([`SettingsState`]) from its projection — the
+/// largest reconstruction. Every draft + list + modal + picker is restored so the
+/// settings view (and its pure helper methods, which recompute from these same
+/// fields) renders exactly as the daemon's would.
+fn shadow_settings(s: SettingsSnapshot) -> SettingsState {
+    SettingsState {
+        cat: s.cat,
+        field: s.field,
+        in_detail: s.in_detail,
+        editing: s.editing,
+        api_key: s.api_key,
+        model: s.model,
+        provider: s.provider,
+        name: s.name,
+        theme: shadow_theme(&s.theme),
+        accent: s.accent,
+        workdir: s.workdir,
+        awareness_enabled: s.awareness_enabled,
+        awareness_inherit: s.awareness_inherit,
+        awareness_model: s.awareness_model,
+        awareness_provider: s.awareness_provider,
+        classifier_enabled: s.classifier_enabled,
+        classifier_model: s.classifier_model,
+        classifier_provider: s.classifier_provider,
+        allowed_folders: s.allowed_folders,
+        short_send_enabled: s.short_send_enabled,
+        sliding_cache: s.sliding_cache,
+        internet_mode: shadow_internet_mode(&s.internet_mode),
+        cwd: std::path::PathBuf::from(s.cwd),
+        list_editing: s.list_editing,
+        list_sel: s.list_sel,
+        picker: s.picker.map(shadow_path_picker),
+        providers: s
+            .providers
+            .into_iter()
+            .map(|p| ProviderDraft {
+                uuid: p.uuid,
+                name: p.name,
+                endpoint: p.endpoint,
+                api_type: shadow_api_type(&p.api_type),
+                api_key: p.api_key,
+            })
+            .collect(),
+        prov_sel: s.prov_sel,
+        prov_delete_armed: s.prov_delete_armed,
+        prov_modal: s.prov_modal.map(|m| ProviderModal {
+            name: m.name,
+            endpoint: m.endpoint,
+            api_type: shadow_api_type(&m.api_type),
+            api_key: m.api_key,
+            field: m.field,
+        }),
+        models: s
+            .models
+            .into_iter()
+            .map(|m| ModelDraft {
+                uuid: m.uuid,
+                name: m.name,
+                model_id: m.model_id,
+                provider_idx: m.provider_idx,
+                roles: m.roles.iter().map(|r| shadow_role(r)).collect(),
+                route: m.route,
+                session_only: m.session_only,
+            })
+            .collect(),
+        model_sel: s.model_sel,
+        model_delete_armed: s.model_delete_armed,
+        model_modal: s.model_modal.map(shadow_model_modal),
+    }
+}
+
+/// Rebuild the add/edit-model modal ([`ModelModal`]) from its projection. The
+/// endpoints are reconstructed from the serde mirror back into [`ModelEndpoint`]
+/// (a `Default`-padded copy carrying just the rendered fields).
+fn shadow_model_modal(m: ModelModalSnapshot) -> ModelModal {
+    ModelModal {
+        editing_idx: m.editing_idx,
+        uuid: m.uuid,
+        name: m.name,
+        provider_idx: m.provider_idx,
+        model_id: m.model_id,
+        field: m.field,
+        roles: m.roles.iter().map(|r| shadow_role(r)).collect(),
+        role_picker: m.role_picker.map(|rp| RolePickerState {
+            checked: rp.checked,
+            cursor: rp.cursor,
+        }),
+        query: m.query,
+        result_sel: m.result_sel,
+        route: m.route,
+        route_sel: m.route_sel,
+        endpoints: m.endpoints.map(|eps| {
+            eps.into_iter()
+                .map(|ep| ModelEndpoint {
+                    name: ep.name,
+                    provider_name: ep.provider_name,
+                    pricing: Some(ModelPricing {
+                        prompt: ep.price_prompt,
+                        completion: ep.price_completion,
+                    }),
+                    context_length: None,
+                    quantization: None,
+                    max_completion_tokens: None,
+                    uptime_last_30m: ep.uptime_last_30m,
+                    status: None,
+                })
+                .collect()
+        }),
+        endpoints_loading: m.endpoints_loading,
+        endpoints_for: m.endpoints_for,
+    }
+}
+
+/// Rebuild the FS directory picker overlay ([`PathPicker`]) from its projection.
+///
+/// The matches are the daemon's already-computed `read_dir` results, used VERBATIM
+/// (the client never walks its own filesystem — its cwd is unrelated to the
+/// daemon's session). Constructed as a struct literal rather than via
+/// `PathPicker::new`, which would re-run `list_dirs` against the local FS.
+fn shadow_path_picker(p: PathPickerSnapshot) -> PathPicker {
+    PathPicker {
+        query: p.query,
+        matches: p.matches,
+        sel: p.sel,
+        mode: match p.replace_idx {
+            None => PickerMode::Add,
+            Some(i) => PickerMode::Replace(i),
+        },
+    }
+}
+
+/// Map a theme wire token back to a [`ThemeMode`] (unknown → Dark).
+fn shadow_theme(t: &str) -> ThemeMode {
+    match t {
+        "light" => ThemeMode::Light,
+        _ => ThemeMode::Dark,
+    }
+}
+
+/// Map an internet-mode wire token back to an [`InternetMode`] (unknown → Simple).
+fn shadow_internet_mode(t: &str) -> InternetMode {
+    match t {
+        "full" => InternetMode::Full,
+        _ => InternetMode::Simple,
+    }
+}
+
+/// Map an api-type wire token back to an [`ApiType`] (unknown → OpenAiCompatible).
+fn shadow_api_type(t: &str) -> ApiType {
+    match t {
+        "anthropic" => ApiType::AnthropicCompatible,
+        _ => ApiType::OpenAiCompatible,
+    }
+}
+
+/// Map a role wire token back to a [`ModelRole`] (unknown → Main, never lost).
+fn shadow_role(r: &str) -> ModelRole {
+    match r {
+        "awareness" => ModelRole::Awareness,
+        "safeguard" => ModelRole::Safeguard,
+        "compactor" => ModelRole::Compactor,
+        _ => ModelRole::Main,
+    }
 }
 
 /// Apply one incremental [`StateDelta`] to the shadow in place.
@@ -635,6 +918,7 @@ fn apply_delta(shadow: &mut AppState, delta: StateDelta) -> bool {
                 shadow.rest.sessions.push(shadow_session_runtime(&snap));
                 return true;
             }
+            // (`snap` is `Box<SessionSnapshot>`; `&snap` derefs to `&SessionSnapshot`.)
             false
         }
         StateDelta::Toast { kind, text } => {

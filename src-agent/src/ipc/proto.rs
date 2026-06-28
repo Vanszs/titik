@@ -236,8 +236,12 @@ pub struct DaemonFrame {
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub enum DaemonEvent {
     /// A full state projection — sent on attach and on resync. The client rebuilds
-    /// its entire shadow from this.
-    Snapshot(StateSnapshot),
+    /// its entire shadow from this. Boxed because a `StateSnapshot` is by far the
+    /// largest event payload (it carries every session + the full mode projection,
+    /// including the settings dashboard draft), so an unboxed variant would bloat
+    /// every `DaemonEvent` — including the high-frequency `Delta`/`Ack` frames — to
+    /// the snapshot's size.
+    Snapshot(Box<StateSnapshot>),
     /// An incremental update folded onto the existing shadow.
     Delta(StateDelta),
     /// Acknowledgement of a request that produces no other reply.
@@ -289,6 +293,17 @@ pub struct SessionSnapshot {
     pub awaiting_approval: bool,
     /// Why the tool-call classifier flagged the paused call (if classifier-driven).
     pub approval_reason: Option<String>,
+    /// The tool calls emitted by the in-flight stream that are pending execution /
+    /// approval. Carried so the client's tool-approval overlay (rendered in Chat
+    /// mode when `awaiting_approval`) shows the SAME pending call — name, args,
+    /// payload preview — the local TUI does. `ToolCall` is already serde-clean.
+    /// Empty when no calls are pending. Only the call at `tool_idx` is shown, but
+    /// the whole round is carried so a future per-call preview has the full set.
+    pub pending_tool_calls: Vec<crate::dto::chat::ToolCall>,
+    /// Index of the call in `pending_tool_calls` the approval overlay is asking
+    /// about (the `SessionRuntime::tool_idx`). The overlay reads
+    /// `pending_tool_calls[tool_idx]`, so it must ride alongside the calls.
+    pub tool_idx: usize,
     /// Mirror of `SessionRuntime::is_working()` at snapshot time — any work in
     /// flight (streaming, waiting, parked lanes, or a running sub-agent).
     pub working: bool,
@@ -374,12 +389,290 @@ pub struct GlobalSnapshot {
     /// phase + elapsed-seconds counter the daemon is at — instead of resetting to
     /// 0 every time a snapshot rebuilds the shadow.
     pub work_elapsed_ms: Option<u64>,
+    /// The GLOBAL UI theme as a wire token (`"dark"` / `"light"`), projected from
+    /// [`crate::model::app_config::AppConfig::theme`]. `view::draw` frames EVERY
+    /// screen with `theme::palette(&state.rest.config)` BEFORE dispatching to a mode
+    /// renderer, so without this the thin client's `rest.config` stays at
+    /// `AppConfig::default()` (Dark) and a Light-theme daemon would render every
+    /// label/border/highlight in the wrong palette. (The Settings DRAFT `theme` is a
+    /// separate value-preview field; the outer palette comes from `rest.config`, not
+    /// the mode payload.)
+    pub theme: String,
+    /// The GLOBAL accent colour token, projected from
+    /// [`crate::model::app_config::AppConfig::accent`] (an arbitrary palette key like
+    /// `"green"`, carried verbatim). Drives every accent in `theme::palette`; without
+    /// it a non-green daemon's selections/status bars render green on the client.
+    pub accent: String,
     /// A PURE-DATA projection of the current [`crate::app::mode::Mode`] carrying
     /// each mode's render-relevant payload, so the thin client can reconstruct +
     /// draw every screen (not just Chat). See [`ModeSnapshot`].
     pub mode: ModeSnapshot,
     /// Active toast as `(kind, text)`, or `None`. `kind` is "error" / "info".
     pub toast: Option<(String, String)>,
+    /// The on-demand model catalogue ([`crate::app::state::AppStateRest::models_cache`]):
+    /// `None` = never fetched, `Some(vec)` = fetched for `models_cache_endpoint`
+    /// (an empty vec means "fetched, none found" — terminal). The Settings model
+    /// modal's omnisearch AND the KeyInput step-1 search render their result
+    /// dropdowns from this; without it a remote client's omnisearch can never show
+    /// catalogue rows (it would sit on `searching models…` forever). `ModelInfo`
+    /// is serde-clean, so the cache crosses the wire verbatim.
+    pub models_cache: Option<Vec<crate::dto::openrouter::ModelInfo>>,
+    /// Which endpoint `models_cache` was fetched for
+    /// ([`crate::app::state::AppStateRest::models_cache_endpoint`]). The omnisearch
+    /// views only trust the cache when this matches the EDITED provider's endpoint;
+    /// otherwise they show `searching models…`. Projected alongside the cache so the
+    /// client makes the SAME match decision the daemon would.
+    pub models_cache_endpoint: Option<String>,
+}
+
+// ─── mode payload projections (stage 2: core interactive modes) ──────────────
+
+/// A serde-safe projection of the first-run setup wizard ([`crate::app::mode::KeyInputForm`]).
+///
+/// Mirrors every field the wizard view (`view::key_input`) reads: the step/field
+/// cursor, the three text drafts, and the step-1 omnisearch `query`/`result_sel`.
+/// The `first_run`/`from_picker` flags only steer Esc behaviour (handled on the
+/// daemon via forwarded keys), but are carried so the reconstructed form is an
+/// exact copy rather than a render-only shell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct KeyInputSnapshot {
+    pub step: usize,
+    pub field: usize,
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub query: String,
+    pub result_sel: usize,
+    pub first_run: bool,
+    pub from_picker: bool,
+}
+
+/// A serde-safe projection of the startup warming splash ([`crate::app::mode::LoadingState`]).
+///
+/// The live `started` is an [`std::time::Instant`] (not serialisable); it is
+/// projected as `elapsed_ms` so the client re-anchors its OWN `Instant` (`now -
+/// elapsed`) and the footer's elapsed-seconds counter continues from the daemon's
+/// phase instead of restarting at 0 each snapshot. `frame` drives the spinner; the
+/// two `WarmStatus` steps are projected as [`WarmStatusWire`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct LoadingSnapshot {
+    /// Milliseconds since the splash opened (the live `Instant`'s elapsed).
+    pub elapsed_ms: u64,
+    /// Spinner frame counter.
+    pub frame: u64,
+    /// The "indexing workspace" step status.
+    pub workspace: WarmStatusWire,
+    /// The "reading project docs" awareness step status.
+    pub awareness: WarmStatusWire,
+}
+
+/// A serde-safe mirror of [`crate::app::mode::WarmStatus`] (which is not serde).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub enum WarmStatusWire {
+    Pending,
+    Running,
+    /// Carries the short detail string the renderer shows dim next to the marker.
+    Done(String),
+    Skipped,
+    Failed,
+}
+
+/// A serde-safe projection of one COOKING row in the session hub
+/// ([`crate::app::mode::CookingEntry`]). The live `idx` is a daemon-side
+/// `sessions` index used only on Enter (forwarded as a key), so it is NOT rendered
+/// and not projected; the row's display fields are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct CookingEntrySnapshot {
+    pub name: String,
+    pub working: bool,
+    pub is_foreground: bool,
+}
+
+/// A serde-safe projection of one HISTORY row in the session hub
+/// ([`crate::app::mode::HistoryEntry`]). The live `path` is the daemon-side load
+/// target (used on Enter, forwarded as a key) and is not rendered, so only the
+/// display fields cross: the name and the last-active time as seconds-since-epoch
+/// (the live `SystemTime` is rebuilt as `UNIX_EPOCH + secs` on the client, since
+/// the view formats it as a relative age).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct HistoryEntrySnapshot {
+    pub name: String,
+    /// Last-active time as whole seconds since the Unix epoch (`0` if the live
+    /// time predates the epoch / clock skew — the view degrades that to `"?"`).
+    pub last_active_secs: u64,
+}
+
+/// A serde-safe projection of the two-pane session hub ([`crate::app::mode::SessionHub`]).
+/// Carries both pane lists + the focus + each pane's cursor — everything
+/// `view::session_hub` reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct SessionHubSnapshot {
+    pub cooking: Vec<CookingEntrySnapshot>,
+    pub history: Vec<HistoryEntrySnapshot>,
+    /// `true` = the COOKING pane has focus; `false` = HISTORY.
+    pub focus_cooking: bool,
+    pub cooking_selected: usize,
+    pub history_selected: usize,
+}
+
+/// A serde-safe mirror of [`crate::dto::openrouter::ModelEndpoint`], which is
+/// `Deserialize`-only (so it cannot ride directly on a serde wire DTO). Carries
+/// only the fields the model modal's Route list renders (provider name, pricing,
+/// uptime); the rest of `ModelEndpoint` is reconstructed at `Default` on the client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ModelEndpointWire {
+    pub name: Option<String>,
+    pub provider_name: Option<String>,
+    /// Per-token USD price strings `(prompt, completion)` (as OpenRouter reports
+    /// them); the view formats them per-million. `None` when the endpoint omits
+    /// pricing.
+    pub price_prompt: Option<String>,
+    pub price_completion: Option<String>,
+    pub uptime_last_30m: Option<f64>,
+}
+
+/// A serde-safe projection of one API-provider draft ([`crate::app::mode::settings::ProviderDraft`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ProviderDraftSnapshot {
+    pub uuid: String,
+    pub name: String,
+    pub endpoint: String,
+    /// `api_type` as a wire token: `"openai"` / `"anthropic"`.
+    pub api_type: String,
+    pub api_key: String,
+}
+
+/// A serde-safe projection of one model draft ([`crate::app::mode::settings::ModelDraft`]).
+/// Roles are projected as wire tokens (`"main"`/`"awareness"`/`"safeguard"`/`"compactor"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ModelDraftSnapshot {
+    pub uuid: String,
+    pub name: String,
+    pub model_id: String,
+    pub provider_idx: usize,
+    pub roles: Vec<String>,
+    pub route: Option<String>,
+    pub session_only: bool,
+}
+
+/// A serde-safe projection of the add-provider modal ([`crate::app::mode::settings::ProviderModal`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ProviderModalSnapshot {
+    pub name: String,
+    pub endpoint: String,
+    pub api_type: String,
+    pub api_key: String,
+    pub field: usize,
+}
+
+/// A serde-safe projection of the role multi-select picker overlay
+/// ([`crate::app::mode::settings::RolePickerState`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct RolePickerSnapshot {
+    /// Parallel to `ModelRole::ALL` — the 4 role checkboxes.
+    pub checked: Vec<bool>,
+    pub cursor: usize,
+}
+
+/// A serde-safe projection of the add/edit-model modal ([`crate::app::mode::settings::ModelModal`]).
+/// Endpoints ride as [`ModelEndpointWire`] (the live type is Deserialize-only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct ModelModalSnapshot {
+    pub editing_idx: Option<usize>,
+    pub uuid: String,
+    pub name: String,
+    pub provider_idx: usize,
+    pub model_id: String,
+    pub field: usize,
+    pub roles: Vec<String>,
+    pub role_picker: Option<RolePickerSnapshot>,
+    pub query: String,
+    pub result_sel: usize,
+    pub route: Option<String>,
+    pub route_sel: usize,
+    /// `None` until a fetch resolves; `Some(vec)` once loaded (empty = none found).
+    pub endpoints: Option<Vec<ModelEndpointWire>>,
+    pub endpoints_loading: bool,
+    pub endpoints_for: Option<String>,
+}
+
+/// A serde-safe projection of the filesystem directory picker overlay
+/// ([`crate::app::mode::settings::PathPicker`]). The matches are precomputed on the
+/// daemon side (a `read_dir` walk), so the client renders the SAME list without
+/// touching the daemon's filesystem.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct PathPickerSnapshot {
+    pub query: String,
+    pub matches: Vec<String>,
+    pub sel: usize,
+    /// `None` = Add mode; `Some(i)` = Replace the entry at index `i`.
+    pub replace_idx: Option<usize>,
+}
+
+/// A serde-safe projection of the `/settings` dashboard ([`crate::app::mode::SettingsState`]).
+///
+/// This is the BIGGEST mode projection: the settings view reads dozens of draft
+/// fields plus the providers/models lists, the open sub-modals, the path-list and
+/// FS-picker state, and several pure helper methods (`is_providers_category`,
+/// `model_modal_fields`, `mm_provider_omnisearchable`, …) that all recompute from
+/// these same fields. So the client reconstructs a REAL `SettingsState` from this
+/// projection and renders it through the unmodified `view::settings::draw` — every
+/// helper then yields the same answer the daemon's would. `theme`/`internet_mode`
+/// ride as wire tokens; `cwd` is carried only so a reconstructed FS picker can
+/// recompute correctly (it is otherwise not rendered).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct SettingsSnapshot {
+    pub cat: usize,
+    pub field: usize,
+    pub in_detail: bool,
+    pub editing: bool,
+    pub api_key: String,
+    pub model: String,
+    pub provider: String,
+    pub name: String,
+    /// Theme as a wire token: `"dark"` / `"light"`.
+    pub theme: String,
+    pub accent: String,
+    pub workdir: Vec<String>,
+    pub awareness_enabled: bool,
+    pub awareness_inherit: bool,
+    pub awareness_model: String,
+    pub awareness_provider: String,
+    pub classifier_enabled: bool,
+    pub classifier_model: String,
+    pub classifier_provider: String,
+    pub allowed_folders: Vec<String>,
+    pub short_send_enabled: bool,
+    pub sliding_cache: bool,
+    /// Internet mode as a wire token: `"simple"` / `"full"`.
+    pub internet_mode: String,
+    /// The session's effective working directory (FS-picker base path).
+    pub cwd: String,
+    pub list_editing: bool,
+    pub list_sel: usize,
+    pub picker: Option<PathPickerSnapshot>,
+    pub providers: Vec<ProviderDraftSnapshot>,
+    pub prov_sel: usize,
+    pub prov_delete_armed: bool,
+    pub prov_modal: Option<ProviderModalSnapshot>,
+    pub models: Vec<ModelDraftSnapshot>,
+    pub model_sel: usize,
+    pub model_delete_armed: bool,
+    pub model_modal: Option<ModelModalSnapshot>,
 }
 
 /// A PURE-DATA projection of the live [`crate::app::mode::Mode`].
@@ -392,30 +685,29 @@ pub struct GlobalSnapshot {
 ///
 /// # Staging (task #122)
 ///
-/// This stage (1) fills the payloads for the two ALREADY-projected screens —
-/// `Chat` (payload-free) and `QuitConfirm` (its busy/total counts) — and keeps
-/// every OTHER variant a STUB (no payload yet). The stubbed variants exist so the
-/// enum is 1:1 with `Mode` and the wire type is stable; their forms/pickers/
-/// dashboards are projected in stages 2-3 when the client renders them. A stubbed
-/// variant tells the client only "this screen is active"; the client falls back to
-/// the safe Chat render for it until its payload lands (never fabricating an empty
+/// Stage 1 filled `Chat` (payload-free) and `QuitConfirm`. Stage 2 fills the CORE
+/// interactive modes — `KeyInput`, `SessionHub`, `Loading`, `Settings` — with full
+/// payloads so the client reconstructs + renders them. The remaining variants
+/// (`SessionPicker`, `Agents`, `Effort`, `Usage`, `MessageRewind`) stay STUBS: they
+/// tell the client only "this screen is active", and the client falls back to the
+/// safe Chat render for them until their payload lands (never fabricating an empty
 /// modal), exactly as the old tag did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub enum ModeSnapshot {
-    /// Credentials form (`Mode::KeyInput`). STUB — payload projected in a later stage.
-    KeyInput,
+    /// First-run credentials wizard (`Mode::KeyInput`). Carries the full form state.
+    KeyInput(KeyInputSnapshot),
     /// `--resume` disk session picker (`Mode::SessionPicker`). STUB.
     SessionPicker,
-    /// Two-pane session hub (`Mode::SessionHub`). STUB.
-    SessionHub,
+    /// Two-pane session hub (`Mode::SessionHub`). Carries both panes + focus/cursors.
+    SessionHub(SessionHubSnapshot),
     /// Normal chat view (`Mode::Chat`). Payload-free: everything Chat renders lives
     /// in the session + global projections already, so the variant carries nothing.
     Chat,
-    /// Startup warming splash (`Mode::Loading`). STUB.
-    Loading,
-    /// `/settings` dashboard (`Mode::Settings`). STUB.
-    Settings,
+    /// Startup warming splash (`Mode::Loading`). Carries the step statuses + spinner.
+    Loading(LoadingSnapshot),
+    /// `/settings` dashboard (`Mode::Settings`). Carries the full draft + modal state.
+    Settings(Box<SettingsSnapshot>),
     /// `/agents` manager (`Mode::Agents`). STUB.
     Agents,
     /// `/effort` reasoning-effort picker (`Mode::Effort`). STUB.
@@ -477,8 +769,12 @@ pub enum StateDelta {
     },
     /// The foreground session changed (by stable id).
     ForegroundChanged { session_id: String },
-    /// A new session was added; carries its full initial projection.
-    SessionAdded(SessionSnapshot),
+    /// A new session was added; carries its full initial projection. Boxed so this
+    /// variant doesn't bloat the whole `StateDelta` enum (a `SessionSnapshot` is the
+    /// largest payload here — it carries the full message + tool-call + sub-agent
+    /// projections), keeping the common small deltas (token/reasoning appends) cheap
+    /// to move.
+    SessionAdded(Box<SessionSnapshot>),
     /// Show a toast. `kind` is "error" / "info".
     Toast { kind: String, text: String },
 }

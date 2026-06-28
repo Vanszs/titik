@@ -62,6 +62,15 @@ mod roundtrip_tests {
             waiting: true,
             awaiting_approval: false,
             approval_reason: None,
+            pending_tool_calls: vec![crate::dto::chat::ToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: crate::dto::chat::FunctionCall {
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                },
+            }],
+            tool_idx: 0,
             working: true,
             finished_unseen: false,
             subagents: vec![SubAgentSnapshot {
@@ -89,11 +98,27 @@ mod roundtrip_tests {
             follow: true,
             status: "ready".to_string(),
             work_elapsed_ms: Some(1500),
-            mode: ModeSnapshot::QuitConfirm {
-                working: 1,
-                total: 2,
-            },
+            // Non-default theme/accent so the round-trip proves a Light, non-green
+            // daemon's palette tokens survive serialize -> deserialize (a Dark/green
+            // pair would alias the struct default and hide a dropped field).
+            theme: "light".to_string(),
+            accent: "cyan".to_string(),
+            // Use a populated stage-2 payload (KeyInput) so a full mode projection
+            // gets round-trip coverage, not just the unit/struct-light variants.
+            mode: ModeSnapshot::KeyInput(KeyInputSnapshot {
+                step: 1,
+                field: 0,
+                endpoint: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "openai/gpt-4o-mini".to_string(),
+                query: "gpt".to_string(),
+                result_sel: 2,
+                first_run: true,
+                from_picker: false,
+            }),
             toast: Some(("info".to_string(), "saved".to_string())),
+            models_cache: None,
+            models_cache_endpoint: None,
         }
     }
 
@@ -144,7 +169,7 @@ mod roundtrip_tests {
         let frames = vec![
             DaemonFrame {
                 seq: 1,
-                event: DaemonEvent::Snapshot(sample_snapshot()),
+                event: DaemonEvent::Snapshot(Box::new(sample_snapshot())),
             },
             DaemonFrame {
                 seq: 2,
@@ -202,7 +227,7 @@ mod roundtrip_tests {
             StateDelta::ForegroundChanged {
                 session_id: "s".to_string(),
             },
-            StateDelta::SessionAdded(sample_session_snapshot()),
+            StateDelta::SessionAdded(Box::new(sample_session_snapshot())),
             StateDelta::Toast {
                 kind: "error".to_string(),
                 text: "nope".to_string(),
