@@ -11,8 +11,57 @@
 //! - `--daemon`                    — run the headless koma-daemon event loop (no terminal).
 //! - `--attach`                    — run as a thin client that attaches to a running daemon.
 //!
+//! Subcommands (positional, distinct from the `--flags`):
+//! - `daemon <status|kill|restart|clean>` — the daemon management CLI (#118). Parsed
+//!   into [`Opts::subcommand`] and short-circuited in `main` BEFORE the TUI, so it
+//!   works even when the TUI can't start.
+//!
 //! `parse` accepts anything that yields `String` items so it can be called
 //! with `std::env::args()` directly from `main`.
+
+/// A `koma daemon <verb>` management subcommand (#118).
+///
+/// Parsed POSITIONALLY (the literal token `daemon` followed by a verb), separate
+/// from the `--flags`. `main` short-circuits these BEFORE starting the TUI, so they
+/// must run even when the terminal can't be set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonSub {
+    /// `koma daemon status` — report whether a daemon is live (+ PID / socket / session count).
+    Status,
+    /// `koma daemon kill` — gracefully stop a running daemon (escalating to signals if it won't die).
+    Kill,
+    /// `koma daemon restart` — kill then spawn a fresh detached daemon, reporting the new PID.
+    Restart,
+    /// `koma daemon clean` — nuke a stale socket/pidfile when NO daemon is running (refuses if one is).
+    Clean,
+}
+
+impl DaemonSub {
+    /// Map a verb token (`status`/`kill`/`restart`/`clean`) to a [`DaemonSub`].
+    /// Returns `None` for anything else so the caller can print usage rather than guess.
+    fn from_verb(verb: &str) -> Option<Self> {
+        match verb {
+            "status" => Some(DaemonSub::Status),
+            "kill" => Some(DaemonSub::Kill),
+            "restart" => Some(DaemonSub::Restart),
+            "clean" => Some(DaemonSub::Clean),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome of detecting a `koma daemon …` invocation.
+///
+/// One field on [`Opts`] captures all three cases so `main` can short-circuit the
+/// TUI for ANY `daemon` invocation (valid OR malformed) — a bare/unknown verb must
+/// print usage and exit, NOT silently fall through to launching the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonCli {
+    /// `daemon <valid-verb>` — run that management action.
+    Run(DaemonSub),
+    /// `daemon` with no verb or an unrecognised one — print usage and exit non-zero.
+    Usage,
+}
 
 /// Parsed command-line options passed through to the runtime.
 #[derive(Debug, Clone, Default)]
@@ -39,15 +88,34 @@ pub struct Opts {
     /// (`--attach` flag): connect to `~/.koma/daemon.sock`, render the daemon's
     /// foreground session from streamed snapshots/deltas, and forward input.
     pub attach: bool,
+    /// A `koma daemon …` management invocation, if one was given (#118).
+    /// `Some(Run(sub))` short-circuits `main` into that management action; `Some(Usage)`
+    /// short-circuits into a usage print + non-zero exit (bare/unknown verb); `None`
+    /// is the normal path (TUI / other flags). Either `Some` exits before the TUI.
+    pub subcommand: Option<DaemonCli>,
 }
 
 /// Parse command-line arguments into [`Opts`].
 ///
 /// All flags may appear anywhere in the argument list; position is not
 /// significant. Unknown flags are silently ignored.
+///
+/// The `daemon <verb>` SUBCOMMAND is parsed positionally: the first non-`--`
+/// argument (after `argv[0]`) equal to `daemon` makes this a daemon-CLI invocation.
+/// The following non-`--` argument is its verb — a valid one yields
+/// `Some(DaemonCli::Run(sub))`, a missing/unrecognised one yields
+/// `Some(DaemonCli::Usage)`. EITHER short-circuits the TUI in `main`, so a typo like
+/// `koma daemon staus` prints usage instead of silently opening the terminal.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
     let mut opts = Opts::default();
-    for arg in args {
+
+    // Collect once so we can both flag-match and positionally scan for the
+    // `daemon <verb>` subcommand. `argv[0]` (the program path) is skipped for the
+    // positional scan so a binary literally named `daemon` can't be mistaken for the
+    // subcommand, while still being flag-matched (it lands in the `_` arm, a no-op).
+    let all: Vec<String> = args.into_iter().collect();
+
+    for arg in &all {
         match arg.as_str() {
             "--resume"                       => opts.resume = true,
             "--internet-fullmode-install"    => opts.internet_fullmode_install = true,
@@ -60,5 +128,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
             _                                => {}
         }
     }
+
+    // Positional subcommand scan: skip argv[0], find the first `daemon` token among
+    // the POSITIONAL (non-flag) args, and read the next positional as its verb. A
+    // bare `daemon` (no following positional) or an unknown verb maps to
+    // `DaemonCli::Usage` so `main` prints usage instead of dropping into the TUI.
+    let mut positional = all.iter().skip(1).filter(|a| !a.starts_with("--"));
+    if positional.next().is_some_and(|first| first == "daemon") {
+        opts.subcommand = Some(match positional.next().and_then(|v| DaemonSub::from_verb(v)) {
+            Some(sub) => DaemonCli::Run(sub),
+            None => DaemonCli::Usage,
+        });
+    }
+
     opts
 }

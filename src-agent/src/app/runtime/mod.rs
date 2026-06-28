@@ -21,6 +21,7 @@ mod event_loop;
 mod stream;
 mod actions;
 mod client;
+mod manage;
 // `pub(crate)` so the shared `commands::internet::internet_feedback` helper is
 // reachable from the controller's Ctrl+E handler (outside this module tree).
 pub(crate) mod commands;
@@ -52,6 +53,12 @@ pub(crate) use event_loop::daemon::HubInbound;
 // Re-export the thin-attach-client entry so `app::client_run` reaches the
 // `koma --attach` path (defined in the `client` submodule).
 pub use client::client_run;
+
+// Re-export the daemon management CLI entry + usage helper so `main` can short-circuit
+// `koma daemon <verb>` before the TUI (defined in the `manage` submodule, #118).
+// `ensure_daemon_and_connect` / `daemon_alive` stay crate-internal for now — they are
+// the spawn-or-attach mechanism the later default-launch flip will consume.
+pub use manage::{print_daemon_usage, run_daemon_subcommand};
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 

@@ -42,6 +42,30 @@ fn main() -> anyhow::Result<()> {
 
     let opts = cli::parse(std::env::args());
 
+    // --- short-circuit: `koma daemon <verb>` management CLI (no TUI) ---
+    // Mirrors how the provisioner / self-test flags short-circuit BEFORE the TUI, but
+    // this is a positional SUBCOMMAND (status/kill/restart/clean) — the operator
+    // control surface for the headless daemon (#118). It must work even when the TUI
+    // can't start, so it runs first and exits the process directly. A bare/unknown verb
+    // (`DaemonCli::Usage`) prints usage and exits non-zero. The default launch path is
+    // unchanged — `daemon` is the only token that diverts here.
+    if let Some(sub) = opts.subcommand {
+        match sub {
+            cli::DaemonCli::Run(verb) => {
+                return match app::run_daemon_subcommand(verb) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            cli::DaemonCli::Usage => {
+                std::process::exit(app::print_daemon_usage());
+            }
+        }
+    }
+
     // --- short-circuit: provisioner modes (no TUI) ---
 
     if opts.internet_fullmode_install {
