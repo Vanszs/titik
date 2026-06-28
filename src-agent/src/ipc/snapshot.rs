@@ -281,6 +281,20 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
         });
     }
 
+    // --- shared composer (text + caret) ---
+    // The composer is NOT append-only (mid-string insert/delete, arrow-key caret
+    // moves), so unlike the streaming buffers it can't be expressed as a suffix
+    // append — carry the whole input string. A caret-only move (text unchanged,
+    // cursor changed) still emits so the rendered caret tracks the daemon. Without
+    // this the controller client's composer stays blank while the user types, until
+    // the next structural change forces a full snapshot.
+    if prev.global.input != next.global.input || prev.global.cursor != next.global.cursor {
+        deltas.push(StateDelta::InputChanged {
+            text: next.global.input.clone(),
+            cursor: next.global.cursor,
+        });
+    }
+
     // --- foreground switch (by stable id) ---
     if prev.foreground_id != next.foreground_id {
         if let Some(id) = next.foreground_id.clone() {

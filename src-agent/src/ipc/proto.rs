@@ -379,6 +379,13 @@ pub enum StateDelta {
         session_id: Option<String>,
         text: String,
     },
+    /// The shared composer text and/or caret moved. Carries the WHOLE input string
+    /// (not a suffix): the composer is small, edited in the middle (insert/delete/
+    /// arrow), and not append-only like the streaming buffers, so a full replace is
+    /// the only always-correct fold. Without this delta a controller client's typed
+    /// characters stay invisible until the next structural change forces a full
+    /// snapshot (the composer would appear permanently blank as the user types).
+    InputChanged { text: String, cursor: usize },
     /// A session's working / finished-unseen flags changed.
     SessionStatusChanged {
         session_id: String,

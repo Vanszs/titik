@@ -481,6 +481,15 @@ fn apply_delta(shadow: &mut AppState, delta: StateDelta) -> bool {
             }
             Some(_) => false,
         },
+        StateDelta::InputChanged { text, cursor } => {
+            // The shared composer moved (typed/deleted a char, or the caret moved).
+            // Carries the WHOLE input string, so replace wholesale; clamp the caret
+            // into bounds defensively (the daemon sends a consistent pair, but the
+            // composer renderer indexes by cursor and must never read past the end).
+            shadow.rest.input = text;
+            shadow.rest.cursor = cursor.min(shadow.rest.input.chars().count());
+            true
+        }
         StateDelta::SessionStatusChanged {
             session_id,
             working,

@@ -174,6 +174,10 @@ mod roundtrip_tests {
                 session_id: None,
                 text: "global".to_string(),
             },
+            StateDelta::InputChanged {
+                text: "hi".to_string(),
+                cursor: 2,
+            },
             StateDelta::SessionStatusChanged {
                 session_id: "s".to_string(),
                 working: false,
