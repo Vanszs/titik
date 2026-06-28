@@ -892,20 +892,29 @@ fn build_day_horizontal_chart(
     max_width: usize,
     palette: &Palette,
 ) -> Vec<Line<'static>> {
-    const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const DOW: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now = now_secs();
     let tz = crate::model::usage::local_utc_offset_secs();
     let local_now = now + tz;
-    let snap = local_now - local_now % 86400 - tz; // UTC epoch of local midnight
-    let today_dow = (local_now / 86400 + 3) % 7; // Mon=0..Sun=6 in local time
-    let monday = snap - today_dow * 86400;
-    let epochs: Vec<i64> = (0..7).map(|i| monday + i * 86400).collect();
+    let snap = local_now - local_now % 86400 - tz; // UTC epoch of local midnight today
+
+    // Rolling 7-day window: oldest (today-6) at top, today at bottom.
+    let epochs: Vec<i64> = (0..7).map(|i| snap - (6 - i) * 86400).collect();
 
     let values: Vec<f64> = epochs
         .iter()
         .map(|ep| map.get(ep).map(|b| metric_val(b, metric)).unwrap_or(0.0))
+        .collect();
+
+    // Per-epoch DOW label (each row gets its own correct day name).
+    let labels: Vec<&str> = epochs
+        .iter()
+        .map(|ep| {
+            let local = ep + tz;
+            DOW[((local / 86400 + 3) % 7) as usize]
+        })
         .collect();
 
     let nonzero: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
@@ -917,7 +926,7 @@ fn build_day_horizontal_chart(
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(8); // 7 bars + legend
 
-    for (i, (&v, label)) in values.iter().zip(DAY_LABELS.iter()).enumerate() {
+    for (i, (&v, label)) in values.iter().zip(labels.iter()).enumerate() {
         let col = heat_color(v, p33, p66, p90, false);
         let fill = if max_val <= 0.0 {
             0usize
@@ -927,7 +936,8 @@ fn build_day_horizontal_chart(
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 2);
 
-        let label_style = if i as i64 == today_dow {
+        // Today is always the last row (index 6).
+        let label_style = if i == 6 {
             Style::default().fg(palette.accent).bg(HEAT_EMPTY).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(palette.dim).bg(HEAT_EMPTY)
