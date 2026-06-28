@@ -449,14 +449,14 @@ pub fn role_split(since_ts: i64) -> RoleSplit {
 ///
 /// **Non-fatal**: returns an empty `Vec` on any DB error.
 #[allow(dead_code)]
-pub fn spend_buckets(since_ts: i64, bucket: BucketSize, _n: usize) -> Vec<SpendBucket> {
+pub fn spend_buckets(since_ts: i64, bucket: BucketSize, _n: usize, tz: i64) -> Vec<SpendBucket> {
     let Some(conn) = open() else { return Vec::new() };
     let secs = bucket.secs();
     // Bucket size is injected as a literal; SQLite does not accept arithmetic
     // expressions in GROUP BY via parameter substitution.
     let sql = format!(
         "SELECT
-            (ts - ts % {secs}) AS bucket_epoch,
+            ((ts + {tz}) - (ts + {tz}) % {secs} - {tz}) AS bucket_epoch,
             COALESCE(SUM(cost), 0.0),
             COALESCE(SUM(tokens_in + tokens_out), 0)
          FROM usage
@@ -662,7 +662,7 @@ impl UsageData {
                 totals: range_totals(since),
                 top_models: top_models_in_range(since, 8),
                 role_split: role_split(since),
-                heatmap_buckets: spend_buckets(since, heat_bucket, heat_n),
+                heatmap_buckets: spend_buckets(since, heat_bucket, heat_n, local_utc_offset_secs()),
                 ..Default::default()
             }
         }
