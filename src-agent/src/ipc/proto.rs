@@ -552,6 +552,8 @@ pub struct GlobalSnapshot {
     /// the projected list (mirrors how `usage_data` / `models_cache` feed a DB-less /
     /// fetch-less client). `Some(vec![])` = an `@partial` with no matches.
     pub file_palette: Option<Vec<String>>,
+    /// "auto" | "normal" — the current agent mode, matches AgentMode::label().
+    pub agent_mode: String,
 }
 
 // ─── mode payload projections (stage 2: core interactive modes) ──────────────

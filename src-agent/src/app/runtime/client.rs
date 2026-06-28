@@ -937,6 +937,11 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     // helper, unknown → Dark); accent is an opaque palette key copied verbatim.
     shadow.rest.config.theme = shadow_theme(&global.theme);
     shadow.rest.config.accent = global.accent;
+    // Agent mode: decode from the wire token so the header reflects the current mode.
+    shadow.rest.agent_mode = match global.agent_mode.as_str() {
+        "normal" => crate::app::state::AgentMode::Normal,
+        _        => crate::app::state::AgentMode::Auto,
+    };
     // The shadow `AppConfig`'s registered-model + provider catalogue is populated
     // ONLY for the `/agents` screen (which resolves a chosen `model_uuid` to a
     // `name @ provider` label off `rest.config`), from that mode's KEYLESS projection.

@@ -269,6 +269,10 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         // otherwise so the projection never lingers into an unrelated frame. Uses
         // the SAME `search(partial, FILE_PAL_MAX)` the local file-palette view calls.
         file_palette: file_palette_matches(state),
+        agent_mode: match state.rest.agent_mode {
+            crate::app::state::AgentMode::Auto   => "auto",
+            crate::app::state::AgentMode::Normal => "normal",
+        }.to_string(),
     }
 }
 
@@ -849,7 +853,10 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
     // dispatching to any mode renderer, so without this the client stays in the default
     // palette (Dark/green) until the next structural change forces a full resync. A full
     // snapshot ensures the client's `rest.config` palette stays in sync with the daemon's.
-    if prev.global.theme != next.global.theme || prev.global.accent != next.global.accent {
+    if prev.global.theme != next.global.theme
+        || prev.global.accent != next.global.accent
+        || prev.global.agent_mode != next.global.agent_mode
+    {
         return DiffResult::full();
     }
 
