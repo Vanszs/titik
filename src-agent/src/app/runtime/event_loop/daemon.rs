@@ -406,6 +406,14 @@ impl DaemonHub {
                 self.ack_or_error(idx, result);
             }
 
+            // Run a `!` shell command in the foreground session's cwd, no model
+            // round-trip — the same `Action::Shell` the local composer's leading-`!`
+            // detection emits, so the shell-entry-append logic is never forked.
+            ClientRequest::Shell { cmd } => {
+                let result = apply_action(Action::Shell(cmd), state, client, handle);
+                self.ack_or_error(idx, result);
+            }
+
             // Forward a key to the foreground session through the EXACT local input
             // pipeline: KeyWire -> crossterm KeyEvent -> controller::handle_key ->
             // Action -> apply_action. So the daemon reuses the same per-mode key

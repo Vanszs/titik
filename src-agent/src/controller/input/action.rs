@@ -33,6 +33,14 @@ pub enum Action {
     // --- Chat actions ---
     /// User confirmed a non-slash message; inner string is the trimmed input.
     Submit(String),
+    /// User ran a `!`-prefixed shell command directly in the session cwd (the `!`
+    /// user-shell shortcut). Inner string is the command WITH the leading `!`
+    /// stripped + trimmed. The runtime runs it in the foreground session's current
+    /// working directory, captures stdout+stderr (same cap/strip/timeout as the
+    /// `bash` tool), and appends a distinct shell entry to the conversation — it
+    /// does NOT send a turn to the model or start a stream. NOT WC-gated (the user
+    /// is trusted; it runs wherever the session cwd currently is).
+    Shell(String),
     /// User entered a `/slash` command; inner value is the parsed [`Command`].
     Slash(Command),
     /// Abort an in-flight API request (Ctrl+C / Esc while `waiting = true`).

@@ -71,6 +71,17 @@ pub enum ClientRequest {
     /// Submit composed input text to the FOREGROUND session (equivalent to the
     /// user pressing Enter on a finished composer).
     SubmitInput { text: String },
+    /// Run a `!`-prefixed shell command directly in the FOREGROUND session's CURRENT
+    /// working directory, with NO model round-trip. `cmd` is the command WITHOUT the
+    /// leading `!`. The daemon runs it (captured stdout+stderr, same output cap /
+    /// ANSI strip / timeout as the `bash` tool), appends a distinct shell entry to
+    /// that session's conversation, and the result is projected to the client via the
+    /// normal snapshot/delta. NOT gated by the workspace allow-list (the user is
+    /// trusted). In the daemon-default world keys are forwarded, so the leading-`!`
+    /// detection normally happens daemon-side (the composer Enter handler emits the
+    /// shell action); this variant is the explicit-request equivalent for a client
+    /// that interprets the composer itself.
+    Shell { cmd: String },
     /// Forward a single key event to the daemon (routed to whatever modal/handler
     /// the foreground session's mode dictates), as a serde-safe [`KeyWire`].
     SendKey(KeyWire),

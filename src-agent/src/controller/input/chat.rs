@@ -327,6 +327,19 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                     // Slash command (not submit): discard staged attachments.
                     rest.pending_attachments.clear();
                     Action::Slash(command::parse(&line))
+                } else if rest.input.trim_start().starts_with('!') {
+                    // `!` user-shell shortcut: run the rest of the line directly in
+                    // the session cwd (no model round-trip). Strip the leading `!` +
+                    // trim. An empty command (a lone `!`) is a no-op. Discard staged
+                    // attachments — they belong to a message, not a shell run.
+                    let line = rest.take_input();
+                    rest.pending_attachments.clear();
+                    let cmd = line.trim_start().strip_prefix('!').unwrap_or("").trim();
+                    if cmd.is_empty() {
+                        Action::None
+                    } else {
+                        Action::Shell(cmd.to_string())
+                    }
                 } else if !rest.input.trim().is_empty() && !rest.fg().waiting {
                     Action::Submit(rest.take_input())
                 } else {

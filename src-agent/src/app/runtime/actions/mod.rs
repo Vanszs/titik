@@ -64,6 +64,10 @@ pub(in crate::app::runtime) fn apply_action(
             chat::handle_submit(text, state, client, handle)?;
         }
 
+        Action::Shell(cmd) => {
+            chat::handle_shell(cmd, state)?;
+        }
+
         Action::Slash(cmd) => {
             super::commands::apply_slash(cmd, state, client, handle)?;
         }

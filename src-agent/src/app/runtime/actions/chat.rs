@@ -139,6 +139,58 @@ pub(super) fn handle_submit(
     Ok(())
 }
 
+/// Handle `Action::Shell`: run a `!`-prefixed command directly in the foreground
+/// session's CURRENT working directory and append a DISTINCT shell entry to the
+/// conversation — without sending a turn to the model or starting a stream.
+///
+/// The command runs via the SAME primitive the `bash` tool uses
+/// ([`crate::tool::shell::run_shell_capture`]): captured stdout+stderr, ANSI-
+/// stripped, output-capped, and timeout-bounded (the default 120s, matching the
+/// tool). It is NOT gated by the workspace allow-list (WC) — this is a user
+/// affordance, so it runs wherever the session cwd currently is (the live `cd`
+/// override when set, else the configured workdir).
+///
+/// The result is stored as a [`Role::User`] message prefixed with
+/// [`crate::dto::chat::SHELL_MARK`] and shaped `"$ <cmd>\n<output>"`. The mark makes
+/// the transcript render it distinctly (a `$` header over dim output, see
+/// `view::chat::transcript`) and is STRIPPED by the wire builder, so the model still
+/// sees the clean `$ <cmd>\n<output>` text as context on its next real turn. The
+/// entry is persisted to the msglog so it survives resume.
+pub(super) fn handle_shell(text: String, state: &mut AppState) -> Result<()> {
+    if state.rest.fg().session.is_none() {
+        state.rest.status = "no active session".into();
+        return Ok(());
+    }
+    let cmd = text.trim();
+    if cmd.is_empty() {
+        state.rest.status = "usage: !<command>".into();
+        return Ok(());
+    }
+    // Run in the session's EFFECTIVE cwd (follows `cd`). Same default timeout as
+    // the bash tool. Captured into a local before the `&mut` conversation borrow.
+    let cwd = state.rest.fg().effective_cwd();
+    let output = crate::tool::shell::run_shell_capture(cmd, &cwd, 120_000);
+    // Build the distinct shell entry: an invisible SHELL_MARK so the transcript
+    // renders it as a `$ <cmd>` block (not a `★` user turn), then the visible
+    // `$ <cmd>\n<output>` body the model reads (with the mark stripped on the wire).
+    let content = format!("{}$ {cmd}\n{output}", crate::dto::chat::SHELL_MARK);
+    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
+        let _ = msglog::append(&sess.path, Role::User, &content, None);
+        sess.conversation.push_user(content);
+        if let Err(e) = sess.save() {
+            state.rest.status = format!("error: {e}");
+            return Ok(());
+        }
+    }
+    // Show the new entry (the shell output sits at the bottom of the transcript)
+    // and report the command's exit status on the status line via the last line of
+    // the captured output (`exit code: N`).
+    state.rest.reset_scroll();
+    let exit_line = output.lines().last().unwrap_or("done");
+    state.rest.status = format!("$ {cmd} — {exit_line}");
+    Ok(())
+}
+
 /// Handle `Action::Interrupt`: abort the in-flight stream, finalize the partial
 /// buffer with an "[interrupted]" marker, and reset the agentic-loop state.
 pub(super) fn handle_interrupt(state: &mut AppState) -> Result<()> {

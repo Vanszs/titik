@@ -153,6 +153,9 @@ mod roundtrip_tests {
             ClientRequest::SubmitInput {
                 text: "hello world".to_string(),
             },
+            ClientRequest::Shell {
+                cmd: "ls -la".to_string(),
+            },
             ClientRequest::SendKey(KeyWire {
                 code: KeyCodeWire::Char('x'),
                 mods: key_mods::CONTROL,
