@@ -747,7 +747,8 @@ fn build_session_hourly_heatmap(hourly: &[SpendBucket], palette: &Palette, max_w
             ((v / max_val) * bar_w as f64).round() as usize
         };
 
-        let hour = ((epoch % 86400) / 3600) as usize;
+        let tz = crate::model::usage::local_utc_offset_secs();
+        let hour = (((epoch + tz) % 86400) / 3600) as usize;
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 1);
 
         spans.push(Span::styled(
@@ -816,8 +817,10 @@ fn build_hourly_horizontal_chart(
     let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now = now_secs();
-    let today = now - now % 86400;
-    let current_hour = ((now % 86400) / 3600) as usize;
+    let tz = crate::model::usage::local_utc_offset_secs();
+    let local_now = now + tz;
+    let today = local_now - local_now % 86400 - tz; // UTC epoch of local midnight
+    let current_hour = ((local_now % 86400) / 3600) as usize;
     let epochs: Vec<i64> = (0..24).map(|i| today + i * 3600).collect();
 
     let values: Vec<f64> = epochs
@@ -844,7 +847,7 @@ fn build_hourly_horizontal_chart(
             ((v / max_val) * bar_w as f64).round() as usize
         };
 
-        let hour = ((h % 86400) / 3600) as usize;
+        let hour = (((h + tz) % 86400) / 3600) as usize;
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(bar_w + 2);
 
         // Hour label: current hour gets bold accent, others dim.

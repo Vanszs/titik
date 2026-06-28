@@ -29,6 +29,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+/// Returns the local timezone offset in seconds east of UTC (e.g. UTC+7 → 25200,
+/// UTC-5 → -18000). Uses POSIX `localtime_r` via libc. Falls back to 0 on error.
+#[allow(unsafe_code)]
+pub fn local_utc_offset_secs() -> i64 {
+    unsafe {
+        let ts = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&ts, &mut tm);
+        tm.tm_gmtoff
+    }
+}
+
 // ── Read-only query types ────────────────────────────────────────────────────
 
 /// Cost for one calendar day, returned by [`daily_costs`].

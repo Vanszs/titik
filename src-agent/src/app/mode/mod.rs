@@ -75,8 +75,12 @@ impl UsageRange {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         match self {
-            // Floor to midnight UTC so "today" always starts at 00:00:00.
-            Self::Today => now - now % 86400,
+            // Floor to local midnight so "today" starts at 00:00:00 local time.
+            Self::Today => {
+                let tz = crate::model::usage::local_utc_offset_secs();
+                let local_now = now + tz;
+                local_now - local_now % 86400 - tz
+            }
             Self::Week  => now - 7 * 86400,
             Self::Year  => now - 365 * 86400,
         }
