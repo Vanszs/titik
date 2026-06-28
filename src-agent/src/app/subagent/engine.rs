@@ -107,7 +107,8 @@ fn cap_report(text: String) -> String {
 
 /// Run the autonomous sub-agent loop to completion.
 ///
-/// Loops up to `max_steps` model calls. Each step:
+/// Loops until the model produces a final answer (no tool calls) or, when
+/// `max_steps` is `Some(n)`, until the step cap is reached. Each step:
 /// 1. emits [`AgentEvent::Step`], then streams one reply via
 ///    [`OpenRouterClient::stream_complete`] on the resolved route, draining the
 ///    per-step channel (accumulating assistant text as [`AgentEvent::Token`]s,
@@ -120,10 +121,11 @@ fn cap_report(text: String) -> String {
 ///    [`crate::tool::execute_tool`] — pushing every result back into `convo` so
 ///    the next step sees them.
 ///
-/// Exhausting the budget emits [`AgentEvent::Done`] with the last assistant text
-/// (or a "(stopped: step budget reached)" note). A fatal stream error emits
-/// [`AgentEvent::Error`] and returns. Never panics; a dropped receiver makes
-/// every emit a no-op.
+/// `max_steps = None` means unbounded (the natural termination above is the only
+/// exit). `max_steps = Some(n)` adds an explicit cap; exhausting it emits
+/// [`AgentEvent::Done`] with the last assistant text (or a "(stopped: step
+/// budget reached)" note). A fatal stream error emits [`AgentEvent::Error`] and
+/// returns. Never panics; a dropped receiver makes every emit a no-op.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop(
     client: Arc<OpenRouterClient>,
@@ -134,7 +136,7 @@ pub async fn run_agent_loop(
     ctx: ToolCtx,
     mut convo: Conversation,
     task_intent: String,
-    max_steps: usize,
+    max_steps: Option<usize>,
     tx: UnboundedSender<AgentEvent>,
 ) {
     // The most-recent assistant text, surfaced as the final answer if the loop
@@ -150,7 +152,8 @@ pub async fn run_agent_loop(
     let mut acc_tokens_out: u64 = 0;
     let mut acc_cost: f64 = 0.0;
 
-    for step in 0..max_steps {
+    let mut step: usize = 0;
+    loop {
         emit(&tx, AgentEvent::Step(step));
 
         // 1. Stream one model reply on a fresh per-step channel, then drain it.
@@ -279,24 +282,30 @@ pub async fn run_agent_loop(
         // Turn committed (assistant + every tool result): snapshot the history
         // so the UI sees this step's tool round.
         emit(&tx, AgentEvent::Snapshot(convo.messages().to_vec()));
+
+        // Advance counter; check explicit cap (None = unbounded).
+        step += 1;
+        if let Some(cap) = max_steps {
+            if step >= cap {
+                // Explicit cap exhausted without a no-tool finish.
+                let final_text = if last_text.trim().is_empty() {
+                    "(stopped: step budget reached)".to_string()
+                } else {
+                    last_text
+                };
+                // Surface accumulated spend before Done (budget-exhausted path).
+                emit(&tx, AgentEvent::UsageReport {
+                    model_id: resolved.model_id.clone(),
+                    tokens_in: acc_tokens_in,
+                    tokens_out: acc_tokens_out,
+                    cost: acc_cost,
+                });
+                emit(&tx, AgentEvent::Done(cap_report(final_text)));
+                return;
+            }
+        }
         // Loop: the next step re-streams with the tool results in `convo`.
     }
-
-    // Budget exhausted without a no-tool finish. Surface the last assistant text
-    // if we have one; otherwise a clear "stopped" note.
-    let final_text = if last_text.trim().is_empty() {
-        "(stopped: step budget reached)".to_string()
-    } else {
-        last_text
-    };
-    // Surface accumulated spend before Done (budget-exhausted path).
-    emit(&tx, AgentEvent::UsageReport {
-        model_id: resolved.model_id.clone(),
-        tokens_in: acc_tokens_in,
-        tokens_out: acc_tokens_out,
-        cost: acc_cost,
-    });
-    emit(&tx, AgentEvent::Done(cap_report(final_text)));
 }
 
 /// Stream a single model reply and drain its events into a [`StreamOutcome`].
