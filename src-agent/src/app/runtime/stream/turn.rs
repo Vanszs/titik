@@ -259,15 +259,16 @@ pub(crate) fn advance_turn(
     state.rest.sessions[sess_idx].agent_steps += 1;
 
     // 4b. Workspace check (WC): the deterministic harness gate. When the harness
-    //     is enabled and the session workdir is NOT an allowed folder (the launch
-    //     dir or an allow-list entry), refuse to run ANY tool this turn. Every
-    //     pending call is answered with a refusal (so the conversation stays
-    //     API-valid — no dangling tool_call ids) and the turn is stopped. When
-    //     the harness is disabled this is skipped entirely (zero behaviour
+    //     is enabled and the session cwd is NOT within an allowed folder (at or
+    //     under the launch dir or an allow-list root), refuse to run ANY tool this
+    //     turn. Every pending call is answered with a refusal (so the conversation
+    //     stays API-valid — no dangling tool_call ids) and the turn is stopped.
+    //     When the harness is disabled this is skipped entirely (zero behaviour
     //     change). The check runs once per round, before the plan gate / tools.
     // Check the session's EFFECTIVE cwd (the live `cd` override when set, else the
-    // configured workdir) — NOT the raw configured workdir — so that a `/cd` to a
-    // directory outside every allowed root makes this turn WC-denied (Phase 8).
+    // configured workdir) — NOT the raw configured workdir — so that a `/cd` into a
+    // SUBDIR of an allowed root stays allowed (containment, not equality), while a
+    // `/cd` outside every allowed root makes this turn WC-denied (Phase 8).
     let effective_cwd = state.rest.sessions[sess_idx].effective_cwd();
     let wc_blocked = state.rest.sessions[sess_idx]
         .session
