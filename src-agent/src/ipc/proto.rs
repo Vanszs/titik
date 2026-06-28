@@ -380,6 +380,12 @@ pub struct SessionSnapshot {
     /// this the client's reconstructed session has an empty queue and the panel
     /// never lists waiting delegations.
     pub pending_subagents: Vec<PendingSubagentSnapshot>,
+    /// The daemon-side resolved Main model id for this session, computed via
+    /// `resolve_role(config, settings, ModelRole::Main)` with fallback to
+    /// `settings.model`. Projected here so the thin client can display the exact
+    /// model name in the chat header without needing the full keyed config or
+    /// model catalogue (both of which are stripped from the client's shadow).
+    pub resolved_model_id: String,
 }
 
 /// A plain-data projection of one [`crate::app::subagent::SubAgent`] — NOT the

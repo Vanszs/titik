@@ -30,9 +30,10 @@ use crate::app::mode::{
     PickerState, RewindState, SessionHub, SettingsState, UsageMetric, UsageNavState, UsageView,
     WarmStatus,
 };
+use crate::app::resolve::resolve_role;
 use crate::app::state::AppState;
 use crate::app::subagent::SubAgentStatus;
-use crate::model::app_config::{ApiType, ModelRole, ThemeMode};
+use crate::model::app_config::{ApiType, AppConfig, ModelRole, ThemeMode};
 use crate::model::store::SessionMeta;
 
 use super::proto::{
@@ -52,11 +53,12 @@ use super::proto::{
 /// it, holds no channel, and resolves every session by its stable UUID). Sent on
 /// attach and whenever [`diff`] reports a structural change.
 pub fn build_snapshot(state: &AppState) -> StateSnapshot {
+    let config = &state.rest.config;
     let sessions: Vec<SessionSnapshot> = state
         .rest
         .sessions
         .iter()
-        .map(session_snapshot)
+        .map(|rt| session_snapshot(rt, config))
         .collect();
 
     // Foreground id by stable UUID (never the index — see proto critique #2). The
@@ -76,7 +78,11 @@ pub fn build_snapshot(state: &AppState) -> StateSnapshot {
 }
 
 /// Project ONE live [`crate::app::state::SessionRuntime`] into a [`SessionSnapshot`].
-fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
+///
+/// `config` is the daemon's live [`AppConfig`] — needed to resolve the Main model id
+/// (session-override catalogue + global catalogue + legacy settings.model fallback)
+/// the same way `view::mod` does, so the projected id is always accurate.
+fn session_snapshot(rt: &crate::app::state::SessionRuntime, config: &AppConfig) -> SessionSnapshot {
     // Committed conversation messages for render. Carry the FULL slice (including
     // System) — it is the source of truth; the client applies the same display
     // filter the local view does (`role != System`). Empty when no session is open.
@@ -101,6 +107,19 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
         .session
         .as_ref()
         .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    // Resolve the Main model id the same way view::mod does (session overrides
+    // win over the global catalogue, then fall back to settings.model). This is
+    // what the chat header should display; without projecting it the client's
+    // shadow config is keyless + catalogue-cleared, so resolve_role returns empty
+    // and the header shows nothing useful.
+    let resolved_model_id = rt
+        .session
+        .as_ref()
+        .and_then(|s| resolve_role(config, &s.settings, ModelRole::Main))
+        .map(|r| r.model_id)
+        .or_else(|| rt.session.as_ref().map(|s| s.settings.model.clone()))
         .unwrap_or_default();
 
     SessionSnapshot {
@@ -143,6 +162,7 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
             .iter()
             .map(pending_subagent_snapshot)
             .collect(),
+        resolved_model_id,
     }
 }
 
@@ -908,7 +928,10 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
             // change forces a full resync — the client rebuilds with the new cwd.
             || p.cwd != n.cwd
             || p.subagents != n.subagents
-            || p.pending_subagents != n.pending_subagents;
+            || p.pending_subagents != n.pending_subagents
+            // A model change (settings override or global catalogue edit) has no
+            // incremental delta; resync so the header updates immediately.
+            || p.resolved_model_id != n.resolved_model_id;
         if structural {
             return DiffResult::full();
         }

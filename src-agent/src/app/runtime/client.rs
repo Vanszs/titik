@@ -964,13 +964,13 @@ fn shadow_subagent_status(status: &str) -> SubAgentStatus {
 /// path / pwd_hash / api_key are render-irrelevant on the client and left empty —
 /// the client never saves, sends, or locks anything.
 fn shadow_session(s: &SessionSnapshot) -> Session {
-    // The model row falls back to `settings.model` when the resolved model is empty;
-    // the snapshot doesn't carry the resolved model separately, so seed a blank model
-    // and let the header's own fallback render. (Model projection can be added to the
-    // snapshot later if the client should show the exact resolved id.)
+    // Seed `settings.model` with the daemon-side resolved model id projected in the
+    // snapshot. The client's shadow config is keyless + catalogue-cleared, so
+    // resolve_role on the client would return empty; using the projected id means
+    // the chat header always shows the same model name the daemon resolved.
     let settings = Settings {
         name: s.name.clone(),
-        model: String::new(),
+        model: s.resolved_model_id.clone(),
         ..Default::default()
     };
 
