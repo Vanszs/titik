@@ -115,6 +115,15 @@ pub(in crate::app::runtime) fn apply_action(
             session::handle_picker_select(state, client, handle)?;
         }
 
+        Action::PickerNewSession => {
+            super::commands::apply_slash(
+                crate::controller::command::Command::New,
+                state,
+                client,
+                handle,
+            )?;
+        }
+
         Action::LiveSwitch(idx) => {
             session::handle_live_switch(idx, state, client)?;
         }

@@ -77,14 +77,17 @@ pub enum Action {
     /// Esc from a KeyInput that was opened from the --resume picker: go back to
     /// the picker rather than pinning a no-client Chat.
     CancelKeyInputToPicker,
+    // --- Picker actions ---
     /// Esc/Ctrl+C in the session picker opened via /resume (an active session
     /// exists) — discard the picker and return to the unchanged Chat. The
     /// --resume startup picker has no session, so it Quits instead.
     CancelPickerToChat,
-    // --- Picker actions ---
     /// Enter on the `--resume` startup session picker — open the highlighted
     /// session (non-destructive: append-or-swap).
     PickerSelect,
+    /// `/new` typed in the `--resume` session picker — spawn a fresh session
+    /// and jump straight into Chat.
+    PickerNewSession,
     // --- Session hub (`/resume`) actions ---
     /// Enter on the hub's COOKING pane: switch the foreground to the live session
     /// at the carried Vec index (`state.rest.sessions[idx]`). The runtime sets

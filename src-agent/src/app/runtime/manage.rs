@@ -125,17 +125,10 @@ pub fn daemon_alive() -> bool {
 
 /// Spawn a DETACHED `koma --daemon` child and return its PID.
 ///
-/// The child is fully detached so it survives this short-lived CLI process:
-/// - `pre_exec(setsid)` puts it in its own session (no controlling terminal), so a
-///   closed terminal can't SIGHUP it and it is not in our process group.
-/// - stdio is redirected to `/dev/null` (the daemon is headless; it must not write to
-///   our terminal or hold our fds open).
-///
-/// We do NOT `wait()` on the child: this CLI exits almost immediately, at which point
-/// the now-orphaned daemon is reparented to and reaped by init — so it never lingers
-/// as a zombie. The returned PID is advisory (for messaging); liveness is still the
-/// socket, via [`daemon_alive`] / the poll-connect in [`ensure_daemon_and_connect`].
-fn spawn_daemon() -> Result<u32> {
+/// When `resume` is `true`, the `--resume` flag is forwarded to the spawned
+/// daemon so `build_startup()` opens the session picker instead of eagerly
+/// creating an empty session.
+fn spawn_daemon(resume: bool) -> Result<u32> {
     // Re-launch THIS binary with `--daemon`. `current_exe` is the running koma binary,
     // so a renamed/installed binary still respawns itself correctly.
     let exe = std::env::current_exe().context("cannot resolve current executable path")?;
@@ -145,6 +138,9 @@ fn spawn_daemon() -> Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if resume {
+        cmd.arg("--resume");
+    }
 
     // SAFETY: `setsid()` is async-signal-safe and the canonical way to detach a child
     // into its own session; it touches no Rust state and only runs in the forked child
@@ -207,12 +203,23 @@ fn probe_or_clear(path: &Path) -> Result<bool> {
 /// Bounded by the spawn timeout, so it can never hang forever waiting on a daemon that
 /// fails to come up.
 pub fn ensure_daemon_running() -> Result<()> {
+    ensure_daemon_running_inner(false)
+}
+
+/// Like [`ensure_daemon_running`], but when `resume` is `true` the spawned
+/// daemon receives `--resume` so it opens the session picker instead of
+/// eagerly creating a session.
+pub fn ensure_daemon_running_with_resume(resume: bool) -> Result<()> {
+    ensure_daemon_running_inner(resume)
+}
+
+fn ensure_daemon_running_inner(resume: bool) -> Result<()> {
     let path = store::daemon_sock_path()?;
     if probe_or_clear(&path)? {
         return Ok(()); // already live — attach to it
     }
     // Nothing live → spawn a detached daemon and wait until it accepts.
-    spawn_and_wait_until_alive(&path)
+    spawn_and_wait_until_alive(&path, resume)
 }
 
 /// Spawn-or-attach: return a connected blocking [`UnixStream`] to a LIVE daemon,
@@ -242,7 +249,7 @@ pub fn ensure_daemon_and_connect() -> Result<UnixStream> {
     }
 
     // Nothing live → spawn + wait until it accepts, then connect for the caller.
-    spawn_and_wait_until_alive(&path)?;
+    spawn_and_wait_until_alive(&path, false)?;
     UnixStream::connect(&path)
         .with_context(|| format!("connect to spawned daemon socket {}", path.display()))
 }
@@ -255,8 +262,8 @@ pub fn ensure_daemon_and_connect() -> Result<UnixStream> {
 /// [`ensure_daemon_and_connect`] (restart): both need "spawn, then wait until alive";
 /// only the latter additionally returns a connected stream. The wait is the SAME
 /// connect-probe as [`daemon_alive`], so "alive" means exactly "the socket accepts".
-fn spawn_and_wait_until_alive(path: &Path) -> Result<()> {
-    let pid = spawn_daemon()?;
+fn spawn_and_wait_until_alive(path: &Path, resume: bool) -> Result<()> {
+    let pid = spawn_daemon(resume)?;
     let deadline = Instant::now() + SPAWN_CONNECT_TIMEOUT;
     loop {
         match UnixStream::connect(path) {
