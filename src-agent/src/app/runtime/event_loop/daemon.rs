@@ -218,6 +218,35 @@ impl DaemonHub {
         }
     }
 
+    /// Send one event to the CONTROLLER client (the single writer) as a fresh seq-
+    /// tagged frame; a no-op if no controller is enrolled. Used for one-shot
+    /// daemon -> controller signals that target whoever owns the controlling TTY — e.g.
+    /// [`DaemonEvent::EnterSelect`], whose `/select` transcript dump must run on the
+    /// controller's terminal (the headless daemon owns none). Reuses [`send_to`], so it
+    /// advances only the controller's own per-connection seq (blocker #1) and a dead
+    /// socket is ignored (the client is reaped on the next sweep).
+    fn send_to_controller(&mut self, event: DaemonEvent) {
+        if let Some(idx) = self.clients.iter().position(|c| c.is_controller) {
+            self.send_to(idx, event);
+        }
+    }
+
+    /// Drain a pending `/select` request by signalling the CONTROLLER client to run
+    /// the transcript dump on its OWN terminal (the headless daemon owns no TTY, so it
+    /// cannot run `enter_select`). The daemon's `/select` slash-command set
+    /// `state.rest.select_pending`; this consumes that flag and emits exactly one
+    /// [`DaemonEvent::EnterSelect`] to the controller (payload-free — the client renders
+    /// the dump from its shadow conversation). Mirrors the standalone loop's
+    /// `select_pending` check, minus the terminal work (which now lives client-side). If
+    /// no controller is enrolled the flag is still cleared (the request is dropped — there
+    /// is nowhere to dump to), so it can't re-fire spuriously on the next attach.
+    fn drain_select_pending(&mut self, state: &mut AppState) {
+        if state.rest.select_pending {
+            state.rest.select_pending = false;
+            self.send_to_controller(DaemonEvent::EnterSelect);
+        }
+    }
+
     /// Deregister the client at `idx` and pass the controller seat if it held it.
     ///
     /// Shared by `Detach` (polite leave) and `Disconnect` (socket EOF). Single-
@@ -840,6 +869,16 @@ pub(in crate::app::runtime) fn daemon_loop(
         //    `QuitSession`, which tombstones one session). Stream AFTER the kill-all
         //    handling below so a closed-state snapshot reflects the tombstones.
         hub.drain_inbound(state, client, handle);
+
+        // 3a-pre. `/select` hand-off: a just-drained `/select` slash-command (forwarded
+        //     by the controller) set `state.rest.select_pending`. The standalone loop
+        //     acts on this every tick by dumping the transcript to its OWN terminal; the
+        //     daemon owns no TTY, so instead it signals the CONTROLLER client to run the
+        //     dump on its terminal via a one-shot `DaemonEvent::EnterSelect`. Consume the
+        //     flag here (right after `drain_inbound`, so it observes a same-tick
+        //     `/select`) BEFORE `stream_deltas` — the EnterSelect is a control frame, not
+        //     a render delta, and its seq is independent of the snapshot stream.
+        hub.drain_select_pending(state);
 
         // 3a. Kill-all (item 4): a forwarded QuitConfirm `[k]` set `should_quit` via
         //     `handle_quit_kill_all`. In the DAEMON that means "close every session"

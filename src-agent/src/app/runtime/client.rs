@@ -93,14 +93,17 @@
 //! [`ClientRequest::Detach`] and exits the client, leaving the daemon (and every
 //! session) running.
 
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
 };
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::app::mode::agents::{
@@ -118,6 +121,7 @@ use crate::app::mode::{
 };
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
 use crate::app::subagent::{PendingSubagent, SubAgent, SubAgentStatus};
+use crate::dto::chat::Role;
 use crate::dto::openrouter::{ModelEndpoint, ModelPricing};
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
@@ -298,6 +302,11 @@ fn render_loop(
         // Pace to ~60fps: stamp the frame start, do the work, sleep the remainder.
         let frame_start = Instant::now();
 
+        // Latched by `apply_frame` when a `DaemonEvent::EnterSelect` arrives this drain
+        // pass: the daemon asked THIS (controller) client to run the `/select` transcript
+        // dump on its own terminal. Acted on AFTER the drain (we own `terminal` here).
+        let mut select_requested = false;
+
         // --- (a) drain every queued incoming frame (NON-BLOCKING) ---
         // try_recv never blocks, so a quiet daemon can't stall the paint below. The
         // per-frame `dirty` bookkeeping is gone: we repaint unconditionally, so the
@@ -311,6 +320,7 @@ fn render_loop(
                         &mut expected,
                         &mut seeded,
                         &mut awaiting_resync,
+                        &mut select_requested,
                         req_tx,
                     );
                 }
@@ -319,6 +329,17 @@ fn render_loop(
                 // Nothing more will ever arrive — leave the client.
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
+        }
+
+        // --- (a-bis) `/select` transcript dump (controller-side) ---
+        // If the daemon signalled EnterSelect this pass, run the dump NOW — we hold the
+        // `terminal`, so we can leave the alt-screen, print the shadow conversation,
+        // block for a keypress, and re-enter. This is a synchronous, blocking detour
+        // (exactly like the standalone loop's `/select`); the socket keeps buffering
+        // frames meanwhile and the next pass drains them. A no-op if there is no shadow
+        // session/conversation (the dump leaves the terminal exactly as it found it).
+        if select_requested {
+            client_select_dump(terminal, &shadow)?;
         }
 
         // --- (b) advance LOCAL animations from the monotonic clock ---
@@ -420,6 +441,72 @@ fn render_loop(
     }
 }
 
+/// Run the `/select` transcript dump on the CLIENT's terminal (the controller-side
+/// half of the `/select` hand-off — see [`crate::ipc::proto::DaemonEvent::EnterSelect`]).
+///
+/// The daemon owns no TTY, so when a forwarded `/select` set its `select_pending` flag
+/// it signalled THIS client to perform the dump. This mirrors the standalone loop's
+/// [`super::super::event_loop::drains`] `enter_select`/`exit_select`, but sourced from
+/// the SHADOW conversation and self-contained (it blocks for the return keypress here
+/// rather than threading a `select_active` state through the render loop):
+///   1. leave the alt-screen + disable mouse capture,
+///   2. print the foreground shadow session's conversation as plain text (so the user
+///      can select/copy with the terminal's native selection) — raw mode stays on, so
+///      lines are terminated with `\r\n`,
+///   3. block until the user presses any key,
+///   4. re-enter the alt-screen + mouse capture and force a full repaint
+///      (`terminal.clear()`), so the next loop pass redraws the live shadow cleanly.
+///
+/// Robustness: if the shadow has no foreground session/conversation there is nothing to
+/// dump, so it returns immediately WITHOUT touching the terminal — the alt-screen is
+/// never left, so the terminal can't be stranded in a half-restored state.
+fn client_select_dump(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    shadow: &AppState,
+) -> Result<()> {
+    // No shadow session → nothing to dump. Return before any terminal mutation so we
+    // never leave the alt-screen with nothing to show (clean no-op).
+    if shadow.rest.fg().session.is_none() {
+        return Ok(());
+    }
+
+    // (1) Drop to the normal screen so the printed transcript uses the scrollback the
+    // user can select from.
+    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    // (2) Print the conversation as plain text (raw mode is on → `\r\n`). Mirrors
+    // `drains::enter_select`'s formatting exactly: skip System/Tool, label you/ai.
+    let mut out = stdout();
+    if let Some(sess) = shadow.rest.fg().session.as_ref() {
+        for m in sess.conversation.messages() {
+            let label = match m.role {
+                Role::System | Role::Tool => continue,
+                Role::User => "you",
+                Role::Assistant => "ai",
+            };
+            write!(out, "\r\n{label}:\r\n")?;
+            for line in m.content.split('\n') {
+                write!(out, "{line}\r\n")?;
+            }
+        }
+    }
+    write!(out, "\r\n-- copy with your mouse, then press any key to return --\r\n")?;
+    out.flush()?;
+
+    // (3) Block until a key is pressed. Read events (blocking) and ignore non-key ones
+    // (a stray resize/mouse must NOT count as the "any key" return).
+    loop {
+        if let Event::Key(_) = event::read()? {
+            break;
+        }
+    }
+
+    // (4) Restore the alt-screen + mouse and force a full repaint next draw.
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+    Ok(())
+}
+
 /// Advance the LOCAL-clock animations on the shadow once per frame.
 ///
 /// The client owns NO daemon ticks, so animations that the local TUI advances from
@@ -518,6 +605,7 @@ fn apply_frame(
     expected: &mut u64,
     seeded: &mut bool,
     awaiting_resync: &mut bool,
+    select_requested: &mut bool,
     req_tx: &Sender<ClientRequest>,
 ) -> bool {
     // --- seq-gap detection (critique #1) ---
@@ -562,6 +650,15 @@ fn apply_frame(
                 return false;
             }
             apply_delta(shadow, delta)
+        }
+        // The controller's `/select` hand-off: the daemon (which owns no TTY) asks
+        // THIS client to run the transcript dump on its own terminal. The dump leaves
+        // the alt-screen + blocks on a keypress, which can't happen here (no `terminal`
+        // handle, mid-frame-drain); just latch the request so the render loop performs
+        // it after this drain pass completes. Non-visual to the shadow itself.
+        DaemonEvent::EnterSelect => {
+            *select_requested = true;
+            false
         }
         // Non-visual control replies. (A future refinement could toast an Error.)
         DaemonEvent::Ack | DaemonEvent::Error(_) => false,

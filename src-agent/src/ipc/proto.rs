@@ -280,6 +280,13 @@ pub enum DaemonEvent {
     Ack,
     /// A request failed; the `String` is a human-readable reason.
     Error(String),
+    /// One-shot: the CONTROLLER asked for the `/select` transcript dump (the daemon's
+    /// `/select` set `select_pending`). The dump MUST run on the CLIENT — it leaves the
+    /// alt-screen and writes to the controlling TTY, which the headless daemon does NOT
+    /// own. Payload-free: the client already holds the full conversation in its shadow
+    /// state, so it renders the dump from `rest.fg().session` without any data riding the
+    /// wire. Sent ONLY to the controller (the controlling client).
+    EnterSelect,
 }
 
 // ─── full-state snapshot (pure data) ─────────────────────────────────────────
