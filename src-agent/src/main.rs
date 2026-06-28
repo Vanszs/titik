@@ -1,17 +1,25 @@
 //! Binary entry point for the simple-coders-agent TUI.
 //!
 //! Parses CLI arguments via [`cli::parse`], handles any short-circuit modes
-//! (provisioner flags), then hands control to [`app::run`] which initialises
-//! the terminal, enters the event loop, and returns when the user quits.
+//! (provisioner flags), then routes into one of the launch paths below.
 //!
-//! # Short-circuit modes (exit before TUI)
+//! # Launch routing (Stage 7: daemon-by-default)
+//!
+//! | Invocation | Action |
+//! |---|---|
+//! | `koma` (no flags) | **default** — ensure a daemon is running (spawn a detached `koma --daemon` if none is up), then attach as a thin client. NO fallback to local. |
+//! | `koma --local` | force the OLD standalone local TUI ([`app::run`]); REFUSES if a daemon is already alive. The escape hatch. |
+//! | `koma --daemon` | run the headless koma-daemon event loop (no TUI). |
+//! | `koma --attach` | attach to an ALREADY-running daemon as a thin client (does not spawn one). |
+//!
+//! # Short-circuit modes (exit before any launch path)
 //!
 //! | Flag | Action |
 //! |---|---|
 //! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
 //! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
 //! | `--ipc-selftest`                        | round-trip the daemon IPC transport then exit |
-//! | `--daemon`                              | run the headless koma-daemon event loop (no TUI) |
+//! | `daemon <status\|kill\|restart\|clean>` | daemon management CLI then exit |
 //!
 //! Data flow overview:
 //! ```text
@@ -110,14 +118,54 @@ fn main() -> anyhow::Result<()> {
         return app::run_daemon(opts);
     }
 
-    // --- thin-client path: attach to a running daemon and render its state ---
+    // --- explicit thin-client path: attach to an ALREADY-running daemon ---
     // Connects to ~/.koma/daemon.sock, renders the daemon's foreground session from
     // streamed snapshots/deltas, and forwards input. Detaching (Ctrl-C) leaves the
-    // daemon running. The daemon path is opt-in; normal `koma` is unaffected.
+    // daemon running. Unlike the default path below, `--attach` does NOT spawn a daemon:
+    // it surfaces "no daemon up" as an error (the operator asked to attach to one that
+    // should already exist).
     if opts.attach {
         return app::client_run(opts);
     }
 
-    // --- normal path: launch the LOCAL TUI (fully functional standalone) ---
-    app::run(opts)
+    // --- escape hatch: force the OLD standalone local TUI (`--local`) ---
+    // The fully-standalone single-process TUI that owns its own session runtime — the
+    // way `koma` launched before the daemon-by-default flip (Stage 7). GUARDED: if a
+    // daemon is ALREADY alive (bind-as-oracle probe), refuse, because a local TUI is a
+    // SECOND writer against the same on-disk sessions/locks and dual-PID ownership
+    // corrupts the locks. Direct the user to attach (plain `koma`) or kill the daemon
+    // first, and exit non-zero. With no daemon up, run the standalone TUI normally.
+    if opts.local {
+        if app::daemon_alive() {
+            eprintln!(
+                "error: a koma daemon is running; use `koma` to attach to it, \
+                 or `koma daemon kill` first (refusing to run a standalone local TUI \
+                 against a live daemon — it would corrupt the session locks)"
+            );
+            std::process::exit(1);
+        }
+        return app::run(opts);
+    }
+
+    // --- DEFAULT: ensure a daemon is running, then attach as a thin client ---
+    // This is THE daemon-by-default launch: `koma` with no flags first guarantees a
+    // daemon is accepting (connect if one is up, else spawn a DETACHED `koma --daemon`
+    // and poll-connect until it accepts — the Stage-13 spawn-or-attach machinery), then
+    // hands off to the SAME thin client `--attach` uses (`client_run` opens its own
+    // connection to the now-live daemon and renders its foreground session).
+    //
+    // NO AUTO-FALLBACK TO LOCAL: if the daemon can't be spawned/connected, surface a
+    // CLEAR error and exit — never silently drop into a standalone local TUI. A local
+    // TUI here would be a second writer against the daemon's sessions (the dual-writer
+    // corruption trap); `--local` is the explicit, guarded opt-in for standalone mode.
+    //
+    // Creds note: a freshly-spawned daemon whose session has no api_key sits in KeyInput
+    // mode, which the client now renders (#122) — the user enters creds via the client,
+    // forwarded to the daemon. So a first-ever `koma` (no prior creds) reaches a usable
+    // KeyInput screen through the client, not a crash.
+    if let Err(e) = app::ensure_daemon_running() {
+        eprintln!("error: could not start the koma daemon: {e:#} — try `koma --local`");
+        std::process::exit(1);
+    }
+    app::client_run(opts)
 }

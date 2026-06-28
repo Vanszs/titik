@@ -146,11 +146,66 @@ fn spawn_daemon() -> Result<u32> {
     Ok(child.id())
 }
 
+/// Probe the daemon socket and, if nothing is accepting, clear any stale socket file
+/// so a fresh `bind` won't trip over `AddrInUse`.
+///
+/// Returns `Ok(true)` when a daemon is ALREADY live (the caller should NOT spawn),
+/// `Ok(false)` when nothing is accepting and the path is now clear to spawn into, and
+/// `Err` on an unexpected probe failure (permissions, etc.) — in which case the caller
+/// must NOT blindly spawn a second daemon on top of an unknown condition. Logic:
+/// - connect succeeds → a daemon is live (`Ok(true)`).
+/// - `ECONNREFUSED` with a socket file still present → a CRASHED daemon left a stale
+///   socket; unlink it (best-effort) and report not-live (`Ok(false)`).
+/// - `ENOENT` (no socket) → nothing running (`Ok(false)`).
+fn probe_or_clear(path: &Path) -> Result<bool> {
+    match UnixStream::connect(path) {
+        Ok(_stream) => Ok(true), // a daemon is already live (probe stream dropped)
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => {
+                // Stale socket from a crashed daemon: remove it so the spawn's bind
+                // doesn't trip over `AddrInUse`. Best-effort (it may have just gone).
+                let _ = std::fs::remove_file(path);
+                Ok(false)
+            }
+            // No socket at all — nothing running. Clear to spawn.
+            std::io::ErrorKind::NotFound => Ok(false),
+            // Any other error (permissions, etc.): surface it rather than blindly
+            // spawning a second daemon on top of an unknown condition.
+            _ => Err(anyhow!("cannot probe daemon socket {}: {e}", path.display())),
+        },
+    }
+}
+
+/// Ensure a koma daemon is RUNNING and accepting on the socket, spawning a detached
+/// one if none is up. Returns once a daemon is confirmed accepting; does NOT return a
+/// stream (the caller connects itself — e.g. the thin client opens its own async
+/// connection right after).
+///
+/// This is the default-launch primitive (`koma` with no flags = ensure-then-attach):
+/// 1. Probe the socket. Live already → return `Ok(())` (attach to the existing one).
+/// 2. Not live → (stale socket cleared by [`probe_or_clear`]) spawn a detached
+///    `koma --daemon`, then POLL the bind-as-oracle liveness up to
+///    [`SPAWN_CONNECT_TIMEOUT`] until it accepts — or return a clear error if it never
+///    came up (the default path turns that into "could not start the koma daemon …
+///    try `koma --local`", NEVER a silent fallback to a local TUI).
+///
+/// Bounded by the spawn timeout, so it can never hang forever waiting on a daemon that
+/// fails to come up.
+pub fn ensure_daemon_running() -> Result<()> {
+    let path = store::daemon_sock_path()?;
+    if probe_or_clear(&path)? {
+        return Ok(()); // already live — attach to it
+    }
+    // Nothing live → spawn a detached daemon and wait until it accepts.
+    spawn_and_wait_until_alive(&path)
+}
+
 /// Spawn-or-attach: return a connected blocking [`UnixStream`] to a LIVE daemon,
 /// spawning one first if none is up.
 ///
-/// This is the reusable mechanism the default-launch flip will sit on (it is NOT
-/// wired into the default launch now). Logic:
+/// The blocking-stream variant of [`ensure_daemon_running`], used by `koma daemon
+/// restart` to CONFIRM the freshly-spawned daemon is accepting (it drops the stream
+/// immediately). Logic:
 /// 1. Try to connect. Success → a daemon is live; return the stream.
 /// 2. `ECONNREFUSED` with a socket file still present → a CRASHED daemon left a stale
 ///    socket (bind would fail with `AddrInUse` until it's gone). Unlink it, then spawn.
@@ -162,33 +217,35 @@ fn spawn_daemon() -> Result<u32> {
 /// Note: the daemon's own `server::bind` ALSO unlinks a stale socket before binding,
 /// so step 2's unlink is belt-and-suspenders; doing it here too keeps the contract
 /// explicit and avoids racing a bind that hasn't happened yet.
-#[allow(dead_code)] // wired into the default-launch flip in a later stage
 pub fn ensure_daemon_and_connect() -> Result<UnixStream> {
     let path = store::daemon_sock_path()?;
 
-    match UnixStream::connect(&path) {
-        Ok(stream) => return Ok(stream), // a daemon is already live
-        Err(e) => match e.kind() {
-            std::io::ErrorKind::ConnectionRefused => {
-                // Stale socket from a crashed daemon: remove it so the spawn's bind
-                // doesn't trip over `AddrInUse`. Best-effort (it may have just gone).
-                let _ = std::fs::remove_file(&path);
-            }
-            std::io::ErrorKind::NotFound => {
-                // No socket at all — nothing running. Fall through to spawn.
-            }
-            // Any other error (permissions, etc.): surface it rather than blindly
-            // spawning a second daemon on top of an unknown condition.
-            _ => return Err(anyhow!("cannot probe daemon socket {}: {e}", path.display())),
-        },
+    if probe_or_clear(&path)? {
+        // Already live — reconnect for the caller (the probe stream was dropped).
+        return UnixStream::connect(&path)
+            .with_context(|| format!("connect to live daemon socket {}", path.display()));
     }
 
-    // Nothing live → spawn a detached daemon, then poll-connect until it accepts.
+    // Nothing live → spawn + wait until it accepts, then connect for the caller.
+    spawn_and_wait_until_alive(&path)?;
+    UnixStream::connect(&path)
+        .with_context(|| format!("connect to spawned daemon socket {}", path.display()))
+}
+
+/// Spawn a detached `koma --daemon` and POLL the bind-as-oracle liveness until it
+/// accepts, up to [`SPAWN_CONNECT_TIMEOUT`]. Returns `Ok(())` once the socket accepts,
+/// or a clear `Err` (naming the advisory PID + the timeout) if it never came up.
+///
+/// Shared by [`ensure_daemon_running`] (default launch) and
+/// [`ensure_daemon_and_connect`] (restart): both need "spawn, then wait until alive";
+/// only the latter additionally returns a connected stream. The wait is the SAME
+/// connect-probe as [`daemon_alive`], so "alive" means exactly "the socket accepts".
+fn spawn_and_wait_until_alive(path: &Path) -> Result<()> {
     let pid = spawn_daemon()?;
     let deadline = Instant::now() + SPAWN_CONNECT_TIMEOUT;
     loop {
-        match UnixStream::connect(&path) {
-            Ok(stream) => return Ok(stream),
+        match UnixStream::connect(path) {
+            Ok(_stream) => return Ok(()), // accepting — probe stream dropped
             Err(_) if Instant::now() < deadline => std::thread::sleep(SPAWN_POLL_INTERVAL),
             Err(e) => {
                 return Err(anyhow!(

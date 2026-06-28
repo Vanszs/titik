@@ -10,6 +10,9 @@
 //! - `--daemon-selftest`           — drive the full daemon stack (bind/accept/per-client/loop) end-to-end, then exit.
 //! - `--daemon`                    — run the headless koma-daemon event loop (no terminal).
 //! - `--attach`                    — run as a thin client that attaches to a running daemon.
+//! - `--local`                     — force the OLD standalone local TUI (the escape hatch from the
+//!   daemon-by-default launch). Refuses to run if a daemon is already alive (it would corrupt the
+//!   daemon's session locks); use plain `koma` to attach, or `koma daemon kill` first.
 //!
 //! Subcommands (positional, distinct from the `--flags`):
 //! - `daemon <status|kill|restart|clean>` — the daemon management CLI (#118). Parsed
@@ -88,6 +91,11 @@ pub struct Opts {
     /// (`--attach` flag): connect to `~/.koma/daemon.sock`, render the daemon's
     /// foreground session from streamed snapshots/deltas, and forward input.
     pub attach: bool,
+    /// When `true`, force the OLD standalone local TUI (`--local` flag) — the escape
+    /// hatch from the daemon-by-default launch. `main` refuses this if a daemon is
+    /// already alive (running a second writer against the daemon's sessions would
+    /// corrupt the session locks); with no daemon up it runs the fully-standalone TUI.
+    pub local: bool,
     /// A `koma daemon …` management invocation, if one was given (#118).
     /// `Some(Run(sub))` short-circuits `main` into that management action; `Some(Usage)`
     /// short-circuits into a usage print + non-zero exit (bare/unknown verb); `None`
@@ -125,6 +133,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Opts {
             "--daemon-selftest"              => opts.daemon_selftest = true,
             "--daemon"                       => opts.daemon = true,
             "--attach"                       => opts.attach = true,
+            "--local"                        => opts.local = true,
             _                                => {}
         }
     }

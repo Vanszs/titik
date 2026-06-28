@@ -56,9 +56,13 @@ pub use client::client_run;
 
 // Re-export the daemon management CLI entry + usage helper so `main` can short-circuit
 // `koma daemon <verb>` before the TUI (defined in the `manage` submodule, #118).
-// `ensure_daemon_and_connect` / `daemon_alive` stay crate-internal for now — they are
-// the spawn-or-attach mechanism the later default-launch flip will consume.
-pub use manage::{print_daemon_usage, run_daemon_subcommand};
+//
+// `daemon_alive` + `ensure_daemon_running` are the spawn-or-attach mechanism the
+// default-launch flip (Stage 7) consumes: `daemon_alive` is the bind-as-oracle probe
+// the `--local` guard uses to REFUSE running a second writer against a live daemon;
+// `ensure_daemon_running` is the default path's "connect if up, else spawn a detached
+// daemon and wait until it accepts" primitive (the thin client then attaches itself).
+pub use manage::{daemon_alive, ensure_daemon_running, print_daemon_usage, run_daemon_subcommand};
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
