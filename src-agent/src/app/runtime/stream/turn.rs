@@ -265,6 +265,10 @@ pub(crate) fn advance_turn(
     //     API-valid — no dangling tool_call ids) and the turn is stopped. When
     //     the harness is disabled this is skipped entirely (zero behaviour
     //     change). The check runs once per round, before the plan gate / tools.
+    // Check the session's EFFECTIVE cwd (the live `cd` override when set, else the
+    // configured workdir) — NOT the raw configured workdir — so that a `/cd` to a
+    // directory outside every allowed root makes this turn WC-denied (Phase 8).
+    let effective_cwd = state.rest.sessions[sess_idx].effective_cwd();
     let wc_blocked = state.rest.sessions[sess_idx]
         .session
         .as_ref()
@@ -272,7 +276,7 @@ pub(crate) fn advance_turn(
             sess.settings.classifier_enabled
                 && !crate::app::harness::workspace_allowed(
                     &sess.settings,
-                    &sess.workdir(),
+                    &effective_cwd,
                     &state.rest.launch_dir,
                 )
         });

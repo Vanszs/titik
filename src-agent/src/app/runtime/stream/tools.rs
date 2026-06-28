@@ -155,6 +155,31 @@ pub(crate) fn process_tools(
             state.rest.sessions[sess_idx].tool_idx += 1;
             continue;
         }
+        // Intercept the model-callable `cd` tool BEFORE the generic dispatch path.
+        // `cd` must MUTATE session state (the live cwd + dir cache + awareness),
+        // which a read-only `ToolCtx` can't do — so the tool's `run` only RESOLVES
+        // + validates the target (allow-list-checked) and returns it tagged with
+        // `CWD_CHANGE_PREFIX` on success; here we apply the repoint via the shared
+        // `apply_workspace_change` primitive and answer the call with a
+        // human-readable confirmation. A resolution/validation failure returns a
+        // plain `error:`/refusal string, which is surfaced to the model verbatim
+        // (the cwd is left unchanged). The path resolution is INSTANT (canonicalize
+        // + stat), so running it inline here — not via the deferred lane — is fine.
+        // `tool_idx` advances either way so the rest of the round still processes.
+        if call.function.name == "cd" {
+            let result = run_tool(state, sess_idx, &call);
+            let final_result = if let Some(target) = result.strip_prefix(crate::tool::cd::CWD_CHANGE_PREFIX) {
+                let new_cwd = std::path::PathBuf::from(target);
+                super::spawn::apply_workspace_change(state, sess_idx, new_cwd, client, handle);
+                format!("changed working directory to {target}")
+            } else {
+                // Already an `error:`/refusal line — pass it through unchanged.
+                result
+            };
+            state.rest.sessions[sess_idx].tool_results.push((call.id.clone(), final_result));
+            state.rest.sessions[sess_idx].tool_idx += 1;
+            continue;
+        }
         if tool_is_risky(&call.function.name) {
             match tac_inputs(state, sess_idx, client) {
                 // Classifier enabled → run TAC in both modes and act on its verdict.

@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{bail, Result};
 use serde_json::Value;
 
+pub mod cd;
 pub mod dircache;
 pub mod fs;
 pub mod internet;
@@ -82,6 +83,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(fs::Edit),
         Box::new(fs::Delete),
         Box::new(shell::Bash),
+        Box::new(cd::Cd),
         Box::new(fs::DirList),
         Box::new(dircache::DirCacheUpdate),
         Box::new(pong::Pong),

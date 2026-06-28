@@ -273,6 +273,14 @@ pub struct SessionSnapshot {
     pub id: String,
     /// Human-readable session name (from its `Session`), empty if unnamed/none.
     pub name: String,
+    /// The session's EFFECTIVE working directory as a display string (the live
+    /// `cd` override when set, else the configured workdir — see
+    /// [`crate::app::state::SessionRuntime::effective_cwd`]). Carried so a client
+    /// reflects where the session currently is (e.g. a future cwd indicator) and so
+    /// its reconstructed `SessionRuntime` reports the same `effective_cwd()`. Empty
+    /// only when there is no session. The configured allow-list roots are NOT
+    /// projected here (cd moves only the cwd).
+    pub cwd: String,
     /// Committed conversation messages (already serde via `ChatMessage`).
     pub messages: Vec<ChatMessage>,
     /// In-progress assistant content buffer, or `None` when not streaming.

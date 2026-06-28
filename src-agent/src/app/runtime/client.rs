@@ -588,6 +588,13 @@ fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
     let mut rt = SessionRuntime::new();
     rt.id = s.id.clone();
     rt.session = Some(shadow_session(s));
+    // Mirror the daemon's effective cwd onto the shadow as the live override, so
+    // the reconstructed runtime's `effective_cwd()` matches (the shadow session's
+    // own `settings.workdir` isn't projected, so this is the only cwd source).
+    // Empty only when the daemon had no session; leave the default `None` then.
+    if !s.cwd.is_empty() {
+        rt.active_cwd = Some(std::path::PathBuf::from(&s.cwd));
+    }
     rt.streaming = s.streaming.clone();
     rt.stream_reasoning = s.stream_reasoning.clone();
     rt.tokens_in = s.tokens_in;

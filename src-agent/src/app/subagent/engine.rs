@@ -269,7 +269,17 @@ pub async fn run_agent_loop(
                     args: args_json,
                 },
             );
-            let result = crate::tool::execute_tool(&ctx, call);
+            let mut result = crate::tool::execute_tool(&ctx, call);
+            // The `cd` tool returns a `CWD_CHANGE_PREFIX`-tagged target that only the
+            // main runtime's interception knows how to apply (it repoints the LIVE
+            // session). A sub-agent runs to completion in a fixed workspace and has no
+            // persistent cwd to move, so translate the sentinel into a plain note here
+            // rather than leak the internal marker into the sub-agent's transcript.
+            if let Some(target) = result.strip_prefix(crate::tool::cd::CWD_CHANGE_PREFIX) {
+                result = format!(
+                    "note: changing the working directory is not supported inside a sub-agent (target was {target}); continue using paths under your workspace"
+                );
+            }
             emit(
                 &tx,
                 AgentEvent::ToolDone {

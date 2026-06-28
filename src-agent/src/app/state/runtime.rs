@@ -157,6 +157,19 @@ pub struct SessionRuntime {
     /// Monotonic counter: the id assigned to the NEXT spawned sub-agent.
     #[allow(dead_code)]
     pub next_subagent_id: usize,
+    /// LIVE working-directory override for this session, set by the `cd` tool /
+    /// the user `/cd` command (Phase 8). `None` means "use the session's
+    /// configured workdir" (`Session::workdir()` — the first `settings.workdir`
+    /// entry); `Some(dir)` REPOINTS the session's effective cwd to `dir` without
+    /// touching the persisted `settings.workdir` list. Like `awareness_summary`
+    /// it is purely in-memory and NEVER serialised — a cd is ephemeral per
+    /// session run. The effective cwd (this override, else the configured
+    /// workdir) feeds `build_tool_ctx`'s `ToolCtx::workspace` (so `bash` runs
+    /// there and the dir cache indexes it) and the harness workspace check (so a
+    /// `/cd` outside every allowed root makes the next MODEL tool turn WC-denied).
+    /// The configured roots in `Session::workdirs()` stay the allow-list / the
+    /// `[N]` multi-root set; cd never widens them (use `/adddir` for that).
+    pub active_cwd: Option<PathBuf>,
     /// Background-refreshed index of the active session's workspace files
     /// (gitignore-respecting). Re-indexed off-thread; shared with the tool layer.
     pub dir_cache: Arc<RwLock<DirCache>>,
@@ -266,6 +279,7 @@ impl SessionRuntime {
             pending_subagent_calls: Vec::new(),
             awaiting_subagents: false,
             next_subagent_id: 0,
+            active_cwd: None,
             dir_cache: Arc::new(RwLock::new(DirCache::default())),
             awareness_summary: None,
             held_lock: None,
@@ -420,5 +434,26 @@ impl SessionRuntime {
                 .subagents
                 .iter()
                 .any(|s| matches!(s.status, crate::app::subagent::SubAgentStatus::Running))
+    }
+
+    /// This session's EFFECTIVE working directory: the live `cd` override
+    /// ([`active_cwd`](Self::active_cwd)) when set, else the session's configured
+    /// workdir (`Session::workdir()` — the first `settings.workdir` entry), else
+    /// the process cwd when there is no session at all.
+    ///
+    /// The single source of truth for "where this session is right now". Read by
+    /// `build_tool_ctx` (→ `ToolCtx::workspace`, so `bash` + the dir cache follow
+    /// `cd`), by the harness workspace check (so a `cd` outside every allowed root
+    /// blocks the next MODEL tool turn), and by the IPC snapshot. The configured
+    /// allow-list / `[N]` roots in `Session::workdirs()` are deliberately NOT
+    /// affected — cd moves only the cwd.
+    pub fn effective_cwd(&self) -> PathBuf {
+        if let Some(cwd) = self.active_cwd.as_ref() {
+            return cwd.clone();
+        }
+        self.session
+            .as_ref()
+            .map(|s| s.workdir())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 }

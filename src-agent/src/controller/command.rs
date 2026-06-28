@@ -8,6 +8,7 @@
 //! Supported commands: `/compact`, `/new`, `/mode`, `/effort`,
 //! `/rename [session] <name>`, `/settings` (alias `/config`),
 //! `/resume` (alias `/sessions`), `/task <agent> <task>`,
+//! `/cd <path>`, `/adddir <path>`,
 //! `/internet [simple|full]`, `/help`, `/quit` (aliases: `/q`, `/exit`).
 
 use crate::model::settings::InternetMode;
@@ -23,6 +24,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/settings", "Edit key, model, provider, theme, name"),
     ("/agents", "Create, modify, or delete agent definitions"),
     ("/task", "Run an agent on a task in the background"),
+    ("/cd", "Change the session working directory"),
+    ("/adddir", "Add a directory to the workspace roots"),
     ("/compact", "Summarize and compact the conversation"),
     ("/usage", "Show the cost and token usage dashboard"),
     ("/rename", "Rename the current session"),
@@ -71,6 +74,13 @@ pub enum Command {
     Agents,
     /// Run a named agent on a task in the background. Holds `<agent> <task>`.
     Task(String),
+    /// Change the session's working directory to the held path (Phase 8). The
+    /// USER path is UNRESTRICTED — no workspace allow-list check (the user is
+    /// trusted); resolution is shell-like (`[N]` / absolute / relative-to-cwd).
+    Cd(String),
+    /// Append the held directory to the session's workspace roots (widen the
+    /// allow-list / add an `[N]` root). Resolved relative to the current cwd.
+    AddDir(String),
     /// Toggle or set internet mode. `None` = toggle; `Some(mode)` = set explicitly.
     Internet(Option<InternetMode>),
     /// Open the unified session hub — live (cooking) + past (history) sessions in
@@ -117,6 +127,8 @@ pub fn parse(line: &str) -> Command {
         "settings" | "config" => Command::Settings,
         "agents" | "agent" => Command::Agents,
         "task" => Command::Task(rest.to_string()),
+        "cd" => Command::Cd(rest.to_string()),
+        "adddir" => Command::AddDir(rest.to_string()),
         "internet" => Command::Internet(InternetMode::from_token(rest)),
         "resume" | "sessions" => Command::Resume,
         "select" => Command::Select,

@@ -94,6 +94,13 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
     SessionSnapshot {
         id: rt.id.clone(),
         name,
+        // The session's effective cwd (live `cd` override, else configured
+        // workdir) as a display string. Empty when there is no session.
+        cwd: rt
+            .session
+            .as_ref()
+            .map(|_| rt.effective_cwd().display().to_string())
+            .unwrap_or_default(),
         messages,
         streaming: rt.streaming.clone(),
         stream_reasoning: rt.stream_reasoning.clone(),
@@ -823,6 +830,9 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
             || p.pending_tool_calls != n.pending_tool_calls
             || p.tool_idx != n.tool_idx
             || p.name != n.name
+            // A `cd` (the effective cwd moving) has no incremental delta, so a
+            // change forces a full resync — the client rebuilds with the new cwd.
+            || p.cwd != n.cwd
             || p.subagents != n.subagents
             || p.pending_subagents != n.pending_subagents;
         if structural {

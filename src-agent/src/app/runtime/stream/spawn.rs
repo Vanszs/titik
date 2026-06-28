@@ -15,10 +15,12 @@ use crate::service::openrouter::OpenRouterClient;
 pub(crate) fn build_tool_ctx(state: &AppState, sess_idx: usize) -> crate::tool::ToolCtx {
     let rt = &state.rest.sessions[sess_idx];
     let session_ref = rt.session.as_ref();
-    let workspace = session_ref
-        .as_ref()
-        .map(|s| s.workdir())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // The session's EFFECTIVE cwd: the live `cd` override when set, else the
+    // configured workdir. This drives `bash` (its `current_dir`) and the dir
+    // cache root, so both follow `cd`. The configured `workdirs()` below stay the
+    // allow-list / `[N]` multi-root set — cd repoints only the cwd, never the
+    // allow-list (use `/adddir` to widen that).
+    let workspace = rt.effective_cwd();
     let workspaces = session_ref
         .as_ref()
         .map(|s| s.workdirs())
@@ -44,6 +46,84 @@ pub(crate) fn build_tool_ctx(state: &AppState, sess_idx: usize) -> crate::tool::
         dir_cache: rt.dir_cache.clone(),
         memory_dir,
         internet_mode,
+    }
+}
+
+/// THE WORKSPACE-MUTATING PRIMITIVE (Phase 8): repoint session `sess_idx`'s live
+/// working directory to `new_cwd` and refresh everything derived from the cwd.
+///
+/// Most tools are read-only against a [`crate::tool::ToolCtx`]; `cd` is the
+/// exception. Both the model-callable `cd` tool (allow-list-checked, intercepted
+/// in `process_tools`) and the user `/cd` command (unrestricted) funnel their
+/// already-resolved + canonicalised target through HERE so the side effects can
+/// never diverge:
+///
+/// 1. set the session's [`active_cwd`](crate::app::state::SessionRuntime::active_cwd)
+///    override (so `effective_cwd()` — and thus `build_tool_ctx`'s
+///    `ToolCtx::workspace` + the harness workspace check — now point at `new_cwd`);
+/// 2. REBUILD the session's dir cache against the new cwd (so `@`-autocomplete and
+///    `dir_list` reflect it). Indexed as a SINGLE root — bare relative paths — to
+///    match the shell-cd mental model; the async reindex never blocks the UI;
+/// 3. recompute the project-awareness summary for the new cwd, IF awareness is
+///    enabled + routable. This mirrors the post-`/compact` recompute
+///    (`event_loop::drains`) and, like it, runs via `block_on` on the event-loop
+///    thread; when awareness is off (the common case) there is no network at all.
+///    The summary is recomputed for the session at `sess_idx` directly (not
+///    `fg_mut()`), so a background-session cd updates the RIGHT session.
+///
+/// The session's persisted `settings.workdir` list (the allow-list / `[N]` roots)
+/// is deliberately UNTOUCHED — cd moves only the cwd. `memory_dir` is also left
+/// as-is on purpose (a cd does NOT re-point memory; kept simple).
+pub(crate) fn apply_workspace_change(
+    state: &mut AppState,
+    sess_idx: usize,
+    new_cwd: std::path::PathBuf,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) {
+    // 1. Repoint the live cwd.
+    state.rest.sessions[sess_idx].active_cwd = Some(new_cwd.clone());
+
+    // 2. Rebuild the dir cache against the new cwd (single root → bare paths). The
+    //    reindex runs on a background thread and replaces the cache when done.
+    crate::tool::dircache::reindex(
+        vec![new_cwd.clone()],
+        state.rest.sessions[sess_idx].dir_cache.clone(),
+    );
+
+    // 3. Recompute awareness for the new cwd when enabled + routable. Snapshot the
+    //    inputs (cloning the settings + config) so no session borrow is held
+    //    across the `block_on`. `summarize` returns `None` on no-docs / disabled /
+    //    failure, which simply clears the summary — best-effort, never fatal.
+    let aware_inputs = match (
+        client.as_ref(),
+        state.rest.sessions[sess_idx].session.as_ref(),
+    ) {
+        (Some(c), Some(sess)) if sess.settings.awareness_enabled => Some((
+            Arc::clone(c),
+            state.rest.config.clone(),
+            sess.settings.clone(),
+        )),
+        _ => None,
+    };
+    if let Some((c, config, settings)) = aware_inputs {
+        if let Some(route) = crate::app::resolve::resolve_role(
+            &config,
+            &settings,
+            crate::model::app_config::ModelRole::Awareness,
+        )
+        .filter(|r| r.is_routable())
+        {
+            let summary = handle.block_on(crate::app::awareness::summarize(
+                &c,
+                &settings,
+                route.conn(),
+                &route.model_id,
+                route.provider(),
+                &new_cwd,
+            ));
+            state.rest.sessions[sess_idx].awareness_summary = summary;
+        }
     }
 }
 

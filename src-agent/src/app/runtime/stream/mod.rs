@@ -14,6 +14,9 @@ pub(crate) use tools::resume_after_subagents;
 // auto-denies a too-long parked call through the SAME deny path the TUI uses.
 pub(crate) use tools::deny_all_pending;
 pub(crate) use spawn::{spawn_or_queue, try_start_pending, SpawnOutcome};
+// The Phase 8 workspace-mutating primitive, shared by the `cd` tool interception
+// (here) and the user `/cd` + `/adddir` commands.
+pub(crate) use spawn::apply_workspace_change;
 #[allow(unused_imports)]
 pub(crate) use spawn::spawn_task;
 

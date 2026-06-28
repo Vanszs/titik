@@ -52,6 +52,7 @@ mod roundtrip_tests {
         SessionSnapshot {
             id: "11111111-1111-4111-8111-111111111111".to_string(),
             name: "demo".to_string(),
+            cwd: "/work/demo".to_string(),
             messages: vec![ChatMessage::new(Role::User, "hi")],
             streaming: Some("partial".to_string()),
             stream_reasoning: "thinking".to_string(),
