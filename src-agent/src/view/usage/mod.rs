@@ -896,8 +896,10 @@ fn build_day_horizontal_chart(
     let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now = now_secs();
-    let snap = now - now % 86400;
-    let today_dow = (now / 86400 + 4) % 7; // 0=Sun..6=Sat
+    let tz = crate::model::usage::local_utc_offset_secs();
+    let local_now = now + tz;
+    let snap = local_now - local_now % 86400 - tz; // UTC epoch of local midnight
+    let today_dow = (local_now / 86400 + 3) % 7; // Mon=0..Sun=6 in local time
     let monday = snap - today_dow * 86400;
     let epochs: Vec<i64> = (0..7).map(|i| monday + i * 86400).collect();
 
@@ -962,8 +964,10 @@ fn build_heatmap_yearly(buckets: &[SpendBucket], metric: UsageMetric, palette: &
     let map: HashMap<i64, SpendBucket> = buckets.iter().cloned().map(|b| (b.bucket_epoch, b)).collect();
 
     let now        = now_secs();
-    let today      = now - now % 86400;
-    let today_dow  = ((today / 86400 + 4) % 7) as usize; // 0=Sun..6=Sat
+    let tz         = crate::model::usage::local_utc_offset_secs();
+    let local_now  = now + tz;
+    let today      = local_now - local_now % 86400 - tz; // UTC epoch of local midnight
+    let today_dow  = ((local_now / 86400 + 3) % 7) as usize; // Mon=0..Sun=6 in local time
 
     const COLS: usize = 53;
     const ROWS: usize = 7;
