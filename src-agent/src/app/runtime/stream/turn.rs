@@ -27,6 +27,8 @@ fn is_image_input_error(e: &str) -> bool {
     e.contains("image input")
         || e.contains("support image")
         || (e.contains("no endpoints") && e.contains("image"))
+        || e.contains("multimodal")
+        || (e.contains("corrupt") && (e.contains("image") || e.contains("media")))
 }
 
 /// Finalize a finished stream: commit any buffered assistant text, clear the
