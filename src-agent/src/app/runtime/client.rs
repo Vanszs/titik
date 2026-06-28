@@ -298,7 +298,7 @@ fn connect_attach_and_handshake(
 /// the client prints an error and renders against it anyway rather than restart-looping
 /// forever. A daemon that sends no `Hello` (predates the handshake, or is slow) is
 /// never restarted on that absence alone — only a CONFIRMED mismatch triggers a restart.
-pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
+pub fn client_run(opts: crate::cli::Opts) -> Result<()> {
     // The client needs the config dirs only to resolve the socket path; it owns no
     // sessions and writes no config. In particular it touches NO session lock here
     // or anywhere downstream (lock ownership belongs to the daemon — see the
@@ -382,7 +382,7 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     // needs a runtime in scope — see `shadow_subagent`); the loop itself stays sync.
     let result = {
         let _rt_ctx = handle.enter();
-        render_loop(&mut terminal, &frame_rx, &req_tx, prebuffered)
+        render_loop(&mut terminal, &frame_rx, &req_tx, prebuffered, opts.resume)
     };
 
     // Polite detach so the daemon passes the controller seat promptly (the socket
@@ -432,6 +432,7 @@ fn render_loop(
     frame_rx: &Receiver<DaemonFrame>,
     req_tx: &Sender<ClientRequest>,
     prebuffered: Vec<DaemonFrame>,
+    resume: bool,
 ) -> Result<()> {
     // The shadow is a real AppState reconstructed purely from frames. It starts in
     // a neutral Chat with a single empty session; the first Snapshot replaces it.
@@ -445,6 +446,9 @@ fn render_loop(
     // (the daemon's newly-opened editor starts at usize::MAX). Reset to None whenever
     // the shadow is NOT in the agents full-screen editor so each fresh open re-sends.
     let mut last_sent_wrap_w: Option<usize> = None;
+
+    // Fire once after the first full snapshot lands when launched with --resume.
+    let mut resume_fired = false;
 
     // Per-connection seq tracking (critique #1). `expected` is the seq the NEXT
     // frame should carry. `0` means "not yet seeded" — the first frame seeds it.
@@ -507,6 +511,14 @@ fn render_loop(
                 // Nothing more will ever arrive — leave the client.
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
+        }
+
+        // Fire OpenSessionHub once after the first full snapshot lands when the client
+        // was launched with --resume / koma agents. Gated on the shadow having a real
+        // session so we don't fire against the initial empty placeholder state.
+        if resume && !resume_fired && shadow.rest.fg().session.is_some() {
+            resume_fired = true;
+            let _ = req_tx.send(ClientRequest::OpenSessionHub);
         }
 
         // --- (a-bis) `/select` transcript dump (controller-side) ---

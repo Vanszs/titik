@@ -134,7 +134,7 @@ pub(super) fn handle_new(
 /// Focus defaults to the cooking pane (always non-empty) with the cursor on the
 /// current foreground row. We do NOT clear the current session/client — Esc out of
 /// the hub returns to the active chat unchanged.
-pub(super) fn handle_resume(state: &mut AppState) -> Result<()> {
+pub(crate) fn handle_resume(state: &mut AppState) -> Result<()> {
     // Don't open the hub mid /new-KeyInput confirmation (mirror the picker-select
     // guard): the session tail is unstable until the new session's creds resolve.
     if state.rest.spawn_pending {

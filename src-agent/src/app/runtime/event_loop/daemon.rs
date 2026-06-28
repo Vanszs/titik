@@ -564,6 +564,14 @@ impl DaemonHub {
                 self.send_to(idx, DaemonEvent::Ack);
             }
 
+            // The client was launched with --resume / koma agents: open the session
+            // hub immediately, same as the /resume slash command. Ack on success or
+            // Error on failure (e.g. spawn_pending is set mid-/new).
+            ClientRequest::OpenSessionHub => {
+                let result = crate::app::runtime::commands::new_session::handle_resume(state);
+                self.ack_or_error(idx, result);
+            }
+
             // The client reports the on-screen editor wrap width so the daemon's
             // TextEditorState can navigate soft-wrapped rows with the same visual
             // width the client renders. Only meaningful when the daemon is in the

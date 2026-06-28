@@ -121,6 +121,9 @@ pub enum ClientRequest {
     /// Client publishes the on-screen editor wrap width so the daemon's editor
     /// navigation wraps by the same visual rows.
     EditorWrapW(usize),
+    /// Sent by the client on startup when launched with `--resume` / `koma agents`:
+    /// asks the daemon to open the session hub (same as the /resume slash command).
+    OpenSessionHub,
 }
 
 // ─── key projection ──────────────────────────────────────────────────────────

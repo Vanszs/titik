@@ -16,7 +16,7 @@ mod effort;
 // mode and must show the identical status line.
 pub(crate) mod internet;
 mod misc;
-mod new_session;
+pub(crate) mod new_session;
 mod task;
 
 /// Apply a parsed slash command. Like [`apply_action`], it mutates state and
