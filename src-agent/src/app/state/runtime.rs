@@ -125,6 +125,28 @@ pub struct SessionRuntime {
     /// Kept here so later deferred tools in the same session reuse the one channel.
     /// `None` until the first deferred tool runs.
     pub tool_task_tx: Option<UnboundedSender<(String, String)>>,
+    // --- `!` user-shell lane (off-thread, parallel to the deferred tool lane) ---
+    /// True while a `!`-shortcut command is running OFF the UI/event-loop thread
+    /// (see `actions::chat::handle_shell`). The `!` shell uses the SAME blocking
+    /// `run_shell_capture` primitive the `bash` tool does, so running it inline on
+    /// the event-loop thread would freeze the local TUI render loop — or, in the
+    /// daemon, the whole event loop for EVERY session — for the command's duration
+    /// (the 120s timeout). Instead the work is spawned on a plain `std::thread` and
+    /// this latches `true`; the event-loop drain folds the captured output into a
+    /// `SHELL_MARK` conversation entry and clears it. Counts as "working"
+    /// (`is_working`) so the busy indicator stays on and the self-exit grace timer
+    /// treats the session as live; also gates a second `!`/Submit/Resend so a shell
+    /// result can never be interleaved into an in-flight or queued turn.
+    pub awaiting_shell: bool,
+    /// Receiver for `!`-shell results: `(command, captured_output)`. Lazily created
+    /// (with `shell_task_tx`) the first time a `!` command runs in a session, then
+    /// reused. Drained each event-loop tick. `None` until the first `!` runs.
+    pub shell_task_rx: Option<UnboundedReceiver<(String, String)>>,
+    /// Sender half of the `!`-shell result channel. Cloned into the spawned shell
+    /// thread (the sender is `Send`, so it can fire from a non-tokio thread). Kept
+    /// here so later `!` commands in the same session reuse the one channel.
+    /// `None` until the first `!` runs.
+    pub shell_task_tx: Option<UnboundedSender<(String, String)>>,
     /// All sub-agents spawned this session (running + finished). Drained each tick
     /// by the event loop; finished ones stay in the list for the UI to show their
     /// final state.
@@ -274,6 +296,9 @@ impl SessionRuntime {
             awaiting_tool_tasks: false,
             tool_task_rx: None,
             tool_task_tx: None,
+            awaiting_shell: false,
+            shell_task_rx: None,
+            shell_task_tx: None,
             subagents: Vec::new(),
             pending_subagents: VecDeque::new(),
             pending_subagent_calls: Vec::new(),
@@ -400,6 +425,10 @@ impl SessionRuntime {
         // keeps the inert slot fully clean.
         self.park_started_at = None;
         self.awaiting_tool_tasks = false;
+        // A `!` shell may be draining off-thread; clear the park flag so a late
+        // delivery to this tombstone is discarded by the gated drain (the OS child
+        // finishes on its own — we never block close() on it).
+        self.awaiting_shell = false;
         // Sub-agents: kill running, drop model-delegated queued work, clear the
         // parked-delegation bookkeeping. (Unlike a turn-halt, a CLOSE also drops
         // user-initiated /task entries — the session is going away entirely.)
@@ -429,6 +458,7 @@ impl SessionRuntime {
             || self.streaming.is_some()
             || self.awaiting_approval
             || self.awaiting_tool_tasks
+            || self.awaiting_shell
             || self.awaiting_subagents
             || self
                 .subagents

@@ -24,7 +24,10 @@ pub(super) fn handle_submit(
         state.rest.status = "no active session".into();
         return Ok(());
     }
-    if state.rest.fg().waiting {
+    // Busy guard: block while a turn is streaming OR a `!` shell is draining
+    // off-thread — a Submit landing during the latter would race the shell entry
+    // into the same conversation tail.
+    if state.rest.fg().waiting || state.rest.fg().awaiting_shell {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }
@@ -139,9 +142,10 @@ pub(super) fn handle_submit(
     Ok(())
 }
 
-/// Handle `Action::Shell`: run a `!`-prefixed command directly in the foreground
-/// session's CURRENT working directory and append a DISTINCT shell entry to the
-/// conversation — without sending a turn to the model or starting a stream.
+/// Handle `Action::Shell`: run a `!`-prefixed command in the foreground session's
+/// CURRENT working directory — OFF the event-loop thread — and (once it finishes)
+/// append a DISTINCT shell entry to the conversation, without sending a turn to the
+/// model or starting a stream.
 ///
 /// The command runs via the SAME primitive the `bash` tool uses
 /// ([`crate::tool::shell::run_shell_capture`]): captured stdout+stderr, ANSI-
@@ -149,6 +153,17 @@ pub(super) fn handle_submit(
 /// tool). It is NOT gated by the workspace allow-list (WC) — this is a user
 /// affordance, so it runs wherever the session cwd currently is (the live `cd`
 /// override when set, else the configured workdir).
+///
+/// CRITICAL — it runs OFF-THREAD. `run_shell_capture` blocks the calling thread on
+/// a `recv_timeout` (up to the full 120s) waiting for the child. Calling it inline
+/// here would freeze the local TUI render loop or — in the daemon — the single
+/// event loop that services EVERY session, stalling all sessions for the whole
+/// command duration. So we spawn the blocking work on a plain `std::thread` (the
+/// same shape `dispatch_deferred` uses for the model-callable `bash` tool, which
+/// is exactly why `bash` lives in `DEFERRED_TOOLS`), mark the session
+/// `awaiting_shell`, and return immediately. The event-loop drain
+/// (`event_loop::sessions`) folds the captured `(command, output)` into the
+/// conversation when it lands.
 ///
 /// The result is stored as a [`Role::User`] message prefixed with
 /// [`crate::dto::chat::SHELL_MARK`] and shaped `"$ <cmd>\n<output>"`. The mark makes
@@ -161,33 +176,51 @@ pub(super) fn handle_shell(text: String, state: &mut AppState) -> Result<()> {
         state.rest.status = "no active session".into();
         return Ok(());
     }
-    let cmd = text.trim();
+    // Waiting guard (mirrors `handle_submit` / `handle_resend`): never start a `!`
+    // shell while a turn is streaming OR another `!` shell is still draining
+    // off-thread. Pushing a shell entry mid-turn would interleave it between the
+    // pending question and the not-yet-committed assistant reply, and the committed
+    // history would read [user, shell, assistant] — sent to the model in that order
+    // next turn. The controller already declines to route a `!` while busy; this is
+    // the daemon-side backstop (the daemon drives the same handler over IPC).
+    if state.rest.fg().waiting || state.rest.fg().awaiting_shell {
+        state.rest.status = "busy — wait for response".into();
+        return Ok(());
+    }
+    let cmd = text.trim().to_string();
     if cmd.is_empty() {
         state.rest.status = "usage: !<command>".into();
         return Ok(());
     }
-    // Run in the session's EFFECTIVE cwd (follows `cd`). Same default timeout as
-    // the bash tool. Captured into a local before the `&mut` conversation borrow.
-    let cwd = state.rest.fg().effective_cwd();
-    let output = crate::tool::shell::run_shell_capture(cmd, &cwd, 120_000);
-    // Build the distinct shell entry: an invisible SHELL_MARK so the transcript
-    // renders it as a `$ <cmd>` block (not a `★` user turn), then the visible
-    // `$ <cmd>\n<output>` body the model reads (with the mark stripped on the wire).
-    let content = format!("{}$ {cmd}\n{output}", crate::dto::chat::SHELL_MARK);
-    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
-        let _ = msglog::append(&sess.path, Role::User, &content, None);
-        sess.conversation.push_user(content);
-        if let Err(e) = sess.save() {
-            state.rest.status = format!("error: {e}");
-            return Ok(());
-        }
+    let fgi = state.rest.foreground;
+    // Lazily create THIS session's shell-result channel once, then reuse it. The
+    // spawned thread fires back over session `fgi`'s own `shell_task_tx`, so the
+    // result is routed structurally to that session's drain regardless of which
+    // session is foreground when it lands.
+    if state.rest.sessions[fgi].shell_task_tx.is_none() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.rest.sessions[fgi].shell_task_tx = Some(tx);
+        state.rest.sessions[fgi].shell_task_rx = Some(rx);
     }
-    // Show the new entry (the shell output sits at the bottom of the transcript)
-    // and report the command's exit status on the status line via the last line of
-    // the captured output (`exit code: N`).
-    state.rest.reset_scroll();
-    let exit_line = output.lines().last().unwrap_or("done");
-    state.rest.status = format!("$ {cmd} — {exit_line}");
+    // Run in the session's EFFECTIVE cwd (follows `cd`). Same default timeout as
+    // the bash tool. Capture cwd + the sender before the spawn so nothing borrows
+    // `state` across the thread boundary.
+    let cwd = state.rest.fg().effective_cwd();
+    let tx = state.rest.sessions[fgi].shell_task_tx.as_ref().unwrap().clone();
+    // Plain `std::thread` (NOT a tokio task): `run_shell_capture` itself spawns a
+    // helper thread + blocks on `recv_timeout`, and there's no async involved, so a
+    // bare OS thread is the right home. The `UnboundedSender` is `Send`, so it can
+    // fire from this off-runtime thread.
+    std::thread::spawn(move || {
+        let output = crate::tool::shell::run_shell_capture(&cmd, &cwd, 120_000);
+        let _ = tx.send((cmd, output));
+    });
+    // Park the session on the shell lane: `awaiting_shell` keeps the busy indicator
+    // on (it feeds `is_working`) and gates a second `!`/Submit until the drain
+    // clears it. Phase label names the affordance so the shimmering status surfaces
+    // what's running.
+    state.rest.sessions[fgi].awaiting_shell = true;
+    state.rest.status = "running shell".into();
     Ok(())
 }
 
@@ -266,7 +299,7 @@ pub(super) fn handle_resend(
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
-    if state.rest.fg().waiting {
+    if state.rest.fg().waiting || state.rest.fg().awaiting_shell {
         state.rest.status = "busy — wait for response".into();
         return Ok(());
     }

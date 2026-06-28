@@ -332,15 +332,27 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                     // the session cwd (no model round-trip). Strip the leading `!` +
                     // trim. An empty command (a lone `!`) is a no-op. Discard staged
                     // attachments — they belong to a message, not a shell run.
-                    let line = rest.take_input();
-                    rest.pending_attachments.clear();
-                    let cmd = line.trim_start().strip_prefix('!').unwrap_or("").trim();
-                    if cmd.is_empty() {
+                    //
+                    // Busy guard (mirrors the Submit arm below): if a turn is
+                    // streaming OR a previous `!` is still draining off-thread, do
+                    // NOT route the shell — running it now would push a shell entry
+                    // mid-turn, interleaving it between the pending question and the
+                    // not-yet-committed reply ([user, shell, assistant] on the next
+                    // send). Leave the input intact (no `take_input`) so the typed
+                    // command is preserved, and consume the keystroke as a no-op.
+                    if rest.fg().waiting || rest.fg().awaiting_shell {
                         Action::None
                     } else {
-                        Action::Shell(cmd.to_string())
+                        let line = rest.take_input();
+                        rest.pending_attachments.clear();
+                        let cmd = line.trim_start().strip_prefix('!').unwrap_or("").trim();
+                        if cmd.is_empty() {
+                            Action::None
+                        } else {
+                            Action::Shell(cmd.to_string())
+                        }
                     }
-                } else if !rest.input.trim().is_empty() && !rest.fg().waiting {
+                } else if !rest.input.trim().is_empty() && !rest.fg().waiting && !rest.fg().awaiting_shell {
                     Action::Submit(rest.take_input())
                 } else {
                     Action::None

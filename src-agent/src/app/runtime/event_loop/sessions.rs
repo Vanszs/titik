@@ -513,6 +513,54 @@ fn service_session(
             }
         }
 
+        // --- drain `!` user-shell results (off-thread, independent lane) ---
+        // A `!`-shortcut command runs the blocking `run_shell_capture` on a plain
+        // std::thread (spawned in `actions::chat::handle_shell`) and sends its
+        // `(command, captured_output)` back over `shell_task_rx`. Folding it here —
+        // not inline in the handler — is what keeps the event loop (and so every
+        // session) responsive for the whole command duration. Build the distinct
+        // SHELL_MARK entry (a `$ <cmd>` block over dim output that the wire builder
+        // strips to clean `$ <cmd>\n<output>` context for the model), append it to
+        // the conversation + msglog, and clear the park. Status/scroll updates are
+        // FOREGROUND-ONLY so a background session's shell finishing can't yank the
+        // viewed transcript. Only fold while `awaiting_shell` is set; a delivery
+        // after a close/clear is stale and dropped.
+        {
+            // Drain into a local FIRST inside a narrow scope so the `rx` borrow of
+            // this session's runtime is released before the session/conversation
+            // writes below. At most one `!` runs per session at a time (the busy
+            // guard), so this is normally zero or one pair.
+            let mut shell_results: Vec<(String, String)> = Vec::new();
+            if state.rest.sessions[idx].awaiting_shell {
+                if let Some(rx) = state.rest.sessions[idx].shell_task_rx.as_mut() {
+                    while let Ok(pair) = rx.try_recv() {
+                        shell_results.push(pair);
+                    }
+                }
+            }
+            for (cmd, output) in shell_results {
+                // Invisible SHELL_MARK so the transcript renders this as a `$ <cmd>`
+                // block (not a `★` user turn); the visible `$ <cmd>\n<output>` body is
+                // what the model reads (the mark is stripped on the wire).
+                let content = format!("{}$ {cmd}\n{output}", crate::dto::chat::SHELL_MARK);
+                if let Some(sess) = state.rest.sessions[idx].session.as_mut() {
+                    let _ = crate::model::msglog::append(&sess.path, crate::dto::chat::Role::User, &content, None);
+                    sess.conversation.push_user(content);
+                    let _ = sess.save();
+                }
+                // Park ends: a fresh `!`/Submit is allowed again.
+                state.rest.sessions[idx].awaiting_shell = false;
+                // Foreground-only UI: surface the new entry + the command's exit
+                // status (the captured output's last line is `exit code: N`).
+                if idx == state.rest.foreground {
+                    state.rest.reset_scroll();
+                    let exit_line = output.lines().last().unwrap_or("done");
+                    state.rest.status = format!("$ {cmd} — {exit_line}");
+                }
+                dirty = true;
+            }
+        }
+
         // --- resume a round parked on deferred work (BOTH lanes) ---
         // Unpark only when EVERY deferred id — sub-agent delegations AND deferred
         // tool tasks — has filled its result (above). The resume
