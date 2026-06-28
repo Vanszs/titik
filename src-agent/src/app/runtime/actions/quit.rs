@@ -3,9 +3,11 @@
 //!
 //! The single entry point for ANY quit request (the `/quit` command and the quit
 //! keybind both route here) is [`request_quit`]:
-//!   - no session is working  → quit immediately (set `should_quit`);
-//!   - any session is working → open the confirm overlay so the user picks
-//!     kill-all vs detach vs cancel.
+//!   - ALWAYS opens the confirm overlay so the user picks kill-all vs detach vs
+//!     cancel — even when nothing is working, the user may want to detach idle
+//!     sessions so they remain in the /swap list on the next launch.
+//!   - Only exception: zero sessions (should never happen normally); in that
+//!     case quit immediately.
 //!
 //! All on-disk lock teardown happens on the NATURAL exit path (after `run_loop`
 //! returns, in [`crate::app::runtime::run`]), which now releases EVERY session's
@@ -16,28 +18,30 @@ use crate::app::state::AppState;
 
 /// Quit chokepoint shared by the `/quit` command and the quit keybind.
 ///
-/// Counts the sessions with work in flight ([`SessionRuntime::is_working`]).
-/// When none are busy, quit immediately (the old behaviour). When at least one
-/// is busy, open the [`Mode::QuitConfirm`] overlay instead so the user must
-/// choose kill-all, detach, or cancel — nothing is aborted yet.
+/// Always opens the [`Mode::QuitConfirm`] overlay so the user must choose
+/// kill-all, detach, or cancel — even when nothing is working, the user may
+/// want to detach idle sessions so they remain in the /swap list on the next
+/// launch. The overlay header adapts its wording to the working-vs-idle state.
+///
+/// Only exception: zero sessions (normally impossible), in which case quit
+/// immediately.
 ///
 /// [`SessionRuntime::is_working`]: crate::app::state::SessionRuntime::is_working
 pub(in crate::app::runtime) fn request_quit(state: &mut AppState) {
+    let total = state.rest.sessions.len();
+    // Zero sessions: nothing to keep or kill — just quit immediately.
+    if total == 0 {
+        state.rest.should_quit = true;
+        return;
+    }
     let working = state
         .rest
         .sessions
         .iter()
         .filter(|s| s.is_working())
         .count();
-    if working == 0 {
-        // Nothing in flight: exit straight away. The natural exit path releases
-        // every session's lock on the way out.
-        state.rest.should_quit = true;
-    } else {
-        // Work in flight: ask. The overlay snapshots the busy count for its
-        // warning text.
-        state.mode = Mode::QuitConfirm(Box::new(QuitConfirmState::new(working)));
-    }
+    // Always ask: the overlay header adapts to whether work is in flight.
+    state.mode = Mode::QuitConfirm(Box::new(QuitConfirmState::new(working, total)));
 }
 
 /// Handle `Action::QuitKillAll`: abort EVERY session's in-flight stream, then

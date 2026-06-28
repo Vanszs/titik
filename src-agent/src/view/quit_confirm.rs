@@ -1,11 +1,13 @@
 //! View – quit-confirm overlay (`Mode::QuitConfirm`).
 //!
-//! Shown when the user asks to quit while a session is still working. Flat,
-//! boxless layout (top+bottom rules only, matching the `/swap` picker + the repo
-//! border convention) — top to bottom:
+//! Shown always when the user asks to quit — regardless of whether any session
+//! has work in flight. Flat, boxless layout (top+bottom rules only, matching the
+//! `/swap` picker + the repo border convention) — top to bottom:
 //!
 //! 1. Top+bottom rule title bar — ` quit ` on the TOP rule.
-//! 2. A warning line — `N session(s) still working`.
+//! 2. An adaptive header line:
+//!    - working > 0: "N session(s) still cooking — keep them running or kill all?"
+//!    - working == 0: "Keep your N session(s) for next time, or close them?"
 //! 3. The three keyed choices, each on its own line, the key accented.
 //! 4. A one-line honesty note about Phase-1 detach (no daemon yet).
 //!
@@ -41,19 +43,29 @@ pub fn draw(frame: &mut Frame, s: &QuitConfirmState, palette: &Palette) {
         .title(Span::styled(" quit ", Style::default().fg(palette.dim)))
         .padding(Padding::horizontal(1));
     let title_inner = title_block.inner(chunks[0]);
-    let note = Line::from(Span::styled(
-        "a quit was requested while work is still in flight",
-        Style::default().fg(palette.dim),
-    ));
+    let subtitle = if s.working > 0 {
+        "a quit was requested while work is still in flight"
+    } else {
+        "a quit was requested"
+    };
+    let note = Line::from(Span::styled(subtitle, Style::default().fg(palette.dim)));
     frame.render_widget(title_block, chunks[0]);
     frame.render_widget(Paragraph::new(note), title_inner);
 
-    // --- Body: warning + choices + honesty note ---
+    // --- Body: header + choices + honesty note ---
     let inner = chunks[1].inner(Margin { horizontal: 1, vertical: 0 });
 
-    // Pluralize the warning on the busy-session count.
-    let plural = if s.working == 1 { "session" } else { "sessions" };
-    let warn = format!("{} {plural} still working", s.working);
+    // Adaptive header: wording differs based on whether any work is in flight.
+    let warn = if s.working > 0 {
+        let plural = if s.working == 1 { "session" } else { "sessions" };
+        format!(
+            "{} {plural} still cooking — keep them running or kill all?",
+            s.working
+        )
+    } else {
+        let plural = if s.total == 1 { "session" } else { "sessions" };
+        format!("Keep your {} {plural} for next time, or close them?", s.total)
+    };
 
     // Each choice: an accented key glyph + a dim description. The accent colour
     // marks the actionable key; the rest stays neutral.
