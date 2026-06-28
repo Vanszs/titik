@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
 use crate::controller::command::Command;
-use crate::controller::input::{handle_key, Action};
+use crate::controller::input::{handle_key, handle_paste, Action};
 use crate::ipc::proto::{ClientRequest, DaemonEvent, DaemonFrame, StateSnapshot};
 use crate::ipc::snapshot::{build_snapshot, diff};
 use crate::service::openrouter::OpenRouterClient;
@@ -422,6 +422,22 @@ impl DaemonHub {
                 let action = handle_key(state, key.to_key_event());
                 let result = apply_action(action, state, client, handle);
                 self.ack_or_error(idx, result);
+            }
+
+            // Forward a bracketed PASTE through the EXACT local paste pipeline:
+            // `controller::input::handle_paste` routes the text to the active field of
+            // the current mode (deepest-modal priority), and — in Chat — runs the
+            // image-path detection: a pasted image-file PATH is ingested DAEMON-SIDE
+            // into the foreground session's `images/` dir as an `[Image #N]`
+            // attachment (the daemon owns the session + its images dir), while
+            // ordinary text lands in the composer with CRLF normalisation. The
+            // resulting `input` marker, `pending_attachments`, and any toast are
+            // projected to the client by the normal snapshot/delta. `handle_paste`
+            // mutates `state` directly and is infallible, so this always Acks (mirrors
+            // the local loop, which just calls it then redraws — no `apply_action`).
+            ClientRequest::Paste { text } => {
+                handle_paste(state, &text);
+                self.send_to(idx, DaemonEvent::Ack);
             }
 
             // Answer the foreground session's pending tool-approval prompt via the

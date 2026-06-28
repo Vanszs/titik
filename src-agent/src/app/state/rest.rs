@@ -199,6 +199,17 @@ pub struct AppStateRest {
     /// omnisearch dropdowns remotely). Read only while in `Mode::Usage`; left `None`
     /// otherwise so it never lingers.
     pub usage_data: Option<crate::model::usage::UsageData>,
+    /// Pre-computed `@`-file palette matches, supplied ONLY on the daemon's thin
+    /// attach client (whose reconstructed session has an empty `dir_cache`, so it
+    /// cannot run the `search` the file-palette view normally calls). `None` on a
+    /// local TUI: `view::chat::render_file_palette` then computes the matches live
+    /// from `fg().dir_cache` every frame (unchanged behaviour). `Some(_)` on the
+    /// client: seeded from each [`crate::ipc::proto::GlobalSnapshot::file_palette`]
+    /// so the dropdown renders the SAME entries the daemon computed (mirrors how
+    /// `usage_data` feeds the DB-less `/usage` dashboard). Read only while the
+    /// composer's last token is an `@partial`; the daemon leaves it `None` otherwise
+    /// so it never lingers into an unrelated frame.
+    pub file_palette: Option<Vec<String>>,
 }
 
 impl Default for AppStateRest {
@@ -256,6 +267,7 @@ impl AppStateRest {
             agent_viewer_follow: true,
             clipboard_rx: None,
             usage_data: None,
+            file_palette: None,
         }
     }
 

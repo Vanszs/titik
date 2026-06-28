@@ -127,6 +127,14 @@ mod roundtrip_tests {
             agent_viewer_follow: false,
             subagents_open: true,
             subagent_sel: 2,
+            // A staged attachment + a populated `@`-file palette so the round-trip
+            // proves both new global projections survive serialize -> deserialize.
+            pending_attachments: vec![crate::dto::chat::Attachment {
+                marker_n: 1,
+                rel_path: "images/01-shot.png".to_string(),
+                mime: "image/png".to_string(),
+            }],
+            file_palette: Some(vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]),
         }
     }
 
@@ -160,6 +168,9 @@ mod roundtrip_tests {
                 code: KeyCodeWire::Char('x'),
                 mods: key_mods::CONTROL,
             }),
+            ClientRequest::Paste {
+                text: "/home/u/shot.png".to_string(),
+            },
             ClientRequest::ApproveTool { approve: true },
             ClientRequest::NewSession {
                 name: Some("scratch".to_string()),

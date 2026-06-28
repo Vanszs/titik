@@ -223,7 +223,43 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         agent_viewer_follow: state.rest.agent_viewer_follow,
         subagents_open: state.rest.subagents_open,
         subagent_sel: state.rest.subagent_sel,
+        // Staged composer attachments (path-paste / clipboard-image / @-picker),
+        // ingested daemon-side — projected so the client's shadow composer mirrors
+        // the daemon's exactly. `Attachment` is serde-clean.
+        pending_attachments: state.rest.pending_attachments.clone(),
+        // The `@`-file palette, precomputed daemon-side so the thin client (whose
+        // reconstructed `dir_cache` is empty) can still render the dropdown. Only
+        // computed when the composer's last token is an `@partial`; `None`
+        // otherwise so the projection never lingers into an unrelated frame. Uses
+        // the SAME `search(partial, FILE_PAL_MAX)` the local file-palette view calls.
+        file_palette: file_palette_matches(state),
     }
+}
+
+/// The maximum `@`-file palette rows, kept in lockstep with the view's `MAX_VIS`
+/// and the chat controller's `FILE_PAL_MAX` (both 10) so the projected list is the
+/// same length the local renderer would compute.
+const FILE_PAL_MAX: usize = 10;
+
+/// Precompute the `@`-file palette matches the way the local view does, for the
+/// thin client (whose reconstructed `dir_cache` is empty).
+///
+/// Returns `None` unless the composer's last whitespace-delimited token is an
+/// `@partial` (the only time the file palette shows). When it is, runs the SAME
+/// `dir_cache.search(partial, FILE_PAL_MAX)` the local `render_file_palette` calls
+/// against the foreground session's live index, so the client renders an identical
+/// dropdown. `Some(vec![])` means an `@partial` that matched nothing (still shows
+/// no rows on the client, matching the daemon).
+fn file_palette_matches(state: &AppState) -> Option<Vec<String>> {
+    let partial = crate::controller::input::file_ref_partial(&state.rest.input)?;
+    let matches = state
+        .rest
+        .fg()
+        .dir_cache
+        .read()
+        .map(|c| c.search(partial, FILE_PAL_MAX))
+        .unwrap_or_default();
+    Some(matches)
 }
 
 /// Project the (large, non-serde) [`Mode`] into the pure-data [`ModeSnapshot`].
@@ -781,6 +817,21 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
         || prev.global.agent_viewer_follow != next.global.agent_viewer_follow
         || prev.global.subagents_open != next.global.subagents_open
         || prev.global.subagent_sel != next.global.subagent_sel
+    {
+        return DiffResult::full();
+    }
+
+    // --- structural: staged composer attachments / `@`-file palette changed ---
+    // Neither rides an incremental delta. `pending_attachments` flips only on a
+    // discrete attach/submit/clear; `file_palette` changes as an `@token` is typed
+    // (the match set narrows) — both infrequent relative to streaming, so a full
+    // snapshot on a change is cheap-correct. Without this the client's `[Image #N]`
+    // card data lags and (crucially) its `@` dropdown — which renders ONLY from the
+    // projected `file_palette` on a thin client — never updates as the user types
+    // the partial. (The `[Image #N]` marker TEXT still rides `input` via InputChanged,
+    // but the palette + attachment records need the snapshot.)
+    if prev.global.pending_attachments != next.global.pending_attachments
+        || prev.global.file_palette != next.global.file_palette
     {
         return DiffResult::full();
     }

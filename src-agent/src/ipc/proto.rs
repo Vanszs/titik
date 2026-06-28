@@ -85,6 +85,15 @@ pub enum ClientRequest {
     /// Forward a single key event to the daemon (routed to whatever modal/handler
     /// the foreground session's mode dictates), as a serde-safe [`KeyWire`].
     SendKey(KeyWire),
+    /// Forward a bracketed-PASTE event verbatim (the whole pasted text, which may
+    /// be a file PATH or multi-line content). The daemon routes it through the SAME
+    /// [`crate::controller::input::handle_paste`] the local TUI uses, so a pasted
+    /// image-file path becomes an `[Image #N]` attachment (copied into the session's
+    /// `images/` dir, daemon-side) and ordinary text lands in the active field with
+    /// the same line-ending normalisation. Forwarded as a distinct request (NOT
+    /// char-by-char `SendKey`s) precisely so the daemon's `handle_paste` runs — the
+    /// per-char path can't detect an image-path paste and mangles CRLF newlines.
+    Paste { text: String },
     /// Answer the foreground session's pending tool-approval prompt.
     ApproveTool { approve: bool },
     /// Spawn a fresh parallel session, optionally named / rooted at a directory.
@@ -460,6 +469,25 @@ pub struct GlobalSnapshot {
     /// `subagents` + `pending_subagents`).
     pub subagents_open: bool,
     pub subagent_sel: usize,
+    /// The composer's staged-but-unsubmitted image attachments
+    /// ([`crate::app::state::AppStateRest::pending_attachments`]). Each was ingested
+    /// DAEMON-SIDE (its bytes already under `<session>/images/`) by a path-paste,
+    /// clipboard-image paste, or `@`-picker pick, and matches an `[Image #N]` marker
+    /// in `input`. The marker text rides in `input` already, but projecting the
+    /// records keeps the client's shadow faithful (so its reconstructed composer
+    /// state mirrors the daemon's exactly) and lets a future composer-side card read
+    /// them. `Attachment` is serde-clean. Empty when nothing is staged.
+    pub pending_attachments: Vec<crate::dto::chat::Attachment>,
+    /// The `@`-file palette matches, precomputed DAEMON-SIDE, or `None` when the
+    /// composer's last token is not an `@partial`. The palette is normally rendered
+    /// by `view::chat` calling `dir_cache.search(partial, …)`, but a thin client's
+    /// reconstructed session has an EMPTY `dir_cache` (the workspace index never
+    /// crosses the wire), so its `@` dropdown would always be blank. The daemon runs
+    /// the SAME `search` against ITS index and ships the result here; the client
+    /// seeds `rest.file_palette` from it and the unmodified file-palette view renders
+    /// the projected list (mirrors how `usage_data` / `models_cache` feed a DB-less /
+    /// fetch-less client). `Some(vec![])` = an `@partial` with no matches.
+    pub file_palette: Option<Vec<String>>,
 }
 
 // ─── mode payload projections (stage 2: core interactive modes) ──────────────

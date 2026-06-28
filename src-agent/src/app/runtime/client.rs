@@ -387,16 +387,18 @@ fn render_loop(
                 },
                 // A resize just needs the next unconditional paint to relayout.
                 Event::Resize(_, _) => {}
-                // Pasted text is forwarded character-by-character as key events so
-                // the daemon's composer ingests it through the same path as typing.
-                // Echo each char locally too so a paste appears instantly.
+                // Bracketed paste: forward the WHOLE text as one Paste request so the
+                // daemon runs the SAME `handle_paste` the local TUI uses. This is what
+                // makes path-image paste work remotely — a pasted image-file path is
+                // detected daemon-side and ingested into the session's `images/` dir as
+                // an `[Image #N]` attachment, and multi-line text keeps its newlines
+                // (CRLF-normalised). Forwarding char-by-char (the old behaviour) ran the
+                // daemon's plain `Char` handler instead, which can't detect an image
+                // path and mangles line endings. NOT echoed locally: a paste may become
+                // a marker rather than literal text, so faking the raw text would
+                // flicker — the daemon's InputChanged/Snapshot reconciles within a frame.
                 Event::Paste(text) => {
-                    for ch in text.chars() {
-                        let key =
-                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty());
-                        local_echo(&mut shadow, &key);
-                        let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(key)));
-                    }
+                    let _ = req_tx.send(ClientRequest::Paste { text });
                 }
                 _ => {}
             }
@@ -633,6 +635,18 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
     shadow.rest.agent_viewer_follow = global.agent_viewer_follow;
     shadow.rest.subagents_open = global.subagents_open;
     shadow.rest.subagent_sel = global.subagent_sel;
+
+    // Staged composer attachments (ingested daemon-side via path-paste / clipboard /
+    // @-picker). The `[Image #N]` marker text already arrives in `input`; mirror the
+    // attachment RECORDS too so the shadow composer matches the daemon's exactly.
+    shadow.rest.pending_attachments = global.pending_attachments;
+    // The precomputed `@`-file palette (the daemon ran `dir_cache.search` on its
+    // index). The client's reconstructed `dir_cache` is empty, so the unmodified
+    // file-palette view renders this projected list instead (see
+    // `view::chat::render_file_palette`). `None` when the composer isn't on an
+    // `@token`; seeding it every snapshot (including with `None`) means a stale list
+    // never lingers after the `@token` is completed/cleared.
+    shadow.rest.file_palette = global.file_palette;
 
     // Re-anchor the comet clock from the projected elapsed-ms (authoritative for
     // this snapshot). `work_since = now - elapsed` makes the status shimmer animate
