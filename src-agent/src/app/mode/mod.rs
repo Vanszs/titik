@@ -33,7 +33,7 @@ pub use effort::EffortPickerState;
 pub use key_input::KeyInputForm;
 pub use loading::{LoadingState, WarmStatus};
 pub use picker::PickerState;
-pub use session_hub::{CookingEntry, HistoryEntry, HubPane, SessionHub};
+pub use session_hub::{CookingEntry, HistoryEntry, HubPane, SessionHub, SessionKind};
 pub use quit_confirm::QuitConfirmState;
 pub use rewind::{RewindEntry, RewindState};
 pub use settings::{

@@ -24,7 +24,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
-use crate::app::mode::{HubPane, SessionHub};
+use crate::app::mode::{HubPane, SessionHub, SessionKind};
 use crate::view::theme::Palette;
 
 /// Format a `SystemTime` as a human-readable relative age string.
@@ -81,7 +81,7 @@ pub fn draw(frame: &mut Frame, hub: &SessionHub, palette: &Palette) {
     draw_history(frame, chunks[1], hub, palette);
 
     // --- Keybinding hint ---
-    let hint = "Tab switch pane · ↑↓ select · Enter open · Esc close";
+    let hint = "Tab switch pane · ↑↓ select · Enter open · N new · Esc close";
     let instructions = Paragraph::new(hint).style(Style::default().fg(palette.dim));
     frame.render_widget(instructions, chunks[2]);
 }
@@ -90,29 +90,33 @@ pub fn draw(frame: &mut Frame, hub: &SessionHub, palette: &Palette) {
 fn draw_cooking(frame: &mut Frame, area: Rect, hub: &SessionHub, palette: &Palette) {
     let focused = hub.focus == HubPane::Cooking;
 
-    let inner = pane_inner(frame, area, &format!("cooking ({})", hub.cooking.len()), focused, palette);
+    let real_sessions = hub.cooking.iter().filter(|e| e.kind == SessionKind::Session).count();
+    let inner = pane_inner(frame, area, &format!("cooking ({real_sessions})"), focused, palette);
     let inner_w = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, entry) in hub.cooking.iter().enumerate() {
-        // Right column: working/ready marker + a (current) tag on the foreground.
-        // NO emoji — house rule; the ●/○ glyphs are box-drawing-adjacent markers.
-        let state_marker = if entry.working { "● working" } else { "○ ready  " };
-        let current = if entry.is_foreground { "  (current)" } else { "" };
-        let right = format!("{state_marker}{current}");
-        let name_w = inner_w.saturating_sub(right.chars().count() + 2).max(4);
-        let name = truncate(&entry.name, name_w);
-        let row = format!("{name:<name_w$}  {right}");
-
-        // Only the FOCUSED pane shows a highlighted selection; an unfocused pane's
-        // cursor row renders as a plain row so focus is unambiguous.
         let style = if focused && i == hub.cooking_selected {
             Style::default().fg(palette.sel_fg).bg(palette.sel_bg)
+        } else if entry.kind == SessionKind::NewSession {
+            Style::default().fg(palette.accent)
         } else if focused {
             Style::default().fg(palette.fg)
         } else {
             Style::default().fg(palette.dim)
         };
+
+        let row = if entry.kind == SessionKind::NewSession {
+            entry.name.clone()
+        } else {
+            let state_marker = if entry.working { "● working" } else { "○ ready  " };
+            let current = if entry.is_foreground { "  (current)" } else { "" };
+            let right = format!("{state_marker}{current}");
+            let name_w = inner_w.saturating_sub(right.chars().count() + 2).max(4);
+            let name = truncate(&entry.name, name_w);
+            format!("{name:<name_w$}  {right}")
+        };
+
         lines.push(Line::styled(row, style));
     }
 

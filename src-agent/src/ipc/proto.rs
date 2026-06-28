@@ -619,6 +619,8 @@ pub enum WarmStatusWire {
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub struct CookingEntrySnapshot {
     pub name: String,
+    /// `"session"` or `"new_session"` — determines rendering on the client.
+    pub kind: String,
     pub working: bool,
     pub is_foreground: bool,
 }

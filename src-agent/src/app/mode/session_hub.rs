@@ -30,20 +30,37 @@ pub enum HubPane {
     History,
 }
 
-/// One row in the COOKING pane: a snapshot of a single live session.
+/// The kind of a cooking entry — either a real live session or a synthetic
+/// "[+ new session]" action row pinned at the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// A real live session (has a `sessions` index).
+    Session,
+    /// Synthetic "[+ new session]" row — Enter triggers `/new`.
+    NewSession,
+}
+
+/// One row in the COOKING pane: a snapshot of a single live session, or a
+/// synthetic action row.
 pub struct CookingEntry {
     /// Index of this session in `AppStateRest::sessions`. Carried out on Enter so
     /// the foreground switch sets `foreground = idx` directly. Stable for the
     /// hub's lifetime — `sessions` is only ever appended to / has its foreground
     /// changed, never reordered or removed.
+    ///
+    /// For `NewSession` entries this is `usize::MAX` (never a valid index).
     pub idx: usize,
+    /// The kind of entry (real session vs synthetic new-session row).
+    pub kind: SessionKind,
     /// Display name of the session (its [`crate::model::session::Session::name`]),
     /// or a placeholder when the slot has no session yet.
     pub name: String,
     /// Whether the session had work in flight when the snapshot was taken
     /// (`SessionRuntime::is_working()`), shown as a ● working / ○ ready marker.
+    /// Ignored for `NewSession` entries.
     pub working: bool,
     /// Whether this is the current foreground session, tagged `(current)`.
+    /// Ignored for `NewSession` entries.
     pub is_foreground: bool,
 }
 

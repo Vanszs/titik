@@ -27,7 +27,7 @@ use crate::app::mode::editor::TextEditorState;
 use crate::app::mode::settings::{ModelDraft, ModelModal, PathPicker, PickerMode, ProviderDraft};
 use crate::app::mode::{
     CookingEntry, EffortPickerState, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode,
-    PickerState, RewindState, SessionHub, SettingsState, UsageMetric, UsageNavState, UsageView,
+    PickerState, RewindState, SessionHub, SessionKind, SettingsState, UsageMetric, UsageNavState, UsageView,
     WarmStatus,
 };
 use crate::app::resolve::resolve_role;
@@ -385,6 +385,11 @@ fn session_hub_snapshot(h: &SessionHub) -> SessionHubSnapshot {
 fn cooking_entry_snapshot(e: &CookingEntry) -> CookingEntrySnapshot {
     CookingEntrySnapshot {
         name: e.name.clone(),
+        kind: match e.kind {
+            SessionKind::Session => "session",
+            SessionKind::NewSession => "new_session",
+        }
+        .to_string(),
         working: e.working,
         is_foreground: e.is_foreground,
     }

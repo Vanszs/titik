@@ -13,14 +13,16 @@
 //! `_rest` is unused — mirroring [`super::handle_rewind`].
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use crate::app::mode::{HubPane, SessionHub};
+use crate::app::mode::{HubPane, SessionHub, SessionKind};
 use crate::app::state::AppStateRest;
 use super::{is_ctrl, Action};
 
 /// Handle a key press inside the session hub.
 ///
 /// Esc and Ctrl+C both close back to Chat unchanged. Enter resolves against the
-/// FOCUSED pane: cooking -> foreground switch, history -> load into a new tab.
+/// FOCUSED pane: cooking -> foreground switch (or new session on the synthetic
+/// row), history -> load into a new tab. `N` is a global shortcut for `/new`
+/// regardless of which pane is focused.
 pub fn handle_session_hub(
     hub: &mut SessionHub,
     _rest: &mut AppStateRest,
@@ -46,7 +48,9 @@ pub fn handle_session_hub(
         }
         KeyCode::Enter => match hub.focus {
             HubPane::Cooking => match hub.selected_cooking() {
-                // Reuse the live foreground-switch path (carries the Vec index).
+                Some(entry) if entry.kind == SessionKind::NewSession => {
+                    Action::Slash(crate::controller::command::Command::New)
+                }
                 Some(entry) => Action::LiveSwitch(entry.idx),
                 None => Action::CloseSessionHub,
             },
@@ -57,6 +61,7 @@ pub fn handle_session_hub(
                 None => Action::CloseSessionHub,
             },
         },
+        KeyCode::Char('n') | KeyCode::Char('N') => Action::Slash(crate::controller::command::Command::New),
         _ => Action::None,
     }
 }

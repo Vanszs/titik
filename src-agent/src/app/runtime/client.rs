@@ -116,7 +116,7 @@ use crate::app::mode::settings::{
 };
 use crate::app::mode::{
     CookingEntry, EffortPickerState, HistoryEntry, HubPane, KeyInputForm, LoadingState, Mode,
-    PickerState, QuitConfirmState, RewindEntry, RewindState, SessionHub, UsageMetric, UsageNavState,
+    PickerState, QuitConfirmState, RewindEntry, RewindState, SessionHub, SessionKind, UsageMetric, UsageNavState,
     UsageRange, UsageView, WarmStatus,
 };
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
@@ -1276,6 +1276,10 @@ fn shadow_session_hub(h: SessionHubSnapshot) -> SessionHub {
             .into_iter()
             .map(|c| CookingEntry {
                 idx: 0, // daemon-side index; not rendered, resolved on the daemon
+                kind: match c.kind.as_str() {
+                    "new_session" => SessionKind::NewSession,
+                    _ => SessionKind::Session,
+                },
                 name: c.name,
                 working: c.working,
                 is_foreground: c.is_foreground,

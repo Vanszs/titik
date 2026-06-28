@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::app::mode::{
-    CookingEntry, HistoryEntry, HubPane, KeyInputForm, Mode, SessionHub,
+    CookingEntry, HistoryEntry, HubPane, KeyInputForm, Mode, SessionHub, SessionKind,
 };
 use crate::app::state::{AppState, SessionRuntime};
 use crate::config::DEFAULT_MODEL;
@@ -141,23 +141,33 @@ pub(crate) fn handle_resume(state: &mut AppState) -> Result<()> {
         return Ok(());
     }
 
-    // COOKING pane: one row per live session, in `sessions` order.
-    let cooking: Vec<CookingEntry> = state
-        .rest
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(idx, rt)| CookingEntry {
-            idx,
+    // COOKING pane: a synthetic "[+ new session]" row at index 0, then one row
+    // per LIVE session with a non-empty Session (the daemon's initial empty
+    // placeholder is filtered out — it is dead on arrival).
+    let mut cooking: Vec<CookingEntry> = Vec::with_capacity(state.rest.sessions.len() + 1);
+    cooking.push(CookingEntry {
+        idx: usize::MAX,
+        kind: SessionKind::NewSession,
+        name: "[+ new session]".to_string(),
+        working: false,
+        is_foreground: false,
+    });
+    for (raw_idx, rt) in state.rest.sessions.iter().enumerate() {
+        if rt.session.is_none() {
+            continue; // skip the initial empty placeholder
+        }
+        cooking.push(CookingEntry {
+            idx: raw_idx,
+            kind: SessionKind::Session,
             name: rt
                 .session
                 .as_ref()
                 .map(|s| s.name.clone())
-                .unwrap_or_else(|| "(no session)".to_string()),
+                .unwrap_or_default(),
             working: rt.is_working(),
-            is_foreground: idx == state.rest.foreground,
-        })
-        .collect();
+            is_foreground: raw_idx == state.rest.foreground,
+        });
+    }
 
     // Set of LIVE on-disk paths, used to dedup the history pane. A live session's
     // path is its canonical identity, matching the `SessionMeta.path` listing.
@@ -187,8 +197,16 @@ pub(crate) fn handle_resume(state: &mut AppState) -> Result<()> {
         }
     };
 
-    // Default the cooking cursor to the current foreground's row; focus cooking.
-    let cooking_selected = state.rest.foreground.min(cooking.len().saturating_sub(1));
+    // Default the cooking cursor to the current foreground's row. The synthetic
+    // [+ new session] row is at index 0, so a real session at `sessions` index N
+    // maps to cooking index N+1 (filtered sessions before it are skipped, but
+    // since we only skip the initial empty placeholder which is always at index 0
+    // and never the foreground, the mapping is simply N+1). Clamp defensively.
+    let cooking_selected = cooking
+        .iter()
+        .position(|e| e.kind == SessionKind::Session && e.idx == state.rest.foreground)
+        .unwrap_or(0)
+        .min(cooking.len().saturating_sub(1));
 
     state.mode = Mode::SessionHub(Box::new(SessionHub {
         cooking,
