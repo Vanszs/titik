@@ -211,6 +211,19 @@ pub struct SessionRuntime {
     /// tombstone is permanent for the daemon's lifetime. Starts `false`; the local
     /// TUI never sets it (it has no per-session close).
     pub closed: bool,
+    /// PARK-START instant for the detached-approval timeout (daemon stage 11). Set by
+    /// the daemon loop to `Some(Instant::now())` the first tick this session is
+    /// `awaiting_approval` while NO client is attached — i.e. a risky tool is parked
+    /// with no operator present to answer it. Once the elapsed time crosses
+    /// `APPROVAL_PARK_TIMEOUT` the loop AUTO-DENIES the pending call(s) (via the shared
+    /// `deny_all_pending` path, so the conversation stays API-valid) and clears this
+    /// back to `None`. Cleared the moment the park ends for ANY reason — the operator
+    /// approves/denies, or a client (re)attaches (an attached client waits for the
+    /// operator indefinitely, so the timer must not run while attached). The local TUI
+    /// never sets it (it always has its operator on screen); it is purely the daemon's
+    /// safety valve against an immortal parked daemon holding a lock with nobody home.
+    /// Starts `None`.
+    pub park_started_at: Option<Instant>,
 }
 
 impl Default for SessionRuntime {
@@ -262,6 +275,7 @@ impl SessionRuntime {
             was_working: false,
             finished_unseen: false,
             closed: false,
+            park_started_at: None,
         }
     }
 
@@ -367,6 +381,10 @@ impl SessionRuntime {
         self.waiting = false;
         self.awaiting_approval = false;
         self.approval_reason = None;
+        // Drop any detached-park timer (daemon stage 11) — a tombstone is never
+        // awaiting, and the loop only inspects non-closed sessions, so this just
+        // keeps the inert slot fully clean.
+        self.park_started_at = None;
         self.awaiting_tool_tasks = false;
         // Sub-agents: kill running, drop model-delegated queued work, clear the
         // parked-delegation bookkeeping. (Unlike a turn-halt, a CLOSE also drops

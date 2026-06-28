@@ -61,7 +61,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::mode::Mode;
 use crate::app::state::AppState;
@@ -72,6 +72,7 @@ use crate::ipc::snapshot::{build_snapshot, diff};
 use crate::service::openrouter::OpenRouterClient;
 
 use super::super::actions::apply_action;
+use super::super::stream::deny_all_pending;
 use super::global::{has_running_subagents, service_global};
 use super::sessions::service_all_sessions;
 
@@ -551,6 +552,19 @@ impl DaemonHub {
 /// working again or a client is enrolled.
 const SELF_EXIT_GRACE_TICKS: u32 = 10;
 
+/// How long a session may stay PARKED on tool-approval while DETACHED (no client
+/// attached) before the daemon AUTO-DENIES the pending risky call(s) (daemon stage
+/// 11, item 1). Rationale (critique): an immortal parked daemon holding a session
+/// lock with no operator on the wire is strictly worse than a denied tool — the deny
+/// keeps the conversation API-valid and lets the session go idle so the daemon can
+/// eventually self-exit and release its lock. The window is generous (30 min) so an
+/// operator who merely stepped away has ample time to reattach and answer; while a
+/// client IS attached the timer never runs (it is cleared on attach), so an attached
+/// operator can leave an approval pending indefinitely — that is the intended
+/// pause-till-reattach. Measured from `SessionRuntime::park_started_at`, stamped the
+/// first detached+awaiting tick.
+const APPROVAL_PARK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// True when every session is CLOSED (tombstoned) — the "nothing left to run" half
 /// of the self-exit condition (daemon stage 10). The documented contract
 /// ([`crate::ipc::proto::ClientRequest::Detach`]) is that the daemon self-exits only
@@ -601,6 +615,111 @@ fn close_all_sessions(state: &mut AppState) {
         s.close();
     }
     repoint_foreground_off_closed(state);
+}
+
+/// Drive the DETACHED-approval park timer for every live session and AUTO-DENY any
+/// that has been parked-on-approval too long with no operator on the wire (daemon
+/// stage 11, item 1). Called once per tick AFTER `drain_inbound` (so a same-tick
+/// attach / approve / deny is already reflected) and BEFORE `stream_deltas` (so an
+/// auto-deny folds into this tick's frames).
+///
+/// `client_attached` is `hub.client_count() > 0`. Per live (non-closed) session:
+/// - PARKED + DETACHED (`awaiting_approval && !client_attached`): stamp
+///   `park_started_at` on the first such tick; once `Instant::elapsed()` crosses
+///   [`APPROVAL_PARK_TIMEOUT`], answer the pending risky call(s) as DENIED via the
+///   shared [`deny_all_pending`] path — which keeps the conversation API-valid (no
+///   dangling `tool_call` ids), resets the agentic machine, clears `awaiting_approval`
+///   (so the session goes idle), and tears down any sub-agents — then clear the timer.
+/// - NOT parked, OR a client is attached: clear `park_started_at`. An attached client
+///   waits for its operator indefinitely (no timeout), so the timer must not run while
+///   attached; clearing also restarts the grace from zero on the next detach, so an
+///   operator who reattaches then leaves again gets a full fresh window.
+///
+/// Returns `true` if any session was auto-denied (so the caller flags the loop dirty,
+/// purely for symmetry with the other servicers — headless, nothing is drawn).
+fn service_approval_park_timeouts(state: &mut AppState, client_attached: bool) -> bool {
+    let mut denied_any = false;
+    let now = Instant::now();
+    // Index-based throughout (no long-lived `&mut` session borrow) so the auto-deny
+    // branch can re-borrow `state` for `deny_all_pending` with no borrow-checker
+    // gymnastics. Each arm touches only `sessions[idx]` (or hands `idx` to the deny).
+    for idx in 0..state.rest.sessions.len() {
+        if state.rest.sessions[idx].closed {
+            continue;
+        }
+        let parked_detached =
+            state.rest.sessions[idx].awaiting_approval && !client_attached;
+        if !parked_detached {
+            // Not parked, or a client is attached → no timeout; reset the clock.
+            state.rest.sessions[idx].park_started_at = None;
+            continue;
+        }
+        // Detached + parked: start (or keep) the timer, then check expiry. `Instant`
+        // is `Copy`, so this reads out the (possibly just-stamped) start instant.
+        let started = *state.rest.sessions[idx].park_started_at.get_or_insert(now);
+        if now.duration_since(started) >= APPROVAL_PARK_TIMEOUT {
+            // Auto-deny via the shared deny path (keeps every tool_call id answered, so
+            // the conversation stays API-valid). `deny_all_pending` clears
+            // `awaiting_approval`; clear the timer too so a fresh park (should the model
+            // somehow re-enter approval) re-stamps from now.
+            deny_all_pending(
+                state,
+                idx,
+                "auto-denied: approval request timed out while detached",
+            );
+            state.rest.sessions[idx].park_started_at = None;
+            denied_any = true;
+        }
+    }
+    denied_any
+}
+
+/// True when the daemon has NO self-advancing work to do this tick — every live
+/// session is either idle or PARKED on tool-approval, no global async (catalogue
+/// fetch / loading splash / running sub-agent) is in flight, AND (when any session
+/// is parked) no client is attached (daemon stage 11, item 2). In that state the
+/// only thing that could change is an operator's approve — which, while DETACHED,
+/// can't arrive — so the loop should nap on the SLOW idle cadence instead of spinning
+/// the busy 8ms tick.
+///
+/// "Self-advancing work" is anything that progresses on its own via an async channel:
+/// a live stream, a parked deferred tool-task / sub-agent lane, a running sub-agent,
+/// or a pending catalogue/loading transition. `awaiting_approval` is the ONE working
+/// state that does NOT self-advance (it needs an external answer), so it does NOT
+/// count as busy here. While a client IS attached, a parked session keeps the FAST
+/// cadence (caller handles that) so a reattached operator's approve is processed
+/// with minimal latency.
+fn all_idle_or_parked_detached(state: &AppState, client_attached: bool) -> bool {
+    // Any global async work pending → not quiescent.
+    if state.rest.catalogue_pending.is_some()
+        || matches!(state.mode, Mode::Loading(_))
+        || has_running_subagents(state)
+    {
+        return false;
+    }
+    // Any live session doing self-advancing work (anything working that ISN'T merely
+    // awaiting approval) → not quiescent.
+    let any_progressing = state
+        .rest
+        .sessions
+        .iter()
+        .any(|s| !s.closed && s.is_working() && !s.awaiting_approval);
+    if any_progressing {
+        return false;
+    }
+    // Here: nothing is self-advancing. If a client is attached AND a session is parked
+    // on approval, keep fast (responsive approve); otherwise (detached, or fully idle)
+    // we can nap slow.
+    if client_attached
+        && state
+            .rest
+            .sessions
+            .iter()
+            .any(|s| !s.closed && s.awaiting_approval)
+    {
+        return false;
+    }
+    true
 }
 
 /// The headless daemon loop. Each tick services every session + every global
@@ -684,6 +803,18 @@ pub(in crate::app::runtime) fn daemon_loop(
             state.rest.should_quit = false;
         }
 
+        // 3a-bis. DETACHED-approval park timeout (stage 11, item 1). With the inbound
+        //     batch (incl. any attach / approve / deny) already applied above, drive
+        //     each live session's park timer: a session parked on tool-approval while
+        //     NO client is attached is auto-denied once it crosses
+        //     `APPROVAL_PARK_TIMEOUT`, via the shared `deny_all_pending` path (so the
+        //     conversation stays API-valid and the session goes idle — freeing the
+        //     daemon to eventually self-exit and release its lock). A client being
+        //     attached clears the timer (an attached operator waits indefinitely).
+        //     Run BEFORE `stream_deltas` so an auto-deny's idle state folds into this
+        //     tick's frames.
+        let _ = service_approval_park_timeouts(state, hub.client_count() > 0);
+
         // 3b. Stream this tick's render-state changes to every attached client as
         //     seq'd frames (after kill-all so a tombstoned set folds back).
         hub.stream_deltas(state);
@@ -734,14 +865,19 @@ pub(in crate::app::runtime) fn daemon_loop(
         //    wakes every 100ms to notice the next change. A closed foreground reads
         //    `waiting == false` (see `SessionRuntime::close`), so a fully-tombstoned
         //    daemon naps at the idle cadence through its grace window.
-        let busy = state.rest.fg().waiting
-            || state.rest.catalogue_pending.is_some()
-            || matches!(state.mode, Mode::Loading(_))
-            || has_running_subagents(state);
-        let nap = if busy {
-            Duration::from_millis(8)
-        } else {
+        //    Stage 11, item 2: an APPROVAL-PARKED session keeps `waiting`/`is_working`
+        //    true (so the daemon stays alive), but while DETACHED nothing can advance
+        //    it — so don't busy-spin on it. `all_idle_or_parked_detached` is true when
+        //    no session has self-advancing async work AND (any parked session has no
+        //    client attached); in that case nap slow even though a session is "waiting".
+        //    As soon as a client attaches (responsive approve) or any session resumes
+        //    real work, the predicate flips false and the fast cadence returns. (This
+        //    also tightens the old foreground-only `fg().waiting` check to ALL sessions,
+        //    so a background stream now correctly keeps the daemon fast too.)
+        let nap = if all_idle_or_parked_detached(state, hub.client_count() > 0) {
             Duration::from_millis(100)
+        } else {
+            Duration::from_millis(8)
         };
         std::thread::sleep(nap);
     }
@@ -1372,5 +1508,184 @@ mod tests {
 
         assert!(!state.rest.should_quit, "flag cleared by the daemon close path");
         assert!(all_sessions_closed(&state), "kill-all flag closed every session");
+    }
+
+    // ─── daemon stage 11: detached-approval park timeout + parked cadence ─────
+
+    /// Put session `idx` into the PARKED-on-approval state with one unanswered risky
+    /// tool call, mirroring what the approval machine leaves set when it pauses.
+    fn park_on_approval(state: &mut AppState, idx: usize) {
+        use crate::dto::chat::{FunctionCall, ToolCall};
+        let s = &mut state.rest.sessions[idx];
+        s.waiting = true; // a parked turn is still "working" (keeps the daemon alive)
+        s.awaiting_approval = true;
+        s.approval_reason = Some("writes outside workspace".into());
+        s.pending_tool_calls = vec![ToolCall {
+            id: "call-1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        }];
+        s.tool_idx = 0;
+    }
+
+    /// Detached + awaiting: the first pass STAMPS the park timer but does NOT deny
+    /// before the window elapses (the session stays parked, awaiting an operator).
+    #[test]
+    fn park_timer_stamps_when_detached_no_premature_deny() {
+        let mut state = AppState::new(Mode::Chat);
+        park_on_approval(&mut state, 0);
+        assert!(state.rest.sessions[0].park_started_at.is_none(), "no timer yet");
+
+        // No client attached → detached.
+        let denied = service_approval_park_timeouts(&mut state, false);
+
+        assert!(!denied, "nothing denied on the first detached tick");
+        assert!(
+            state.rest.sessions[0].park_started_at.is_some(),
+            "the park timer is stamped on the first detached+awaiting tick"
+        );
+        assert!(
+            state.rest.sessions[0].awaiting_approval,
+            "still parked — the window has not elapsed"
+        );
+    }
+
+    /// While a client IS attached, the timer never runs: it is cleared each pass and
+    /// the session waits for its operator indefinitely (the intended pause).
+    #[test]
+    fn park_timer_cleared_while_client_attached() {
+        let mut state = AppState::new(Mode::Chat);
+        park_on_approval(&mut state, 0);
+        // Pretend a prior detached tick had stamped it.
+        state.rest.sessions[0].park_started_at = Some(Instant::now());
+
+        // A client is attached → no timeout; the clock is reset.
+        let denied = service_approval_park_timeouts(&mut state, true);
+
+        assert!(!denied, "an attached operator is never auto-denied");
+        assert!(
+            state.rest.sessions[0].park_started_at.is_none(),
+            "the timer is cleared while a client is attached"
+        );
+        assert!(state.rest.sessions[0].awaiting_approval, "still parked, waiting for the operator");
+    }
+
+    /// Once a DETACHED park exceeds `APPROVAL_PARK_TIMEOUT`, the pending call is
+    /// auto-denied: `awaiting_approval` clears, the pending calls drain, `waiting`
+    /// drops (the session goes idle), and the timer is cleared.
+    #[test]
+    fn park_timeout_auto_denies_after_window() {
+        let mut state = AppState::new(Mode::Chat);
+        park_on_approval(&mut state, 0);
+        // Backdate the park start to just past the timeout so this pass expires it.
+        let past = Instant::now()
+            .checked_sub(APPROVAL_PARK_TIMEOUT + Duration::from_secs(1))
+            .expect("instant far enough in the past");
+        state.rest.sessions[0].park_started_at = Some(past);
+
+        let denied = service_approval_park_timeouts(&mut state, false);
+
+        assert!(denied, "the expired park was auto-denied");
+        let s = &state.rest.sessions[0];
+        assert!(!s.awaiting_approval, "auto-deny clears the approval park");
+        assert!(s.pending_tool_calls.is_empty(), "pending calls were answered/drained");
+        assert!(!s.waiting, "the session goes idle after the auto-deny");
+        assert!(s.park_started_at.is_none(), "the park timer is cleared after the deny");
+    }
+
+    /// A session that is NOT awaiting approval has its timer cleared every pass — this
+    /// is how an operator's approve/deny (which clears `awaiting_approval`) resets the
+    /// clock for any future park.
+    #[test]
+    fn park_timer_reset_when_not_awaiting() {
+        let mut state = AppState::new(Mode::Chat);
+        // Stamp a stale timer but leave the session NOT awaiting.
+        state.rest.sessions[0].park_started_at = Some(Instant::now());
+        state.rest.sessions[0].awaiting_approval = false;
+
+        let denied = service_approval_park_timeouts(&mut state, false);
+
+        assert!(!denied, "an idle session is never denied");
+        assert!(
+            state.rest.sessions[0].park_started_at.is_none(),
+            "a non-awaiting session's timer is cleared"
+        );
+    }
+
+    /// A CLOSED (tombstoned) session is ignored by the park timer — even if it somehow
+    /// still carries `awaiting_approval`, it is skipped (no deny, no timer touch).
+    #[test]
+    fn park_timeout_skips_closed_session() {
+        let mut state = AppState::new(Mode::Chat);
+        park_on_approval(&mut state, 0);
+        let stamp = Instant::now()
+            .checked_sub(APPROVAL_PARK_TIMEOUT + Duration::from_secs(1))
+            .expect("past instant");
+        state.rest.sessions[0].park_started_at = Some(stamp);
+        // Tombstone the flag directly (not via close(), which would clear awaiting).
+        state.rest.sessions[0].closed = true;
+
+        let denied = service_approval_park_timeouts(&mut state, false);
+
+        assert!(!denied, "a closed session is skipped, never auto-denied");
+        assert!(
+            state.rest.sessions[0].park_started_at.is_some(),
+            "a closed session's fields are left untouched (skipped before any reset)"
+        );
+    }
+
+    /// Cadence predicate: a DETACHED daemon with a session parked on approval and no
+    /// other work reports "idle-or-parked-detached" (→ slow 100ms nap); attaching a
+    /// client flips it false (→ fast 8ms for a responsive approve).
+    #[test]
+    fn cadence_slow_when_parked_detached_fast_when_attached() {
+        let mut state = AppState::new(Mode::Chat);
+        park_on_approval(&mut state, 0);
+
+        // Detached + only-parked → nap slow.
+        assert!(
+            all_idle_or_parked_detached(&state, false),
+            "detached + parked-on-approval should nap on the slow cadence"
+        );
+        // A client attached → keep the fast cadence so its approve is low-latency.
+        assert!(
+            !all_idle_or_parked_detached(&state, true),
+            "an attached client over a parked session keeps the fast cadence"
+        );
+    }
+
+    /// Cadence predicate: a session doing SELF-ADVANCING work (a live stream) is never
+    /// "idle-or-parked" regardless of client attachment — the daemon must stay fast.
+    #[test]
+    fn cadence_fast_when_session_streaming() {
+        let mut state = AppState::new(Mode::Chat);
+        state.rest.sessions[0].begin_stream(); // streaming = Some("") → is_working()
+
+        assert!(
+            !all_idle_or_parked_detached(&state, false),
+            "a streaming session keeps the daemon on the fast cadence (detached)"
+        );
+        assert!(
+            !all_idle_or_parked_detached(&state, true),
+            "a streaming session keeps the daemon on the fast cadence (attached)"
+        );
+    }
+
+    /// Cadence predicate: a fully idle daemon (no work, nothing parked) naps slow
+    /// whether or not a client is attached — the prior idle behaviour is preserved.
+    #[test]
+    fn cadence_slow_when_fully_idle() {
+        let state = AppState::new(Mode::Chat);
+        assert!(
+            all_idle_or_parked_detached(&state, false),
+            "idle + detached naps slow"
+        );
+        assert!(
+            all_idle_or_parked_detached(&state, true),
+            "idle + an attached-but-quiet client still naps slow"
+        );
     }
 }
