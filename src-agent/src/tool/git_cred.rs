@@ -151,6 +151,12 @@ fn select_key(ssh_dir: &std::path::Path, key: &str) -> Result<String> {
     if key.contains('/') || key.contains('\\') || key.contains("..") {
         return Ok("error: invalid key name (must be a bare filename, no path separators or '..')".into());
     }
+    // Reject whitespace and shell-special characters: the key name is embedded
+    // inside a single-quoted ssh command string, so a single-quote in the name
+    // would escape out of the quoting, and whitespace would cause word-splitting.
+    if key.chars().any(|c| matches!(c, ' ' | '\t' | '\'' | '"' | '$' | '`')) {
+        return Ok("error: invalid key name (must not contain whitespace or shell-special characters)".into());
+    }
 
     let private_path = ssh_dir.join(key);
     let pub_path = ssh_dir.join(format!("{key}.pub"));

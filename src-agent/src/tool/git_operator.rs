@@ -33,7 +33,12 @@ impl Tool for GitOperator {
          Destructive operations (force-push, hard reset, clean -f, branch -D, etc.) \
          require confirm_destructive=true. This tool is NON-INTERACTIVE: git is exec'd \
          directly (never via a shell) and will never prompt for credentials or \
-         passphrases — it fails fast instead."
+         passphrases — it fails fast instead. \
+         IMPORTANT: the FIRST element of 'args' MUST be the git subcommand (e.g. \
+         \"push\", \"commit\", \"status\"). Global options that precede the subcommand \
+         (e.g. -C, --git-dir) are NOT supported and will be rejected — they are \
+         unnecessary because git already runs in the session workspace. Put the \
+         subcommand first, e.g. [\"push\", \"origin\", \"main\"]."
     }
 
     fn parameters(&self) -> Value {
@@ -80,6 +85,20 @@ impl Tool for GitOperator {
             }
         }
 
+        // --- Subcommand-first guard (BLOCKER 1) -----------------------------------
+        // Global git options (e.g. -C, --git-dir) placed before the subcommand
+        // would cause the destructive guardrail to see the flag as the subcmd and
+        // skip all checks.  We reject them outright: the session workspace is
+        // already the cwd so no global options are needed.
+        if git_args[0].starts_with('-') {
+            return Ok(format!(
+                "error: the first element of 'args' must be the git subcommand, \
+                 not a flag/option (got '{}'). Put the subcommand first, \
+                 e.g. [\"push\",\"origin\",\"main\"].",
+                git_args[0]
+            ));
+        }
+
         let confirm_destructive = args
             .get("confirm_destructive")
             .and_then(Value::as_bool)
@@ -108,7 +127,7 @@ impl Tool for GitOperator {
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for SSH key path"))?;
             let key_path = home.join(".ssh").join(key);
             Some(format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
+                "ssh -i '{}' -o IdentitiesOnly=yes -o BatchMode=yes",
                 key_path.display()
             ))
         } else {
@@ -155,21 +174,11 @@ impl Tool for GitOperator {
         let combined = crate::dto::chat::strip_ansi(&combined);
 
         let exit_code_n = output.status.code().unwrap_or(-1);
-        let exit_code_str = if exit_code_n != 0 {
-            format!("{exit_code_n}")
-        } else {
-            "0".to_string()
-        };
-
-        // Prefix non-zero exits with a short header so the model notices immediately.
-        let text = if exit_code_n != 0 {
-            format!("exit code {exit_code_n}\n{combined}")
-        } else {
-            combined
-        };
+        let exit_code_str = exit_code_n.to_string();
 
         // Cap via the shared helper (last MAX_TOOL_OUTPUT_CHARS chars).
-        Ok(super::shell::format_captured_output(text, &exit_code_str))
+        // format_captured_output appends "exit code: N" — do not duplicate it here.
+        Ok(super::shell::format_captured_output(combined, &exit_code_str))
     }
 }
 
@@ -223,6 +232,7 @@ fn check_destructive(args: &[String]) -> Option<&'static str> {
         "push" => {
             if has_flag(rest, "--force")
                 || has_flag(rest, "-f")
+                || has_bundle_char(rest, 'f')
                 || has_prefix(rest, "--force-with-lease")
                 || has_flag(rest, "--delete")
                 || has_flag(rest, "-d")
@@ -251,13 +261,14 @@ fn check_destructive(args: &[String]) -> Option<&'static str> {
         }
 
         "branch" => {
-            // -D (uppercase) is the explicit force-delete shorthand.
-            if has_flag(rest, "-D") {
+            // -D (uppercase) is the explicit force-delete shorthand; also catch
+            // bundles like -dD.
+            if has_flag(rest, "-D") || has_bundle_char(rest, 'D') {
                 return Some("branch -D (force delete)");
             }
             // -d + --force or -d + -f is equivalent.
             if (has_flag(rest, "-d") || has_flag(rest, "--delete"))
-                && (has_flag(rest, "--force") || has_flag(rest, "-f"))
+                && (has_flag(rest, "--force") || has_flag(rest, "-f") || has_bundle_char(rest, 'f'))
             {
                 return Some("branch -d --force");
             }
@@ -267,6 +278,7 @@ fn check_destructive(args: &[String]) -> Option<&'static str> {
             if has_flag(rest, "-f")
                 || has_flag(rest, "--force")
                 || has_flag(rest, "--discard-changes")
+                || has_bundle_char(rest, 'f')
             {
                 return Some("checkout/switch/restore --force (discards local changes)");
             }
