@@ -22,6 +22,7 @@ pub mod cd;
 pub mod dircache;
 pub mod fs;
 pub mod git_cred;
+pub mod git_operator;
 pub mod internet;
 pub mod memory;
 pub mod pong;
@@ -100,6 +101,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(internet::WebFetch),
         Box::new(internet::WebSearch),
         Box::new(git_cred::GitCred),
+        Box::new(git_operator::GitOperator),
     ]
 }
 
@@ -141,6 +143,7 @@ pub const DEFERRED_TOOLS: &[&str] = &[
     "read", "write", "edit", "delete", "bash", "grep", "glob",
     "remember", "forget", "recall",
     "web_fetch", "web_search",
+    "git_operator",
 ];
 
 /// Tool names advertised to the MAIN chat model (everything except agent-only

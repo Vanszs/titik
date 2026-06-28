@@ -65,19 +65,25 @@ pub fn run_shell_capture(command: &str, cwd: &Path, timeout_ms: u64) -> String {
     // tool results, history, the transcript, and the rolling summary.
     let combined = crate::dto::chat::strip_ansi(&combined);
 
-    // Cap to the LAST MAX_CHARS chars so big build logs don't flood the context.
+    let exit_code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".to_string());
+    format_captured_output(combined, &exit_code)
+}
+
+/// Format captured command output: ANSI must already be stripped. Applies the
+/// shared output cap (last [`crate::config::MAX_TOOL_OUTPUT_CHARS`] chars), adds a
+/// truncation notice when trimmed, ensures a trailing newline, and appends
+/// `exit code: <code>`. Shared by [`run_shell_capture`] and `git_operator`.
+pub(crate) fn format_captured_output(text: String, exit_code: &str) -> String {
     const MAX_CHARS: usize = crate::config::MAX_TOOL_OUTPUT_CHARS;
     let truncated;
-    let tail: String = if combined.chars().count() > MAX_CHARS {
+    let tail: String = if text.chars().count() > MAX_CHARS {
         truncated = true;
-        combined.chars().rev().take(MAX_CHARS).collect::<String>()
+        text.chars().rev().take(MAX_CHARS).collect::<String>()
             .chars().rev().collect()
     } else {
         truncated = false;
-        combined
+        text
     };
-
-    let exit_code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".to_string());
 
     let mut out = String::new();
     if truncated {

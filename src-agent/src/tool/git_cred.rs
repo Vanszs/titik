@@ -144,7 +144,10 @@ fn list_keys(ssh_dir: &std::path::Path, current: &Option<String>) -> Result<Stri
 /// `~/.ssh/<key>.pub` exist (metadata only), and on success return the tagged
 /// result string so the runtime can persist the selection.
 fn select_key(ssh_dir: &std::path::Path, key: &str) -> Result<String> {
-    // Reject any path traversal attempt in the bare filename.
+    // Reject empty key name and any path traversal attempt in the bare filename.
+    if key.is_empty() {
+        return Ok("error: invalid key name (must not be empty)".into());
+    }
     if key.contains('/') || key.contains('\\') || key.contains("..") {
         return Ok("error: invalid key name (must be a bare filename, no path separators or '..')".into());
     }
