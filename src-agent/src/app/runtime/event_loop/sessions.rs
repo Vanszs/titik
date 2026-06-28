@@ -544,6 +544,19 @@ fn service_session(
             .map(|s| s.name.clone())
             .unwrap_or_else(|| format!("session {idx}"));
         state.rest.set_toast_info(format!("session {name} ready"));
+        // STICKY counterpart of the TTL toast (daemon critique #3): latch the
+        // unseen marker so a DETACHED client still learns this background session
+        // finished once it reattaches, long after the toast would have expired.
+        state.rest.sessions[idx].finished_unseen = true;
+        dirty = true;
+    }
+    // Clear the sticky marker the moment this session is the one being looked at
+    // (it is the foreground). Covers the local TUI (always has a foreground) and a
+    // client that foregrounds this session: switching INTO it counts as "seen". A
+    // later switch-handler stage may also clear on an explicit view; this keeps the
+    // marker honest for the common foreground==idx case with no extra plumbing.
+    if idx == state.rest.foreground && state.rest.sessions[idx].finished_unseen {
+        state.rest.sessions[idx].finished_unseen = false;
         dirty = true;
     }
     state.rest.sessions[idx].was_working = now_working;

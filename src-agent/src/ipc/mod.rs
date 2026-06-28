@@ -23,6 +23,7 @@ pub mod frame;
 pub mod proto;
 pub mod selftest;
 pub mod server;
+pub mod snapshot;
 
 #[cfg(test)]
 mod roundtrip_tests {

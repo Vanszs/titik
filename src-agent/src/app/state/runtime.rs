@@ -190,6 +190,16 @@ pub struct SessionRuntime {
     /// transition for a NON-foreground session fires a "session ready" toast. Starts
     /// `false` so a freshly-created idle session never spuriously nudges.
     pub was_working: bool,
+    /// STICKY "this background session finished a turn and nobody has looked at it
+    /// since" flag (daemon critique #3). Distinct from the background-finish TOAST,
+    /// which is TTL-based and expires on its own — useless when the only client is
+    /// DETACHED, since it would lapse before anyone reattaches. This flag instead
+    /// LATCHES on the same NON-foreground `working -> ready` edge that raises the
+    /// toast (set in `service_all_sessions`) and is carried in `SessionSnapshot` so a
+    /// reattaching client still sees the unseen marker. Cleared when a client
+    /// foregrounds / views the session (the switch handler in a later stage, or here
+    /// the moment this session IS the foreground). Starts `false`.
+    pub finished_unseen: bool,
 }
 
 impl Default for SessionRuntime {
@@ -239,6 +249,7 @@ impl SessionRuntime {
             summarizing: false,
             last_send_at: None,
             was_working: false,
+            finished_unseen: false,
         }
     }
 
