@@ -277,8 +277,9 @@ impl SessionRuntime {
         }
     }
 
-    /// Kill every still-running sub-agent that belongs to THIS session and drop
-    /// the entire pending (queued-but-never-started) queue.
+    /// Kill every still-running sub-agent that belongs to THIS session, drop
+    /// model-delegated queued sub-agents, but PRESERVE user-initiated /task
+    /// jobs (tool_call_id == None).
     ///
     /// Called from every turn-halt path (interrupt, deny-tool, deny-all-pending)
     /// so that "stop means stop" — no orphaned background tokio tasks continue
@@ -287,8 +288,10 @@ impl SessionRuntime {
     /// - Running sub-agents: `abort.abort()` kills the tokio task; status is
     ///   flipped to `Killed` immediately so the `$` panel reflects it without
     ///   waiting for a terminal event that will never arrive.
-    /// - Queued (pending) sub-agents: dropped wholesale — they never ran, so
-    ///   there is nothing to abort.
+    /// - Model-delegated queued sub-agents (tool_call_id == Some): dropped to
+    ///   halt the interrupted turn's work.
+    /// - User-initiated /task entries (tool_call_id == None): retained so the
+    ///   user's independent pending commands survive the turn halt.
     /// - `pending_subagent_calls` / `awaiting_subagents`: cleared here so the
     ///   caller does NOT need to do it separately (keeps the three halt paths
     ///   consistent).
@@ -303,7 +306,7 @@ impl SessionRuntime {
                 sub.status = crate::app::subagent::SubAgentStatus::Killed;
             }
         }
-        self.pending_subagents.clear();
+        self.pending_subagents.retain(|p| p.tool_call_id.is_none());
         self.pending_subagent_calls.clear();
         self.awaiting_subagents = false;
     }

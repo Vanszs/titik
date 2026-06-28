@@ -243,6 +243,13 @@ pub(super) fn handle_picker_select(
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
+    // Guard: /resume can't append onto an unstable session tail while a /new
+    // KeyInput is pending confirmation. The modal state should prevent this,
+    // but make the invariant explicit.
+    if state.rest.spawn_pending {
+        return Ok(());
+    }
+
     // Extract selected path first (borrow of mode released before
     // mutating rest/mode below). The picked path is the canonical identity:
     // a session dir is `sessions/<pwd_hash>/<uuid>`, so equal paths ⇒ equal id,
