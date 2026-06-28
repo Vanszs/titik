@@ -34,15 +34,45 @@
 //!
 //! # Transport bridge (mirrors the daemon's [`crate::ipc::conn`], client-side)
 //!
-//! The render loop is SYNCHRONOUS (crossterm draw + input poll). Socket I/O lives
-//! in two tokio tasks bridged over `std::sync::mpsc`:
+//! The render loop is SYNCHRONOUS (crossterm draw + input poll) and runs on a FIXED
+//! ~60fps frame cadence that is DECOUPLED from the socket: it never blocks on a read
+//! or a write. Socket I/O lives in two tokio tasks bridged over `std::sync::mpsc`:
 //! - a READER task: `read_frame_from` -> decode [`DaemonFrame`] -> push onto the
 //!   loop's incoming `std::sync::mpsc::Sender<DaemonFrame>`. On EOF/error it drops
-//!   the sender, which the loop observes as the daemon going away.
+//!   the sender, which the loop observes as the daemon going away. The loop drains
+//!   this channel NON-BLOCKING (`try_recv`) once per frame, so a slow/quiet daemon
+//!   can never stall a paint.
 //! - a WRITER task: owns the outbound `std::sync::mpsc::Receiver<ClientRequest>`,
 //!   polls it on a short interval, and writes each as a frame. (Same `!Sync`
 //!   reasoning as `conn::write_loop`: a `std::sync::mpsc::Receiver` held across an
 //!   await makes the future non-`Send`; collect-then-write keeps it off the await.)
+//!   The render loop only ever PUSHES onto this channel — it never awaits a socket
+//!   write — so a typed key is enqueued in O(1) and the frame proceeds.
+//!
+//! # Why render is decoupled from the socket (the "broken ship" fix)
+//!
+//! An earlier loop redrew only when a frame changed the shadow (`dirty`-gated) AND
+//! blocked inside `event::poll(timeout)` for up to the poll interval. The effect was
+//! that animations (the status "comet", the loading spinner) only advanced at the
+//! daemon's frame rate / the poll cadence, and every keystroke round-tripped to the
+//! daemon before it appeared — laggy and jittery. The fix (same medicine as the
+//! tool-call freeze): the render loop runs at a FIXED ~16ms cadence, drains all
+//! pending frames non-blocking, advances every animation from a LOCAL monotonic
+//! clock (`Instant::elapsed()` read at draw time — never daemon ticks), repaints
+//! UNCONDITIONALLY (ratatui's buffer diff makes an unchanged frame ~free), then
+//! polls input with a ZERO timeout. No socket operation can block a frame.
+//!
+//! # Local input echo (render-ahead)
+//!
+//! For the PLAIN composer edits (typing a char, Backspace, Left/Right/Home) the loop
+//! applies the keystroke to the shadow's `input`/`cursor` IMMEDIATELY — the SAME
+//! mutation `controller::input` would make — AND forwards the key. The daemon's
+//! authoritative [`StateDelta::InputChanged`] (or any full Snapshot) reconciles on a
+//! later frame and ALWAYS wins, so a mispredicted echo self-corrects within a frame
+//! or two. Only the unambiguous text edits are echoed; mode-changing / submitting /
+//! history / completion keys (Enter, Up/Down, Tab, Esc, `$`-on-empty, Ctrl-anything)
+//! are NOT faked locally — they depend on daemon-side state, so they are forwarded
+//! and the resulting snapshot drives the shadow.
 //!
 //! # Seq-gap recovery (critique #1)
 //!
@@ -220,9 +250,23 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     result
 }
 
-/// The synchronous render loop. Each tick: redraw if dirty, drain incoming frames
-/// (apply snapshot/delta or recover a seq gap), then poll + forward terminal input.
-/// Returns when the user detaches (Ctrl-C) or the daemon's socket closes.
+/// Target frame budget: ~60fps. Each loop iteration paints once and then sleeps the
+/// remainder of this budget, so animations advance smoothly from the local clock and
+/// the client never busy-spins. This is the FIXED cadence the render loop runs at,
+/// independent of the daemon's frame rate (the socket is drained non-blocking).
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
+/// The synchronous render loop, decoupled from the socket and paced at ~60fps.
+///
+/// Each frame, in order: (a) drain ALL pending [`DaemonFrame`]s non-blocking and
+/// apply them (snapshot/delta or seq-gap -> Resync); (b) advance animations from a
+/// LOCAL monotonic clock (reconcile the comet's `work_since`, re-anchor the loading
+/// spinner) — never from daemon ticks; (c) repaint the shadow UNCONDITIONALLY (the
+/// ratatui buffer diff makes an unchanged frame ~free); (d) poll terminal input with
+/// a ZERO timeout and handle it (local echo for the plain composer edits, forward the
+/// rest). The loop NEVER blocks on the socket: if no frame arrived it still paints and
+/// animations still advance. Returns when the user detaches (Ctrl-C) or the socket
+/// closes.
 fn render_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     frame_rx: &Receiver<DaemonFrame>,
@@ -243,27 +287,25 @@ fn render_loop(
     // a Resync was sent, so the shadow is stale until the full snapshot rebuilds it.
     let mut awaiting_resync = false;
 
-    let mut dirty = true; // paint once on entry
     loop {
-        if dirty {
-            terminal.draw(|f| view::draw(f, &shadow))?;
-            dirty = false;
-        }
+        // Pace to ~60fps: stamp the frame start, do the work, sleep the remainder.
+        let frame_start = Instant::now();
 
-        // --- drain every queued incoming frame ---
+        // --- (a) drain every queued incoming frame (NON-BLOCKING) ---
+        // try_recv never blocks, so a quiet daemon can't stall the paint below. The
+        // per-frame `dirty` bookkeeping is gone: we repaint unconditionally, so the
+        // only thing that matters here is keeping the shadow current.
         loop {
             match frame_rx.try_recv() {
                 Ok(frame) => {
-                    if apply_frame(
+                    apply_frame(
                         frame,
                         &mut shadow,
                         &mut expected,
                         &mut seeded,
                         &mut awaiting_resync,
                         req_tx,
-                    ) {
-                        dirty = true;
-                    }
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 // The reader task dropped its sender: the daemon's socket closed.
@@ -272,82 +314,185 @@ fn render_loop(
             }
         }
 
-        // --- poll + forward terminal input ---
-        // Adaptive cadence mirroring the local loop: fast while the foreground
-        // session is working (so streamed deltas flush at >=60fps), idle otherwise.
-        let busy = shadow.rest.fg().waiting;
-        let timeout = if busy {
-            Duration::from_millis(8)
-        } else {
-            Duration::from_millis(100)
-        };
-        if event::poll(timeout)? {
-            while event::poll(Duration::ZERO)? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        // The `/quit` overlay's choices are CLIENT-process decisions, so
-                        // when the shadow is in QuitConfirm (mirrored from the daemon's
-                        // mode) the client intercepts its keys locally instead of
-                        // forwarding them (daemon stage 12). `Detach`/`Kill` ask the loop
-                        // to exit the client.
-                        if matches!(shadow.mode, Mode::QuitConfirm(_)) {
-                            match handle_quit_confirm_key(&key, req_tx) {
-                                QuitConfirmKey::ExitClient => return Ok(()),
-                                QuitConfirmKey::Stay => {}
-                            }
-                            continue;
-                        }
-                        // Outside the overlay: the ONE locally-interpreted gesture is
-                        // Ctrl-C, which detaches the client (leaves the daemon running).
-                        // Everything else is forwarded verbatim for the daemon.
-                        if is_detach(&key) {
-                            return Ok(());
-                        }
-                        let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(key)));
-                    }
-                    // Mouse wheel scrolls the LOCAL shadow transcript (a pure view
-                    // concern — the daemon's scroll is its own; scrolling the shadow
-                    // gives immediate feedback without a round-trip). Bottom-pinning
-                    // follow is reconstructed from snapshots, so a manual scroll just
-                    // nudges the local offset for this render.
-                    Event::Mouse(m) if matches!(shadow.mode, Mode::Chat) => match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            for _ in 0..3 {
-                                shadow.rest.scroll_up();
-                            }
-                            dirty = true;
-                        }
-                        MouseEventKind::ScrollDown => {
-                            for _ in 0..3 {
-                                shadow.rest.scroll_down();
-                            }
-                            dirty = true;
-                        }
-                        _ => {}
-                    },
-                    Event::Resize(_, _) => dirty = true,
-                    // Pasted text is forwarded character-by-character as key events so
-                    // the daemon's composer ingests it through the same path as typing.
-                    Event::Paste(text) => {
-                        for ch in text.chars() {
-                            let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(
-                                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
-                            )));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // --- (b) advance LOCAL animations from the monotonic clock ---
+        // The comet shimmer + loading spinner derive their phase from
+        // `Instant::elapsed()` read inside `view::draw`, so they advance every frame
+        // for free once we repaint at 60fps below. Two things still need a nudge:
+        // reconcile the comet's `work_since` on the rising/falling working edge (so it
+        // starts/stops promptly between snapshots), and tick the loading splash's
+        // local spinner counter (the daemon's projected `frame` is stale between
+        // snapshots — drive it locally so the braille glyph cycles).
+        advance_local_animations(&mut shadow);
 
         // Expire a locally-reconstructed toast once its TTL passes (the daemon never
         // sends a "toast cleared" delta; the client owns its own dismissal timer).
         if let Some((_, until, _)) = shadow.rest.toast.as_ref() {
             if Instant::now() >= *until {
                 shadow.rest.toast = None;
-                dirty = true;
             }
         }
+
+        // --- (c) repaint UNCONDITIONALLY ---
+        // ratatui computes the cell-level diff against the previous buffer, so an
+        // unchanged frame flushes ~nothing; painting every frame is what lets the
+        // local animations advance smoothly without any dirty-tracking.
+        terminal.draw(|f| view::draw(f, &shadow))?;
+
+        // --- (d) poll + handle terminal input (ZERO timeout, never blocks) ---
+        // Drain EVERY buffered event this frame so fast typing / paste never lag.
+        while event::poll(Duration::ZERO)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // The `/quit` overlay's choices are CLIENT-process decisions, so
+                    // when the shadow is in QuitConfirm (mirrored from the daemon's
+                    // mode) the client intercepts its keys locally instead of
+                    // forwarding them (daemon stage 12). `Detach`/`Kill` ask the loop
+                    // to exit the client.
+                    if matches!(shadow.mode, Mode::QuitConfirm(_)) {
+                        match handle_quit_confirm_key(&key, req_tx) {
+                            QuitConfirmKey::ExitClient => return Ok(()),
+                            QuitConfirmKey::Stay => {}
+                        }
+                        continue;
+                    }
+                    // Outside the overlay: the ONE locally-interpreted gesture is
+                    // Ctrl-C, which detaches the client (leaves the daemon running).
+                    if is_detach(&key) {
+                        return Ok(());
+                    }
+                    // Render-ahead: apply the plain composer edits to the shadow NOW
+                    // (the daemon's authoritative InputChanged reconciles later), then
+                    // forward the key verbatim for the daemon to interpret. Only the
+                    // unambiguous text edits are echoed — see `local_echo`.
+                    local_echo(&mut shadow, &key);
+                    let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(key)));
+                }
+                // Mouse wheel scrolls the LOCAL shadow transcript (a pure view
+                // concern — the daemon's scroll is its own; scrolling the shadow
+                // gives immediate feedback without a round-trip). Bottom-pinning
+                // follow is reconstructed from snapshots, so a manual scroll just
+                // nudges the local offset for this render.
+                Event::Mouse(m) if matches!(shadow.mode, Mode::Chat) => match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        for _ in 0..3 {
+                            shadow.rest.scroll_up();
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        for _ in 0..3 {
+                            shadow.rest.scroll_down();
+                        }
+                    }
+                    _ => {}
+                },
+                // A resize just needs the next unconditional paint to relayout.
+                Event::Resize(_, _) => {}
+                // Pasted text is forwarded character-by-character as key events so
+                // the daemon's composer ingests it through the same path as typing.
+                // Echo each char locally too so a paste appears instantly.
+                Event::Paste(text) => {
+                    for ch in text.chars() {
+                        let key =
+                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty());
+                        local_echo(&mut shadow, &key);
+                        let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(key)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // --- frame pacing: sleep the remainder of the ~16ms budget ---
+        // Keeps the loop at ~60fps instead of busy-spinning. If a frame overran the
+        // budget (a big snapshot rebuild) we skip the sleep and proceed immediately.
+        if let Some(rem) = FRAME_BUDGET.checked_sub(frame_start.elapsed()) {
+            std::thread::sleep(rem);
+        }
+    }
+}
+
+/// Advance the LOCAL-clock animations on the shadow once per frame.
+///
+/// The client owns NO daemon ticks, so animations that the local TUI advances from
+/// its event loop must be advanced here from the client's own monotonic clock:
+///
+/// - **Comet shimmer (`work_since`).** Reconcile it on the rising/falling working
+///   edge exactly like the local loop's `service_global`: stamp `now` when the
+///   foreground session starts working (and isn't paused on a y/n approval) and it
+///   isn't already running; clear it when work ends or an approval takes over. The
+///   travelling head + elapsed counter then derive from `work_since.elapsed()` at
+///   draw time. (A snapshot may also set `work_since` from the daemon's anchored
+///   `work_elapsed_ms`; this only fills the rising/falling edges BETWEEN snapshots so
+///   the comet never freezes or lingers.)
+/// - **Loading splash spinner (`frame`).** The braille glyph is indexed by
+///   `frame % 10`; the daemon's projected `frame` is frozen between snapshots, so
+///   tick it locally each frame to keep the spinner rotating (the footer's elapsed
+///   counter already derives from `started.elapsed()`).
+fn advance_local_animations(shadow: &mut AppState) {
+    // Comet: rising/falling-edge reconcile (mirrors `service_global`).
+    reconcile_work_clock(shadow);
+
+    // Loading splash: keep the local spinner counter rotating between snapshots.
+    if let Mode::Loading(s) = &mut shadow.mode {
+        s.frame = s.frame.wrapping_add(1);
+    }
+}
+
+/// Apply the SAFE subset of composer edits to the shadow immediately (render-ahead),
+/// so typing appears with zero round-trip. The key is ALSO forwarded to the daemon by
+/// the caller; the daemon's authoritative [`StateDelta::InputChanged`] (or a full
+/// Snapshot) reconciles on a later frame and ALWAYS wins, so a mispredicted echo is
+/// self-correcting.
+///
+/// Only edits that PURELY mutate `input`/`cursor` with no dependence on daemon-side
+/// state are echoed — using the EXACT same `AppStateRest` helpers `controller::input`
+/// calls, so the local result matches the daemon's byte-for-byte:
+///   - a plain `Char(c)` (no Ctrl) — EXCEPT `$` on an empty input, which opens the
+///     sub-agents panel daemon-side (a mode change, not a text edit);
+///   - `Backspace`, and the pure caret moves `Left` / `Right` / `Home`.
+///
+/// Everything else is deliberately NOT echoed (forwarded only), because its meaning
+/// depends on state the client doesn't authoritatively own: `Enter` (submit / slash /
+/// palette-complete), `Up`/`Down` (history recall / palette nav / multiline caret),
+/// `End` (scroll-to-bottom when empty, else caret), `Tab`/`BackTab` (completion /
+/// mode toggle), `Esc` (interrupt / rewind), and any Ctrl-modified key. Those still
+/// reconcile from the daemon's snapshot.
+///
+/// The echo is suppressed unless the shadow is in plain `Chat` with no modal surface
+/// open (help / sub-agents panel / viewer / tool-approval), matching where the
+/// daemon's chat composer actually consumes these keys.
+fn local_echo(shadow: &mut AppState, key: &KeyEvent) {
+    // Only echo in plain Chat with no modal overlay capturing keys. In any other mode
+    // (or with a modal open) the daemon routes the key elsewhere, so faking a text
+    // edit would desync until the next snapshot corrects it.
+    if !matches!(shadow.mode, Mode::Chat) {
+        return;
+    }
+    let rest = &mut shadow.rest;
+    if rest.help_open
+        || rest.subagents_open
+        || rest.agent_viewer.is_some()
+        || rest.fg().awaiting_approval
+    {
+        return;
+    }
+    // Never echo a Ctrl-modified key (Ctrl-J newline, Ctrl-V paste, interrupts, …);
+    // those are gestures, not plain text the composer inserts at the caret.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return;
+    }
+    match key.code {
+        // `$` on an EMPTY input opens the `$` panel daemon-side (not a typed char), so
+        // don't echo it; with text present it is a normal character and echoes below.
+        KeyCode::Char('$') if rest.input.is_empty() => {}
+        KeyCode::Char(c) => rest.push_char(c),
+        KeyCode::Backspace => rest.backspace(),
+        KeyCode::Left => rest.cursor_left(),
+        KeyCode::Right => rest.cursor_right(),
+        KeyCode::Home => rest.cursor_home(),
+        // Enter / Up / Down / End / Tab / BackTab / Esc / everything else: forwarded
+        // only (handled above by NOT matching here) — the daemon snapshot reconciles.
+        _ => {}
     }
 }
 
