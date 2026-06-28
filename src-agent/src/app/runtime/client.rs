@@ -8,6 +8,20 @@
 //! to the EXISTING [`crate::view::draw`] — so the attach client renders identically
 //! to a local TUI, with zero second render path to drift.
 //!
+//! # Session-lock ownership (daemon stage 8)
+//!
+//! Session locks (`session.lock`, holding the owner's PID — see
+//! [`crate::model::store`]) are owned EXCLUSIVELY by the process that runs the
+//! session lifecycle: the local TUI or the headless daemon. The client does the
+//! real work through neither path — its [`SessionRuntime`]s are SHADOW copies
+//! rebuilt from frames, never warmed, never saved, never the foreground of a real
+//! turn. So this module deliberately calls NO lock function
+//! (`store::write_lock` / `store::remove_lock` / `store::is_locked`) and never
+//! `warm_session` / `reconcile_session_lock`. When a forwarded key drives a `/new`
+//! or a foreground switch, it is the DAEMON's `apply_action` that writes the lock
+//! (with the daemon's PID), not the client. Writing a lock here would stamp a
+//! shadow session with the CLIENT's PID and corrupt the daemon's ownership.
+//!
 //! # Why a real `AppState` as the shadow
 //!
 //! `view::draw` reads only `state.rest` (in Chat mode) + `state.mode`. Rebuilding
@@ -92,7 +106,9 @@ const TOAST_TTL: Duration = Duration::from_secs(4);
 /// restored by [`TerminalGuard`]'s drop and the runtime is dropped last.
 pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     // The client needs the config dirs only to resolve the socket path; it owns no
-    // sessions and writes no config.
+    // sessions and writes no config. In particular it touches NO session lock here
+    // or anywhere downstream (lock ownership belongs to the daemon — see the
+    // module header): the only `store` calls are these two lock-free path helpers.
     store::ensure_dirs()?;
     let sock_path = store::daemon_sock_path()?;
 

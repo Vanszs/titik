@@ -380,24 +380,58 @@ pub(crate) fn slugify(name: &str) -> Result<String> {
 //
 // Crash safety is by PID liveness, not by the file's mere presence: if the PID
 // recorded in `session.lock` is no longer a live process, the lock is STALE and
-// treated as unlocked (and the stale file is swept). This platform is Linux, so
-// liveness is a `/proc/<pid>` existence check. All IO here is best-effort — a
-// failed read/write/remove must never crash or block the TUI.
+// treated as unlocked (and the stale file is swept). Liveness is probed with the
+// portable `kill(pid, 0)` idiom (see [`pid_alive`]), which works on Linux AND
+// macOS — macOS has no `/proc`, so a `/proc/<pid>` check there would read every
+// lock as stale and let two instances enter the same session (#119). All IO here
+// is best-effort — a failed read/write/remove must never crash or block the TUI.
+//
+// LOCK OWNERSHIP: these locks are owned by whichever process runs the session
+// lifecycle — the local TUI (`run`/`run_loop`) or the headless daemon
+// (`daemon_run`). Both write `std::process::id()` into the lock via `write_lock`,
+// so a daemon-owned lock holds the DAEMON's PID. The thin attach client
+// (`client_run`, `--attach`) runs NO session lifecycle — its sessions are shadow
+// copies rebuilt from daemon frames — so it MUST NOT call any lock function here
+// (`write_lock` / `remove_lock` / `is_locked`); it only renders + forwards keys,
+// and the daemon executes the real lock writes on its behalf.
 
 /// Path to a session's lock file: `<session_dir>/session.lock`.
 fn lock_path(session_dir: &Path) -> PathBuf {
     session_dir.join("session.lock")
 }
 
-/// Whether `pid` refers to a live process on this (Linux) host.
+/// Whether `pid` refers to a live process on this host.
 ///
-/// Our own PID is alive by definition. Any other PID is alive iff `/proc/<pid>`
-/// exists — the simple, Linux-correct check the spec calls for.
+/// Portable across Linux and macOS via the `kill(pid, 0)` idiom (#119): sending
+/// signal `0` performs the kernel's permission + existence checks WITHOUT actually
+/// delivering a signal. The earlier `/proc/<pid>` existence check was Linux-only —
+/// macOS has no `/proc`, so it read every foreign PID as dead, marking all locks
+/// stale and letting two instances enter the same session.
+///
+/// Interpreting the result:
+/// - returns `0` → the process exists and we may signal it → ALIVE.
+/// - returns `-1` with `EPERM` → the process EXISTS but is owned by another user we lack permission to signal → ALIVE.
+/// - returns `-1` with `ESRCH` → no such process → DEAD.
+/// - any other errno (e.g. `EINVAL`, which signal 0 won't produce) → treat as DEAD so a surprising kernel reply can never wedge a session as permanently locked.
+///
+/// Our own PID is alive by definition (kept as a fast path / belt-and-suspenders).
 fn pid_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
-    Path::new(&format!("/proc/{pid}")).exists()
+    // SAFETY: `kill` with signal 0 sends no signal; it only runs the existence +
+    // permission checks. It has no memory-safety preconditions and the FFI types
+    // match libc's signature.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        // Signal 0 succeeded → the process exists and we can signal it.
+        return true;
+    }
+    // kill returned -1: distinguish "exists but not ours" (EPERM) from "gone"
+    // (ESRCH) by errno. EPERM means the PID is live, just owned by another user.
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
 }
 
 /// Write our PID into the session's lock file, overwriting any existing one.
