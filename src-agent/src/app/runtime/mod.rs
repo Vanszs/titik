@@ -620,7 +620,8 @@ fn daemon_selftest_inner() -> Result<()> {
         let mut reader = FrameReader::new();
 
         // Attach -> expect a full Snapshot.
-        let attach = serde_json::to_vec(&ClientRequest::Attach { foreground_id: None })?;
+        let attach =
+            serde_json::to_vec(&ClientRequest::Attach { foreground_id: None, cwd: None })?;
         write_frame(&mut stream, &attach).await?;
         let snap_frame: DaemonFrame =
             serde_json::from_slice(&read_frame(&mut stream, &mut reader).await?)?;

@@ -233,12 +233,25 @@ pub fn write_daemon_pid() -> Result<()> {
 pub fn list_sessions() -> Result<Vec<SessionMeta>> {
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let hash = pwd_hash(&workdir);
+    list_sessions_for(&hash)
+}
 
-    let rows = session_registry::list_by_pwd(&hash)?;
+/// List the sessions for an EXPLICIT working-directory bucket (`pwd_hash`), most-
+/// recently updated first.
+///
+/// The pwd-EXPLICIT twin of [`list_sessions`]: it takes the bucket hash directly
+/// instead of reading `std::env::current_dir()`. The headless daemon needs this —
+/// its own process cwd is the dir it was spawned in, NOT the attaching client's pwd,
+/// so a `current_dir()`-based listing would enumerate the wrong directory's sessions.
+/// pwd-aware attach (see `app::runtime::actions::session::attach_select_for_pwd`)
+/// passes the CLIENT's `pwd_hash` here so it lists sessions for the client's dir.
+/// [`list_sessions`] is the thin `current_dir()` wrapper over this.
+pub fn list_sessions_for(pwd_hash: &str) -> Result<Vec<SessionMeta>> {
+    let rows = session_registry::list_by_pwd(pwd_hash)?;
     let mut metas: Vec<SessionMeta> = Vec::with_capacity(rows.len());
 
     for row in rows {
-        let path = session_dir(&hash, &row.uuid)?;
+        let path = session_dir(pwd_hash, &row.uuid)?;
 
         // Count non-System messages for the list view; 0 on any parse failure
         // (e.g. a session that's registered but never saved messages.json yet).
@@ -290,7 +303,21 @@ pub fn create_session() -> Result<Session> {
     // The launch cwd determines both the bucket (pwd_hash) and the seeded
     // workdir. Fall back to "." if the cwd can't be resolved.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let hash = pwd_hash(&workdir);
+    create_session_in(&workdir)
+}
+
+/// Create a brand-new session bucketed by an EXPLICIT `workdir` (its `pwd_hash`),
+/// seeding that same `workdir` as the session's first workspace root.
+///
+/// The pwd-EXPLICIT twin of [`create_session`]: it takes the target working
+/// directory directly instead of reading `std::env::current_dir()`. The headless
+/// daemon needs this because its own process cwd is the dir it was spawned in, not
+/// the attaching client's pwd — so a `current_dir()`-based create would bucket the new
+/// session under the WRONG directory. pwd-aware attach passes the CLIENT's launch dir
+/// here so a relaunch from a new dir gets a session rooted at that new dir.
+/// [`create_session`] is the thin `current_dir()` wrapper over this.
+pub fn create_session_in(workdir: &Path) -> Result<Session> {
+    let hash = pwd_hash(workdir);
     let uuid = Uuid::new_v4().to_string();
     let dir = session_dir(&hash, &uuid)?;
     // Pre-create memory/ so the user can drop MEMORY.md there immediately. This

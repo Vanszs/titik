@@ -202,9 +202,16 @@ pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
     };
 
     // Send the Attach handshake; the daemon answers with the initial full Snapshot
-    // (drained in the loop's first incoming pass).
+    // (drained in the loop's first incoming pass). Carry THIS client's launch cwd so
+    // the daemon does pwd-aware session selection (stage 3): launching from a NEW dir
+    // foregrounds/loads/creates a session for THAT dir, not the daemon's last one.
+    // `current_dir` failing is non-fatal — `None` just keeps the daemon's foreground.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
     let _ = req_tx.send(ClientRequest::Attach {
         foreground_id: None,
+        cwd,
     });
 
     // Terminal setup — identical to the local TUI (`run`). Guard first so a failure

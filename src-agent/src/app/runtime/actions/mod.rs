@@ -23,6 +23,13 @@ pub(in crate::app::runtime) mod quit;
 mod rewind;
 mod session;
 mod settings;
+
+// Re-export the pwd-aware attach selector so the daemon's `Attach` handler (in the
+// sibling `event_loop::daemon` module) can drive session selection through the SAME
+// load/switch/create handlers the local TUI uses. Attach is not a keystroke, so it
+// doesn't route through `apply_action` — it calls this directly. The `session` module
+// is otherwise private to `actions`, so this single re-export is the only surface.
+pub(in crate::app::runtime) use session::attach_select_for_pwd;
 mod settings_creds;
 
 /// Apply one `Action` (the decoded result of a keystroke) by mutating state and,

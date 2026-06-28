@@ -151,6 +151,7 @@ mod roundtrip_tests {
         let variants = vec![
             ClientRequest::Attach {
                 foreground_id: Some("abc".to_string()),
+                cwd: Some("/home/u/project".to_string()),
             },
             ClientRequest::Detach,
             ClientRequest::ListSessions,

@@ -71,7 +71,7 @@ use crate::ipc::proto::{ClientRequest, DaemonEvent, DaemonFrame, StateSnapshot};
 use crate::ipc::snapshot::{build_snapshot, diff};
 use crate::service::openrouter::OpenRouterClient;
 
-use super::super::actions::apply_action;
+use super::super::actions::{apply_action, attach_select_for_pwd};
 use super::super::stream::deny_all_pending;
 use super::global::{has_running_subagents, service_global};
 use super::sessions::service_all_sessions;
@@ -315,13 +315,33 @@ impl DaemonHub {
 
         match req {
             // --- read-only / control (honoured for everyone) ---
-            ClientRequest::Attach { .. } => {
+            ClientRequest::Attach { cwd, .. } => {
+                // pwd-AWARE attach selection (stage 3): BEFORE snapshotting, point the
+                // foreground at a session for the ATTACHING CLIENT's working directory,
+                // so launching `koma` from a NEW dir lands on a session for THAT dir —
+                // not the daemon's unrelated last session. Runs ONLY for the controller
+                // (the single writer): session selection mutates state (it can SWAP /
+                // LOAD / CREATE a session), which an observer must not do. An observer,
+                // or a controller that sent no `cwd`, just gets the current foreground.
+                // Last-attach-wins on foreground (single-client assumption — DECISIONS).
+                // Any handler error is swallowed (surfaced via status, never aborts the
+                // loop) so a bad selection can't wedge the attach handshake; the snapshot
+                // below still goes out, reflecting whatever foreground resulted.
+                if self.clients[idx].is_controller {
+                    if let Some(cwd) = cwd {
+                        let cwd = std::path::PathBuf::from(cwd);
+                        if let Err(e) = attach_select_for_pwd(state, client, handle, &cwd) {
+                            state.rest.status = format!("attach select error: {e:#}");
+                        }
+                    }
+                }
                 // ATOMIC attach (critique #2): build the full snapshot, send it, and
                 // flip the client to attached + seed ITS OWN baseline IN THIS TICK.
                 // Only this client's baseline is (re)seeded (blocker #2) — never a
                 // hub-global one — so a late attach can't swallow deltas another
                 // already-attached client still owes; that client diffs against its
-                // own untouched baseline.
+                // own untouched baseline. Built AFTER pwd selection so this client's very
+                // first snapshot already reflects the resolved (possibly new) foreground.
                 let snap = build_snapshot(state);
                 self.send_to(idx, DaemonEvent::Snapshot(Box::new(snap.clone())));
                 self.clients[idx].attached = true;
@@ -965,6 +985,7 @@ mod tests {
                 client_id: 1,
                 req: ClientRequest::Attach {
                     foreground_id: None,
+                    cwd: None,
                 },
             },
             &mut state,
@@ -1030,6 +1051,7 @@ mod tests {
                 client_id: 7,
                 req: ClientRequest::Attach {
                     foreground_id: None,
+                    cwd: None,
                 },
             },
             &mut state,

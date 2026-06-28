@@ -56,7 +56,19 @@ pub enum ClientRequest {
     /// which session should be foreground on attach (by stable UUID); `None`
     /// keeps the daemon's current foreground. The daemon replies with a full
     /// [`DaemonEvent::Snapshot`].
-    Attach { foreground_id: Option<String> },
+    ///
+    /// `cwd` is the CLIENT's launch working directory (its own `pwd`, NOT the
+    /// daemon's). When present on the CONTROLLER's attach it drives pwd-aware
+    /// session selection (stage 3): the daemon foregrounds a LIVE session for that
+    /// pwd if one exists, else loads the most-recent ON-DISK session for that pwd,
+    /// else CREATES a fresh session targeting that pwd. This is what makes relaunching
+    /// `koma` from a NEW directory land on a session for THAT directory instead of the
+    /// daemon's unrelated last session. `None` (e.g. an observer attach, or a client
+    /// that can't resolve its cwd) keeps the daemon's current foreground untouched.
+    Attach {
+        foreground_id: Option<String>,
+        cwd: Option<String>,
+    },
     /// Detach this client. The daemon keeps every session running (approval-
     /// when-detached pauses a session awaiting approval until a client reattaches);
     /// it self-exits only when zero sessions AND no client remain.
