@@ -102,7 +102,9 @@ pub struct Bash;
 impl Tool for Bash {
     fn name(&self) -> &'static str { "bash" }
     fn description(&self) -> &'static str {
-        "Run a shell command in the workspace. Use for git, cargo, build, and tests. Output is captured (stdout+stderr)."
+        "Run a shell command in the workspace. Use for cargo, build commands, and general shell tasks. \
+         For git operations, use the git_operator tool instead — it handles SSH key injection and \
+         destructive-operation guards automatically. Output is captured (stdout+stderr)."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -124,6 +126,21 @@ impl Tool for Bash {
         let command = args.get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing required string argument 'command'"))?;
+
+        // Redirect git commands to git_operator, which handles SSH key injection
+        // and destructive-operation guards. Bash can't do either safely.
+        let trimmed = command.trim();
+        if trimmed == "git"
+            || trimmed.starts_with("git ")
+            || trimmed.starts_with("git\t")
+        {
+            return Ok(
+                "error: use the git_operator tool for git commands, not bash. \
+                 git_operator runs git directly (no shell-injection risk), injects the \
+                 session SSH key automatically, and gates destructive operations. \
+                 Example: git_operator({\"args\": [\"log\", \"--oneline\", \"-5\"]})".to_string()
+            );
+        }
 
         let timeout_ms: u64 = args.get("timeout_ms")
             .and_then(Value::as_u64)
