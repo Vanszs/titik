@@ -25,13 +25,9 @@ use crate::app::state::AppState;
 use crate::app::subagent::SubAgentStatus;
 
 use super::proto::{
-    GlobalSnapshot, ModeTag, SessionSnapshot, StateDelta, StateSnapshot, SubAgentSnapshot,
+    GlobalSnapshot, ModeSnapshot, PendingSubagentSnapshot, SessionSnapshot, StateDelta,
+    StateSnapshot, SubAgentSnapshot,
 };
-
-/// How many trailing transcript lines a [`SubAgentSnapshot::transcript_tail`]
-/// carries — an at-a-glance preview, never the full transcript (the dedicated
-/// viewer fetches that). Mirrors the "short tail" contract in [`super::proto`].
-const SUBAGENT_TAIL_LINES: usize = 6;
 
 /// Build a complete, frozen [`StateSnapshot`] from the live [`AppState`].
 ///
@@ -97,11 +93,24 @@ fn session_snapshot(rt: &crate::app::state::SessionRuntime) -> SessionSnapshot {
         working: rt.is_working(),
         finished_unseen: rt.finished_unseen,
         subagents: rt.subagents.iter().map(subagent_snapshot).collect(),
+        // Queued-but-not-started delegations (over the concurrency cap), in FIFO
+        // order, so the client's `$` panel lists the same "pending" rows.
+        pending_subagents: rt
+            .pending_subagents
+            .iter()
+            .map(pending_subagent_snapshot)
+            .collect(),
     }
 }
 
-/// Project one live [`crate::app::subagent::SubAgent`] into its plain-data tail
+/// Project one live [`crate::app::subagent::SubAgent`] into its plain-data
 /// projection (no `rx`, no `AbortHandle`).
+///
+/// Carries the full transcript + structured messages (not just a tail): the `$`
+/// panel + the full-screen viewer both read them, so a remote render must have the
+/// same data a local one does. The transcript is short-lived display text, so the
+/// full copy is cheap; the diff only ships it on a structural change (any sub-agent
+/// field moving forces a full snapshot — see [`diff`]).
 fn subagent_snapshot(sa: &crate::app::subagent::SubAgent) -> SubAgentSnapshot {
     // Render the lifecycle enum down to the short string the proto documents, so
     // the client need not mirror `SubAgentStatus`.
@@ -111,16 +120,27 @@ fn subagent_snapshot(sa: &crate::app::subagent::SubAgent) -> SubAgentSnapshot {
         SubAgentStatus::Killed => "killed".to_string(),
         SubAgentStatus::Error(e) => format!("error: {e}"),
     };
-    // A short tail of the most-recent transcript lines (never the whole thing).
-    let tail_start = sa.transcript.len().saturating_sub(SUBAGENT_TAIL_LINES);
-    let transcript_tail = sa.transcript[tail_start..].to_vec();
 
     SubAgentSnapshot {
+        id: sa.id,
         name: sa.agent_name.clone(),
+        label: sa.label.clone(),
         status,
         // Progress proxy: accumulated transcript line count.
         steps: sa.transcript.len(),
-        transcript_tail,
+        transcript: sa.transcript.clone(),
+        messages: sa.messages.clone(),
+    }
+}
+
+/// Project one queued [`crate::app::subagent::PendingSubagent`] into its plain-data
+/// render projection (id + agent + prompt — the only fields the panel's pending row
+/// shows; the turn-bookkeeping `tool_call_id` is daemon-internal and not projected).
+fn pending_subagent_snapshot(p: &crate::app::subagent::PendingSubagent) -> PendingSubagentSnapshot {
+    PendingSubagentSnapshot {
+        id: p.id,
+        agent_name: p.agent_name.clone(),
+        prompt: p.prompt.clone(),
     }
 }
 
@@ -132,7 +152,14 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
         scroll: state.rest.scroll,
         follow: state.rest.follow,
         status: state.rest.status.clone(),
-        mode: mode_tag(&state.mode),
+        // `work_since` is a daemon-local `Instant` (the comet's clock); project it
+        // as elapsed-ms so the client re-anchors its own clock and the shimmer
+        // continues from the same phase instead of restarting at 0 each snapshot.
+        work_elapsed_ms: state
+            .rest
+            .work_since
+            .map(|since| since.elapsed().as_millis() as u64),
+        mode: mode_snapshot(&state.mode),
         // Project the toast as (kind, text); the TTL `Instant` is daemon-local and
         // never crosses the wire (the client re-derives its own dismissal timer).
         toast: state.rest.toast.as_ref().map(|(msg, _until, kind)| {
@@ -145,22 +172,29 @@ fn global_snapshot(state: &AppState) -> GlobalSnapshot {
     }
 }
 
-/// Collapse the (large, non-serde) [`Mode`] into its lightweight [`ModeTag`]
-/// discriminant. 1:1 with the `Mode` variants; the per-mode modal payloads are
-/// projected separately in a later stage when the client renders them.
-fn mode_tag(mode: &Mode) -> ModeTag {
+/// Project the (large, non-serde) [`Mode`] into the pure-data [`ModeSnapshot`].
+///
+/// 1:1 with the `Mode` variants. This stage fills the payloads for the two already-
+/// projected screens — `Chat` (payload-free) and `QuitConfirm` (its busy/total
+/// counts, copied straight off the inner `QuitConfirmState`) — and leaves every
+/// other variant a STUB carrying only "this screen is active"; their modal payloads
+/// are projected in a later stage when the client renders them (see [`ModeSnapshot`]).
+fn mode_snapshot(mode: &Mode) -> ModeSnapshot {
     match mode {
-        Mode::KeyInput(_) => ModeTag::KeyInput,
-        Mode::SessionPicker(_) => ModeTag::SessionPicker,
-        Mode::SessionHub(_) => ModeTag::SessionHub,
-        Mode::Chat => ModeTag::Chat,
-        Mode::Loading(_) => ModeTag::Loading,
-        Mode::Settings(_) => ModeTag::Settings,
-        Mode::Agents(_) => ModeTag::Agents,
-        Mode::Effort(_) => ModeTag::Effort,
-        Mode::Usage(_) => ModeTag::Usage,
-        Mode::MessageRewind(_) => ModeTag::MessageRewind,
-        Mode::QuitConfirm(_) => ModeTag::QuitConfirm,
+        Mode::KeyInput(_) => ModeSnapshot::KeyInput,
+        Mode::SessionPicker(_) => ModeSnapshot::SessionPicker,
+        Mode::SessionHub(_) => ModeSnapshot::SessionHub,
+        Mode::Chat => ModeSnapshot::Chat,
+        Mode::Loading(_) => ModeSnapshot::Loading,
+        Mode::Settings(_) => ModeSnapshot::Settings,
+        Mode::Agents(_) => ModeSnapshot::Agents,
+        Mode::Effort(_) => ModeSnapshot::Effort,
+        Mode::Usage(_) => ModeSnapshot::Usage,
+        Mode::MessageRewind(_) => ModeSnapshot::MessageRewind,
+        Mode::QuitConfirm(s) => ModeSnapshot::QuitConfirm {
+            working: s.working,
+            total: s.total,
+        },
     }
 }
 
@@ -204,13 +238,17 @@ impl DiffResult {
 /// the correctness-first stance the stage calls for: a full snapshot is always a
 /// valid update, so when in doubt we send one rather than risk a wrong shadow.
 pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
-    // --- structural: the global mode changed (e.g. Chat -> QuitConfirm) ---
-    // The per-mode modal payloads are not carried by any incremental delta, so a
-    // mode transition can't be folded — and crucially, an idle session has no other
-    // structural change to coincidentally trigger a full snapshot. Without this the
-    // client shadow stays in the old mode (e.g. never enters QuitConfirm), so its
-    // key-interception branch never fires. A full snapshot rebuilds the overlay and
-    // is always a valid update, so force one the instant the mode tag moves.
+    // --- structural: the mode VARIANT or its payload changed ---
+    // `ModeSnapshot` is now a pure-data projection (not a bare tag), so this `!=`
+    // fires on BOTH a variant switch (Chat -> QuitConfirm) AND a payload change
+    // within a variant (e.g. QuitConfirm's busy/total counts moving). Neither is
+    // carried by any incremental delta, and an idle session has no other structural
+    // change to coincidentally trigger a full snapshot, so without this the client
+    // shadow stays in the old mode/payload (e.g. never enters QuitConfirm, so its
+    // key-interception branch never fires; or shows a stale overlay header). A full
+    // snapshot rebuilds the screen and is always a valid update, so force one the
+    // instant the mode projection moves. (The per-tick `work_elapsed_ms` is
+    // deliberately NOT diffed — see the note where the global fields are compared.)
     if prev.global.mode != next.global.mode {
         return DiffResult::full();
     }
@@ -244,7 +282,8 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
             || p.awaiting_approval != n.awaiting_approval
             || p.approval_reason != n.approval_reason
             || p.name != n.name
-            || p.subagents != n.subagents;
+            || p.subagents != n.subagents
+            || p.pending_subagents != n.pending_subagents;
         if structural {
             return DiffResult::full();
         }
@@ -291,6 +330,26 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
             text: next.global.status.clone(),
         });
     }
+
+    // --- transcript scroll + follow (global view state) ---
+    // A daemon-side scroll (forwarded PageUp/Home/End, or new content re-pinning
+    // follow) moves these every-so-often; carry an incremental delta so a controller
+    // client's rendered scroll tracks the daemon between full snapshots instead of
+    // freezing until the next structural change. Both fields ride together since
+    // they move together (a scroll up clears follow; reaching bottom re-sets it).
+    if prev.global.scroll != next.global.scroll || prev.global.follow != next.global.follow {
+        deltas.push(StateDelta::ScrollChanged {
+            scroll: next.global.scroll,
+            follow: next.global.follow,
+        });
+    }
+
+    // NOTE: `global.work_elapsed_ms` is intentionally NOT diffed. It is the comet's
+    // clock and ticks up every render while a session works — diffing it would force
+    // a delta (or worse, a full snapshot) on EVERY tick. The client re-anchors its
+    // own `work_since` clock from each full snapshot and lets it tick locally in
+    // between, so the comet stays smooth without per-tick wire traffic (same stance
+    // as the toast TTL `Instant`, which is also not carried).
 
     // --- shared composer (text + caret) ---
     // The composer is NOT append-only (mid-string insert/delete, arrow-key caret

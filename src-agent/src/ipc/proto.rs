@@ -297,23 +297,58 @@ pub struct SessionSnapshot {
     pub finished_unseen: bool,
     /// Projections of this session's sub-agents (running + finished history).
     pub subagents: Vec<SubAgentSnapshot>,
+    /// Projections of this session's QUEUED-but-not-yet-started delegations (the
+    /// over-cap [`crate::app::subagent::PendingSubagent`] FIFO). Carried so the
+    /// remote `$` panel can render the "pending" rows a local TUI shows — without
+    /// this the client's reconstructed session has an empty queue and the panel
+    /// never lists waiting delegations.
+    pub pending_subagents: Vec<PendingSubagentSnapshot>,
 }
 
 /// A plain-data projection of one [`crate::app::subagent::SubAgent`] — NOT the
 /// live handle (no `rx` channel, no `AbortHandle`).
+///
+/// Carries everything the `$` panel + the full-screen viewer read off a live
+/// `SubAgent`: the stable id, the agent name + compact label, the lifecycle
+/// status string, the FULL transcript (so the viewer's body and the panel's tail
+/// both render), and the structured `messages` the viewer renders as a chat.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub struct SubAgentSnapshot {
+    /// Stable per-session id (the `#N` shown in the panel/viewer headers).
+    pub id: usize,
     /// The agent definition's name this sub-agent runs.
     pub name: String,
+    /// Compact one-line label (the truncated task) shown in the panel list.
+    pub label: String,
     /// Lifecycle state rendered as a short string ("running" / "done" /
     /// "killed" / "error: …"), so the client needn't mirror the status enum.
     pub status: String,
     /// Progress proxy: number of accumulated transcript lines so far.
     pub steps: usize,
-    /// A short tail of the transcript (the most recent lines) for an at-a-glance
-    /// preview — never the full transcript, which the dedicated viewer fetches.
-    pub transcript_tail: Vec<String>,
+    /// The accumulated transcript lines. Carried in full (not just a tail) so the
+    /// client can reconstruct a `SubAgent` whose panel preview AND inline running
+    /// indicator render exactly as the local TUI's do.
+    pub transcript: Vec<String>,
+    /// The sub-agent's structured conversation, rendered by the full-screen viewer
+    /// exactly like the main chat. Empty until the first turn commits.
+    pub messages: Vec<ChatMessage>,
+}
+
+/// A plain-data projection of one queued [`crate::app::subagent::PendingSubagent`]
+/// — a delegation accepted but parked behind the concurrency cap. Carries only the
+/// fields the `$` panel's "pending" row renders (id + agent + prompt); the live
+/// `tool_call_id` is daemon-internal turn-bookkeeping, never rendered, so it is not
+/// projected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
+pub struct PendingSubagentSnapshot {
+    /// Stable id pre-allocated at enqueue time (the `#N` in the pending row).
+    pub id: usize,
+    /// The agent definition's name the queued delegation will run.
+    pub agent_name: String,
+    /// The task prompt the queued delegation will be seeded with.
+    pub prompt: String,
 }
 
 /// Projection of the mode-independent, NON-session global UI state (the flat
@@ -331,33 +366,74 @@ pub struct GlobalSnapshot {
     pub follow: bool,
     /// The status-line text.
     pub status: String,
-    /// A lightweight tag of the current [`crate::app::mode::Mode`]; the full
-    /// modal payloads (forms/pickers) are added in a later stage as needed.
-    pub mode: ModeTag,
+    /// Elapsed milliseconds since the foreground session's CURRENT run of work
+    /// began, or `None` when idle. The live state holds an `Instant`
+    /// ([`crate::app::state::AppStateRest::work_since`]) which cannot serialise;
+    /// projected here as elapsed-ms so the client re-anchors its OWN clock
+    /// (`Instant::now() - elapsed`) and the status comet animates from the SAME
+    /// phase + elapsed-seconds counter the daemon is at — instead of resetting to
+    /// 0 every time a snapshot rebuilds the shadow.
+    pub work_elapsed_ms: Option<u64>,
+    /// A PURE-DATA projection of the current [`crate::app::mode::Mode`] carrying
+    /// each mode's render-relevant payload, so the thin client can reconstruct +
+    /// draw every screen (not just Chat). See [`ModeSnapshot`].
+    pub mode: ModeSnapshot,
     /// Active toast as `(kind, text)`, or `None`. `kind` is "error" / "info".
     pub toast: Option<(String, String)>,
 }
 
-/// A lightweight discriminant of the current [`crate::app::mode::Mode`].
+/// A PURE-DATA projection of the live [`crate::app::mode::Mode`].
 ///
-/// The client uses this to know which top-level screen is active without the
-/// daemon shipping the (large, non-serde) per-mode state. Modal payloads
-/// (credential forms, pickers, dashboards) are projected separately in a later
-/// stage when the client needs to render them interactively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Unlike the old lightweight discriminant, this carries each mode's
+/// render-relevant payload so the thin client can RECONSTRUCT the mode and draw
+/// it through the unmodified `view::draw` — the goal of making the client render
+/// every screen, not just Chat. It stays pure data (no channels / `Instant` /
+/// `Cell`): every field is copied out of the live mode at snapshot time.
+///
+/// # Staging (task #122)
+///
+/// This stage (1) fills the payloads for the two ALREADY-projected screens —
+/// `Chat` (payload-free) and `QuitConfirm` (its busy/total counts) — and keeps
+/// every OTHER variant a STUB (no payload yet). The stubbed variants exist so the
+/// enum is 1:1 with `Mode` and the wire type is stable; their forms/pickers/
+/// dashboards are projected in stages 2-3 when the client renders them. A stubbed
+/// variant tells the client only "this screen is active"; the client falls back to
+/// the safe Chat render for it until its payload lands (never fabricating an empty
+/// modal), exactly as the old tag did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
-pub enum ModeTag {
+pub enum ModeSnapshot {
+    /// Credentials form (`Mode::KeyInput`). STUB — payload projected in a later stage.
     KeyInput,
+    /// `--resume` disk session picker (`Mode::SessionPicker`). STUB.
     SessionPicker,
+    /// Two-pane session hub (`Mode::SessionHub`). STUB.
     SessionHub,
+    /// Normal chat view (`Mode::Chat`). Payload-free: everything Chat renders lives
+    /// in the session + global projections already, so the variant carries nothing.
     Chat,
+    /// Startup warming splash (`Mode::Loading`). STUB.
     Loading,
+    /// `/settings` dashboard (`Mode::Settings`). STUB.
     Settings,
+    /// `/agents` manager (`Mode::Agents`). STUB.
     Agents,
+    /// `/effort` reasoning-effort picker (`Mode::Effort`). STUB.
     Effort,
+    /// `/usage` dashboard (`Mode::Usage`). STUB.
     Usage,
+    /// Message-rewind picker (`Mode::MessageRewind`). STUB.
     MessageRewind,
-    QuitConfirm,
+    /// `/quit` confirm overlay (`Mode::QuitConfirm`). Carries the busy/total session
+    /// counts the overlay's warning text reads (the inner `QuitConfirmState`), so the
+    /// client renders the EXACT header the daemon would — no longer re-derived from
+    /// the shadow sessions on the client side.
+    QuitConfirm {
+        /// Count of sessions with work in flight at open time (display only).
+        working: usize,
+        /// Total number of sessions at open time (display only).
+        total: usize,
+    },
 }
 
 // ─── incremental deltas ──────────────────────────────────────────────────────
@@ -386,6 +462,13 @@ pub enum StateDelta {
     /// characters stay invisible until the next structural change forces a full
     /// snapshot (the composer would appear permanently blank as the user types).
     InputChanged { text: String, cursor: usize },
+    /// The transcript scroll offset and/or its bottom-pinning follow flag moved.
+    /// Both are GLOBAL view state ([`GlobalSnapshot::scroll`] / `follow`), not
+    /// session-scoped. Carried as a dedicated delta so a daemon-side scroll (e.g.
+    /// PageUp forwarded by a client, or new content nudging follow) propagates
+    /// incrementally — previously only a full snapshot moved it, so a controller
+    /// client's scroll position lagged until the next structural change.
+    ScrollChanged { scroll: u16, follow: bool },
     /// A session's working / finished-unseen flags changed.
     SessionStatusChanged {
         session_id: String,

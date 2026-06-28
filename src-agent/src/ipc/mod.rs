@@ -65,10 +65,18 @@ mod roundtrip_tests {
             working: true,
             finished_unseen: false,
             subagents: vec![SubAgentSnapshot {
+                id: 1,
                 name: "explorer".to_string(),
+                label: "scan the repo".to_string(),
                 status: "running".to_string(),
                 steps: 3,
-                transcript_tail: vec!["scanned src/".to_string()],
+                transcript: vec!["scanned src/".to_string()],
+                messages: vec![ChatMessage::new(Role::User, "scan")],
+            }],
+            pending_subagents: vec![PendingSubagentSnapshot {
+                id: 2,
+                agent_name: "reviewer".to_string(),
+                prompt: "review the diff".to_string(),
             }],
         }
     }
@@ -80,7 +88,11 @@ mod roundtrip_tests {
             scroll: 0,
             follow: true,
             status: "ready".to_string(),
-            mode: ModeTag::Chat,
+            work_elapsed_ms: Some(1500),
+            mode: ModeSnapshot::QuitConfirm {
+                working: 1,
+                total: 2,
+            },
             toast: Some(("info".to_string(), "saved".to_string())),
         }
     }
@@ -177,6 +189,10 @@ mod roundtrip_tests {
             StateDelta::InputChanged {
                 text: "hi".to_string(),
                 cursor: 2,
+            },
+            StateDelta::ScrollChanged {
+                scroll: 7,
+                follow: false,
             },
             StateDelta::SessionStatusChanged {
                 session_id: "s".to_string(),

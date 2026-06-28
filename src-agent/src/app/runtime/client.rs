@@ -75,9 +75,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::app::mode::{Mode, QuitConfirmState};
 use crate::app::state::{AppState, SessionRuntime, ToastKind};
+use crate::app::subagent::PendingSubagent;
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
-    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, ModeTag, SessionSnapshot, StateDelta,
+    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, ModeSnapshot, SessionSnapshot, StateDelta,
     StateSnapshot,
 };
 use crate::model::conversation::Conversation;
@@ -428,34 +429,41 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
         (text, Instant::now() + TOAST_TTL, toast_kind(&kind))
     });
 
+    // Re-anchor the comet clock from the projected elapsed-ms (authoritative for
+    // this snapshot). `work_since = now - elapsed` makes the status shimmer animate
+    // from the SAME phase + elapsed-seconds the daemon is at, rather than restarting
+    // at 0 each snapshot. `None` (idle) clears it. This REPLACES the old derive-from-
+    // working-flag reconcile on the snapshot path; the delta path still reconciles
+    // approximately (a working flip there means work just began, so `now` is right).
+    shadow.rest.work_since = global
+        .work_elapsed_ms
+        .map(|ms| Instant::now() - Duration::from_millis(ms));
+
     // The committed history may have changed wholesale; drop the rendered-lines
     // cache so the next draw rebuilds it against the new messages.
     shadow.rest.transcript_cache.borrow_mut().blocks.clear();
 
-    // Mode: Chat is the payload-free, fully-projected screen. The ONE other mode the
-    // client reconstructs is QuitConfirm (daemon stage 12): when the daemon enters the
-    // `/quit` overlay (the user typed `/quit` or hit the quit keybind, forwarded as
-    // keys), the client mirrors it so the EXISTING overlay view renders AND the client
-    // can intercept the lifecycle keys ([d] detach / [k] kill-all) locally — those are
+    // Mode: reconstruct from the pure-data `ModeSnapshot`. Chat is the payload-free,
+    // fully-projected screen. QuitConfirm (daemon stage 12) is the ONE other mode the
+    // client reconstructs: when the daemon enters the `/quit` overlay (forwarded keys),
+    // the client mirrors it so the EXISTING overlay view renders AND the client can
+    // intercept the lifecycle keys ([d] detach / [k] kill-all) locally — those are
     // client-process decisions, not pure daemon mutations (see `render_loop`). Its
-    // counts are display-only, so derive them from the shadow sessions rather than
-    // projecting them over the wire (a slightly stale count is harmless — same note as
-    // `QuitConfirmState`). Every OTHER ModeTag's modal payload is still not projected,
-    // so those fall back to Chat (the safe, correct render) rather than fabricate an
-    // empty picker/form.
+    // busy/total counts now ride on the snapshot (the daemon's exact `QuitConfirmState`),
+    // so the header reads the same as the daemon's instead of being re-derived here.
+    // Every OTHER `ModeSnapshot` variant is still a STUB (its modal payload is not
+    // projected until a later stage), so those fall back to Chat — the safe, correct
+    // render — rather than fabricate an empty picker/form.
     shadow.mode = match global.mode {
-        ModeTag::QuitConfirm => {
-            let total = shadow.rest.sessions.len();
-            let working = shadow.rest.sessions.iter().filter(|s| s.waiting).count();
+        ModeSnapshot::QuitConfirm { working, total } => {
             Mode::QuitConfirm(Box::new(QuitConfirmState::new(working, total)))
         }
         _ => Mode::Chat,
     };
 
-    // Reconcile the derived "comet" animation clock from the foreground session's
-    // working flag (the daemon owns its own clock; the client re-derives one purely
-    // for the local shimmer so it doesn't need to cross the wire).
-    reconcile_work_clock(shadow);
+    // NOTE: the comet clock (`work_since`) was already set authoritatively from the
+    // snapshot's `work_elapsed_ms` above, so it is deliberately NOT reconciled here
+    // (re-deriving would discard the precise daemon-anchored phase).
 }
 
 /// Build a shadow [`SessionRuntime`] from one [`SessionSnapshot`].
@@ -465,9 +473,15 @@ fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
 /// name + model are reconstructed into a minimal [`Session`] so the unmodified chat
 /// transcript/header/input renderers consume it exactly as they do a live session.
 /// Every NON-render field stays at `Default` — the client never advances a turn, so
-/// the tool/sub-agent state machines and channels are never read. (Sub-agents are
-/// intentionally NOT reconstructed: the `$` panel is not part of this stage's render
-/// proof and `SubAgent` holds non-reconstructible live handles.)
+/// the tool/sub-agent state machines and channels are never read.
+///
+/// The QUEUED [`PendingSubagent`]s ARE reconstructed (they are plain data — no live
+/// handles), so once the `$`-panel open-state is itself projected (a later stage) the
+/// panel's "pending" rows render off real shadow data. The RUNNING `subagents` are
+/// still NOT reconstructed: a live [`crate::app::subagent::SubAgent`] holds a tokio
+/// `AbortHandle` + receiver that cannot be minted on the client's sync render thread,
+/// so their reconstruction is deferred (their wire projection is already enriched for
+/// that later stage).
 fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
     let mut rt = SessionRuntime::new();
     rt.id = s.id.clone();
@@ -485,6 +499,20 @@ fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
     rt.awaiting_approval = s.awaiting_approval;
     rt.approval_reason = s.approval_reason.clone();
     rt.finished_unseen = s.finished_unseen;
+    // Reconstruct the queued delegations (plain data) so the remote `$` panel can
+    // list the same "pending" rows the local TUI shows. FIFO order is preserved.
+    rt.pending_subagents = s
+        .pending_subagents
+        .iter()
+        .map(|p| PendingSubagent {
+            id: p.id,
+            agent_name: p.agent_name.clone(),
+            prompt: p.prompt.clone(),
+            // The turn-bookkeeping call id is daemon-internal + never rendered, and the
+            // client never advances a turn, so a shadow pending entry carries `None`.
+            tool_call_id: None,
+        })
+        .collect();
     rt
 }
 
@@ -556,6 +584,16 @@ fn apply_delta(shadow: &mut AppState, delta: StateDelta) -> bool {
             // composer renderer indexes by cursor and must never read past the end).
             shadow.rest.input = text;
             shadow.rest.cursor = cursor.min(shadow.rest.input.chars().count());
+            true
+        }
+        StateDelta::ScrollChanged { scroll, follow } => {
+            // Global transcript view state moved on the daemon (a forwarded scroll
+            // key, or new content re-pinning follow). Mirror it so the rendered
+            // offset tracks the daemon between full snapshots. The renderer clamps
+            // `scroll` against the live content height each draw, so an offset that
+            // momentarily exceeds the shadow's shorter content is self-correcting.
+            shadow.rest.scroll = scroll;
+            shadow.rest.follow = follow;
             true
         }
         StateDelta::SessionStatusChanged {
