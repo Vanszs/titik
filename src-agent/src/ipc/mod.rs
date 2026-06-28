@@ -394,10 +394,10 @@ mod roundtrip_tests {
 
         // Agents: the largest payload — list + drafts + overlays + keyless catalogue.
         let agents = ModeSnapshot::Agents(Box::new(AgentsSnapshot {
-            agents: vec![crate::model::agent_def::AgentDef {
+            agents: vec![crate::ipc::proto::AgentEntry {
                 name: "explore".to_string(),
                 description: "scout the codebase".to_string(),
-                ..crate::model::agent_def::AgentDef::default()
+                ..crate::ipc::proto::AgentEntry::default()
             }],
             list_sel: 0,
             in_detail: true,

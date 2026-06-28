@@ -664,7 +664,20 @@ fn agents_snapshot(a: &AgentsState, state: &AppState) -> AgentsSnapshot {
         .collect();
 
     AgentsSnapshot {
-        agents: a.agents.clone(),
+        agents: a.agents.iter().map(|ag| crate::ipc::proto::AgentEntry {
+            name: ag.name.clone(),
+            description: ag.description.clone(),
+            conditions: ag.conditions.clone(),
+            source: match ag.source {
+                crate::model::agent_def::AgentSource::Session => "session",
+                crate::model::agent_def::AgentSource::Global  => "global",
+                crate::model::agent_def::AgentSource::Builtin => "builtin",
+            }.to_string(),
+            model_uuid: ag.model_uuid.clone(),
+            model: ag.model.clone(),
+            tools: ag.tools.clone(),
+            prompt: ag.prompt.clone(),
+        }).collect(),
         list_sel: a.list_sel,
         in_detail: a.in_detail,
         mode: agent_submode_token(a.mode).to_string(),

@@ -949,11 +949,27 @@ pub struct AgentModelPickerSnapshot {
     pub cursor: usize,
 }
 
+/// Lightweight agent entry for IPC display — carries the fields that AgentDef
+/// marks #[serde(skip)] and would otherwise be lost over the socket.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AgentEntry {
+    pub name: String,
+    pub description: String,
+    pub conditions: String,
+    /// "session" | "project" | "global" | "builtin"
+    pub source: String,
+    pub model_uuid: Option<String>,
+    pub model: Option<String>,
+    pub tools: Vec<String>,
+    pub prompt: String,
+}
+
 /// A serde-safe projection of the `/agents` dashboard ([`crate::app::mode::AgentsState`]).
 ///
-/// The agent LIST rides as `Vec<AgentDef>` (already serde-clean), the working
-/// drafts + sub-mode + field cursor as plain data + wire tokens, and the three
-/// overlays (tool picker / model picker / full-screen field editor) as their own
+/// The agent LIST rides as `Vec<AgentEntry>` (carrying the display fields that
+/// `AgentDef` marks `#[serde(skip)]` and would otherwise vanish over the socket),
+/// the working drafts + sub-mode + field cursor as plain data + wire tokens, and the
+/// three overlays (tool picker / model picker / full-screen field editor) as their own
 /// projections. A KEYLESS model+provider catalogue rides alongside so the client
 /// resolves a chosen `model_uuid` to its `name @ provider` label exactly as the
 /// daemon would, WITHOUT any API key crossing the wire (the client reconstructs a
@@ -961,7 +977,7 @@ pub struct AgentModelPickerSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // wired in daemon stage 2+ (no callers in stage 1)
 pub struct AgentsSnapshot {
-    pub agents: Vec<crate::model::agent_def::AgentDef>,
+    pub agents: Vec<AgentEntry>,
     pub list_sel: usize,
     pub in_detail: bool,
     /// Sub-mode: `"browse"` / `"edit"` / `"create"` / `"delete_confirm"`.

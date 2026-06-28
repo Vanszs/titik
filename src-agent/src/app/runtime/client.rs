@@ -125,7 +125,7 @@ use crate::dto::chat::Role;
 use crate::dto::openrouter::{ModelEndpoint, ModelPricing};
 use crate::ipc::frame::{self, FrameReader};
 use crate::ipc::proto::{
-    AgentModelPickerSnapshot, AgentsSnapshot, ClientRequest, DaemonEvent, DaemonFrame,
+    AgentEntry, AgentModelPickerSnapshot, AgentsSnapshot, ClientRequest, DaemonEvent, DaemonFrame,
     KeyInputSnapshot, KeyWire, LoadingSnapshot, ModeSnapshot, ModelModalSnapshot, PathPickerSnapshot,
     PickerSnapshot, RewindSnapshot, SessionHubSnapshot, SessionSnapshot, SettingsSnapshot,
     StateDelta, StateSnapshot, SubAgentSnapshot, TextEditorSnapshot, ToolPickerSnapshot,
@@ -1502,7 +1502,24 @@ fn shadow_rewind(rw: RewindSnapshot) -> RewindState {
 /// state is render-only; key handling is forwarded to the daemon.
 fn shadow_agents(a: AgentsSnapshot) -> AgentsState {
     AgentsState {
-        agents: a.agents,
+        agents: a.agents.into_iter().map(|e: AgentEntry| {
+            crate::model::agent_def::AgentDef {
+                name: e.name,
+                description: e.description,
+                conditions: e.conditions,
+                source: match e.source.as_str() {
+                    "global"  => crate::model::agent_def::AgentSource::Global,
+                    "builtin" => crate::model::agent_def::AgentSource::Builtin,
+                    _         => crate::model::agent_def::AgentSource::Session,
+                },
+                model_uuid: e.model_uuid,
+                model: e.model,
+                tools: e.tools,
+                prompt: e.prompt,
+                file_path: None,
+                ..crate::model::agent_def::AgentDef::default()
+            }
+        }).collect(),
         list_sel: a.list_sel,
         in_detail: a.in_detail,
         mode: match a.mode.as_str() {
