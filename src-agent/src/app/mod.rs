@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod state;
 pub mod subagent;
 
+pub use runtime::client_run;
 pub use runtime::run;
 pub use runtime::run_daemon;
 pub use runtime::run_daemon_selftest;

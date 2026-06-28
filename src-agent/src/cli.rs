@@ -36,7 +36,8 @@ pub struct Opts {
     /// (`--daemon` flag). Owns the agent runtime; a TUI attaches as a client.
     pub daemon: bool,
     /// When `true`, run as a thin client that attaches to a running daemon
-    /// (`--attach` flag). Parsed now; the attach client lands in a later stage.
+    /// (`--attach` flag): connect to `~/.koma/daemon.sock`, render the daemon's
+    /// foreground session from streamed snapshots/deltas, and forward input.
     pub attach: bool,
 }
 

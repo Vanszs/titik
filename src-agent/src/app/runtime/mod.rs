@@ -20,6 +20,7 @@ mod terminal;
 mod event_loop;
 mod stream;
 mod actions;
+mod client;
 // `pub(crate)` so the shared `commands::internet::internet_feedback` helper is
 // reachable from the controller's Ctrl+E handler (outside this module tree).
 pub(crate) mod commands;
@@ -47,6 +48,10 @@ use event_loop::daemon::{daemon_loop, DaemonHub};
 // Re-export the sync-loop <-> per-client-task bridge message so the per-client
 // connection task in `crate::ipc::conn` (outside this module tree) can name it.
 pub(crate) use event_loop::daemon::HubInbound;
+
+// Re-export the thin-attach-client entry so `app::client_run` reaches the
+// `koma --attach` path (defined in the `client` submodule).
+pub use client::client_run;
 
 pub(super) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 

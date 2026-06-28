@@ -1,0 +1,652 @@
+//! Thin attach client — the `koma --attach` core (daemon stage 6).
+//!
+//! [`client_run`] connects to a running daemon's unix socket, attaches, and then
+//! renders the daemon's state + forwards input. It does NONE of the real work:
+//! no `service_all_sessions`, no turn machinery, no agent runtime. It maintains a
+//! SHADOW [`AppState`] populated PURELY from the daemon's
+//! [`DaemonEvent::Snapshot`] / [`DaemonEvent::Delta`] frames and feeds that shadow
+//! to the EXISTING [`crate::view::draw`] — so the attach client renders identically
+//! to a local TUI, with zero second render path to drift.
+//!
+//! # Why a real `AppState` as the shadow
+//!
+//! `view::draw` reads only `state.rest` (in Chat mode) + `state.mode`. Rebuilding
+//! a real [`AppState`] from each snapshot — one [`crate::app::state::SessionRuntime`]
+//! per [`crate::ipc::proto::SessionSnapshot`], each carrying a reconstructed
+//! [`crate::model::session::Session`] (messages + name + model) — lets the
+//! unmodified chat renderer consume it directly. Non-render fields (channels,
+//! abort handles, tool state machines) stay at their `Default`; the client never
+//! advances a turn, so they are never read.
+//!
+//! # Transport bridge (mirrors the daemon's [`crate::ipc::conn`], client-side)
+//!
+//! The render loop is SYNCHRONOUS (crossterm draw + input poll). Socket I/O lives
+//! in two tokio tasks bridged over `std::sync::mpsc`:
+//! - a READER task: `read_frame_from` -> decode [`DaemonFrame`] -> push onto the
+//!   loop's incoming `std::sync::mpsc::Sender<DaemonFrame>`. On EOF/error it drops
+//!   the sender, which the loop observes as the daemon going away.
+//! - a WRITER task: owns the outbound `std::sync::mpsc::Receiver<ClientRequest>`,
+//!   polls it on a short interval, and writes each as a frame. (Same `!Sync`
+//!   reasoning as `conn::write_loop`: a `std::sync::mpsc::Receiver` held across an
+//!   await makes the future non-`Send`; collect-then-write keeps it off the await.)
+//!
+//! # Seq-gap recovery (critique #1)
+//!
+//! Every [`DaemonFrame`] carries a per-connection monotonic `seq`. The loop tracks
+//! the next expected seq; on a gap it sends [`ClientRequest::Resync`] and DROPS
+//! every frame until the fresh full [`DaemonEvent::Snapshot`] arrives (whose seq
+//! reseeds the expectation), so one dropped delta can't leave a permanently-wrong
+//! shadow.
+//!
+//! # Input forwarding (raw keys)
+//!
+//! Each terminal key is forwarded VERBATIM as [`ClientRequest::SendKey`]; the
+//! daemon runs the SAME `controller::input::handle_key` + `apply_action` pipeline
+//! the local TUI uses, so every high-level gesture — submitting a typed message,
+//! `/swap` (remote foreground switch), `/new` — works through forwarded keys with
+//! no client-side command parsing to drift from the daemon. The ONE key the client
+//! interprets locally is the detach gesture (Ctrl-C): it sends
+//! [`ClientRequest::Detach`] and exits the client, leaving the daemon (and every
+//! session) running.
+
+use std::io::stdout;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+
+use crate::app::mode::Mode;
+use crate::app::state::{AppState, SessionRuntime, ToastKind};
+use crate::ipc::frame::{self, FrameReader};
+use crate::ipc::proto::{
+    ClientRequest, DaemonEvent, DaemonFrame, KeyWire, SessionSnapshot, StateDelta, StateSnapshot,
+};
+use crate::model::conversation::Conversation;
+use crate::model::session::Session;
+use crate::model::settings::Settings;
+use crate::model::store;
+use crate::view;
+
+use super::terminal::TerminalGuard;
+
+/// How often the writer task polls its (sync) request queue. 4ms matches the
+/// daemon conn's `FRAME_POLL` so a typed key reaches the daemon within one tick.
+const REQ_POLL: Duration = Duration::from_millis(4);
+
+/// Local TTL for a toast reconstructed from a [`StateDelta::Toast`]. The daemon's
+/// toast `Instant` is daemon-local and never crosses the wire (see `ipc::snapshot`);
+/// the client re-derives its own dismissal timer here, matching the ~4s feel of the
+/// local TUI's toasts.
+const TOAST_TTL: Duration = Duration::from_secs(4);
+
+/// Attach to a running daemon and run the thin render+forward client.
+///
+/// Connects to the daemon socket (an `Err` means no daemon is up — surfaced to the
+/// caller, which prints it), spawns the reader/writer bridge tasks, sends
+/// [`ClientRequest::Attach`], then enters the synchronous render loop. Returns when
+/// the user detaches (Ctrl-C) or the daemon's socket closes; the terminal is
+/// restored by [`TerminalGuard`]'s drop and the runtime is dropped last.
+pub fn client_run(_opts: crate::cli::Opts) -> Result<()> {
+    // The client needs the config dirs only to resolve the socket path; it owns no
+    // sessions and writes no config.
+    store::ensure_dirs()?;
+    let sock_path = store::daemon_sock_path()?;
+
+    // A small multi-thread runtime drives the two socket tasks. The render loop runs
+    // on THIS thread (synchronous), exactly like the local TUI's `run_loop`.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let handle = rt.handle().clone();
+
+    // Connect first so a missing daemon fails BEFORE we touch the terminal (no
+    // alt-screen flash on "no daemon"). The connected stream is split into the two
+    // task halves below.
+    let stream = handle
+        .block_on(async { crate::ipc::client::connect(&sock_path).await })
+        .map_err(|e| {
+            anyhow::anyhow!("could not reach koma daemon at {}: {e}", sock_path.display())
+        })?;
+
+    // Bridge channels: incoming frames (daemon -> loop) and outgoing requests
+    // (loop -> daemon). Mirrors the daemon hub's bridge, client-side.
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<DaemonFrame>();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<ClientRequest>();
+
+    // Split + spawn the two I/O tasks on the runtime (a tokio reactor must be in
+    // scope for `into_split` + `spawn`).
+    {
+        let _enter = handle.enter();
+        let (read_half, write_half) = stream.into_split();
+        handle.spawn(reader_task(read_half, frame_tx));
+        handle.spawn(writer_task(write_half, req_rx));
+    }
+
+    // Send the Attach handshake; the daemon answers with the initial full Snapshot
+    // (drained in the loop's first incoming pass).
+    let _ = req_tx.send(ClientRequest::Attach {
+        foreground_id: None,
+    });
+
+    // Terminal setup — identical to the local TUI (`run`). Guard first so a failure
+    // anywhere after still restores the terminal.
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let result = render_loop(&mut terminal, &frame_rx, &req_tx);
+
+    // Best-effort polite detach so the daemon passes the controller seat promptly
+    // (the socket close would also trigger it, but this is cleaner). Then drop the
+    // runtime LAST so the two tasks are cancelled after the loop has stopped.
+    let _ = req_tx.send(ClientRequest::Detach);
+    drop(rt);
+
+    result
+}
+
+/// The synchronous render loop. Each tick: redraw if dirty, drain incoming frames
+/// (apply snapshot/delta or recover a seq gap), then poll + forward terminal input.
+/// Returns when the user detaches (Ctrl-C) or the daemon's socket closes.
+fn render_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    frame_rx: &Receiver<DaemonFrame>,
+    req_tx: &Sender<ClientRequest>,
+) -> Result<()> {
+    // The shadow is a real AppState reconstructed purely from frames. It starts in
+    // a neutral Chat with a single empty session; the first Snapshot replaces it.
+    let mut shadow = AppState::new(Mode::Chat);
+    // Until the first Snapshot lands the shadow is empty — show a clear status so
+    // the screen isn't a blank "ready".
+    shadow.rest.status = "attaching…".into();
+
+    // Per-connection seq tracking (critique #1). `expected` is the seq the NEXT
+    // frame should carry. `0` means "not yet seeded" — the first frame seeds it.
+    let mut expected: u64 = 0;
+    let mut seeded = false;
+    // While true, every frame except a fresh Snapshot is dropped: a gap was seen and
+    // a Resync was sent, so the shadow is stale until the full snapshot rebuilds it.
+    let mut awaiting_resync = false;
+
+    let mut dirty = true; // paint once on entry
+    loop {
+        if dirty {
+            terminal.draw(|f| view::draw(f, &shadow))?;
+            dirty = false;
+        }
+
+        // --- drain every queued incoming frame ---
+        loop {
+            match frame_rx.try_recv() {
+                Ok(frame) => {
+                    if apply_frame(
+                        frame,
+                        &mut shadow,
+                        &mut expected,
+                        &mut seeded,
+                        &mut awaiting_resync,
+                        req_tx,
+                    ) {
+                        dirty = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                // The reader task dropped its sender: the daemon's socket closed.
+                // Nothing more will ever arrive — leave the client.
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        // --- poll + forward terminal input ---
+        // Adaptive cadence mirroring the local loop: fast while the foreground
+        // session is working (so streamed deltas flush at >=60fps), idle otherwise.
+        let busy = shadow.rest.fg().waiting;
+        let timeout = if busy {
+            Duration::from_millis(8)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(timeout)? {
+            while event::poll(Duration::ZERO)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        // The ONE locally-interpreted gesture: Ctrl-C detaches the
+                        // client (leaves the daemon running). Everything else is
+                        // forwarded verbatim for the daemon to interpret.
+                        if is_detach(&key) {
+                            return Ok(());
+                        }
+                        let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(key)));
+                    }
+                    // Mouse wheel scrolls the LOCAL shadow transcript (a pure view
+                    // concern — the daemon's scroll is its own; scrolling the shadow
+                    // gives immediate feedback without a round-trip). Bottom-pinning
+                    // follow is reconstructed from snapshots, so a manual scroll just
+                    // nudges the local offset for this render.
+                    Event::Mouse(m) if matches!(shadow.mode, Mode::Chat) => match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            for _ in 0..3 {
+                                shadow.rest.scroll_up();
+                            }
+                            dirty = true;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            for _ in 0..3 {
+                                shadow.rest.scroll_down();
+                            }
+                            dirty = true;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => dirty = true,
+                    // Pasted text is forwarded character-by-character as key events so
+                    // the daemon's composer ingests it through the same path as typing.
+                    Event::Paste(text) => {
+                        for ch in text.chars() {
+                            let _ = req_tx.send(ClientRequest::SendKey(KeyWire::from(
+                                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Expire a locally-reconstructed toast once its TTL passes (the daemon never
+        // sends a "toast cleared" delta; the client owns its own dismissal timer).
+        if let Some((_, until, _)) = shadow.rest.toast.as_ref() {
+            if Instant::now() >= *until {
+                shadow.rest.toast = None;
+                dirty = true;
+            }
+        }
+    }
+}
+
+/// Apply one incoming [`DaemonFrame`] to the shadow, handling seq-gap recovery.
+///
+/// Returns `true` if the shadow changed and a redraw is needed. On a detected gap
+/// it sends [`ClientRequest::Resync`], sets `awaiting_resync`, and drops the frame;
+/// while `awaiting_resync` only a fresh `Snapshot` is applied (it reseeds the seq +
+/// clears the flag). `Ack` / `Error` frames advance the seq but are non-visual
+/// (an `Error` could surface as a toast in a later refinement).
+fn apply_frame(
+    frame: DaemonFrame,
+    shadow: &mut AppState,
+    expected: &mut u64,
+    seeded: &mut bool,
+    awaiting_resync: &mut bool,
+    req_tx: &Sender<ClientRequest>,
+) -> bool {
+    // --- seq-gap detection (critique #1) ---
+    if !*seeded {
+        // First frame ever: seed the expectation from it (whatever it is) so we
+        // don't false-positive a gap on the initial Snapshot's seq.
+        *seeded = true;
+        *expected = frame.seq;
+    } else if frame.seq != *expected {
+        // A frame was dropped (or reordered). Ask for a full rebuild and ignore
+        // everything until the fresh Snapshot arrives — UNLESS this very frame is a
+        // Snapshot, which is itself a valid full rebuild we can take right now.
+        if matches!(frame.event, DaemonEvent::Snapshot(_)) {
+            // Fall through to apply it; it reseeds the seq below.
+        } else {
+            if !*awaiting_resync {
+                *awaiting_resync = true;
+                let _ = req_tx.send(ClientRequest::Resync);
+            }
+            // Resync the expectation forward so we don't spam Resync on every
+            // subsequent gapped frame; the awaited Snapshot will reseed precisely.
+            *expected = frame.seq.wrapping_add(1);
+            return false;
+        }
+    }
+    // Next frame should be exactly one past this one.
+    *expected = frame.seq.wrapping_add(1);
+
+    match frame.event {
+        DaemonEvent::Snapshot(snap) => {
+            // A full Snapshot is always a valid rebuild — it clears any pending
+            // resync and reseeds the shadow wholesale.
+            *awaiting_resync = false;
+            apply_snapshot(shadow, snap);
+            true
+        }
+        DaemonEvent::Delta(delta) => {
+            // Drop deltas while the shadow is known-stale (waiting on the resync
+            // Snapshot) — applying them onto a wrong baseline would corrupt it.
+            if *awaiting_resync {
+                return false;
+            }
+            apply_delta(shadow, delta)
+        }
+        // Non-visual control replies. (A future refinement could toast an Error.)
+        DaemonEvent::Ack | DaemonEvent::Error(_) => false,
+    }
+}
+
+/// Rebuild the entire shadow [`AppState`] from a full [`StateSnapshot`].
+///
+/// Replaces `rest.sessions` with one reconstructed [`SessionRuntime`] per snapshot
+/// session, points `foreground` at the `foreground_id`, and copies the global
+/// fields. The transcript-render cache is cleared because a snapshot can replace the
+/// committed history wholesale (e.g. a foreground switch to a different session) and
+/// the cache's incremental-append guard only covers a pure shrink, not a divergence.
+fn apply_snapshot(shadow: &mut AppState, snap: StateSnapshot) {
+    let StateSnapshot {
+        foreground_id,
+        sessions,
+        global,
+    } = snap;
+
+    // Rebuild every session runtime from its projection.
+    let runtimes: Vec<SessionRuntime> = sessions.iter().map(shadow_session_runtime).collect();
+
+    // Resolve the foreground index by stable id (never trust an index across the
+    // wire). Fall back to 0 if the id is somehow absent — `sessions` is always >=1.
+    let fg = foreground_id
+        .as_deref()
+        .and_then(|id| sessions.iter().position(|s| s.id == id))
+        .unwrap_or(0);
+
+    shadow.rest.sessions = if runtimes.is_empty() {
+        // Defensive: never leave `sessions` empty (fg()/fg_mut() index it). The
+        // daemon always projects >=1 session, so this is belt-and-suspenders.
+        vec![SessionRuntime::new()]
+    } else {
+        runtimes
+    };
+    shadow.rest.foreground = fg.min(shadow.rest.sessions.len() - 1);
+
+    // Global render fields.
+    shadow.rest.input = global.input;
+    shadow.rest.cursor = global.cursor;
+    shadow.rest.scroll = global.scroll;
+    shadow.rest.follow = global.follow;
+    shadow.rest.status = global.status;
+    shadow.rest.toast = global.toast.map(|(kind, text)| {
+        (text, Instant::now() + TOAST_TTL, toast_kind(&kind))
+    });
+
+    // The committed history may have changed wholesale; drop the rendered-lines
+    // cache so the next draw rebuilds it against the new messages.
+    shadow.rest.transcript_cache.borrow_mut().blocks.clear();
+
+    // Mode: only Chat carries a payload-free, fully-projected screen today. Every
+    // other ModeTag's modal payload is NOT projected over the wire yet (a later
+    // task), so render Chat as the safe, correct fallback rather than fabricate an
+    // empty picker/form. The foreground chat — the manual-test target — is exact.
+    shadow.mode = Mode::Chat;
+
+    // Reconcile the derived "comet" animation clock from the foreground session's
+    // working flag (the daemon owns its own clock; the client re-derives one purely
+    // for the local shimmer so it doesn't need to cross the wire).
+    reconcile_work_clock(shadow);
+}
+
+/// Build a shadow [`SessionRuntime`] from one [`SessionSnapshot`].
+///
+/// Carries the stable id + the render-relevant fields (streaming buffers, token /
+/// cost counters, approval flags, working/finished-unseen). The committed messages +
+/// name + model are reconstructed into a minimal [`Session`] so the unmodified chat
+/// transcript/header/input renderers consume it exactly as they do a live session.
+/// Every NON-render field stays at `Default` — the client never advances a turn, so
+/// the tool/sub-agent state machines and channels are never read. (Sub-agents are
+/// intentionally NOT reconstructed: the `$` panel is not part of this stage's render
+/// proof and `SubAgent` holds non-reconstructible live handles.)
+fn shadow_session_runtime(s: &SessionSnapshot) -> SessionRuntime {
+    let mut rt = SessionRuntime::new();
+    rt.id = s.id.clone();
+    rt.session = Some(shadow_session(s));
+    rt.streaming = s.streaming.clone();
+    rt.stream_reasoning = s.stream_reasoning.clone();
+    rt.tokens_in = s.tokens_in;
+    rt.tokens_out = s.tokens_out;
+    rt.cost = s.cost;
+    rt.tokens_cached = s.tokens_cached;
+    // `waiting` drives the local input-poll cadence + the comet; mirror the snapshot's
+    // composite `working` so a parked/streaming background session keeps the shadow
+    // ticking fast and shimmering, matching the daemon.
+    rt.waiting = s.working;
+    rt.awaiting_approval = s.awaiting_approval;
+    rt.approval_reason = s.approval_reason.clone();
+    rt.finished_unseen = s.finished_unseen;
+    rt
+}
+
+/// Reconstruct a minimal [`Session`] from a [`SessionSnapshot`] for rendering.
+///
+/// Only the fields the chat view reads are meaningful: `name` (the input-tab label),
+/// `conversation` (the transcript), and `settings.model` (the model-name row). The
+/// path / pwd_hash / api_key are render-irrelevant on the client and left empty —
+/// the client never saves, sends, or locks anything.
+fn shadow_session(s: &SessionSnapshot) -> Session {
+    // The model row falls back to `settings.model` when the resolved model is empty;
+    // the snapshot doesn't carry the resolved model separately, so seed a blank model
+    // and let the header's own fallback render. (Model projection can be added to the
+    // snapshot later if the client should show the exact resolved id.)
+    let settings = Settings {
+        name: s.name.clone(),
+        model: String::new(),
+        ..Default::default()
+    };
+
+    Session::new(
+        s.id.clone(),
+        std::path::PathBuf::new(),
+        String::new(),
+        settings,
+        Conversation::from_messages(s.messages.clone()),
+    )
+}
+
+/// Apply one incremental [`StateDelta`] to the shadow in place.
+///
+/// Returns `true` if the shadow changed. Session-scoped deltas resolve their target
+/// by stable id (never index); an unknown id is a harmless no-op (the next Snapshot
+/// reconciles). The differ only emits these for high-frequency per-tick changes;
+/// anything structural (history, tokens, approval, sub-agents, the session set)
+/// arrives as a full Snapshot instead (see `ipc::snapshot::diff`).
+fn apply_delta(shadow: &mut AppState, delta: StateDelta) -> bool {
+    match delta {
+        StateDelta::TokenAppended { session_id, text } => {
+            if let Some(rt) = session_by_id_mut(shadow, &session_id) {
+                // A token before any `streaming` buffer means the daemon went
+                // None -> Some("…") this turn (the differ treats None/Some("") alike);
+                // initialise the buffer so the append lands.
+                rt.streaming.get_or_insert_with(String::new).push_str(&text);
+                return true;
+            }
+            false
+        }
+        StateDelta::ReasoningAppended { session_id, text } => {
+            if let Some(rt) = session_by_id_mut(shadow, &session_id) {
+                rt.stream_reasoning.push_str(&text);
+                return true;
+            }
+            false
+        }
+        StateDelta::StatusChanged { session_id, text } => match session_id {
+            // Session-scoped status is not separately rendered today (the status line
+            // is global); a `None` (global) status updates the rendered status line.
+            None => {
+                shadow.rest.status = text;
+                true
+            }
+            Some(_) => false,
+        },
+        StateDelta::SessionStatusChanged {
+            session_id,
+            working,
+            finished_unseen,
+        } => {
+            if let Some(rt) = session_by_id_mut(shadow, &session_id) {
+                rt.waiting = working;
+                rt.finished_unseen = finished_unseen;
+                // The working flag feeds the comet clock; reconcile it (only the
+                // foreground session's clock is rendered).
+                reconcile_work_clock(shadow);
+                return true;
+            }
+            false
+        }
+        StateDelta::ForegroundChanged { session_id } => {
+            if let Some(idx) = shadow
+                .rest
+                .sessions
+                .iter()
+                .position(|s| s.id == session_id)
+            {
+                shadow.rest.foreground = idx;
+                // Switching foreground swaps the visible transcript wholesale; clear
+                // the rendered-lines cache so it rebuilds for the new session.
+                shadow.rest.transcript_cache.borrow_mut().blocks.clear();
+                reconcile_work_clock(shadow);
+                return true;
+            }
+            false
+        }
+        StateDelta::SessionAdded(snap) => {
+            // A new parallel session appeared. Append its runtime; the differ would
+            // normally send a full Snapshot for a set change, but accept the delta
+            // form too (it is in the vocabulary) so the shadow stays in step either way.
+            if !shadow.rest.sessions.iter().any(|s| s.id == snap.id) {
+                shadow.rest.sessions.push(shadow_session_runtime(&snap));
+                return true;
+            }
+            false
+        }
+        StateDelta::Toast { kind, text } => {
+            shadow.rest.toast = Some((text, Instant::now() + TOAST_TTL, toast_kind(&kind)));
+            true
+        }
+    }
+}
+
+/// Find a shadow session runtime by its stable id (mutable).
+fn session_by_id_mut<'a>(shadow: &'a mut AppState, id: &str) -> Option<&'a mut SessionRuntime> {
+    shadow.rest.sessions.iter_mut().find(|s| s.id == id)
+}
+
+/// Map a wire toast `kind` string ("error" / "info") to the local [`ToastKind`].
+/// Anything unexpected degrades to `Info` (a neutral box, never a false error).
+fn toast_kind(kind: &str) -> ToastKind {
+    match kind {
+        "error" => ToastKind::Error,
+        _ => ToastKind::Info,
+    }
+}
+
+/// Re-derive the local "comet" animation clock from the FOREGROUND session's working
+/// state, mirroring the rising/falling-edge reconcile the daemon/TUI loop does.
+///
+/// The status-line shimmer renders only when `work_since` is set. The daemon's own
+/// `work_since` is daemon-local and not projected (it's a pure animation clock), so
+/// the client maintains its own: set it the moment the foreground session is working
+/// (and not paused for approval) and it isn't already running; clear it the moment
+/// work ends or an approval prompt takes over.
+fn reconcile_work_clock(shadow: &mut AppState) {
+    let fg = shadow.rest.fg();
+    let shimmer = fg.waiting && !fg.awaiting_approval;
+    if shimmer {
+        if shadow.rest.work_since.is_none() {
+            shadow.rest.work_since = Some(Instant::now());
+        }
+    } else {
+        shadow.rest.work_since = None;
+    }
+}
+
+/// Is this key the client's local DETACH gesture (Ctrl-C)?
+///
+/// Detaching the client leaves the daemon — and every session — running. Every
+/// OTHER key (including Esc, which is meaningful to the remote session's modes) is
+/// forwarded to the daemon, so the client never steals a key the session needs.
+fn is_detach(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+// ─── transport bridge tasks (mirror crate::ipc::conn, client-side) ───────────
+
+/// Reader task: decode framed [`DaemonFrame`]s off the socket and push them onto the
+/// loop's incoming channel. On socket EOF / cap violation / decode error it returns,
+/// dropping `frame_tx` — the loop's `try_recv` then observes `Disconnected` and exits.
+/// `read_frame_from` enforces [`crate::ipc::proto::MAX_FRAME_BYTES`] on every prefix.
+async fn reader_task(
+    mut read_half: tokio::net::unix::OwnedReadHalf,
+    frame_tx: Sender<DaemonFrame>,
+) {
+    let mut reader = FrameReader::new();
+    // `while let Ok(..)` ends the loop on EOF / cap violation / read error (the
+    // daemon closed or misbehaved); a malformed-frame decode or a gone loop breaks.
+    while let Ok(bytes) = frame::read_frame_from(&mut read_half, &mut reader).await {
+        match serde_json::from_slice::<DaemonFrame>(&bytes) {
+            // Forward the frame; a send error means the loop is gone (client
+            // exiting) -> stop reading.
+            Ok(frame) => {
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+            // A malformed frame from the daemon is a protocol fault; stop the
+            // connection rather than guess (the loop sees the dropped sender).
+            Err(_) => break,
+        }
+    }
+    // Dropping `frame_tx` here signals the loop the connection is gone.
+}
+
+/// Writer task: drain the loop's outbound [`ClientRequest`] queue to the socket on a
+/// short interval until the queue closes (the loop dropped its sender at exit) or a
+/// write fails.
+///
+/// The `req_rx` borrow is confined to the synchronous collect step (no `.await` while
+/// it is held), then the batch is written — the same collect-then-write that keeps
+/// the future `Send` despite `std::sync::mpsc::Receiver` being `!Sync` (see
+/// `conn::write_loop`).
+async fn writer_task(
+    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    req_rx: Receiver<ClientRequest>,
+) {
+    let mut poll = tokio::time::interval(REQ_POLL);
+    loop {
+        poll.tick().await;
+
+        // Collect every queued request WITHOUT awaiting while `req_rx` is borrowed.
+        let mut batch: Vec<ClientRequest> = Vec::new();
+        let mut closed = false;
+        loop {
+            match req_rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    closed = true; // loop exited and dropped its sender
+                    break;
+                }
+            }
+        }
+
+        // Write the batch (does not touch `req_rx`). Stop on a dead socket.
+        for req in &batch {
+            let bytes = match serde_json::to_vec(req) {
+                Ok(b) => b,
+                // A request that can't serialise is a client bug, not a transport
+                // fault — skip it rather than tear down the connection.
+                Err(_) => continue,
+            };
+            if frame::write_frame_to(&mut write_half, &bytes).await.is_err() {
+                return; // dead socket
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+}

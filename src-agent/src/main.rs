@@ -80,12 +80,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- headless path: run the koma-daemon event loop (no TUI) ---
-    // Owns the agent runtime with no terminal; a TUI attaches as a thin client in
-    // a later stage. Stays in this branch (loops forever) until Ctrl-C.
+    // Owns the agent runtime with no terminal; a TUI attaches as a thin client via
+    // `--attach`. Stays in this branch (loops forever) until QuitDaemon / Ctrl-C.
     if opts.daemon {
         return app::run_daemon(opts);
     }
 
-    // --- normal path: launch the TUI ---
+    // --- thin-client path: attach to a running daemon and render its state ---
+    // Connects to ~/.koma/daemon.sock, renders the daemon's foreground session from
+    // streamed snapshots/deltas, and forwards input. Detaching (Ctrl-C) leaves the
+    // daemon running. The daemon path is opt-in; normal `koma` is unaffected.
+    if opts.attach {
+        return app::client_run(opts);
+    }
+
+    // --- normal path: launch the LOCAL TUI (fully functional standalone) ---
     app::run(opts)
 }
