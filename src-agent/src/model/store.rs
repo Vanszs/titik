@@ -208,9 +208,17 @@ pub fn daemon_sock_path() -> Result<PathBuf> {
 /// Advisory only — recorded for diagnostics/`kill`. It is NOT the liveness oracle
 /// (PIDs get reused, which would wedge spawn-or-attach); the bound socket at
 /// [`daemon_sock_path`] is. Lives under the same [`base_dir`] (`~/.koma`).
-#[allow(dead_code)] // wired in daemon stage 3+ (pid file written on daemonize)
 pub fn daemon_pid_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("daemon.pid"))
+}
+
+/// Write the running daemon's PID into [`daemon_pid_path`], overwriting any
+/// stale one. Best-effort and advisory only (diagnostics / `kill`), so an IO
+/// error is returned but callers treat it as non-fatal — the bound socket, not
+/// this file, is the liveness oracle. The graceful-shutdown teardown unlinks it.
+pub fn write_daemon_pid() -> Result<()> {
+    std::fs::write(daemon_pid_path()?, std::process::id().to_string())?;
+    Ok(())
 }
 
 /// List the sessions for the CURRENT working directory, most-recently updated

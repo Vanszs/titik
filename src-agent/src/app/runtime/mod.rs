@@ -369,16 +369,103 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     result
 }
 
+/// Install the daemon's process-signal handling on the tokio runtime and return
+/// the shared `shutting_down` flag the SYNC [`daemon_loop`] polls each tick.
+///
+/// One async task owns the three unix signal streams and reacts WITHOUT ever
+/// touching the loop directly (the loop stays synchronous — the task only flips an
+/// atomic the loop reads):
+///
+/// - **SIGHUP — survive a lost controlling terminal.** Registering a tokio handler
+///   for SIGHUP overrides its default "terminate" disposition; the task simply
+///   consumes each SIGHUP and loops, so closing the terminal that launched the
+///   daemon does NOT kill it. (Full detach-from-tty spawning is the stage-7 CLI
+///   machinery; here an already-running daemon just ignores SIGHUP.)
+/// - **SIGTERM / SIGINT (first) — begin graceful shutdown.** Flip `shutting_down`;
+///   the loop observes it next tick and runs the shared teardown (release every
+///   session lock, drop the runtime, unlink socket + pidfile).
+/// - **SIGTERM / SIGINT (second, while already shutting down) — hard exit.** A
+///   repeated terminate/interrupt means "I asked once, stop now": skip the orderly
+///   teardown and `std::process::exit(0)` immediately. Guarded by the task's own
+///   local `requested` counter (no second atomic / no TOCTOU).
+///
+/// SIGPIPE is handled separately by the caller (`SIG_IGN`, set before any socket
+/// IO) and is intentionally NOT part of this task — a dead-client write must return
+/// EPIPE per-write, never reach a handler.
+///
+/// Registration runs inside the runtime context (`handle.enter()`) because
+/// `tokio::signal::unix::signal` needs the reactor. If any stream fails to register
+/// (extremely unlikely on Linux), the daemon proceeds WITHOUT that handler rather
+/// than aborting — a controller's `QuitDaemon` still provides a clean stop path.
+fn install_daemon_signals(handle: &tokio::runtime::Handle) -> Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&shutting_down);
+
+    let _enter = handle.enter();
+    handle.spawn(async move {
+        // Best-effort registration. If any stream can't be built (extremely
+        // unlikely on Linux), the task exits and the daemon runs without signal
+        // handling — a controller's `QuitDaemon` remains as a clean stop path.
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(_) => return, // no signal handling available; rely on QuitDaemon
+        };
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Count of terminate/interrupt requests seen. 0 -> first one begins
+        // graceful shutdown; >=1 -> a second one hard-exits (double-SIGTERM guard).
+        let mut requested = 0u32;
+        loop {
+            tokio::select! {
+                // SIGHUP: consume + ignore so a closed controlling terminal never
+                // kills the daemon. Never sets the shutdown flag.
+                _ = hup.recv() => {}
+                // SIGTERM / SIGINT: first begins graceful shutdown; a second hard-exits.
+                _ = term.recv() => {
+                    if requested == 0 {
+                        requested = 1;
+                        flag.store(true, Ordering::Relaxed);
+                    } else {
+                        std::process::exit(0);
+                    }
+                }
+                _ = int.recv() => {
+                    if requested == 0 {
+                        requested = 1;
+                        flag.store(true, Ordering::Relaxed);
+                    } else {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+    });
+
+    shutting_down
+}
+
 /// Headless entry point: run the koma-daemon event loop with NO terminal.
 ///
 /// Shares [`build_startup`] with the TUI [`run`] (same dirs / runtime / state /
 /// client / warm), then — instead of the terminal + `run_loop` — ignores SIGPIPE,
-/// binds the unix socket, spawns the per-client accept loop, and enters
+/// installs the SIGHUP-survive + graceful/double-SIGTERM signal task, records the
+/// pidfile, binds the unix socket, spawns the per-client accept loop, and enters
 /// [`daemon_loop`]. The accept loop runs on the tokio runtime (async socket I/O);
 /// `daemon_loop` runs synchronously on this thread and drains the bridge each tick
-/// (critique #6). It returns when a controller sends `QuitDaemon` (or the process is
-/// signalled); the shared teardown then releases every session lock, drops the
-/// runtime, and unlinks the socket.
+/// (critique #6). It returns when a controller sends `QuitDaemon` OR the process is
+/// signalled (SIGTERM/SIGINT, via the polled `shutting_down` flag); the shared
+/// teardown then releases every session lock, drops the runtime, and unlinks the
+/// socket + pidfile.
 pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
     // Critique #10: writing to a dead client must never kill the daemon. Ignore
     // SIGPIPE process-wide BEFORE any socket IO so a broken-pipe write returns
@@ -392,6 +479,19 @@ pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
 
     // Shared, terminal-independent startup — identical to the TUI path.
     let (rt, handle, mut state, mut client) = build_startup(&opts)?;
+
+    // Install the SIGHUP-survive + graceful/double-SIGTERM signal handling and get
+    // the flag the SYNC loop polls. Done BEFORE binding the socket so a signal that
+    // arrives during startup is already accounted for (it sets the flag the loop
+    // checks on its very first tick). The daemon now ignores SIGHUP, so closing the
+    // launching terminal can't kill it.
+    let shutting_down = install_daemon_signals(&handle);
+
+    // Record the advisory pidfile (diagnostics / `kill`). Best-effort: a write
+    // failure must not stop the daemon (the bound socket, not this file, is the
+    // liveness oracle), so the error is swallowed. The teardown unlinks it.
+    let pid_path = crate::model::store::daemon_pid_path()?;
+    let _ = crate::model::store::write_daemon_pid();
 
     // Sync-loop <-> per-client-task bridge (critique #1/#6). The runner holds the
     // paired `req_tx` (which the accept loop clones into each connection task) for
@@ -413,13 +513,19 @@ pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
 
     // Enter the headless loop: service_all_sessions + service_global + the request-
     // bridge drain (apply mutations) + delta streaming on the adaptive cadence.
-    // Returns when a controller's QuitDaemon latches the hub shutdown flag.
-    daemon_loop(&mut state, &mut client, &handle, &mut hub);
+    // Returns when a controller's QuitDaemon latches the hub flag OR a signal flips
+    // `shutting_down` (both observed each tick).
+    daemon_loop(&mut state, &mut client, &handle, &mut hub, &shutting_down);
 
-    // Clean shutdown (QuitDaemon, or a future self-exit): release locks, drop the
-    // runtime LAST, and remove the socket so the next spawn binds fresh.
+    // Graceful teardown (QuitDaemon, SIGTERM/SIGINT, or a future self-exit). Dropping
+    // the runtime in `shutdown_runtime` cancels the accept loop and every per-client
+    // task, so no new client is serviced past this point ("stop accepting new
+    // clients"); it also releases every session lock and drops the runtime LAST. Then
+    // remove the socket + pidfile so the next spawn binds fresh. (A second SIGTERM
+    // during this window hard-exits via the signal task instead of reaching here.)
     shutdown_runtime(&mut state, rt);
     let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
 
     Ok(())
 }
@@ -491,7 +597,10 @@ fn daemon_selftest_inner() -> Result<()> {
     let driver = std::thread::spawn(move || {
         let mut state = AppState::new(Mode::Chat);
         let mut client: Option<Arc<OpenRouterClient>> = None;
-        daemon_loop(&mut state, &mut client, &loop_handle, &mut hub);
+        // Signals don't apply to the self-test (it stops via QuitDaemon), so pass a
+        // flag that is never set; only the hub's QuitDaemon path drives the exit.
+        let never = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        daemon_loop(&mut state, &mut client, &loop_handle, &mut hub, &never);
     });
 
     // Client side: connect, attach, submit, observe, quit.

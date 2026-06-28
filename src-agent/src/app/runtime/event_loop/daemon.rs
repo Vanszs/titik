@@ -51,6 +51,7 @@
 //! The "live while >=1 session OR a client; self-exit on zero sessions AND no
 //! client" rule is wired alongside the accept loop in a later stage.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -511,10 +512,19 @@ impl DaemonHub {
 /// concern, drives the hub (drain inbound requests + apply mutations + stream
 /// deltas), then sleeps on the adaptive cadence. No terminal, no input, no draw.
 ///
-/// Returns when a controller sends [`ClientRequest::QuitDaemon`] (the hub latches a
-/// shutdown flag checked each tick) so the caller's teardown runs; otherwise it
-/// runs until the process is signalled. The broader "self-exit on zero sessions AND
-/// no client" lifecycle rule is a later stage.
+/// Returns on EITHER shutdown trigger so the caller's teardown (release every
+/// session lock, drop the runtime, unlink socket + pidfile) runs:
+/// 1. a controller sends [`ClientRequest::QuitDaemon`] (the hub latches its own
+///    flag, observed via [`DaemonHub::should_shutdown`]), or
+/// 2. the process receives SIGTERM/SIGINT — the signal task (installed in
+///    [`super::super::run_daemon`]) flips `shutting_down`, which this loop polls
+///    each tick. The loop stays SYNCHRONOUS: the async signal task only sets the
+///    atomic; no awaiting happens in the loop body. The broader "self-exit on zero
+///    sessions AND no client" lifecycle rule is a later stage.
+///
+/// `shutting_down` is the process-level (signal-driven) stop flag; it is ORed with
+/// the hub's client-driven `QuitDaemon` flag so either path tears down identically.
+/// The daemon-selftest passes a never-set flag (signals don't apply there).
 ///
 /// `client` is `&mut` both to match `service_*`'s signature (a debounced catalogue
 /// fetch can replace the keyless client) AND so a controller's mutating request can
@@ -524,6 +534,7 @@ pub(in crate::app::runtime) fn daemon_loop(
     client: &mut Option<Arc<OpenRouterClient>>,
     handle: &tokio::runtime::Handle,
     hub: &mut DaemonHub,
+    shutting_down: &Arc<AtomicBool>,
 ) {
     loop {
         // 1. Service EVERY session: drain each session's stream / tool-task /
@@ -545,10 +556,14 @@ pub(in crate::app::runtime) fn daemon_loop(
         hub.drain_inbound(state, client, handle);
         hub.stream_deltas(state);
 
-        // 3b. A controller's QuitDaemon latches the hub shutdown flag; honour it so
-        //     the caller's teardown (release locks, drop runtime, unlink socket)
-        //     runs. Checked AFTER streaming so the QuitDaemon Ack is flushed first.
-        if hub.should_shutdown() {
+        // 3b. Honour EITHER shutdown trigger so the caller's teardown (release every
+        //     session lock, drop the runtime, unlink socket + pidfile) runs:
+        //       - the hub's client-driven QuitDaemon flag, or
+        //       - the process-level signal flag (SIGTERM/SIGINT) the signal task set.
+        //     Checked AFTER streaming so a pending QuitDaemon Ack is flushed first.
+        //     `Relaxed` is sufficient: this is a single boolean flag with no other
+        //     memory it must publish/acquire — teardown reads only owned `state`.
+        if hub.should_shutdown() || shutting_down.load(Ordering::Relaxed) {
             break;
         }
 
