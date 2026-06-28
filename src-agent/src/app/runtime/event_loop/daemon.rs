@@ -98,28 +98,38 @@ struct HubClient {
     /// are fanned out ONLY to attached clients, so an enrolled-but-not-yet-attached
     /// client can never receive a delta before its snapshot (critique #2).
     attached: bool,
-    /// Seq of the last frame this client was sent (its expected-next is `+1`).
+    /// PER-CLIENT monotonic frame seq (blocker #1): the seq of the last frame this
+    /// client was sent; its next frame is `last_seq + 1`. Owned per connection — the
+    /// `DaemonFrame.seq` contract is "monotonic PER CONNECTION", so each client's
+    /// stream counts up independently. A single hub-global counter would split a
+    /// fan-out across clients (client A seq N, client B seq N+1) and every later
+    /// frame would read as a gap to both, an infinite Resync storm.
     last_seq: u64,
+    /// PER-CLIENT diff baseline (blocker #2): the most-recent snapshot THIS client
+    /// has been sent. `None` until this client attaches; reseeded on attach/resync
+    /// and advanced every tick its own deltas are computed. Per-client (not one hub-
+    /// global baseline) so a second client attaching — which reseeds only ITS own
+    /// baseline — can never swallow deltas an already-attached client still owes:
+    /// each client's deltas are diffed against exactly what THAT client last saw.
+    last_snapshot: Option<StateSnapshot>,
 }
 
 /// The sync-loop <-> per-client-task bridge + the render-state streaming engine
 /// (critique #1/#2/#4 + single-writer).
 ///
-/// Owns the daemon side of the bridge channel plus the client registry, the
-/// monotonic frame `seq`, and the last snapshot sent (the diff baseline). Built
-/// empty by [`new`](Self::new); the runner holds the paired [`Sender<HubInbound>`]
-/// for the daemon's lifetime so `msg_rx` never goes `Disconnected` before any
-/// client connects.
+/// Owns the daemon side of the bridge channel plus the client registry. The
+/// monotonic frame `seq` AND the diff baseline are held PER CLIENT (on
+/// [`HubClient`], blockers #1/#2) — NOT hub-global — so a fan-out and a late
+/// attach can never cross-wire one client's stream into another's. Built empty by
+/// [`new`](Self::new); the runner holds the paired [`Sender<HubInbound>`] for the
+/// daemon's lifetime so `msg_rx` never goes `Disconnected` before any client
+/// connects.
 pub(in crate::app::runtime) struct DaemonHub {
     /// Inbound client messages, drained per tick (like `active_rx`).
     msg_rx: Receiver<HubInbound>,
-    /// Enrolled clients the loop fans [`DaemonFrame`]s out to.
+    /// Enrolled clients the loop fans [`DaemonFrame`]s out to. Each owns its own
+    /// monotonic seq + diff baseline.
     clients: Vec<HubClient>,
-    /// Monotonic frame counter; bumped once per emitted frame (critique #4).
-    seq: u64,
-    /// The most-recent snapshot SENT (the per-tick diff baseline). `None` until the
-    /// first client attaches; rebuilt-from-live and re-diffed each tick thereafter.
-    last_snapshot: Option<StateSnapshot>,
 }
 
 impl DaemonHub {
@@ -134,26 +144,21 @@ impl DaemonHub {
             Self {
                 msg_rx,
                 clients: Vec::new(),
-                seq: 0,
-                last_snapshot: None,
             },
             msg_tx,
         )
     }
 
-    /// Allocate the next frame seq (monotonic, per critique #4).
-    fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
-    }
-
-    /// Send one event to a single client as a fresh seq-tagged frame, advancing the
-    /// hub seq and the client's `last_seq`. A dead socket (`SendError`) is ignored
-    /// here; the client is reaped by [`sweep_dead`](Self::sweep_dead) afterwards.
+    /// Send one event to a single client as a fresh seq-tagged frame, advancing
+    /// THAT client's own monotonic seq (blocker #1: seq is per-connection, so the
+    /// next frame seq is the client's `last_seq + 1`). A dead socket (`SendError`)
+    /// is ignored here — the seq is NOT advanced on a failed send, so the client's
+    /// stream stays gap-free for the frames it actually received; the client is
+    /// reaped by [`sweep_dead`](Self::sweep_dead) afterwards.
     fn send_to(&mut self, idx: usize, event: DaemonEvent) {
-        let seq = self.next_seq();
-        let frame = DaemonFrame { seq, event };
         // Index validity is the caller's contract (it iterates known indices).
+        let seq = self.clients[idx].last_seq + 1;
+        let frame = DaemonFrame { seq, event };
         if self.clients[idx].frame_tx.send(frame).is_ok() {
             self.clients[idx].last_seq = seq;
         }
@@ -200,6 +205,8 @@ impl DaemonHub {
                     is_controller,
                     attached: false,
                     last_seq: 0,
+                    // Not delta-eligible until its Attach seeds this baseline.
+                    last_snapshot: None,
                 });
             }
             HubInbound::Request { client_id, req } => {
@@ -221,22 +228,26 @@ impl DaemonHub {
             // --- read-only / control (honoured for everyone) ---
             ClientRequest::Attach { .. } => {
                 // ATOMIC attach (critique #2): build the full snapshot, send it, and
-                // flip the client to attached + seed its baseline IN THIS TICK. The
-                // hub's diff baseline is (re)seeded too so this tick's later delta
-                // pass diffs against exactly what every client has now seen.
+                // flip the client to attached + seed ITS OWN baseline IN THIS TICK.
+                // Only this client's baseline is (re)seeded (blocker #2) — never a
+                // hub-global one — so a late attach can't swallow deltas another
+                // already-attached client still owes; that client diffs against its
+                // own untouched baseline.
                 let snap = build_snapshot(state);
                 self.send_to(idx, DaemonEvent::Snapshot(snap.clone()));
                 self.clients[idx].attached = true;
-                self.last_snapshot = Some(snap);
+                self.clients[idx].last_snapshot = Some(snap);
             }
             ClientRequest::Resync | ClientRequest::ListSessions => {
                 // Both answer with a fresh full snapshot (the simplest correct reply
                 // for ListSessions too — it carries the full session set). Re-seed
-                // the baseline so subsequent deltas fold onto what was just sent.
+                // ONLY this client's baseline so its subsequent deltas fold onto what
+                // it was just sent; other clients' baselines are untouched (blocker
+                // #2), so one client's resync never disturbs another's delta stream.
                 let snap = build_snapshot(state);
                 self.send_to(idx, DaemonEvent::Snapshot(snap.clone()));
                 self.clients[idx].attached = true;
-                self.last_snapshot = Some(snap);
+                self.clients[idx].last_snapshot = Some(snap);
             }
             ClientRequest::Detach => {
                 // Drop the client from the registry. If the controller detaches, the
@@ -292,44 +303,55 @@ impl DaemonHub {
 
     /// Stream this tick's render-state changes to every ATTACHED client.
     ///
-    /// Builds a fresh snapshot from live `state`, diffs it against `last_snapshot`,
-    /// and EITHER fans out a full `Snapshot` (structural change / first baseline) OR
-    /// one `Delta` frame per change. Each emitted frame bumps the hub seq once and
-    /// advances each receiving client's `last_seq`. No-op when nothing changed.
+    /// Builds ONE fresh snapshot from live `state`, then for EACH attached client
+    /// diffs it against THAT client's own `last_snapshot` baseline (blocker #2) and
+    /// EITHER sends that client a full `Snapshot` (structural change) OR one `Delta`
+    /// frame per change, advancing only that client's baseline. Per-client diffing
+    /// is what makes a late attach / resync safe: clients that attached at different
+    /// moments hold different baselines, so each receives exactly the updates IT is
+    /// missing — never a shared baseline that one client's reseed could shortcut.
+    /// Each emitted frame bumps the receiving client's own seq (blocker #1). No-op
+    /// for a client whose baseline already equals `next`.
     fn stream_deltas(&mut self, state: &AppState) {
-        // Nothing to do until at least one client has attached (which seeds
-        // `last_snapshot`). An enrolled-but-not-attached client receives nothing.
-        if self.last_snapshot.is_none() || !self.clients.iter().any(|c| c.attached) {
-            // Still refresh the baseline if a client is enrolled but pre-attach, so
-            // the eventual attach diffs from a fresh build (handled in attach).
+        // Nothing to do until at least one client has attached. Enrolled-but-not-
+        // attached clients have no baseline and receive nothing (critique #2).
+        if !self.clients.iter().any(|c| c.attached) {
             return;
         }
 
+        // Build the live projection ONCE; every attached client diffs against it
+        // from its own baseline below.
         let next = build_snapshot(state);
-        let prev = self.last_snapshot.as_ref().expect("checked above");
-        let result = diff(prev, &next);
 
-        if result.needs_full {
-            // Structural change: fan a full Snapshot to every attached client.
-            self.broadcast(DaemonEvent::Snapshot(next.clone()));
-            self.last_snapshot = Some(next);
-        } else if !result.deltas.is_empty() {
-            for d in result.deltas {
-                self.broadcast(DaemonEvent::Delta(d));
-            }
-            self.last_snapshot = Some(next);
-        }
-        // else: no change — keep the existing baseline, emit nothing.
-    }
-
-    /// Fan one event out to EVERY attached client as its own seq-tagged frame.
-    /// One seq is consumed PER FRAME (so each client's stream is gap-free for the
-    /// frames it receives). A dead channel is skipped (reaped later).
-    fn broadcast(&mut self, event: DaemonEvent) {
         for i in 0..self.clients.len() {
-            if self.clients[i].attached {
-                self.send_to(i, event.clone());
+            if !self.clients[i].attached {
+                continue;
             }
+
+            // Diff this client's OWN baseline -> next. Scoped so the immutable
+            // borrow of `last_snapshot` ends before the `&mut self` sends below.
+            // An attached client always has a baseline (seeded at attach/resync).
+            let result = {
+                let prev = self.clients[i]
+                    .last_snapshot
+                    .as_ref()
+                    .expect("attached client always has a baseline");
+                diff(prev, &next)
+            };
+
+            if result.needs_full {
+                // Structural change: resend this client a full Snapshot + advance
+                // its baseline. `next` is shared across the loop, so clone per send.
+                self.send_to(i, DaemonEvent::Snapshot(next.clone()));
+                self.clients[i].last_snapshot = Some(next.clone());
+            } else if !result.deltas.is_empty() {
+                for d in result.deltas {
+                    self.send_to(i, DaemonEvent::Delta(d));
+                }
+                self.clients[i].last_snapshot = Some(next.clone());
+            }
+            // else: this client's shadow already matches — keep its baseline, emit
+            // nothing to it.
         }
     }
 }
