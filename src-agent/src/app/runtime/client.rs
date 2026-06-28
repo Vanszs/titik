@@ -1215,6 +1215,12 @@ fn apply_delta(shadow: &mut AppState, delta: StateDelta) -> bool {
             // form too (it is in the vocabulary) so the shadow stays in step either way.
             if !shadow.rest.sessions.iter().any(|s| s.id == snap.id) {
                 shadow.rest.sessions.push(shadow_session_runtime(&snap));
+                // Clear the transcript cache since a new session may become foreground,
+                // and the committed history can change wholesale on a foreground switch.
+                shadow.rest.transcript_cache.borrow_mut().blocks.clear();
+                // Reconcile the work clock to match the daemon's state with the new session
+                // in place, so the comet animation stays in sync.
+                reconcile_work_clock(shadow);
                 return true;
             }
             // (`snap` is `Box<SessionSnapshot>`; `&snap` derefs to `&SessionSnapshot`.)

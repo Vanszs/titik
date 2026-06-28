@@ -752,6 +752,15 @@ pub fn diff(prev: &StateSnapshot, next: &StateSnapshot) -> DiffResult {
         return DiffResult::full();
     }
 
+    // --- structural: theme / accent palette changed ---
+    // The daemon builds the outer palette via `theme::palette(&state.rest.config)` BEFORE
+    // dispatching to any mode renderer, so without this the client stays in the default
+    // palette (Dark/green) until the next structural change forces a full resync. A full
+    // snapshot ensures the client's `rest.config` palette stays in sync with the daemon's.
+    if prev.global.theme != next.global.theme || prev.global.accent != next.global.accent {
+        return DiffResult::full();
+    }
+
     // --- structural: the sub-agent viewer / `$` panel state changed ---
     // These global flags (the full-screen viewer's open-index + scroll + follow, and
     // the `$` panel's open-state + selection) are rendered FROM Chat mode, so a change
