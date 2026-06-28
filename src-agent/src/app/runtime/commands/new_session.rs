@@ -135,10 +135,6 @@ pub(super) fn handle_new(
 /// current foreground row. We do NOT clear the current session/client — Esc out of
 /// the hub returns to the active chat unchanged.
 pub(super) fn handle_resume(state: &mut AppState) -> Result<()> {
-    if state.rest.fg().waiting {
-        state.rest.status = "busy — wait for response".into();
-        return Ok(());
-    }
     // Don't open the hub mid /new-KeyInput confirmation (mirror the picker-select
     // guard): the session tail is unstable until the new session's creds resolve.
     if state.rest.spawn_pending {
