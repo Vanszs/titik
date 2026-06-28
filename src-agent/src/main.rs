@@ -5,21 +5,28 @@
 //!
 //! # Launch routing (Stage 7: daemon-by-default)
 //!
+//! User-facing surface (what `--help` advertises):
+//!
 //! | Invocation | Action |
 //! |---|---|
-//! | `koma` (no flags) | **default** — ensure a daemon is running (spawn a detached `koma --daemon` if none is up), then attach as a thin client. NO fallback to local. |
-//! | `koma --local` | force the OLD standalone local TUI ([`app::run`]); REFUSES if a daemon is already alive. The escape hatch. |
-//! | `koma --daemon` | run the headless koma-daemon event loop (no TUI). |
-//! | `koma --attach` | attach to an ALREADY-running daemon as a thin client (does not spawn one). |
+//! | `koma` (no args) | **default** — ensure a daemon is running (spawn a detached daemon if none is up), then attach as a thin client. NO fallback to local. |
+//! | `koma agents` | open the session hub (alias for `--resume`). |
+//! | `koma --resume` | open the session hub. |
+//! | `koma alone` | standalone no-daemon TUI ([`app::run`]); REFUSES if a daemon is already alive. The escape hatch (alias for `--local`). |
+//! | `koma daemon <status\|kill\|restart\|clean>` | daemon management CLI then exit. |
+//! | `koma --internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit. |
+//! | `koma --internet-fullmode-uninstall` | remove Python full-mode env then exit. |
 //!
-//! # Short-circuit modes (exit before any launch path)
+//! Hidden plumbing (still parsed + functional, just not advertised — the verbs above
+//! front them, and the default/management paths drive them internally):
 //!
 //! | Flag | Action |
 //! |---|---|
-//! | `--internet-fullmode-install [--force]` | provision Python full-mode (browser) env then exit |
-//! | `--internet-fullmode-uninstall`         | remove Python full-mode env then exit |
-//! | `--ipc-selftest`                        | round-trip the daemon IPC transport then exit |
-//! | `daemon <status\|kill\|restart\|clean>` | daemon management CLI then exit |
+//! | `--local` | fronted by `koma alone`: force the OLD standalone local TUI; REFUSES if a daemon is already alive. |
+//! | `--daemon` | run the headless koma-daemon event loop (no TUI). The default path execs this to spawn the daemon. |
+//! | `--attach` | attach to an ALREADY-running daemon as a thin client (does not spawn one). |
+//! | `--ipc-selftest` | round-trip the daemon IPC transport then exit. |
+//! | `--daemon-selftest` | drive the full daemon stack end-to-end then exit. |
 //!
 //! Data flow overview:
 //! ```text
