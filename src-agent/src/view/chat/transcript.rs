@@ -278,17 +278,31 @@ pub(super) fn render_message_block(
             // separately from `content`). Rendered first, dim + italic, each line
             // prefixed with the blockquote bar so the whole thinking block reads as
             // quoted text. Display-only — it never re-enters the conversation or disk.
-            if let Some(reasoning) = msg.reasoning.as_deref() {
-                if !reasoning.is_empty() {
-                    for line in reasoning.lines() {
-                        push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+            let has_reasoning = msg.reasoning.as_deref().map(|r| !r.is_empty()).unwrap_or(false);
+            let has_thinking = thinking_block.map(|t| !t.is_empty()).unwrap_or(false);
+            if has_reasoning || has_thinking {
+                logical.push(vec![Span::styled(
+                    "\u{256d} thinking".to_string(),
+                    Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
+                )]);
+                if let Some(r2) = msg.reasoning.as_deref() {
+                    if !r2.is_empty() {
+                        for line in r2.lines() {
+                            push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+                        }
                     }
                 }
-            }
-            if let Some(thinking) = thinking_block {
-                for line in thinking.lines() {
-                    push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+                if let Some(tb) = thinking_block {
+                    if !tb.is_empty() {
+                        for line in tb.lines() {
+                            push_thinking_line(&mut logical, line, thinking_style, bar_style, wrap_w);
+                        }
+                    }
                 }
+                logical.push(vec![Span::styled(
+                    "\u{2570}\u{2500}".to_string(),
+                    Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
+                )]);
             }
             // Blank line between the (barred) thinking block and the answer so the
             // quote→answer transition is clear. Only when there IS both.
@@ -306,14 +320,18 @@ pub(super) fn render_message_block(
             if msg.content.starts_with(crate::dto::chat::PLAN_NUDGE_MARK) {
                 return Vec::new();
             }
-            // Compact dim block: just the first line of the tool output, truncated.
-            // Tool results are not markdown-rendered; a plain dim indent reads as a
-            // sub-item under its now-checked (`✓`) call (the finished turn as a list).
-            let first = msg.content.lines().next().unwrap_or("");
-            let first = truncate_chars(first, 80);
+            // Compact dim block: first non-empty line of the tool output, prefixed
+            // with `\u21b3` so it reads as "output from the call above". Skips blank
+            // leading lines (e.g. tool results that start with a blank line).
+            let first = msg
+                .content
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            let first = truncate_chars(first, 76);
             render_block(
                 vec![vec![Span::styled(first, Style::default().fg(palette.dim))]],
-                "    ",
+                "  \u{21b3} ",
                 palette.dim,
                 wrap_w,
                 false,
@@ -441,7 +459,9 @@ pub(super) fn render_tool_lines(
     };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(calls.len());
     for (ci, call) in calls.iter().enumerate() {
-        let args = truncate_chars(&call.function.arguments, 60);
+        // For common tools, extract just the key arg instead of raw JSON so the
+        // line is readable at a glance. Falls back to truncated raw JSON.
+        let args = format_tool_args(&call.function.name, &call.function.arguments);
         let done = completed.contains(call.id.as_str());
         let (glyph, glyph_style) = if done {
             ("✓ ", Style::default().fg(palette.accent))
@@ -482,6 +502,38 @@ pub(super) fn render_tool_lines(
         }
     }
     lines
+}
+
+
+/// Extract a readable summary from a tool call's JSON arguments.
+///
+/// For the common built-in tools (read, write, edit, delete, bash, grep, glob,
+/// dir_list) pull the most meaningful single field so the call line stays
+/// readable without raw JSON. Falls back to truncated raw JSON for unknown tools.
+fn format_tool_args(name: &str, args_json: &str) -> String {
+    // Try to parse; if it fails, fall back to truncated raw.
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return truncate_chars(args_json, 60);
+    };
+    let key_field: Option<&str> = match name {
+        "read" | "write" | "delete" => v.get("path").and_then(|v| v.as_str()),
+        "edit" => v.get("path").and_then(|v| v.as_str()),
+        "bash" => v.get("command").and_then(|v| v.as_str()),
+        "grep" => v.get("pattern").and_then(|v| v.as_str()),
+        "glob" => v.get("pattern").and_then(|v| v.as_str()),
+        "dir_list" => {
+            // paths is an array; show first element
+            v.get("paths")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+        }
+        _ => None,
+    };
+    match key_field {
+        Some(s) => truncate_chars(s, 60),
+        None => truncate_chars(args_json, 60),
+    }
 }
 
 /// Assemble a full transcript from a flat `&[ChatMessage]` slice into styled
