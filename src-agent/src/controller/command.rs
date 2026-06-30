@@ -50,6 +50,7 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ("Ctrl+J", "insert a newline"),
     ("Ctrl+V", "paste an image from the clipboard"),
     ("Ctrl+X", "kill the selected bash job / sub-agent"),
+    ("Ctrl+Y", "toggle mouse capture (off = terminal can select/copy text)"),
     ("Esc", "interrupt while busy"),
     ("Esc Esc", "edit a previous message (rewind)"),
     ("Up/Down/wheel", "scroll the transcript"),

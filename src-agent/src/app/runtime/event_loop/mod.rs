@@ -24,6 +24,21 @@ use drains::{enter_select, exit_select};
 use global::{has_running_subagents, service_global};
 use sessions::service_all_sessions;
 
+/// Toggle mouse capture on/off so the user can select and copy text with the
+/// terminal's native selection mechanism. Returns the new capture state.
+fn toggle_mouse_capture(enabled: bool) -> bool {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use ratatui::crossterm::execute;
+    use std::io::stdout;
+    let new = !enabled;
+    if new {
+        let _ = execute!(stdout(), EnableMouseCapture);
+    } else {
+        let _ = execute!(stdout(), DisableMouseCapture);
+    }
+    new
+}
+
 /// Minimum on-screen duration for the `/compact` animation. Cosmetic and short:
 /// a fast compaction is held this long (via a deferred apply) so the spinner +
 /// progress bar don't merely flash. Deliberately ~1s — long enough to read, not
@@ -41,6 +56,10 @@ pub(super) fn run_loop(
     client: &mut Option<Arc<OpenRouterClient>>,
 ) -> Result<()> {
     let mut dirty = true; // paint once on entry
+    // Tracks whether mouse capture is currently enabled. Starts true (enabled at
+    // terminal init in `terminal.rs`). Ctrl+Y toggles it so the user can select
+    // and copy text with the terminal's native drag-selection.
+    let mut mouse_capture = true;
     loop {
         // Perform a pending /select hand-off: drop to the normal terminal and
         // dump the conversation, then suppress TUI painting until a key returns.
@@ -117,6 +136,22 @@ pub(super) fn run_loop(
                             // Any key returns from /select copy mode.
                             exit_select(terminal)?;
                             state.rest.select_active = false;
+                            dirty = true;
+                        } else if key.code == ratatui::crossterm::event::KeyCode::Char('y')
+                            && key.modifiers
+                                == ratatui::crossterm::event::KeyModifiers::CONTROL
+                        {
+                            // Ctrl+Y: toggle mouse capture so the terminal's native
+                            // drag-selection works (when capture is off, mouse events
+                            // are no longer intercepted by the TUI).
+                            mouse_capture = toggle_mouse_capture(mouse_capture);
+                            if mouse_capture {
+                                state.rest.status = "mouse capture on (scroll enabled)".into();
+                            } else {
+                                state.rest.status =
+                                    "mouse capture off — select text freely; Ctrl+Y to re-enable"
+                                        .into();
+                            }
                             dirty = true;
                         } else {
                             let action = controller::input::handle_key(state, key);

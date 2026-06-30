@@ -42,6 +42,23 @@ pub(super) const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// rest). The loop NEVER blocks on the socket: if no frame arrived it still paints and
 /// animations still advance. Returns when the user detaches (Ctrl-C) or the socket
 /// closes.
+
+/// Toggle mouse capture on/off. Returns the new state (`true` = capture enabled).
+/// When disabled the terminal emulator's native drag-selection works for copy/paste;
+/// wheel scroll from the TUI is suspended (the terminal may still scroll its own
+/// scrollback). Re-enable with a second Ctrl+Y press.
+fn toggle_mouse_capture(enabled: bool) -> bool {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use ratatui::crossterm::execute;
+    use std::io::stdout;
+    let new = !enabled;
+    if new {
+        let _ = execute!(stdout(), EnableMouseCapture);
+    } else {
+        let _ = execute!(stdout(), DisableMouseCapture);
+    }
+    new
+}
 pub(super) fn render_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     frame_rx: &Receiver<DaemonFrame>,
@@ -74,6 +91,11 @@ pub(super) fn render_loop(
     // While true, every frame except a fresh Snapshot is dropped: a gap was seen and
     // a Resync was sent, so the shadow is stale until the full snapshot rebuilds it.
     let mut awaiting_resync = false;
+
+    // Tracks whether mouse capture is currently enabled. Starts true (enabled at
+    // terminal init). Ctrl+Y toggles it so the user can select and copy text with
+    // the terminal's native drag-selection — without leaving the session.
+    let mut mouse_capture = true;
 
     // Apply any frames the pre-render handshake pulled off the wire while hunting for
     // `Hello` (task #142) BEFORE the live drain, through the SAME `apply_frame` path so
@@ -222,6 +244,23 @@ pub(super) fn render_loop(
                     // Ctrl-C, which detaches the client (leaves the daemon running).
                     if is_detach(&key) {
                         return Ok(());
+                    }
+                    // Ctrl+Y: toggle mouse capture locally (client-side only — the
+                    // daemon has no TTY so this is never forwarded). When off, the
+                    // terminal's native drag-selection works for copy/paste.
+                    if key.code == ratatui::crossterm::event::KeyCode::Char('y')
+                        && key.modifiers
+                            == ratatui::crossterm::event::KeyModifiers::CONTROL
+                    {
+                        mouse_capture = toggle_mouse_capture(mouse_capture);
+                        if mouse_capture {
+                            shadow.rest.status = "mouse capture on (scroll enabled)".into();
+                        } else {
+                            shadow.rest.status =
+                                "mouse capture off — select text freely; Ctrl+Y to re-enable"
+                                    .into();
+                        }
+                        continue;
                     }
                     // Render-ahead: apply the plain composer edits to the shadow NOW
                     // (the daemon's authoritative InputChanged reconciles later), then
