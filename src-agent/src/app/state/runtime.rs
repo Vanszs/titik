@@ -77,6 +77,11 @@ pub struct SessionRuntime {
     /// `StreamEvent::ToolCalls` and consumed by `advance_turn` once the stream
     /// finalises. Empty when the model returned a plain (final) answer.
     pub pending_tool_calls: Vec<ToolCall>,
+    /// User messages typed while a turn is still running. OpenCode-style queue:
+    /// each new submit is appended here and replayed one at a time once the
+    /// current turn becomes idle. Per-session so switching tabs carries its own
+    /// queue.
+    pub pending_submits: VecDeque<String>,
     /// Number of tool-call rounds taken in the current turn. Reset to 0 when a
     /// new user turn starts / the turn ends; bounded so a runaway model can't
     /// loop forever.
@@ -313,6 +318,7 @@ impl SessionRuntime {
             cost: 0.0,
             tokens_cached: 0,
             pending_tool_calls: Vec::new(),
+            pending_submits: VecDeque::new(),
             agent_steps: 0,
             tool_idx: 0,
             tool_results: Vec::new(),
@@ -450,6 +456,9 @@ impl SessionRuntime {
     pub fn close(&mut self) {
         if self.closed {
             return;
+        }
+        if let Some(sess) = self.session.as_ref() {
+            let _ = sess.save();
         }
         // In-flight stream task: abort + drop the receiver so late events vanish.
         if let Some(h) = self.current_task.take() {

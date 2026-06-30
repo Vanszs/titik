@@ -149,6 +149,11 @@ impl AppStateRest {
     /// advancing it past the inserted run. Mirrors [`Self::push_char`]'s caret /
     /// palette / history discipline so a bulk marker insert behaves like typing.
     pub fn insert_marker(&mut self, s: &str) {
+        self.insert_str(s);
+    }
+
+    /// Insert a bulk string at the cursor.
+    pub fn insert_str(&mut self, s: &str) {
         let at = self.byte_at(self.cursor);
         self.input.insert_str(at, s);
         self.cursor += s.chars().count();
@@ -216,40 +221,4 @@ impl AppStateRest {
         }
     }
 
-    /// Recall the previous (older) sent user message into the input. `users` is
-    /// the session's user messages oldest-first.
-    pub fn history_prev(&mut self, users: &[String]) {
-        if users.is_empty() {
-            return;
-        }
-        let next = match self.hist_idx {
-            None => {
-                self.input_stash = self.input.clone();
-                users.len() - 1
-            }
-            Some(0) => return, // already at the oldest
-            Some(i) => i - 1,
-        };
-        self.hist_idx = Some(next);
-        self.input = users[next].clone();
-        self.cursor = self.char_len();
-    }
-
-    /// Recall the next (newer) sent user message; past the newest, restore the
-    /// stashed live input and leave recall mode.
-    pub fn history_next(&mut self, users: &[String]) {
-        match self.hist_idx {
-            Some(i) if i + 1 < users.len() => {
-                self.hist_idx = Some(i + 1);
-                self.input = users[i + 1].clone();
-                self.cursor = self.char_len();
-            }
-            Some(_) => {
-                self.hist_idx = None;
-                self.input = std::mem::take(&mut self.input_stash);
-                self.cursor = self.char_len();
-            }
-            None => {}
-        }
-    }
 }

@@ -57,6 +57,12 @@ pub(super) fn drain_stream(
                     // the turn or run tools + continue (which spawns the next task
                     // into a fresh active_rx).
                     advance_turn(state, idx, client, handle);
+                    // OpenCode-style queue: if the user typed follow-ups while the
+                    // turn was running, start the next queued message now that the
+                    // session is idle (one per idle transition).
+                    let _ = crate::app::runtime::actions::drain_one_pending_submit(
+                        state, client, handle,
+                    );
                     still_streaming = false;
                     break;
                 }
@@ -76,6 +82,11 @@ pub(super) fn drain_stream(
                     state.rest.compact_anim_start = None;
                     state.rest.compact_apply_at = None;
                     state.rest.compact_pending = None;
+                    // A failed turn still counts as idle for queue purposes; replay
+                    // the next queued message if any.
+                    let _ = crate::app::runtime::actions::drain_one_pending_submit(
+                        state, client, handle,
+                    );
                     still_streaming = false;
                     break;
                 }

@@ -33,6 +33,7 @@ mod settings;
 // doesn't route through `apply_action` — it calls this directly. The `session` module
 // is otherwise private to `actions`, so this single re-export is the only surface.
 pub(in crate::app::runtime) use session::attach_select_for_pwd;
+pub(in crate::app::runtime) use chat::drain_one_pending_submit;
 mod settings_creds;
 
 /// Apply one `Action` (the decoded result of a keystroke) by mutating state and,

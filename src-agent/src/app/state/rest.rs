@@ -63,6 +63,7 @@ pub struct AppStateRest {
     /// box style (red "error" vs neutral "info").
     pub toast: Option<(String, std::time::Instant, ToastKind)>,
     pub should_quit: bool,
+    pub mouse_capture: bool,
     pub scroll: u16,
     /// When true, the transcript stays pinned to the bottom (auto-follows new
     /// content). Cleared when the user scrolls up; re-set on reaching bottom.
@@ -299,6 +300,7 @@ impl AppStateRest {
             status: "ready".into(),
             toast: None,
             should_quit: false,
+            mouse_capture: true,
             scroll: 0,
             follow: true,
             last_max_scroll: std::cell::Cell::new(0),

@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 use crate::app::state::AppStateRest;
@@ -27,9 +27,20 @@ const PREFIX_W: usize = 4;
 pub(super) fn input_row_count(rest: &AppStateRest, frame_width: u16, frame_height: u16) -> usize {
     let inner_w = (frame_width.saturating_sub(4) as usize).max(1);
     let mut input_rows = 0usize;
-    for line in rest.input.split('\n') {
-        let prefixed = line.chars().count() + PREFIX_W;
-        input_rows += 1usize.max(prefixed.div_ceil(inner_w));
+    let cursor = rest.cursor;
+    let logicals: Vec<&str> = rest.input.split('\n').collect();
+    let last_idx = logicals.len().saturating_sub(1);
+    let mut char_start = 0usize;
+    for (i, logical) in logicals.iter().enumerate() {
+        let line_chars = logical.chars().count();
+        let on_this_line = if i == last_idx {
+            cursor >= char_start && cursor <= char_start + line_chars
+        } else {
+            cursor >= char_start && cursor < char_start + line_chars + 1
+        };
+        let total_cols = PREFIX_W + line_chars + if on_this_line { 1 } else { 0 };
+        input_rows += 1usize.max(total_cols.div_ceil(inner_w));
+        char_start += line_chars + 1;
     }
     if rest.compact_anim_start.is_some() {
         return 2;
@@ -73,13 +84,12 @@ pub(super) fn render_input(frame: &mut Frame, chunk: Rect, rest: &AppStateRest, 
 ///
 /// Logical lines split on '\n'; the first carries the accent prompt, every
 /// continuation a 4-col indent so it hangs under the prompt. A non-blinking
-/// block caret is painted AT `rest.cursor` (a char index into the whole input,
-/// counting the '\n's), so mid-text edits show the caret in place rather than
-/// always at the end.
+/// block caret is painted AT `rest.cursor`.
 ///
-/// When the content exceeds the available height, the editor scrolls vertically
-/// to keep the caret visible (scroll-to-caret, bottom-anchored like a phone
-/// keyboard).
+/// Each logical line is pre-expanded into individual visual rows of exactly
+/// `inner_w` columns. This means `Paragraph` never needs to wrap — we pass
+/// one `Line` per visual row, so `scroll((row, 0))` maps 1:1 to screen rows
+/// and caret tracking is exact.
 fn render_editor(frame: &mut Frame, area: Rect, rest: &AppStateRest, palette: &Palette) {
     let inner_w = (area.width as usize).max(1);
     let cursor = rest.cursor;
@@ -91,7 +101,7 @@ fn render_editor(frame: &mut Frame, area: Rect, rest: &AppStateRest, palette: &P
     let mut caret_vis: usize = 0;
     let mut caret_found = false;
 
-    let mut input_lines: Vec<Line> = Vec::new();
+    let mut visual_lines: Vec<Line> = Vec::new();
 
     // Running char offset accumulator: avoids O(L^2) re-walks from line 0.
     let mut char_start = 0usize;
@@ -104,63 +114,88 @@ fn render_editor(frame: &mut Frame, area: Rect, rest: &AppStateRest, palette: &P
             cursor >= char_start && cursor < char_start + line_chars + 1
         };
 
-        // Build spans for this logical line.
-        let prefix: Span = if i == 0 {
-            Span::styled("[$] ", Style::default().fg(palette.accent))
+        let chars: Vec<char> = logical.chars().collect();
+        let total_cols = PREFIX_W + line_chars + if on_this_line { 1 } else { 0 };
+        let rows = 1usize.max(total_cols.div_ceil(inner_w));
+
+        // Caret position within this logical line (column, prefix included).
+        let caret_col_in_line = if on_this_line {
+            PREFIX_W + (cursor - char_start).min(line_chars)
         } else {
-            Span::raw("    ")
+            usize::MAX
         };
-        let mut spans: Vec<Span> = vec![prefix];
 
-        if on_this_line {
-            let col = (cursor - char_start).min(line_chars);
-            let before: String = logical.chars().take(col).collect();
-            let at: String = logical.chars().nth(col).map(String::from).unwrap_or_default();
-            let after: String = logical.chars().skip(col + 1).collect();
-            if !before.is_empty() {
-                spans.push(Span::raw(before));
+        for row in 0..rows {
+            let row_col_start = row * inner_w;       // first column of this visual row
+            let row_col_end = ((row + 1) * inner_w).min(total_cols);
+
+            // Does the caret land on this visual row?
+            let caret_here = caret_col_in_line >= row_col_start && caret_col_in_line < row_col_end;
+
+            let mut spans: Vec<Span> = Vec::new();
+
+            // Prefix chars that overlap this visual row's column range.
+            if row_col_start < PREFIX_W {
+                let pfx_start = row_col_start;
+                let pfx_end = PREFIX_W.min(row_col_end);
+                let pfx = if i == 0 { "[$] " } else { "    " };
+                let slice = &pfx[pfx_start..pfx_end];
+                if !slice.is_empty() {
+                    if i == 0 {
+                        spans.push(Span::styled(slice.to_string(), Style::default().fg(palette.accent)));
+                    } else {
+                        spans.push(Span::raw(slice.to_string()));
+                    }
+                }
             }
-            if at.is_empty() {
-                spans.push(Span::styled("\u{2588}", Style::default().fg(palette.accent)));
-            } else {
-                spans.push(Span::styled(
-                    at,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
+
+            // Content char index range for this visual row.
+            let cont_start = row_col_start.saturating_sub(PREFIX_W);
+            let cont_end = row_col_end.saturating_sub(PREFIX_W).min(line_chars);
+
+            if caret_here {
+                let caret_cont = caret_col_in_line.saturating_sub(PREFIX_W);
+                // before caret
+                if cont_start < caret_cont.min(cont_end) {
+                    let s: String = chars[cont_start..caret_cont.min(cont_end)].iter().collect();
+                    if !s.is_empty() { spans.push(Span::raw(s)); }
+                }
+                // caret char or block
+                if caret_cont < chars.len() {
+                    spans.push(Span::styled(
+                        chars[caret_cont].to_string(),
+                        Style::default().add_modifier(Modifier::REVERSED),
+                    ));
+                    // after caret
+                    let after_start = caret_cont + 1;
+                    if after_start < cont_end.min(chars.len()) {
+                        let s: String = chars[after_start..cont_end.min(chars.len())].iter().collect();
+                        if !s.is_empty() { spans.push(Span::raw(s)); }
+                    }
+                } else {
+                    // cursor at end of content — block █
+                    spans.push(Span::styled("\u{2588}", Style::default().fg(palette.accent)));
+                }
+                caret_vis = total_vis;
+                caret_found = true;
+            } else if cont_start < cont_end.min(chars.len()) {
+                let s: String = chars[cont_start..cont_end.min(chars.len())].iter().collect();
+                if !s.is_empty() { spans.push(Span::raw(s)); }
             }
-            if !after.is_empty() {
-                spans.push(Span::raw(after));
-            }
-        } else {
-            spans.push(Span::raw(*logical));
+
+            visual_lines.push(Line::from(spans));
+            total_vis += 1;
         }
 
-        // Wrapped visual rows for this logical line (prefix + content).
-        let full_w = PREFIX_W + line_chars;
-        let rows = 1usize.max(full_w.div_ceil(inner_w));
-
-        if on_this_line {
-            // Caret's column within the full prefixed line.
-            let caret_col = PREFIX_W + (cursor - char_start).min(line_chars);
-            // Visual rows consumed before this line + caret's row within it
-            // (floor division: caret_col is a 0-based column index, not a count).
-            caret_vis = total_vis + caret_col / inner_w;
-            caret_found = true;
-        }
-
-        total_vis += rows;
-        input_lines.push(Line::from(spans));
-
-        // Advance accumulator: +1 for the '\n' separator between logical lines.
-        char_start += line_chars + 1;
+        char_start += line_chars + 1; // +1 for the '\n'
     }
 
     if !caret_found {
-        caret_vis = total_vis;
+        caret_vis = total_vis.saturating_sub(1);
     }
 
-    // Scroll-to-caret: bottom-anchored. The caret stays on the last visible
-    // row when possible, like a phone keyboard.
+    // Scroll-to-caret: keep caret on the last visible row (bottom-anchored).
+    // No Wrap needed — each Line is already exactly one visual row.
     let viewport_h = area.height as usize;
     let scroll = if total_vis > viewport_h {
         let desired = caret_vis.saturating_sub(viewport_h.saturating_sub(1));
@@ -171,9 +206,7 @@ fn render_editor(frame: &mut Frame, area: Rect, rest: &AppStateRest, palette: &P
     };
 
     frame.render_widget(
-        Paragraph::new(input_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(visual_lines).scroll((scroll, 0)),
         area,
     );
 }

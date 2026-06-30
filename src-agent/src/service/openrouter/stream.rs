@@ -129,12 +129,22 @@ impl OpenRouterClient {
         // it to `"tool_calls"` on the frame that closes a tool-calling turn; we
         // record it so finalisation can confirm the model wants tools run.
         let mut finished_tool_calls = false;
+        // Consecutive body-decode errors before we give up. A single transient
+        // network hiccup (provider sends a malformed chunk) should not abort the
+        // whole turn; we skip that chunk and keep reading. But 3 in a row means
+        // the connection is unrecoverably broken.
+        let mut decode_errors = 0u8;
         while let Some(chunk) = stream.next().await {
             let bytes = match chunk {
-                Ok(b) => b,
+                Ok(b) => { decode_errors = 0; b }
                 Err(e) => {
-                    emit(&tx, StreamEvent::Error(format!("stream error: {e}")));
-                    return Ok(());
+                    decode_errors += 1;
+                    if decode_errors >= 3 {
+                        emit(&tx, StreamEvent::Error(format!("stream error: {e}")));
+                        return Ok(());
+                    }
+                    // transient — skip chunk, keep reading
+                    continue;
                 }
             };
             buf.extend_from_slice(&bytes);

@@ -97,21 +97,6 @@ fn complete_file_ref(rest: &mut AppStateRest, matches: &[String]) {
     rest.cursor_end();
 }
 
-/// This session's sent user messages, oldest-first (for bash-style recall).
-fn user_messages(rest: &AppStateRest) -> Vec<String> {
-    rest.fg().session
-        .as_ref()
-        .map(|s| {
-            s.conversation
-                .messages()
-                .iter()
-                .filter(|m| m.role == crate::dto::chat::Role::User)
-                .map(|m| m.content.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Handle a key press while the app is in Chat mode.
 ///
 /// Ctrl+C and Esc both interrupt an in-flight request when `waiting` is true;
@@ -346,8 +331,19 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                             Action::Shell(cmd.to_string())
                         }
                     }
-                } else if !rest.input.trim().is_empty() && !rest.fg().waiting && !rest.fg().awaiting_shell {
-                    Action::Submit(rest.take_input())
+                } else if !rest.input.trim().is_empty() && !rest.fg().awaiting_shell {
+                    if rest.fg().waiting {
+                        // OpenCode-style queue: enqueue the typed message while a
+                        // turn is in progress; it will be submitted automatically
+                        // once the model becomes idle.
+                        let text = rest.take_input();
+                        let q = &mut rest.fg_mut().pending_submits;
+                        q.push_back(text);
+                        rest.status = format!("queued ({})", q.len());
+                        Action::None
+                    } else {
+                        Action::Submit(rest.take_input())
+                    }
                 } else {
                     Action::None
                 }
@@ -378,7 +374,9 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
         }
         KeyCode::Up => {
             // Command palette takes precedence; then file palette; then within-input
-            // line movement; finally history recall (only when already on line 0).
+            // line movement; finally scroll the transcript (mirrors OpenCode's
+            // behaviour where arrow keys move through the chat, not through old
+            // prompt history).
             if !command::palette_matches(&rest.input).is_empty() {
                 rest.palette_sel = rest.palette_sel.saturating_sub(1);
             } else {
@@ -388,8 +386,7 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 if !fmatches.is_empty() {
                     rest.palette_sel = rest.palette_sel.saturating_sub(1);
                 } else if !rest.cursor_up() {
-                    let users = user_messages(rest);
-                    rest.history_prev(&users);
+                    rest.scroll_up();
                 }
             }
             Action::None
@@ -405,8 +402,7 @@ pub fn handle_chat(rest: &mut AppStateRest, key: KeyEvent) -> Action {
                 if !fmatches.is_empty() {
                     rest.palette_sel = (rest.palette_sel + 1).min(fmatches.len() - 1);
                 } else if !rest.cursor_down() {
-                    let users = user_messages(rest);
-                    rest.history_next(&users);
+                    rest.scroll_down();
                 }
             }
             Action::None

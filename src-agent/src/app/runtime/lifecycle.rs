@@ -228,6 +228,11 @@ fn build_startup(
 /// this is covered by PID-liveness staleness in `store::is_locked`.
 fn shutdown_runtime(state: &mut AppState, rt: tokio::runtime::Runtime) {
     for s in &mut state.rest.sessions {
+        if !s.closed {
+            if let Some(sess) = s.session.as_ref() {
+                let _ = sess.save();
+            }
+        }
         if let Some(p) = s.held_lock.take() {
             crate::model::store::remove_lock(&p);
         }

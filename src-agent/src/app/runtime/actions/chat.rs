@@ -24,11 +24,18 @@ pub(super) fn handle_submit(
         state.rest.status = "no active session".into();
         return Ok(());
     }
-    // Busy guard: block while a turn is streaming OR a `!` shell is draining
+    // Busy guard: block while a `!` shell is draining
     // off-thread — a Submit landing during the latter would race the shell entry
     // into the same conversation tail.
-    if state.rest.fg().waiting || state.rest.fg().awaiting_shell {
-        state.rest.status = "busy — wait for response".into();
+    if state.rest.fg().awaiting_shell {
+        state.rest.status = "busy — waiting for shell command".into();
+        return Ok(());
+    }
+    if state.rest.fg().waiting {
+        // OpenCode-style queue: don't interrupt the in-flight response; stash
+        // the new message and replay it once the current turn becomes idle.
+        state.rest.fg_mut().pending_submits.push_back(text);
+        state.rest.status = format!("queued ({})", state.rest.fg().pending_submits.len());
         return Ok(());
     }
     // Prompt-classifier (PC): keep a copy of the user's prompt to
@@ -370,5 +377,28 @@ pub(super) fn handle_deny_tool(state: &mut AppState) -> Result<()> {
     state.rest.fg_mut().pending_tool_tasks.clear();
     state.rest.fg_mut().awaiting_tool_tasks = false;
     state.rest.status = "denied — stopped".into();
+    Ok(())
+}
+
+/// OpenCode-style queue drain: if there are user messages queued while a turn
+/// was running, pop the oldest one and submit it now that the session is idle.
+/// Only one message is sent per idle transition; the rest stay queued for the
+/// next completion.
+pub(in crate::app::runtime) fn drain_one_pending_submit(
+    state: &mut AppState,
+    client: &Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if let Some(text) = state.rest.fg_mut().pending_submits.pop_front() {
+        // apply_action expects a mutable Option reference, but it only reads the
+        // client; use a local clone so callers can pass their immutable ref.
+        let mut client_ref = client.clone();
+        super::apply_action(
+            crate::controller::input::Action::Submit(text),
+            state,
+            &mut client_ref,
+            handle,
+        )?;
+    }
     Ok(())
 }

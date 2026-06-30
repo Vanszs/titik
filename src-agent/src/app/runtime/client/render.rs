@@ -253,6 +253,7 @@ pub(super) fn render_loop(
                             == ratatui::crossterm::event::KeyModifiers::CONTROL
                     {
                         mouse_capture = toggle_mouse_capture(mouse_capture);
+                        shadow.rest.mouse_capture = mouse_capture;
                         if mouse_capture {
                             shadow.rest.status = "mouse capture on (scroll enabled)".into();
                         } else {
@@ -261,6 +262,15 @@ pub(super) fn render_loop(
                                     .into();
                         }
                         continue;
+                    }
+                    if matches!(shadow.mode, Mode::Chat) && !mouse_capture {
+                        if key.code == ratatui::crossterm::event::KeyCode::Up {
+                            shadow.rest.scroll_up();
+                            continue;
+                        } else if key.code == ratatui::crossterm::event::KeyCode::Down {
+                            shadow.rest.scroll_down();
+                            continue;
+                        }
                     }
                     // Render-ahead: apply the plain composer edits to the shadow NOW
                     // (the daemon's authoritative InputChanged reconciles later), then

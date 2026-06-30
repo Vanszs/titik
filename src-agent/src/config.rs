@@ -54,9 +54,9 @@ pub const APP_TITLE: &str = "koma";
 /// session files and configuration.
 pub const APP_DIR_NAME: &str = ".koma";
 
-/// Hard cap on a single tool result's size, in characters. ~100k tokens at
+/// Hard cap on a single tool result's size, in characters. ~25k tokens at
 /// ~4 chars/token. Tool outputs are not truncated below this.
-pub const MAX_TOOL_OUTPUT_CHARS: usize = 400_000;
+pub const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 
 /// Hard ceiling on a sub-agent's final report before it is delivered to the
 /// main agent as a `task` tool result. Reports above this are truncated (with a

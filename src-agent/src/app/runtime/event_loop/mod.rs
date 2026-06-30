@@ -145,6 +145,7 @@ pub(super) fn run_loop(
                             // drag-selection works (when capture is off, mouse events
                             // are no longer intercepted by the TUI).
                             mouse_capture = toggle_mouse_capture(mouse_capture);
+                            state.rest.mouse_capture = mouse_capture;
                             if mouse_capture {
                                 state.rest.status = "mouse capture on (scroll enabled)".into();
                             } else {

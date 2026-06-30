@@ -14,6 +14,7 @@ use crate::view::theme::Palette;
 use super::helpers::{
     push_thinking_line, render_block, split_thinking, truncate_chars,
 };
+use serde_json::Value;
 
 /// Render the transcript area into `body_chunk`.
 ///
@@ -52,6 +53,11 @@ pub(super) fn render_transcript(
             })
             .unwrap_or_default();
 
+        // Collapse consecutive bash_output polls for the same job into a single
+        // visual entry. This is a view-layer transformation; the underlying
+        // conversation history stays unchanged for the model.
+        let visual = build_visual_entries(&committed);
+
         // Which tool calls have COMPLETED: a `tool`-role result message exists
         // whose `tool_call_id` points back at the call. Built fresh every frame
         // from the live conversation so the gear→check flip is NOT baked into the
@@ -65,15 +71,27 @@ pub(super) fn render_transcript(
             .filter(|m| m.role == Role::Tool)
             .filter_map(|m| m.tool_call_id.as_deref())
             .collect();
-        if cache.blocks.len() > committed.len() {
+        if cache.blocks.len() > visual.len() {
             cache.blocks.clear(); // shrank → stale prefix can't be trusted
         }
+        // A bash_output group at the tail can still receive new poll results, so
+        // its cached block is volatile. Force a rebuild of the last block when it
+        // is a group; the rest of the cache stays stable.
+        if matches!(visual.last(), Some(VisualEntry::BashOutputGroup { .. })) {
+            cache.blocks.pop();
+        }
         let start = cache.blocks.len();
-        for msg in committed.iter().skip(start) {
-            // One block per message, index-aligned with `committed`. A hidden
+        for entry in visual.iter().skip(start) {
+            // One block per visual entry, index-aligned with `visual`. A hidden
             // harness tool result yields an EMPTY block (skipped at assembly), so
             // the cache never falls out of step with the message list.
-            cache.blocks.push(render_message_block(msg, palette, wrap_w));
+            let block = match entry {
+                VisualEntry::Single(msg) => render_message_block(msg, palette, wrap_w),
+                VisualEntry::BashOutputGroup { .. } => {
+                    render_bash_output_group(entry, palette, wrap_w)
+                }
+            };
+            cache.blocks.push(block);
         }
 
         // Assemble the frame: cached blocks (with blank separators) + the live
@@ -92,9 +110,16 @@ pub(super) fn render_transcript(
             // assistant body is empty (a pure tool-call turn → empty cached block)
             // the FIRST tool line takes the `● ` bullet so the block isn't a
             // bullet-less orphan.
+            //
+            // Bash_output groups already render their own compact block, so they
+            // get no extra tool lines here.
             let has_body = !block.is_empty();
-            let tool_lines: Vec<Line<'static>> = committed
+            let tool_lines: Vec<Line<'static>> = visual
                 .get(i)
+                .and_then(|entry| match entry {
+                    VisualEntry::Single(msg) => Some(*msg),
+                    VisualEntry::BashOutputGroup { .. } => None,
+                })
                 .map(|m| render_tool_lines(m, &completed_tool_ids, has_body, palette))
                 .unwrap_or_default();
 
@@ -225,6 +250,162 @@ pub(super) fn render_transcript(
 /// - `System`   → EMPTY block (never shown).
 ///
 /// An empty `Vec` means "no visual block"; callers skip it (and its separator).
+
+/// A visual unit for transcript rendering. Most messages map 1:1 to [`Single`],
+/// but consecutive `bash_output` polls against the same background job are
+/// collapsed into one [`VisualEntry::BashOutputGroup`] so the transcript does
+/// not show repeated `bash_output({"job_id":"..."})` calls.
+#[derive(Clone)]
+enum VisualEntry<'a> {
+    Single(&'a crate::dto::chat::ChatMessage),
+    BashOutputGroup {
+        last_call: &'a crate::dto::chat::ChatMessage,
+        results: Vec<&'a crate::dto::chat::ChatMessage>,
+    },
+}
+
+struct BashGroup<'a> {
+    last_call: &'a crate::dto::chat::ChatMessage,
+    results: Vec<&'a crate::dto::chat::ChatMessage>,
+    end: usize,
+}
+
+fn build_visual_entries<'a>(
+    committed: &[&'a crate::dto::chat::ChatMessage],
+) -> Vec<VisualEntry<'a>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < committed.len() {
+        if let Some(group) = try_read_bash_group(committed, i) {
+            out.push(VisualEntry::BashOutputGroup {
+                last_call: group.last_call,
+                results: group.results,
+            });
+            i = group.end;
+        } else {
+            out.push(VisualEntry::Single(committed[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_bash_output_job_id(args_json: &str) -> Option<String> {
+    let sanitized = crate::dto::chat::sanitize_tool_arguments(args_json);
+    let v: Value = serde_json::from_str(&sanitized).ok()?;
+    v.get("job_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn try_read_bash_group<'a>(
+    committed: &[&'a crate::dto::chat::ChatMessage],
+    start: usize,
+) -> Option<BashGroup<'a>> {
+    let call_msg = committed.get(start)?;
+    let calls = call_msg.tool_calls.as_ref()?;
+    if calls.len() != 1 || calls[0].function.name != "bash_output" {
+        return None;
+    }
+    let job_id = parse_bash_output_job_id(&calls[0].function.arguments)?;
+    let mut results = Vec::new();
+    let mut i = start + 1;
+
+    let res = committed.get(i)?;
+    if res.role != Role::Tool || res.tool_call_id.as_deref() != Some(calls[0].id.as_str()) {
+        return None;
+    }
+    results.push(*res);
+    i += 1;
+
+    loop {
+        let next_call = committed.get(i)?;
+        let next_calls = next_call.tool_calls.as_ref()?;
+        if next_calls.len() != 1 || next_calls[0].function.name != "bash_output" {
+            break;
+        }
+        let next_job_id = parse_bash_output_job_id(&next_calls[0].function.arguments)?;
+        if next_job_id != job_id {
+            break;
+        }
+        i += 1;
+        let next_res = committed.get(i)?;
+        if next_res.role != Role::Tool
+            || next_res.tool_call_id.as_deref() != Some(next_calls[0].id.as_str())
+        {
+            break;
+        }
+        results.push(*next_res);
+        i += 1;
+    }
+
+    Some(BashGroup {
+        last_call: *call_msg,
+        results,
+        end: i,
+    })
+}
+
+/// Render a collapsed `bash_output` poll group as one compact block:
+///   ↳ background bash · bash-1 · [running] → [exit 0]
+///       <captured output>
+fn render_bash_output_group(
+    group: &VisualEntry<'_>,
+    palette: &Palette,
+    _wrap_w: usize,
+) -> Vec<Line<'static>> {
+    let VisualEntry::BashOutputGroup { last_call, results } = group else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+
+    let job_id = last_call
+        .tool_calls
+        .as_ref()
+        .and_then(|c| c.first())
+        .and_then(|c| parse_bash_output_job_id(&c.function.arguments))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut statuses: Vec<&str> = Vec::new();
+    for res in results {
+        let status = res.content.lines().next().unwrap_or("").trim();
+        if !status.is_empty() && statuses.last() != Some(&status) {
+            statuses.push(status);
+        }
+    }
+    let status_line = if statuses.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", statuses.join(" → "))
+    };
+
+    let dim = Style::default().fg(palette.dim);
+    let italic = Style::default()
+        .fg(palette.dim)
+        .add_modifier(Modifier::ITALIC);
+    lines.push(Line::from(vec![
+        Span::styled("↳ ".to_string(), italic),
+        Span::styled(
+            format!("background bash · {job_id}{status_line}"),
+            italic,
+        ),
+    ]));
+
+    let last_body = results.last().map(|m| m.content.as_str()).unwrap_or("");
+    let output = last_body
+        .lines()
+        .skip(1)
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.trim().is_empty() {
+        lines.push(Line::from(vec![Span::styled("    (no output)", dim)]));
+    } else {
+        for line in output.lines() {
+            lines.push(Line::from(vec![Span::styled(format!("    {line}"), dim)]));
+        }
+    }
+    lines
+}
+
 pub(super) fn render_message_block(
     msg: &crate::dto::chat::ChatMessage,
     palette: &Palette,

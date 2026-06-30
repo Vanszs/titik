@@ -81,8 +81,21 @@ pub(crate) fn start_stream_task(
                     }
                 }
                 if !listing.is_empty() {
+                    // Cap the volatile listing so huge workspaces don't bloat
+                    // every request. 200 top-level entries is enough for the
+                    // model to grasp layout; `dir_list` / `glob` can fetch more.
+                    const MAX_PROJECT_FILES_LIST: usize = 200;
+                    let total = listing.len();
+                    let truncated = total > MAX_PROJECT_FILES_LIST;
+                    listing.truncate(MAX_PROJECT_FILES_LIST);
                     first.content.push_str("\n\n# Project files (top level)\n");
                     first.content.push_str(&listing.join("\n"));
+                    if truncated {
+                        first.content.push_str(&format!(
+                            "\n... ({} more entries not shown; use dir_list or glob to explore)",
+                            total - MAX_PROJECT_FILES_LIST
+                        ));
+                    }
                 }
             }
             if let Some(summary) = state.rest.sessions[sess_idx].awareness_summary.as_deref() {
