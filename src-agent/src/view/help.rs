@@ -37,9 +37,9 @@ const GREEN: Color = Color::Rgb(57, 255, 20);
 /// Render the help reference for `st` using the given colour `palette`.
 ///
 /// Colours flow through `palette`, except the fixed `GREEN` "update available"
-/// accent in the "Updating koma" block (it mirrors the non-themeable header badge).
+/// accent in the "Updating titik" block (it mirrors the non-themeable header badge).
 pub fn draw(frame: &mut Frame, st: &HelpState, palette: &Palette) {
-    // Height of the "Updating koma" block: label + current/available + run-command,
+    // Height of the "Updating titik" block: label + current/available + run-command,
     // plus one extra line when the update carries a release message. A trailing
     // spacer line separates it from the search row.
     let has_msg = matches!(&st.update, Some((_, Some(_))));
@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, st: &HelpState, palette: &Palette) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),                 // header text + BOTTOM border
-            Constraint::Length(update_h as u16),   // "Updating koma" info block + spacer
+            Constraint::Length(update_h as u16),   // "Updating titik" info block + spacer
             Constraint::Length(2),                 // search line + spacer
             Constraint::Min(0),                    // filtered list
             Constraint::Length(1),                 // footer hint
@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame, st: &HelpState, palette: &Palette) {
         }),
     );
 
-    // --- "Updating koma" info block (dim, non-interactive — sits above search). ---
+    // --- "Updating titik" info block (dim, non-interactive — sits above search). ---
     let update_inner = outer[1].inner(Margin {
         horizontal: 2,
         vertical: 0,
@@ -79,7 +79,7 @@ pub fn draw(frame: &mut Frame, st: &HelpState, palette: &Palette) {
     let dim = Style::default().fg(palette.dim);
     let mut update_lines: Vec<Line> = Vec::with_capacity(4);
     // Section label.
-    update_lines.push(Line::from(Span::styled("updating koma", dim)));
+    update_lines.push(Line::from(Span::styled("updating titik", dim)));
     // Current (+ available [latest] when an update is known).
     let mut cur_spans = vec![Span::styled(
         format!("  current {}", st.current_version),
@@ -92,7 +92,7 @@ pub fn draw(frame: &mut Frame, st: &HelpState, palette: &Palette) {
     update_lines.push(Line::from(cur_spans));
     // How to update.
     update_lines.push(Line::from(Span::styled(
-        "  run  koma update  in your shell  (or  curl -fsSL https://koma.run/install.sh | sh )",
+        "  run  titik update  in your shell  (or  curl -fsSL https://koma.run/install.sh | sh )",
         dim,
     )));
     // Optional release message.

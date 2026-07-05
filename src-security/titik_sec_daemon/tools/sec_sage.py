@@ -33,8 +33,8 @@ DESCRIPTOR = {
 
 
 def _handler(args: dict, sessions) -> str:
-    # Lazy import — keeps registry loadable without koma_sec_daemon.sandbox issues
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    # Lazy import — keeps registry loadable without titik_sec_daemon.sandbox issues
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     code = args["code"]
     return sandbox.run(["sage", "-c", code], timeout=180, mem_mb=4096)

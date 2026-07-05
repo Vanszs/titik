@@ -26,7 +26,7 @@ use crate::model::store;
 /// [`store::daemon_sock_path`]).
 ///
 /// Steps:
-/// 1. Ensure the parent dir (`~/.koma`) exists — `bind` fails if it does not.
+/// 1. Ensure the parent dir (`~/.titik`) exists — `bind` fails if it does not.
 /// 2. Unlink any stale socket file already at `path`. A leftover socket from a
 ///    crashed daemon would otherwise make `bind` fail with `AddrInUse` even though
 ///    nobody is listening. (Removing it is safe precisely because bind — not the
@@ -35,7 +35,7 @@ use crate::model::store;
 /// 3. Bind and return the listener. Holding it is what makes this process the live
 ///    daemon.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
-    // 1. ~/.koma (or whatever parent the path has) must exist before bind.
+    // 1. ~/.titik (or whatever parent the path has) must exist before bind.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

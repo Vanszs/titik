@@ -41,8 +41,8 @@ DESCRIPTOR = {
 
 
 def _handler(args: dict, sessions) -> str:
-    # Lazy import — keeps registry loadable when koma_sec_daemon.sandbox is absent
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    # Lazy import — keeps registry loadable when titik_sec_daemon.sandbox is absent
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     url = args["url"]
     data = args.get("data")

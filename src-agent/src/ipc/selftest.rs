@@ -1,4 +1,4 @@
-//! End-to-end self-test for the IPC transport (`koma --ipc-selftest`).
+//! End-to-end self-test for the IPC transport (`titik --ipc-selftest`).
 //!
 //! Exercises [`super::frame`] + [`super::server`] + [`super::client`] together so
 //! none of them rot into dead code before the daemon loop wires them up. It:
@@ -12,7 +12,7 @@
 //! 5. tears the connection down and unlinks the socket,
 //! 6. prints `OK` / `FAIL` and exits with status 0 / 1.
 //!
-//! A dedicated socket path (`~/.koma/ipc-selftest.sock`) is used so the test never
+//! A dedicated socket path (`~/.titik/ipc-selftest.sock`) is used so the test never
 //! collides with a real daemon socket. The whole thing runs on a private tokio
 //! runtime built here, mirroring the sync `main` entry point.
 
@@ -33,17 +33,17 @@ fn selftest_sock_path() -> Result<PathBuf> {
     Ok(store::base_dir()?.join("ipc-selftest.sock"))
 }
 
-/// Run the IPC self-test to completion. Prints `koma ipc-selftest: OK` and exits
+/// Run the IPC self-test to completion. Prints `titik ipc-selftest: OK` and exits
 /// 0 on success, or prints the failure and exits 1. Never returns normally — it
 /// always terminates the process (it is a short-circuit CLI mode).
 pub fn run() -> ! {
     let code = match run_inner() {
         Ok(()) => {
-            println!("koma ipc-selftest: OK");
+            println!("titik ipc-selftest: OK");
             0
         }
         Err(e) => {
-            eprintln!("koma ipc-selftest: FAIL: {e:#}");
+            eprintln!("titik ipc-selftest: FAIL: {e:#}");
             1
         }
     };

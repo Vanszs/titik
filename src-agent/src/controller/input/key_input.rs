@@ -54,6 +54,9 @@ pub fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: K
         };
         return match key.code {
             KeyCode::Esc => {
+                if form.is_model_select {
+                    return Action::CancelKeyInput;
+                }
                 // Non-destructive: back to the connection step (clears the query).
                 form.back_step();
                 Action::None
@@ -72,10 +75,14 @@ pub fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: K
                     // Pick the highlighted catalogue model.
                     let sel = form.result_sel.min(filtered.len() - 1);
                     form.model = cache[filtered[sel]].id.clone();
-                    Action::SaveCreds {
-                        endpoint,
-                        api_key,
-                        model: form.model.clone(),
+                    if form.is_model_select {
+                        Action::SaveModel { model_id: form.model.clone() }
+                    } else {
+                        Action::SaveCreds {
+                            endpoint,
+                            api_key,
+                            model: form.model.clone(),
+                        }
                     }
                 } else {
                     // No results (catalogue still loading / empty, or the query
@@ -87,10 +94,14 @@ pub fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: K
                         Action::None
                     } else {
                         form.model = typed.to_string();
-                        Action::SaveCreds {
-                            endpoint,
-                            api_key,
-                            model: form.model.clone(),
+                        if form.is_model_select {
+                            Action::SaveModel { model_id: form.model.clone() }
+                        } else {
+                            Action::SaveCreds {
+                                endpoint,
+                                api_key,
+                                model: form.model.clone(),
+                            }
                         }
                     }
                 }
@@ -113,6 +124,9 @@ pub fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: K
 
     match key.code {
         KeyCode::Esc => {
+            if form.step == 1 && form.is_model_select {
+                return Action::CancelKeyInput;
+            }
             if form.step == 1 {
                 // Model step: step back to the connection step (non-destructive).
                 form.back_step();
@@ -168,10 +182,16 @@ pub fn handle_key_input(form: &mut KeyInputForm, rest: &mut AppStateRest, key: K
             } else {
                 // Model step (non-OpenRouter plain text): finish if non-empty.
                 if form.can_finish() {
-                    Action::SaveCreds {
-                        endpoint: form.endpoint.trim().to_string(),
-                        api_key: form.api_key.trim().to_string(),
-                        model: form.model.trim().to_string(),
+                    if form.is_model_select {
+                        Action::SaveModel {
+                            model_id: form.model.trim().to_string(),
+                        }
+                    } else {
+                        Action::SaveCreds {
+                            endpoint: form.endpoint.trim().to_string(),
+                            api_key: form.api_key.trim().to_string(),
+                            model: form.model.trim().to_string(),
+                        }
                     }
                 } else {
                     rest.status = "model required".into();

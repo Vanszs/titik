@@ -45,7 +45,7 @@ DESCRIPTOR = {
 
 
 def _handler(args: dict, sessions) -> str:
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     wasm_b64 = args["wasm_b64"]
     mode = args.get("mode", "decompile")

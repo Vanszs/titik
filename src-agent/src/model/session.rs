@@ -168,7 +168,7 @@ impl Session {
         // from loading.
         let scratch = crate::model::store::scratch_dir(&session.id);
         if let Err(e) = std::fs::create_dir_all(&scratch) {
-            eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
+            eprintln!("titik: warning: could not create scratch dir {}: {e}", scratch.display());
         }
 
         // Ensure the image-attachment dir exists so resumed sessions can ingest

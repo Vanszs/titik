@@ -8,7 +8,7 @@ use crate::service::openrouter::OpenRouterClient;
 
 use super::final_answer;
 
-/// Post koma's friendly "this model can't read images" notice into the chat
+/// Post titik's friendly "this model can't read images" notice into the chat
 /// (assistant message + msglog + save). Shared by the submit-time capability
 /// guard and the stream-error interception so the wording lives in one place.
 pub(crate) fn push_image_unsupported_notice(rest: &mut AppStateRest) {
@@ -118,7 +118,7 @@ pub(crate) fn finish_stream(rest: &mut AppStateRest, sess_idx: usize, error: Opt
             // If the provider rejected the request because the model can't take
             // images (e.g. "No endpoints found that support image input") and the
             // last user message actually carried image attachments, swap the raw
-            // error toast for koma's friendly in-chat notice.
+            // error toast for titik's friendly in-chat notice.
             let last_user_had_image = rest.sessions[sess_idx].session.as_ref().is_some_and(|s| {
                 s.conversation
                     .history()

@@ -153,7 +153,7 @@ pub(super) fn render_loop(
         }
 
         // Fire OpenSessionHub once after the first full snapshot lands when the client
-        // was launched with --resume / koma agents. Gated on the shadow having a real
+        // was launched with --resume / titik agents. Gated on the shadow having a real
         // session so we don't fire against the initial empty placeholder state.
         if resume && !resume_fired && shadow.rest.fg().session.is_some() {
             resume_fired = true;

@@ -53,8 +53,8 @@ def arch_tag() -> str:
 
 
 def bin_dir() -> str:
-    """Absolute path to the persisted binary dir: ~/.koma/security/bin."""
-    return os.path.expanduser("~/.koma/security/bin")
+    """Absolute path to the persisted binary dir: ~/.titik/security/bin."""
+    return os.path.expanduser("~/.titik/security/bin")
 
 
 _ARCH = arch_tag()

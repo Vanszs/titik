@@ -1,8 +1,8 @@
 name: release
 
-# Build the koma binary for every supported platform on a version-tag push and
+# Build the titik binary for every supported platform on a version-tag push and
 # attach each one to the GitHub release. Asset names MUST match install.sh:
-#   koma-linux-x64, koma-linux-arm64, koma-darwin-arm64, koma-darwin-x64
+#   titik-linux-x64, titik-linux-arm64, titik-darwin-arm64, titik-darwin-x64
 on:
   push:
     tags:
@@ -22,20 +22,20 @@ jobs:
           # ----- Linux -----
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: koma-linux-x64
+            asset: titik-linux-x64
             cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            asset: koma-linux-arm64
+            asset: titik-linux-arm64
             cross: true
           # ----- macOS (Apple Silicon runner; x86_64 cross-compiles natively) -----
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: koma-darwin-arm64
+            asset: titik-darwin-arm64
             cross: false
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: koma-darwin-x64
+            asset: titik-darwin-x64
             cross: false
 
     steps:
@@ -71,12 +71,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p agent --target ${{ matrix.target }}
 
-      # The bin is named "koma" (see src-agent/Cargo.toml [[bin]]); rename to the
+      # The bin is named "titik" (see src-agent/Cargo.toml [[bin]]); rename to the
       # per-platform asset name so install.sh can fetch it directly.
       - name: Stage asset
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/release/koma" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/titik" "${{ matrix.asset }}"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

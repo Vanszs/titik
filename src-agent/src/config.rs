@@ -48,11 +48,11 @@ pub const DEFAULT_CLASSIFIER_PROVIDER: &str = "groq";
 pub const HTTP_REFERER: &str = "https://koma.run";
 
 /// Human-readable application name (displayed in the TUI title bar).
-pub const APP_TITLE: &str = "koma";
+pub const APP_TITLE: &str = "titik";
 
 /// Name of the hidden directory created in the user's home folder to store
 /// session files and configuration.
-pub const APP_DIR_NAME: &str = ".koma";
+pub const APP_DIR_NAME: &str = ".titik";
 
 /// Hard cap on a single tool result's size, in characters. ~25k tokens at
 /// ~4 chars/token. Tool outputs are not truncated below this.

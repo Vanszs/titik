@@ -1,7 +1,7 @@
-//! Wire protocol vocabulary for the koma daemon <-> client split.
+//! Wire protocol vocabulary for the titik daemon <-> client split.
 //!
 //! These are PURE-DATA, serde-round-trippable types — the only things that ever
-//! cross the unix-socket boundary between the headless `koma-daemon` (which owns
+//! cross the unix-socket boundary between the headless `titik-daemon` (which owns
 //! the agent runtime + session locks) and a thin attach/detach TUI client.
 
 pub mod key;

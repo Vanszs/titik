@@ -6,10 +6,10 @@ install(key) dispatches on the manifest descriptor's "method":
   manual  -> never touches the system; returns the manual hint.
   pip     -> [sys.executable, -m, pip, install, <pkgs>] then any "post" argv
              run with sys.executable. Because sys.executable is the daemon's
-             venv python (~/.koma/security/venv), this installs into that venv.
+             venv python (~/.titik/security/venv), this installs into that venv.
   gem     -> [gem, install, --user-install, <gem>] (requires ruby/gem on PATH).
   binary  -> resolve the latest GitHub release, download the asset matching
-             asset_re, extract the wanted members into ~/.koma/security/bin and
+             asset_re, extract the wanted members into ~/.titik/security/bin and
              chmod 0o755 each.
 
 Every path returns a STRING summary (success or "error: …"). Nothing raises
@@ -29,7 +29,7 @@ import tarfile
 import tempfile
 import zipfile
 
-from koma_sec_daemon.install_manifest import KEY_INDEX, bin_dir
+from titik_sec_daemon.install_manifest import KEY_INDEX, bin_dir
 
 # Generous wall-clock budget — pip building wheels / playwright fetching
 # chromium can be slow on a cold cache.
@@ -156,7 +156,7 @@ def _extract_member(archive_path: str, member_name: str, dest_path: str) -> bool
 def _install_binary(dep: dict) -> str:
     """
     Download the latest GitHub release asset matching dep["asset_re"] and extract
-    dep["members"] into ~/.koma/security/bin. Returns a summary string.
+    dep["members"] into ~/.titik/security/bin. Returns a summary string.
 
     Linux-only for v1. requests is imported lazily here.
     """

@@ -1,6 +1,6 @@
 //! Security daemon provisioner — M1 installer.
 //!
-//! Bundles the Python security daemon (`koma_sec_daemon`) that provides
+//! Bundles the Python security daemon (`titik_sec_daemon`) that provides
 //! pwntools/requests-based security tooling. The package lives in
 //! `src-security/` (sibling of this crate) and is embedded verbatim into the
 //! binary at compile time via [`include_dir!`].
@@ -9,7 +9,7 @@
 //!
 //! | Function | Purpose |
 //! |---|---|
-//! | [`security_dir`] | `~/.koma/security/` — install root |
+//! | [`security_dir`] | `~/.titik/security/` — install root |
 //! | [`venv_python`] | path to the venv Python; used as "installed" marker |
 //! | [`is_installed`] | non-panicking predicate consumed by gating logic |
 //! | [`install`] | provisions the environment (CLI mode, prints progress) |
@@ -24,16 +24,16 @@ use crate::model::store::base_dir;
 ///
 /// The macro path is relative to `$CARGO_MANIFEST_DIR` (i.e. `src-agent/`),
 /// so `../src-security` resolves to the sibling directory that holds the
-/// vendored `koma_sec_daemon` package and `requirements.txt`.
+/// vendored `titik_sec_daemon` package and `requirements.txt`.
 static SECURITY_ASSETS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../src-security");
 
-/// Returns `~/.koma/security/` — the root of the security daemon install.
+/// Returns `~/.titik/security/` — the root of the security daemon install.
 pub fn security_dir() -> Result<PathBuf> {
     Ok(base_dir()?.join("security"))
 }
 
 /// Returns the path to the venv Python binary:
-/// `~/.koma/security/venv/bin/python`.
+/// `~/.titik/security/venv/bin/python`.
 ///
 /// The presence of this file is the canonical "installed" marker.
 pub fn venv_python() -> Result<PathBuf> {
@@ -103,7 +103,7 @@ pub fn install(force: bool) -> Result<()> {
 
     if !py3_ok {
         return Err(anyhow!(
-            "python3 not found — install Python 3.8+ and re-run `koma --security-install`"
+            "python3 not found — install Python 3.8+ and re-run `titik --security-install`"
         ));
     }
 

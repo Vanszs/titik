@@ -14,7 +14,7 @@ use crate::model::settings::InternetMode;
 pub(crate) fn internet_feedback(mode: InternetMode) -> (String, Option<String>) {
     match mode {
         InternetMode::Full if !crate::internet::is_installed() => {
-            let msg = "internet: full needs `koma --internet-fullmode-install`".to_string();
+            let msg = "internet: full needs `titik --internet-fullmode-install`".to_string();
             (msg.clone(), Some(msg))
         }
         InternetMode::Full => ("internet: full".to_string(), None),

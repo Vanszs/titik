@@ -1,8 +1,8 @@
-//! IPC layer: the wire protocol the koma-daemon and its thin TUI client speak.
+//! IPC layer: the wire protocol the titik-daemon and its thin TUI client speak.
 //!
-//! The end-state architecture is ALWAYS-CLIENT/SERVER: a headless `koma-daemon`
+//! The end-state architecture is ALWAYS-CLIENT/SERVER: a headless `titik-daemon`
 //! owns the agent runtime + session locks, and the TUI is a thin attach/detach
-//! client over a unix socket (`~/.koma/daemon.sock`) using length-prefixed JSON
+//! client over a unix socket (`~/.titik/daemon.sock`) using length-prefixed JSON
 //! frames. This module is STAGE 1 of that split: it defines ONLY the message
 //! vocabulary ([`proto`]) — the request/response/snapshot/delta types — with no
 //! transport and no callers yet. The socket server, framing, and snapshot/delta
@@ -122,6 +122,7 @@ mod roundtrip_tests {
                 result_sel: 2,
                 first_run: true,
                 from_picker: false,
+                is_model_select: false,
             }),
             toast: Some(("info".to_string(), "saved".to_string())),
             models_cache: None,

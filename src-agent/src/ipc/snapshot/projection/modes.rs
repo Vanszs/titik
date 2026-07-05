@@ -77,6 +77,7 @@ pub fn key_input_snapshot(f: &KeyInputForm) -> KeyInputSnapshot {
         result_sel: f.result_sel,
         first_run: f.first_run,
         from_picker: f.from_picker,
+        is_model_select: f.is_model_select,
     }
 }
 

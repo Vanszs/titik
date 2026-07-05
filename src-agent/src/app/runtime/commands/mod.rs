@@ -18,6 +18,7 @@ mod effort;
 pub(crate) mod internet;
 mod mcp;
 mod misc;
+mod model;
 pub(crate) mod new_session;
 // `pub(crate)` so the shared `kick_off_health_probe` helper is reachable from BOTH the
 // `/security` command (panel open) and the input-path self-heal (controller), which must
@@ -37,6 +38,7 @@ pub(super) fn apply_slash(
         Command::Compact => compact::handle_compact(state, client, handle)?,
         Command::New(mode) => new_session::handle_new(state, client, handle, mode)?,
         Command::Mode(arg) => misc::handle_mode(state, arg)?,
+        Command::Model(arg) => model::handle_model(state, client, handle, arg)?,
         Command::Effort => effort::handle_effort(state, client)?,
         Command::Rename(name) => new_session::handle_rename(state, name)?,
         Command::Settings => misc::handle_settings(state)?,

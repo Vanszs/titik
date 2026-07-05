@@ -179,3 +179,82 @@ pub(super) fn handle_save_creds(
     super::super::warm_session(state, client, handle);
     Ok(())
 }
+
+/// Handle `Action::SaveModel`: update the Main model entry in config and the
+/// legacy session settings, then rebuild the client.
+pub(in crate::app::runtime) fn handle_save_model(
+    model_id: String,
+    state: &mut AppState,
+    client: &mut Option<Arc<OpenRouterClient>>,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if model_id.is_empty() {
+        state.rest.status = "model required".into();
+        return Ok(());
+    }
+
+    // Determine the provider to keep for the Main role: the provider_uuid of the
+    // existing Main entry, otherwise the first configured provider.
+    let main_provider_uuid = state
+        .rest
+        .config
+        .models
+        .iter()
+        .find(|m| m.roles.contains(&ModelRole::Main))
+        .map(|m| m.provider_uuid.clone())
+        .filter(|u| !u.is_empty())
+        .or_else(|| state.rest.config.providers.first().map(|p| p.uuid.clone()))
+        .unwrap_or_default();
+
+    // Update an existing Main entry, or create one if absent.
+    let mut updated = false;
+    for entry in &mut state.rest.config.models {
+        if entry.roles.contains(&ModelRole::Main) {
+            entry.model_id = model_id.clone();
+            if !main_provider_uuid.is_empty() {
+                entry.provider_uuid = main_provider_uuid.clone();
+            }
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        state.rest.config.models.push(ModelEntry {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            name: "main".to_string(),
+            model_id: model_id.clone(),
+            provider_uuid: main_provider_uuid.clone(),
+            route: None,
+            roles: vec![ModelRole::Main],
+            role: None,
+        });
+    }
+
+    if let Err(e) = state.rest.config.save() {
+        state.rest.status = format!("config save failed: {e}");
+        return Ok(());
+    }
+
+    // Mirror to legacy session settings.
+    if let Some(sess) = state.rest.fg_mut().session.as_mut() {
+        sess.settings.model = model_id.clone();
+        let _ = sess.save();
+    }
+
+    // Rebuild the client so the next turn uses the new Main model.
+    *client = state.rest.fg().session.as_ref().and_then(|sess| {
+        crate::app::resolve::resolve_role(
+            &state.rest.config,
+            &sess.settings,
+            ModelRole::Main,
+        )
+        .filter(|r| !r.api_key.is_empty())
+        .map(|_| build_client())
+    });
+
+    state.rest.status = format!("Main model set to {model_id}");
+    state.mode = Mode::Chat;
+    state.rest.reset_scroll();
+    super::super::warm_session(state, client, handle);
+    Ok(())
+}

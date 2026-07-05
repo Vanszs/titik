@@ -107,7 +107,7 @@ pub fn install(force: bool) -> Result<()> {
 
     if !py3_ok {
         return Err(anyhow!(
-            "python3 not found — install Python 3.8+ and re-run `koma --internet-fullmode-install`"
+            "python3 not found — install Python 3.8+ and re-run `titik --internet-fullmode-install`"
         ));
     }
 

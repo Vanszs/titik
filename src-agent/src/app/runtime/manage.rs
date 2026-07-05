@@ -1,7 +1,7 @@
-//! Daemon management CLI + discovery/spawn machinery (`koma daemon …`, #118).
+//! Daemon management CLI + discovery/spawn machinery (`titik daemon …`, #118).
 //!
 //! This module is the operator-facing control surface for the headless
-//! `koma --daemon` process plus the reusable spawn-or-attach mechanism that a
+//! `titik --daemon` process plus the reusable spawn-or-attach mechanism that a
 //! later default-launch flip will sit on top of. It deliberately does NOT change
 //! the default launch path — `main` still drops into the local TUI by default; the
 //! `daemon` subcommand and these functions are the MECHANISM only.
@@ -68,7 +68,7 @@ const SIGNAL_GRACE: Duration = Duration::from_secs(2);
 /// Stop any running daemon, then spawn a fresh one — the PUBLIC restart primitive
 /// the thin client uses to recover from a build-skew (task #142).
 ///
-/// This is the EXACT `koma daemon restart` path: it delegates straight to
+/// This is the EXACT `titik daemon restart` path: it delegates straight to
 /// [`cmd_restart`], reusing its full graceful→SIGTERM→SIGKILL stop escalation AND its
 /// [`ensure_daemon_and_connect`] spawn-and-confirm (poll-connect until the new daemon
 /// accepts), so the auto-restart never reinvents the kill or the spawn. It returns
@@ -80,7 +80,7 @@ pub fn restart_daemon() -> Result<()> {
     cmd_restart()
 }
 
-/// Entry point for `koma daemon <verb>` — dispatch to the matching handler.
+/// Entry point for `titik daemon <verb>` — dispatch to the matching handler.
 ///
 /// Called from `main` (short-circuited BEFORE the TUI). Each handler prints its
 /// outcome and returns `Ok(())` on success; an `Err` is surfaced by `main` as a
@@ -99,9 +99,9 @@ pub fn run_daemon_subcommand(sub: DaemonSub) -> Result<()> {
 /// exit code the caller should use (non-zero — a malformed invocation is an error).
 pub fn print_daemon_usage() -> i32 {
     eprintln!(
-        "usage: koma daemon <status|kill|restart|clean>\n\
+        "usage: titik daemon <status|kill|restart|clean>\n\
          \n\
-         \x20 status   show whether the koma daemon is running (PID, socket, sessions)\n\
+         \x20 status   show whether the titik daemon is running (PID, socket, sessions)\n\
          \x20 kill     gracefully stop the running daemon (escalates to signals if needed)\n\
          \x20 restart  stop the daemon (if any) then start a fresh one\n\
          \x20 clean    remove a stale socket/pidfile when NO daemon is running"
@@ -123,7 +123,7 @@ pub fn daemon_alive() -> bool {
     UnixStream::connect(&path).is_ok()
 }
 
-/// Spawn a DETACHED `koma --daemon` child and return its PID.
+/// Spawn a DETACHED `titik --daemon` child and return its PID.
 ///
 /// The child is fully detached so it survives this short-lived CLI process:
 /// - `pre_exec(setsid)` puts it in its own session (no controlling terminal), so a
@@ -140,7 +140,7 @@ pub fn daemon_alive() -> bool {
 /// so `build_startup()` opens the session picker instead of eagerly creating a
 /// session.
 fn spawn_daemon(resume: bool) -> Result<u32> {
-    // Re-launch THIS binary with `--daemon`. `current_exe` is the running koma binary,
+    // Re-launch THIS binary with `--daemon`. `current_exe` is the running titik binary,
     // so a renamed/installed binary still respawns itself correctly.
     let exe = std::env::current_exe().context("cannot resolve current executable path")?;
 
@@ -164,7 +164,7 @@ fn spawn_daemon(resume: bool) -> Result<u32> {
         });
     }
 
-    let child = cmd.spawn().context("failed to spawn `koma --daemon`")?;
+    let child = cmd.spawn().context("failed to spawn `titik --daemon`")?;
     Ok(child.id())
 }
 
@@ -198,18 +198,18 @@ fn probe_or_clear(path: &Path) -> Result<bool> {
     }
 }
 
-/// Ensure a koma daemon is RUNNING and accepting on the socket, spawning a detached
+/// Ensure a titik daemon is RUNNING and accepting on the socket, spawning a detached
 /// one if none is up. Returns once a daemon is confirmed accepting; does NOT return a
 /// stream (the caller connects itself — e.g. the thin client opens its own async
 /// connection right after).
 ///
-/// This is the default-launch primitive (`koma` with no flags = ensure-then-attach):
+/// This is the default-launch primitive (`titik` with no flags = ensure-then-attach):
 /// 1. Probe the socket. Live already → return `Ok(())` (attach to the existing one).
 /// 2. Not live → (stale socket cleared by [`probe_or_clear`]) spawn a detached
-///    `koma --daemon`, then POLL the bind-as-oracle liveness up to
+///    `titik --daemon`, then POLL the bind-as-oracle liveness up to
 ///    [`SPAWN_CONNECT_TIMEOUT`] until it accepts — or return a clear error if it never
-///    came up (the default path turns that into "could not start the koma daemon …
-///    try `koma --local`", NEVER a silent fallback to a local TUI).
+///    came up (the default path turns that into "could not start the titik daemon …
+///    try `titik --local`", NEVER a silent fallback to a local TUI).
 ///
 /// Bounded by the spawn timeout, so it can never hang forever waiting on a daemon that
 /// fails to come up.
@@ -228,7 +228,7 @@ pub fn ensure_daemon_running(resume: bool) -> Result<()> {
 /// Spawn-or-attach: return a connected blocking [`UnixStream`] to a LIVE daemon,
 /// spawning one first if none is up.
 ///
-/// The blocking-stream variant of [`ensure_daemon_running`], used by `koma daemon
+/// The blocking-stream variant of [`ensure_daemon_running`], used by `titik daemon
 /// restart` to CONFIRM the freshly-spawned daemon is accepting (it drops the stream
 /// immediately). Logic:
 /// 1. Try to connect. Success → a daemon is live; return the stream.
@@ -257,7 +257,7 @@ pub fn ensure_daemon_and_connect() -> Result<UnixStream> {
         .with_context(|| format!("connect to spawned daemon socket {}", path.display()))
 }
 
-/// Spawn a detached `koma --daemon` and POLL the bind-as-oracle liveness until it
+/// Spawn a detached `titik --daemon` and POLL the bind-as-oracle liveness until it
 /// accepts, up to [`SPAWN_CONNECT_TIMEOUT`]. Returns `Ok(())` once the socket accepts,
 /// or a clear `Err` (naming the advisory PID + the timeout) if it never came up.
 ///
@@ -353,7 +353,7 @@ fn unlink_daemon_files() {
 
 // ─── subcommands ─────────────────────────────────────────────────────────────
 
-/// `koma daemon status` — report liveness via the bind-as-oracle probe.
+/// `titik daemon status` — report liveness via the bind-as-oracle probe.
 ///
 /// If a daemon is live: print "running", its PID (from the pidfile, advisory) and the
 /// socket path, then best-effort ask it for a session count via `ListSessions` and
@@ -363,7 +363,7 @@ fn cmd_status() -> Result<()> {
     let sock = store::daemon_sock_path()?;
 
     if !daemon_alive() {
-        println!("koma daemon: not running");
+        println!("titik daemon: not running");
         return Ok(());
     }
 
@@ -373,7 +373,7 @@ fn cmd_status() -> Result<()> {
         Some(pid) => format!("pid {pid}"),
         None => "pid unknown (no pidfile)".to_string(),
     };
-    println!("koma daemon: running ({pid_str})");
+    println!("titik daemon: running ({pid_str})");
     println!("  socket: {}", sock.display());
 
     // Best-effort session count. ListSessions answers with a full Snapshot; read
@@ -406,7 +406,7 @@ fn daemon_session_count(sock: &Path) -> Result<usize> {
     Err(anyhow!("no snapshot in reply"))
 }
 
-/// `koma daemon kill` — stop a running daemon, escalating only if it won't go.
+/// `titik daemon kill` — stop a running daemon, escalating only if it won't go.
 ///
 /// 1. If not alive: report "no daemon running" and sweep any stale socket/pidfile.
 /// 2. Alive: connect + send `QuitDaemon` (the graceful path — the daemon releases all
@@ -418,7 +418,7 @@ fn daemon_session_count(sock: &Path) -> Result<usize> {
 ///    what happened.
 fn cmd_kill() -> Result<()> {
     if !daemon_alive() {
-        println!("koma daemon: no daemon running");
+        println!("titik daemon: no daemon running");
         // Sweep any leftover turds from a previous crash so the next start is clean.
         unlink_daemon_files();
         return Ok(());
@@ -452,7 +452,7 @@ fn cmd_kill() -> Result<()> {
         // The daemon's own teardown unlinks the socket + pidfile; sweep defensively in
         // case it didn't get that far, then report.
         unlink_daemon_files();
-        println!("koma daemon: stopped (graceful QuitDaemon)");
+        println!("titik daemon: stopped (graceful QuitDaemon)");
         return Ok(());
     }
 
@@ -462,7 +462,7 @@ fn cmd_kill() -> Result<()> {
     let Some(pid) = read_pidfile() else {
         unlink_daemon_files();
         println!(
-            "koma daemon: still up but no pidfile to signal; removed stale socket/pidfile. \
+            "titik daemon: still up but no pidfile to signal; removed stale socket/pidfile. \
              If a daemon is still running, stop it manually."
         );
         return Ok(());
@@ -472,7 +472,7 @@ fn cmd_kill() -> Result<()> {
     send_signal(pid, libc::SIGTERM);
     if wait_until_dead(SIGNAL_GRACE) {
         unlink_daemon_files();
-        println!("koma daemon: stopped (SIGTERM to pid {pid})");
+        println!("titik daemon: stopped (SIGTERM to pid {pid})");
         return Ok(());
     }
 
@@ -481,17 +481,17 @@ fn cmd_kill() -> Result<()> {
     let died = wait_until_dead(SIGNAL_GRACE);
     unlink_daemon_files();
     if died {
-        println!("koma daemon: killed (SIGKILL to pid {pid})");
+        println!("titik daemon: killed (SIGKILL to pid {pid})");
     } else {
         println!(
-            "koma daemon: sent SIGKILL to pid {pid} but the socket is still up; \
+            "titik daemon: sent SIGKILL to pid {pid} but the socket is still up; \
              removed socket/pidfile. The process may be unkillable (zombie/stuck IO)."
         );
     }
     Ok(())
 }
 
-/// `koma daemon restart` — kill any running daemon, then spawn a fresh detached one
+/// `titik daemon restart` — kill any running daemon, then spawn a fresh detached one
 /// and report its PID.
 ///
 /// Reuses `cmd_kill`'s full graceful→signal escalation for the stop, then the
@@ -502,7 +502,7 @@ fn cmd_restart() -> Result<()> {
     // Stop whatever is running (prints its own outcome). A kill error shouldn't block
     // the restart — surface it but continue to the spawn.
     if let Err(e) = cmd_kill() {
-        eprintln!("koma daemon: warning during stop phase of restart: {e:#}");
+        eprintln!("titik daemon: warning during stop phase of restart: {e:#}");
     }
 
     // Spawn + wait for it to accept. `ensure_daemon_and_connect` connects (false here,
@@ -514,13 +514,13 @@ fn cmd_restart() -> Result<()> {
     // visible for a few ms after accept; the poll-connect above usually outlasts that,
     // but tolerate a miss rather than fail the whole restart.
     match read_pidfile() {
-        Some(pid) => println!("koma daemon: restarted (pid {pid})"),
-        None => println!("koma daemon: restarted (pid unknown — pidfile not yet written)"),
+        Some(pid) => println!("titik daemon: restarted (pid {pid})"),
+        None => println!("titik daemon: restarted (pid unknown — pidfile not yet written)"),
     }
     Ok(())
 }
 
-/// `koma daemon clean` — the "OS shit happened, nuke the turds" escape hatch.
+/// `titik daemon clean` — the "OS shit happened, nuke the turds" escape hatch.
 ///
 /// REFUSES to run while a daemon is alive (removing a live daemon's socket would
 /// orphan it with a dangling socket file) — directing the user to `kill` instead.
@@ -529,7 +529,7 @@ fn cmd_restart() -> Result<()> {
 fn cmd_clean() -> Result<()> {
     if daemon_alive() {
         return Err(anyhow!(
-            "daemon is running; use `koma daemon kill` (clean only removes stale files \
+            "daemon is running; use `titik daemon kill` (clean only removes stale files \
              when no daemon is running)"
         ));
     }
@@ -548,9 +548,9 @@ fn cmd_clean() -> Result<()> {
     }
 
     if removed.is_empty() {
-        println!("koma daemon: nothing to clean (no stale socket/pidfile)");
+        println!("titik daemon: nothing to clean (no stale socket/pidfile)");
     } else {
-        println!("koma daemon: removed stale file(s):");
+        println!("titik daemon: removed stale file(s):");
         for f in removed {
             println!("  {f}");
         }

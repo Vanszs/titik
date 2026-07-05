@@ -1,4 +1,4 @@
-//! Headless daemon event loop — the `koma --daemon` core.
+//! Headless daemon event loop — the `titik --daemon` core.
 //!
 //! [`daemon_loop`] mirrors the STRUCTURE of [`super::run_loop`] but with the
 //! terminal stripped: no `terminal.draw(...)`, no crossterm input poll/read, no

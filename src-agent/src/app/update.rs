@@ -1,4 +1,4 @@
-//! `koma update` — stop the daemon then run the official installer to fetch the
+//! `titik update` — stop the daemon then run the official installer to fetch the
 //! latest release binary.
 //!
 //! # NO hotswap
@@ -6,8 +6,8 @@
 //! This does NOT swap the running process in place. It stops the daemon first
 //! (so the on-disk binary is no longer held open by a running process), then
 //! shells out to the installer which overwrites the binary file on disk. The
-//! next `koma` launch picks up the new binary. The user is told to re-run
-//! `koma` afterward.
+//! next `titik` launch picks up the new binary. The user is told to re-run
+//! `titik` afterward.
 
 use anyhow::{anyhow, Result};
 
@@ -21,16 +21,16 @@ use crate::cli::DaemonSub;
 /// downloader (`curl`/`wget`) is surfaced as `Err`.
 pub fn run_update() -> Result<()> {
     // 1. Stop the daemon (graceful → SIGTERM → SIGKILL) via the same public
-    //    path that `koma daemon kill` uses. A "no daemon running" outcome is
+    //    path that `titik daemon kill` uses. A "no daemon running" outcome is
     //    fine — cmd_kill prints "no daemon running" and returns Ok(()).
-    println!("koma update: stopping daemon…");
+    println!("titik update: stopping daemon…");
     // Ignore an Err from kill (e.g. unexpected socket I/O failure): the update
     // should proceed regardless — worst case the installer overwrites the binary
     // while the daemon is still running from its in-memory image.
     let _ = super::run_daemon_subcommand(DaemonSub::Kill);
 
     // 2. Fetch + run the installer.
-    println!("koma update: fetching latest installer…");
+    println!("titik update: fetching latest installer…");
 
     // Prefer curl; fall back to wget; hard error if neither is found.
     let sh_cmd = if which("curl") {
@@ -59,7 +59,7 @@ pub fn run_update() -> Result<()> {
     }
 
     // 3. Done.
-    println!("koma updated. Run 'koma' to start.");
+    println!("titik updated. Run 'titik' to start.");
     Ok(())
 }
 

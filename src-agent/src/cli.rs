@@ -2,11 +2,11 @@
 //!
 //! # User-facing surface (what `--help` should advertise)
 //!
-//! - `koma`                        — default: spawn-or-attach the daemon, then run the client.
-//! - `koma agents`                 — open the session hub (friendly alias for `--resume`).
-//! - `koma --resume`               — open the session hub.
-//! - `koma alone`                  — standalone no-daemon TUI (friendly alias for `--local`).
-//! - `koma daemon <status|kill|restart|clean>` — daemon management CLI.
+//! - `titik`                        — default: spawn-or-attach the daemon, then run the client.
+//! - `titik agents`                 — open the session hub (friendly alias for `--resume`).
+//! - `titik --resume`               — open the session hub.
+//! - `titik alone`                  — standalone no-daemon TUI (friendly alias for `--local`).
+//! - `titik daemon <status|kill|restart|clean>` — daemon management CLI.
 //! - `--internet-fullmode-install` — provision the Python full-mode (browser) environment and exit.
 //! - `--internet-fullmode-uninstall` — remove the Python full-mode environment and exit.
 //! - `--force`                     — modifier for `--internet-fullmode-install`: force a reinstall
@@ -15,14 +15,14 @@
 //! # Hidden plumbing (still parsed + functional, just not advertised)
 //!
 //! These remain so the default launch / management paths can drive them internally
-//! (e.g. `spawn_daemon` execs `koma --daemon`), but they are no longer surfaced to users
+//! (e.g. `spawn_daemon` execs `titik --daemon`), but they are no longer surfaced to users
 //! — the friendly verbs above front them:
 //! - `--resume` is fronted by `agents`; `--local` is fronted by `alone`.
-//! - `--daemon`         — run the headless koma-daemon event loop (no terminal).
+//! - `--daemon`         — run the headless titik-daemon event loop (no terminal).
 //! - `--attach`         — run as a thin client that attaches to a running daemon.
 //! - `--local`          — force the OLD standalone local TUI (the escape hatch from the
 //!   daemon-by-default launch). Refuses to run if a daemon is already alive (it would corrupt the
-//!   daemon's session locks); use plain `koma` to attach, or `koma daemon kill` first.
+//!   daemon's session locks); use plain `titik` to attach, or `titik daemon kill` first.
 //! - `--ipc-selftest`   — round-trip the daemon IPC transport end-to-end, then exit.
 //! - `--daemon-selftest` — drive the full daemon stack (bind/accept/per-client/loop) end-to-end, then exit.
 //!
@@ -38,20 +38,20 @@
 //! `parse` accepts anything that yields `String` items so it can be called
 //! with `std::env::args()` directly from `main`.
 
-/// A `koma daemon <verb>` management subcommand (#118).
+/// A `titik daemon <verb>` management subcommand (#118).
 ///
 /// Parsed POSITIONALLY (the literal token `daemon` followed by a verb), separate
 /// from the `--flags`. `main` short-circuits these BEFORE starting the TUI, so they
 /// must run even when the terminal can't be set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonSub {
-    /// `koma daemon status` — report whether a daemon is live (+ PID / socket / session count).
+    /// `titik daemon status` — report whether a daemon is live (+ PID / socket / session count).
     Status,
-    /// `koma daemon kill` — gracefully stop a running daemon (escalating to signals if it won't die).
+    /// `titik daemon kill` — gracefully stop a running daemon (escalating to signals if it won't die).
     Kill,
-    /// `koma daemon restart` — kill then spawn a fresh detached daemon, reporting the new PID.
+    /// `titik daemon restart` — kill then spawn a fresh detached daemon, reporting the new PID.
     Restart,
-    /// `koma daemon clean` — nuke a stale socket/pidfile when NO daemon is running (refuses if one is).
+    /// `titik daemon clean` — nuke a stale socket/pidfile when NO daemon is running (refuses if one is).
     Clean,
 }
 
@@ -69,7 +69,7 @@ impl DaemonSub {
     }
 }
 
-/// The outcome of detecting a `koma daemon …` invocation.
+/// The outcome of detecting a `titik daemon …` invocation.
 ///
 /// One field on [`Opts`] captures all three cases so `main` can short-circuit the
 /// TUI for ANY `daemon` invocation (valid OR malformed) — a bare/unknown verb must
@@ -102,11 +102,11 @@ pub struct Opts {
     /// per-client tasks + real `daemon_loop`: a client attaches, submits, observes
     /// the resulting delta, then quits the daemon) then exit (`--daemon-selftest`).
     pub daemon_selftest: bool,
-    /// When `true`, run the headless koma-daemon event loop with no terminal
+    /// When `true`, run the headless titik-daemon event loop with no terminal
     /// (`--daemon` flag). Owns the agent runtime; a TUI attaches as a client.
     pub daemon: bool,
     /// When `true`, run as a thin client that attaches to a running daemon
-    /// (`--attach` flag): connect to `~/.koma/daemon.sock`, render the daemon's
+    /// (`--attach` flag): connect to `~/.titik/daemon.sock`, render the daemon's
     /// foreground session from streamed snapshots/deltas, and forward input.
     pub attach: bool,
     /// When `true`, force the OLD standalone local TUI (`--local` flag) — the escape
@@ -114,13 +114,13 @@ pub struct Opts {
     /// already alive (running a second writer against the daemon's sessions would
     /// corrupt the session locks); with no daemon up it runs the fully-standalone TUI.
     pub local: bool,
-    /// A `koma daemon …` management invocation, if one was given (#118).
+    /// A `titik daemon …` management invocation, if one was given (#118).
     /// `Some(Run(sub))` short-circuits `main` into that management action; `Some(Usage)`
     /// short-circuits into a usage print + non-zero exit (bare/unknown verb); `None`
     /// is the normal path (TUI / other flags). Either `Some` exits before the TUI.
     pub subcommand: Option<DaemonCli>,
     /// When `true`, stop the running daemon then run the installer to fetch the
-    /// latest release binary, then exit (`koma update` positional verb).
+    /// latest release binary, then exit (`titik update` positional verb).
     pub update: bool,
 }
 
@@ -135,7 +135,7 @@ pub struct Opts {
 /// - `daemon` makes this a daemon-CLI invocation; the following non-`--` argument is
 ///   its verb — a valid one yields `Some(DaemonCli::Run(sub))`, a missing/unrecognised
 ///   one yields `Some(DaemonCli::Usage)`. EITHER short-circuits the TUI in `main`, so a
-///   typo like `koma daemon staus` prints usage instead of silently opening the terminal.
+///   typo like `titik daemon staus` prints usage instead of silently opening the terminal.
 ///
 /// Because `agents`/`alone` only set a bool the equivalent flag already sets, `main`'s
 /// routing is unchanged — the verbs reuse the same resume / `--local` (guarded) paths.

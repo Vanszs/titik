@@ -17,29 +17,29 @@ Only descriptors() (which strips the handler) is safe to send over the wire.
 
 from __future__ import annotations
 
-from koma_sec_daemon.tools.http import DESCRIPTOR as _HTTP_DESC
-from koma_sec_daemon.tools.remote import DESCRIPTOR as _REMOTE_DESC
-from koma_sec_daemon.tools.sec_sqlmap import DESCRIPTOR as _SEC_SQLMAP_DESC
-from koma_sec_daemon.tools.sec_nuclei import DESCRIPTOR as _SEC_NUCLEI_DESC
-from koma_sec_daemon.tools.sec_ffuf import DESCRIPTOR as _SEC_FFUF_DESC
-from koma_sec_daemon.tools.sec_dalfox import DESCRIPTOR as _SEC_DALFOX_DESC
-from koma_sec_daemon.tools.sec_zap import DESCRIPTOR as _SEC_ZAP_DESC
-from koma_sec_daemon.tools.sec_xss_confirm import DESCRIPTOR as _SEC_XSS_CONFIRM_DESC
-from koma_sec_daemon.tools.sec_z3 import DESCRIPTOR as _SEC_Z3_DESC
-from koma_sec_daemon.tools.sec_sage import DESCRIPTOR as _SEC_SAGE_DESC
-from koma_sec_daemon.tools.sec_rsa import DESCRIPTOR as _SEC_RSA_DESC
-from koma_sec_daemon.tools.sec_factor import DESCRIPTOR as _SEC_FACTOR_DESC
-from koma_sec_daemon.tools.sec_lattice import DESCRIPTOR as _SEC_LATTICE_DESC
-from koma_sec_daemon.tools.sec_crack import DESCRIPTOR as _SEC_CRACK_DESC
-from koma_sec_daemon.tools.sec_hashid import DESCRIPTOR as _SEC_HASHID_DESC
-from koma_sec_daemon.tools.sec_decode import DESCRIPTOR as _SEC_DECODE_DESC
-from koma_sec_daemon.tools.sec_jsdeobf import DESCRIPTOR as _SEC_JSDEOBF_DESC
-from koma_sec_daemon.tools.sec_unmin import DESCRIPTOR as _SEC_UNMIN_DESC
-from koma_sec_daemon.tools.sec_sourcemap import DESCRIPTOR as _SEC_SOURCEMAP_DESC
-from koma_sec_daemon.tools.sec_wasm import DESCRIPTOR as _SEC_WASM_DESC
-from koma_sec_daemon.tools.sec_triage import DESCRIPTOR as _SEC_TRIAGE_DESC
-from koma_sec_daemon.tools.sec_rop import DESCRIPTOR as _SEC_ROP_DESC
-from koma_sec_daemon.tools.sec_pwntmpl import DESCRIPTOR as _SEC_PWNTMPL_DESC
+from titik_sec_daemon.tools.http import DESCRIPTOR as _HTTP_DESC
+from titik_sec_daemon.tools.remote import DESCRIPTOR as _REMOTE_DESC
+from titik_sec_daemon.tools.sec_sqlmap import DESCRIPTOR as _SEC_SQLMAP_DESC
+from titik_sec_daemon.tools.sec_nuclei import DESCRIPTOR as _SEC_NUCLEI_DESC
+from titik_sec_daemon.tools.sec_ffuf import DESCRIPTOR as _SEC_FFUF_DESC
+from titik_sec_daemon.tools.sec_dalfox import DESCRIPTOR as _SEC_DALFOX_DESC
+from titik_sec_daemon.tools.sec_zap import DESCRIPTOR as _SEC_ZAP_DESC
+from titik_sec_daemon.tools.sec_xss_confirm import DESCRIPTOR as _SEC_XSS_CONFIRM_DESC
+from titik_sec_daemon.tools.sec_z3 import DESCRIPTOR as _SEC_Z3_DESC
+from titik_sec_daemon.tools.sec_sage import DESCRIPTOR as _SEC_SAGE_DESC
+from titik_sec_daemon.tools.sec_rsa import DESCRIPTOR as _SEC_RSA_DESC
+from titik_sec_daemon.tools.sec_factor import DESCRIPTOR as _SEC_FACTOR_DESC
+from titik_sec_daemon.tools.sec_lattice import DESCRIPTOR as _SEC_LATTICE_DESC
+from titik_sec_daemon.tools.sec_crack import DESCRIPTOR as _SEC_CRACK_DESC
+from titik_sec_daemon.tools.sec_hashid import DESCRIPTOR as _SEC_HASHID_DESC
+from titik_sec_daemon.tools.sec_decode import DESCRIPTOR as _SEC_DECODE_DESC
+from titik_sec_daemon.tools.sec_jsdeobf import DESCRIPTOR as _SEC_JSDEOBF_DESC
+from titik_sec_daemon.tools.sec_unmin import DESCRIPTOR as _SEC_UNMIN_DESC
+from titik_sec_daemon.tools.sec_sourcemap import DESCRIPTOR as _SEC_SOURCEMAP_DESC
+from titik_sec_daemon.tools.sec_wasm import DESCRIPTOR as _SEC_WASM_DESC
+from titik_sec_daemon.tools.sec_triage import DESCRIPTOR as _SEC_TRIAGE_DESC
+from titik_sec_daemon.tools.sec_rop import DESCRIPTOR as _SEC_ROP_DESC
+from titik_sec_daemon.tools.sec_pwntmpl import DESCRIPTOR as _SEC_PWNTMPL_DESC
 
 # Wire-safe keys — everything except the callable handler
 _WIRE_KEYS = ("name", "description", "parameters", "risk", "compute", "domain")

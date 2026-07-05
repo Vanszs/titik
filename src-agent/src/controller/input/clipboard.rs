@@ -21,7 +21,7 @@
 //! Trigger: Ctrl+V in Chat mode (only when no request is in flight and the mode
 //! is not already in a clipboard fetch).  Ctrl+V was chosen because it is the
 //! conventional "paste" key; the terminal already delivers text pastes via the
-//! bracketed-paste protocol (which koma routes through `handle_paste`), so
+//! bracketed-paste protocol (which titik routes through `handle_paste`), so
 //! Ctrl+V would otherwise be a no-op here.
 
 use std::process::{Command, Stdio};
@@ -211,12 +211,12 @@ fn try_osascript() -> Result<Vec<u8>, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = std::env::temp_dir().join(format!("koma-clip-{}-{}.png", std::process::id(), nanos));
+    let tmp_path = std::env::temp_dir().join(format!("titik-clip-{}-{}.png", std::process::id(), nanos));
     let tmp_str = tmp_path.to_string_lossy().to_string();
 
     // AppleScript: read the clipboard as PNG, open the temp file for writing,
     // write the bytes, and always close the file. `quoted form of` would be
-    // ideal but the path is a koma-generated temp name with no metacharacters,
+    // ideal but the path is a titik-generated temp name with no metacharacters,
     // so a plain quoted POSIX string is safe here.
     let script = format!(
         "set theFile to (POSIX file \"{tmp_str}\")\n\

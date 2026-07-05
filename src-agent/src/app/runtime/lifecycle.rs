@@ -90,7 +90,7 @@ fn build_startup(
         // "Is this user configured?" is whether the MAIN role resolves to a route
         // with a non-empty api_key — `resolve_role` consults the global
         // `config.providers`/`config.models` AND the legacy per-field fallback, so a
-        // populated ~/.koma/config.json (provider + Main model) counts even with no
+        // populated ~/.titik/config.json (provider + Main model) counts even with no
         // legacy session key, and a legacy-only session still counts via the fallback.
         // Probe with a Settings reflecting the prefilled legacy creds so the fallback
         // path has them to work with.
@@ -262,7 +262,7 @@ pub fn run(opts: crate::cli::Opts) -> Result<()> {
     result
 }
 
-/// Headless entry point: run the koma-daemon event loop with NO terminal.
+/// Headless entry point: run the titik-daemon event loop with NO terminal.
 ///
 /// Shares [`build_startup`] with the TUI [`run`] (same dirs / runtime / state /
 /// client / warm), then — instead of the terminal + `run_loop` — ignores SIGPIPE,
@@ -338,7 +338,7 @@ pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
     Ok(())
 }
 
-/// End-to-end daemon self-test (`koma --daemon-selftest`): drive the FULL stage-5
+/// End-to-end daemon self-test (`titik --daemon-selftest`): drive the FULL stage-5
 /// stack — bind + accept loop + per-client tasks + the real [`daemon_loop`] hub —
 /// over a real unix socket, with NO terminal and NO network/session.
 ///
@@ -357,11 +357,11 @@ pub fn run_daemon(opts: crate::cli::Opts) -> Result<()> {
 pub fn run_daemon_selftest() -> ! {
     let code = match daemon_selftest_inner() {
         Ok(()) => {
-            println!("koma daemon-selftest: OK");
+            println!("titik daemon-selftest: OK");
             0
         }
         Err(e) => {
-            eprintln!("koma daemon-selftest: FAIL: {e:#}");
+            eprintln!("titik daemon-selftest: FAIL: {e:#}");
             1
         }
     };

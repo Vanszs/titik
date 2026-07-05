@@ -52,7 +52,7 @@ DESCRIPTOR = {
 def _handler(args: dict, sessions) -> str:
     # Lazy import of sandbox — keeps registry loadable when sandbox has
     # optional deps not yet installed.
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     url = args["url"]
 

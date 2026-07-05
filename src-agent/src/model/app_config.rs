@@ -183,7 +183,7 @@ pub enum McpTransport {
 
 /// One configured MCP (Model Context Protocol) server, keyed by `uuid`.
 ///
-/// koma connects to each ENABLED entry as an MCP client, discovers its tools, and
+/// titik connects to each ENABLED entry as an MCP client, discovers its tools, and
 /// advertises them to the model (see [`crate::app::mcp`]). For now these entries
 /// are managed by hand-editing `config.json`; there is no UI.
 ///

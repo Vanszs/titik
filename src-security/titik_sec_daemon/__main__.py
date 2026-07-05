@@ -1,5 +1,5 @@
 """
-koma_sec_daemon — long-lived security daemon entrypoint.
+titik_sec_daemon — long-lived security daemon entrypoint.
 
 Protocol (newline-delimited JSON, parent speaks first):
   Handshake (parent → daemon):  {"v": 1, "token": "<T>"}   (token optional)
@@ -62,13 +62,13 @@ def main() -> None:
     _augment_path()
 
     parser = argparse.ArgumentParser(
-        description="koma security daemon — speak newline-delimited JSON on stdin/stdout",
-        prog="python -m koma_sec_daemon",
+        description="titik security daemon — speak newline-delimited JSON on stdin/stdout",
+        prog="python -m titik_sec_daemon",
     )
     parser.add_argument(
         "--token",
         default=None,
-        help="Handshake token minted by koma; if provided the daemon verifies it.",
+        help="Handshake token minted by titik; if provided the daemon verifies it.",
     )
     args = parser.parse_args()
     expected_token: str | None = args.token
@@ -87,17 +87,17 @@ def main() -> None:
     # Redirect print() / library output to stderr so the frame channel stays clean
     sys.stdout = sys.stderr
 
-    from koma_sec_daemon.protocol import read_frame, write_frame
-    from koma_sec_daemon import registry
-    from koma_sec_daemon.registry import descriptors, call
-    from koma_sec_daemon.sessions import SessionStore
+    from titik_sec_daemon.protocol import read_frame, write_frame
+    from titik_sec_daemon import registry
+    from titik_sec_daemon.registry import descriptors, call
+    from titik_sec_daemon.sessions import SessionStore
 
     sessions = SessionStore()
 
     # Ensure the persisted binary dir (where Tier-2 downloads land) is on PATH so
     # sandbox.run() subprocesses can find tools installed via the `install` op.
     # Done before the handshake so the very first tool call already sees them.
-    from koma_sec_daemon.install_manifest import bin_dir
+    from titik_sec_daemon.install_manifest import bin_dir
     _bd = bin_dir()
     os.makedirs(_bd, exist_ok=True)
     _venv_bin = os.path.dirname(sys.executable)
@@ -134,7 +134,7 @@ def main() -> None:
                 frame = read_frame(sys.stdin)
             except ValueError as exc:
                 # Malformed JSON — log to stderr, write error without id, continue
-                print(f"[koma_sec_daemon] malformed frame: {exc}", file=sys.stderr)
+                print(f"[titik_sec_daemon] malformed frame: {exc}", file=sys.stderr)
                 write_frame(real_stdout, {"ok": False, "error": f"malformed frame: {exc}"})
                 continue
 
@@ -176,7 +176,7 @@ def main() -> None:
                 # here so daemon startup stays lean. probe() is pure stdlib and
                 # never raises; result is a JSON-encoded string the Rust side
                 # json-parses out of the standard "result" field.
-                from koma_sec_daemon import health
+                from titik_sec_daemon import health
                 write_frame(real_stdout, {
                     "id": frame_id,
                     "ok": True,
@@ -187,7 +187,7 @@ def main() -> None:
                 # Best-effort tiered install for one dep. installer.install()
                 # returns a status string (incl. "error: …") and never raises.
                 key = frame.get("key", "")
-                from koma_sec_daemon import installer
+                from titik_sec_daemon import installer
                 write_frame(real_stdout, {
                     "id": frame_id,
                     "ok": True,

@@ -38,7 +38,7 @@ DESCRIPTOR = {
 
 def _handler(args: dict, sessions) -> str:
     # Lazy import — keeps registry loadable without sandbox available at import time
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     binary = args["binary"]
     pattern = args.get("pattern")

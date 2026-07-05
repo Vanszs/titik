@@ -97,7 +97,7 @@ pub struct AppStateRest {
     /// when the daemon is not installed — behaviour is byte-identical to a build
     /// without the security daemon).
     pub sec_manager: Option<std::sync::Arc<crate::app::sec::SecDaemonManager>>,
-    /// Token koma mints and hands the security daemon child at spawn.
+    /// Token titik mints and hands the security daemon child at spawn.
     pub sec_token: String,
     /// Runtime flag: `true` when the user has enabled the security daemon from the
     /// `/security` panel. Starts `false` so the daemon stays off by default even when
@@ -244,7 +244,7 @@ pub struct AppStateRest {
     /// composer's last token is an `@partial`; the daemon leaves it `None` otherwise
     /// so it never lingers into an unrelated frame.
     pub file_palette: Option<Vec<String>>,
-    /// The newest koma version learned from the public version endpoint. `None`
+    /// The newest titik version learned from the public version endpoint. `None`
     /// until the first background check SUCCEEDS (a failed/unreachable check leaves
     /// it `None`, so the UI shows only the current version). Updated in place on the
     /// event-loop tick when a fresh [`crate::app::version::VersionInfo`] arrives;

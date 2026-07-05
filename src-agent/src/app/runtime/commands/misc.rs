@@ -105,7 +105,7 @@ pub(super) fn handle_select(state: &mut AppState) -> Result<()> {
 /// COMMANDS + KEYBINDINGS registries), so there is no busy/session guard — it
 /// opens regardless of session state, like `/usage`.
 pub(super) fn handle_help(state: &mut AppState) -> Result<()> {
-    // Resolve the "Updating koma" version data from app state at open time: the
+    // Resolve the "Updating titik" version data from app state at open time: the
     // compiled-in version, plus the fetched latest IFF it is strictly newer.
     let current = store::current_version();
     let update = state

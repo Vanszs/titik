@@ -1,11 +1,11 @@
 #!/bin/sh
-# koma native build — https://koma.run
+# titik native build — https://koma.run
 #
-# Builds the koma binary FROM SOURCE for the HOST machine (native compile, not
+# Builds the titik binary FROM SOURCE for the HOST machine (native compile, not
 # cross, not docker). Run it from the repo root.
 #
 # Usage:
-#   ./build.sh              build target/release/koma for this host
+#   ./build.sh              build target/release/titik for this host
 #   ./build.sh --install    build, then copy the binary to $INSTALL_DIR
 #
 # Environment overrides:
@@ -70,7 +70,7 @@ if [ -z "$target" ]; then
     exit 1
 fi
 
-echo "koma build — host ${_os}/${_arch} (target ${target})"
+echo "titik build — host ${_os}/${_arch} (target ${target})"
 
 # ---------------------------------------------------------------------------
 # Toolchain check: cargo must be on PATH.
@@ -89,11 +89,11 @@ fi
 # ---------------------------------------------------------------------------
 # Build (native, release).
 # ---------------------------------------------------------------------------
-echo "Building koma (cargo build --release -p agent)..."
+echo "Building titik (cargo build --release -p agent)..."
 echo "  this is a from-source native build; first run can take a few minutes."
 cargo build --release -p agent
 
-bin="target/release/koma"
+bin="target/release/titik"
 if [ ! -f "$bin" ]; then
     echo "ERROR: build reported success but $bin is missing." >&2
     echo "Are you running ./build.sh from the repo root?" >&2
@@ -117,30 +117,30 @@ echo "Build complete: $bin"
 # ---------------------------------------------------------------------------
 if [ "$DO_INSTALL" = "1" ]; then
     echo ""
-    echo "Installing to $INSTALL_DIR/koma ..."
+    echo "Installing to $INSTALL_DIR/titik ..."
     if [ -w "$INSTALL_DIR" ]; then
-        cp "$bin" "$INSTALL_DIR/koma"
-        chmod +x "$INSTALL_DIR/koma"
+        cp "$bin" "$INSTALL_DIR/titik"
+        chmod +x "$INSTALL_DIR/titik"
     else
         echo "  $INSTALL_DIR is not writable; using sudo for the copy step."
-        sudo cp "$bin" "$INSTALL_DIR/koma"
-        sudo chmod +x "$INSTALL_DIR/koma"
+        sudo cp "$bin" "$INSTALL_DIR/titik"
+        sudo chmod +x "$INSTALL_DIR/titik"
     fi
     # Re-strip quarantine on the installed copy (macOS).
     if [ "$_os" = "Darwin" ] && command -v xattr > /dev/null 2>&1; then
-        if [ -w "$INSTALL_DIR/koma" ]; then
-            xattr -d com.apple.quarantine "$INSTALL_DIR/koma" 2>/dev/null || true
+        if [ -w "$INSTALL_DIR/titik" ]; then
+            xattr -d com.apple.quarantine "$INSTALL_DIR/titik" 2>/dev/null || true
         else
-            sudo xattr -d com.apple.quarantine "$INSTALL_DIR/koma" 2>/dev/null || true
+            sudo xattr -d com.apple.quarantine "$INSTALL_DIR/titik" 2>/dev/null || true
         fi
     fi
-    echo "Installed: $INSTALL_DIR/koma"
-    echo "Run 'koma' to start."
+    echo "Installed: $INSTALL_DIR/titik"
+    echo "Run 'titik' to start."
 else
     echo ""
     echo "  Run it:        ./$bin"
     echo "  Install it:    ./build.sh --install      (copies to $INSTALL_DIR)"
-    echo "  Or by hand:    sudo cp $bin $INSTALL_DIR/koma"
+    echo "  Or by hand:    sudo cp $bin $INSTALL_DIR/titik"
 fi
 
 echo ""

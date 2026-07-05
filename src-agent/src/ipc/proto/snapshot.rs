@@ -90,7 +90,7 @@ pub struct GlobalSnapshot {
     pub pending_attachments: Vec<crate::dto::chat::Attachment>,
     pub file_palette: Option<Vec<String>>,
     pub agent_mode: String,
-    /// Latest published koma version when newer than the running one (for the
+    /// Latest published titik version when newer than the running one (for the
     /// header update badge), else None. Projected from the daemon's version check.
     pub latest_version: Option<String>,
 }
@@ -110,6 +110,7 @@ pub struct KeyInputSnapshot {
     pub result_sel: usize,
     pub first_run: bool,
     pub from_picker: bool,
+    pub is_model_select: bool,
 }
 
 /// A serde-safe projection of the startup warming splash.
@@ -472,10 +473,10 @@ pub struct HelpSnapshot {
     pub all: Vec<HelpEntrySnapshot>,
     pub filtered_idx: Vec<usize>,
     pub selected: usize,
-    /// The compiled-in koma version for the "Updating koma" block (mirrors
+    /// The compiled-in titik version for the "Updating titik" block (mirrors
     /// [`crate::app::mode::help::HelpState::current_version`]).
     pub current_version: String,
-    /// `Some((latest, message))` iff a newer koma version is available (mirrors
+    /// `Some((latest, message))` iff a newer titik version is available (mirrors
     /// [`crate::app::mode::help::HelpState::update`]); serde-safe (tuple of
     /// String + Option<String>).
     pub update: Option<(String, Option<String>)>,

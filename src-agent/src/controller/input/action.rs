@@ -71,6 +71,8 @@ pub enum Action {
     /// Setup wizard finished; carry the entered endpoint, api key, and model out
     /// so the runtime can build a provider-agnostic config from them.
     SaveCreds { endpoint: String, api_key: String, model: String },
+    /// `/model` direct set: change the Main model to the carried id.
+    SaveModel { model_id: String },
     /// Esc on a credentials form that was NOT opened from the picker — return
     /// to the normal Chat view.
     CancelKeyInput,

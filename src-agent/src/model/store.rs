@@ -61,39 +61,39 @@ pub struct SessionMeta {
     pub locked: bool,
 }
 
-/// Returns `~/.koma/` (the application data root).
+/// Returns `~/.titik/` (the application data root).
 pub fn base_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory"))?;
     Ok(home.join(APP_DIR_NAME))
 }
 
-/// Root of koma's throwaway scratch space (`<temp>/koma`). Bash + file tools
+/// Root of titik's throwaway scratch space (`<temp>/titik`). Bash + file tools
 /// are permitted to read/write anywhere under here.
 pub fn scratch_root() -> PathBuf {
-    std::env::temp_dir().join("koma")
+    std::env::temp_dir().join("titik")
 }
 
-/// Per-session scratch dir (`<temp>/koma/<session_id>`).
+/// Per-session scratch dir (`<temp>/titik/<session_id>`).
 pub fn scratch_dir(session_id: &str) -> PathBuf {
     scratch_root().join(session_id)
 }
 
-/// One-time, non-destructive migration: rename `~/.simple-coder` to `~/.koma`
+/// One-time, non-destructive migration: rename `~/.simple-coder` to `~/.titik`
 /// if the new dir does not yet exist and the old one does.
 ///
 /// Must be called ONCE at startup before any code reads `base_dir()`.
 /// Never panics — any error is printed to stderr and silently ignored so the
-/// app can proceed (it will create a fresh `~/.koma` on first use).
+/// app can proceed (it will create a fresh `~/.titik` on first use).
 pub fn migrate_legacy_dir() {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => {
-            eprintln!("koma: warning: cannot resolve home directory; skipping config migration");
+            eprintln!("titik: warning: cannot resolve home directory; skipping config migration");
             return;
         }
     };
     let old_dir = home.join(".simple-coder");
-    let new_dir = home.join(APP_DIR_NAME); // ".koma"
+    let new_dir = home.join(APP_DIR_NAME); // ".titik"
     if new_dir.exists() {
         // New dir already exists — nothing to do.
         return;
@@ -103,8 +103,8 @@ pub fn migrate_legacy_dir() {
         return;
     }
     match std::fs::rename(&old_dir, &new_dir) {
-        Ok(()) => eprintln!("migrated config: ~/.simple-coder -> ~/.koma"),
-        Err(e) => eprintln!("koma: warning: could not migrate ~/.simple-coder to ~/.koma: {e}"),
+        Ok(()) => eprintln!("migrated config: ~/.simple-coder -> ~/.titik"),
+        Err(e) => eprintln!("titik: warning: could not migrate ~/.simple-coder to ~/.titik: {e}"),
     }
 }
 
@@ -196,20 +196,20 @@ pub fn registry_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("session.sqlite"))
 }
 
-/// Path to the daemon's unix-domain socket: `~/.koma/daemon.sock`.
+/// Path to the daemon's unix-domain socket: `~/.titik/daemon.sock`.
 ///
-/// This socket is the koma-daemon's liveness oracle (whoever binds it IS the live
+/// This socket is the titik-daemon's liveness oracle (whoever binds it IS the live
 /// daemon) and the rendezvous point the thin TUI client connects to. Resolved
-/// from the same [`base_dir`] (`~/.koma`) as every other config path.
+/// from the same [`base_dir`] (`~/.titik`) as every other config path.
 pub fn daemon_sock_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("daemon.sock"))
 }
 
-/// Path to the daemon's PID file: `~/.koma/daemon.pid`.
+/// Path to the daemon's PID file: `~/.titik/daemon.pid`.
 ///
 /// Advisory only — recorded for diagnostics/`kill`. It is NOT the liveness oracle
 /// (PIDs get reused, which would wedge spawn-or-attach); the bound socket at
-/// [`daemon_sock_path`] is. Lives under the same [`base_dir`] (`~/.koma`).
+/// [`daemon_sock_path`] is. Lives under the same [`base_dir`] (`~/.titik`).
 pub fn daemon_pid_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("daemon.pid"))
 }
@@ -226,7 +226,7 @@ pub fn write_daemon_pid() -> Result<()> {
 /// A stable identity string for the CURRENTLY-RUNNING executable, used as the
 /// daemon<->client build-skew handshake (task #142).
 ///
-/// The koma daemon is long-lived and survives a rebuild: after `cargo build`
+/// The titik daemon is long-lived and survives a rebuild: after `cargo build`
 /// overwrites the on-disk binary, a freshly-built client attaching to the OLD
 /// still-running daemon renders STALE behaviour (this already produced a phantom
 /// `/agents` bug). The fingerprint lets a client detect that skew — the daemon
@@ -246,7 +246,7 @@ pub fn write_daemon_pid() -> Result<()> {
 /// version. That fallback is coarser (it won't catch a same-version rebuild) but
 /// is strictly better than aborting the attach — a missing fingerprint must never
 /// take the client down.
-/// The compiled-in koma version (from Cargo.toml).
+/// The compiled-in titik version (from Cargo.toml).
 // Consumed by the version/update UI (next stage), which compares it against the
 // fetched `latest_version` via `crate::app::version::is_newer`.
 #[allow(dead_code)]
@@ -388,7 +388,7 @@ pub fn create_session_in(workdir: &Path) -> Result<Session> {
     // Best-effort: create the per-session scratch dir so it is ready immediately.
     let scratch = scratch_dir(&uuid);
     if let Err(e) = std::fs::create_dir_all(&scratch) {
-        eprintln!("koma: warning: could not create scratch dir {}: {e}", scratch.display());
+        eprintln!("titik: warning: could not create scratch dir {}: {e}", scratch.display());
     }
 
     // Pre-create the image-attachment dir so the first paste-ingest has a home.

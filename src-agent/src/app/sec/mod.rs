@@ -1,6 +1,6 @@
 //! Security daemon CLIENT.
 //!
-//! koma can drive a long-lived Python security daemon (`koma_sec_daemon`, vendored
+//! titik can drive a long-lived Python security daemon (`titik_sec_daemon`, vendored
 //! under `src-security/` and provisioned by [`crate::security`]). This module is the
 //! Rust-side manager: it spawns the daemon as a child process, talks to it over
 //! newline-delimited JSON on the child's stdin/stdout, discovers its tools, and
@@ -29,7 +29,7 @@
 //!
 //! ## Protocol (newline-delimited JSON)
 //!
-//! - **Spawn:** `python -m koma_sec_daemon --token <TOKEN>` with cwd =
+//! - **Spawn:** `python -m titik_sec_daemon --token <TOKEN>` with cwd =
 //!   [`crate::security::security_dir`], python = [`crate::security::venv_python`],
 //!   stdin/stdout/stderr all piped.
 //! - **Handshake:** write `{"v":1,"token":"<TOKEN>"}\n`; read the first stdout line
@@ -163,7 +163,7 @@ impl SecDaemonManager {
     /// If the daemon is not installed ([`crate::security::is_installed`]) this is a
     /// no-op and the manager stays inert. Otherwise the generation is bumped (so any
     /// previous child's tasks are superseded) and the start task:
-    /// 1. spawns `python -m koma_sec_daemon --token <token>` (stdio piped),
+    /// 1. spawns `python -m titik_sec_daemon --token <token>` (stdio piped),
     /// 2. writes the handshake frame and reads the first reply line (bounded by
     ///    [`CONNECT_TIMEOUT`]),
     /// 3. on success: stores the tools + child, installs the writer/reader/stderr
@@ -585,7 +585,7 @@ struct Connected {
     tools: Vec<SecToolDesc>,
 }
 
-/// Spawn `python -m koma_sec_daemon --token <token>` (stdio piped), perform the
+/// Spawn `python -m titik_sec_daemon --token <token>` (stdio piped), perform the
 /// newline-delimited-JSON handshake, and return the live child + I/O + advertised
 /// tools.
 ///
@@ -600,7 +600,7 @@ async fn spawn_and_handshake(token: &str) -> Result<Connected, String> {
 
     let mut child = tokio::process::Command::new(&python)
         .arg("-m")
-        .arg("koma_sec_daemon")
+        .arg("titik_sec_daemon")
         .arg("--token")
         .arg(token)
         .current_dir(&dir)
@@ -609,7 +609,7 @@ async fn spawn_and_handshake(token: &str) -> Result<Connected, String> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("spawn koma_sec_daemon failed: {e}"))?;
+        .map_err(|e| format!("spawn titik_sec_daemon failed: {e}"))?;
 
     // Take ownership of the piped I/O halves. All three were requested above, so
     // these are present; a missing handle is a hard error (child gets dropped/reaped).

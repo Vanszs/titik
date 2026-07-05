@@ -429,7 +429,7 @@ pub(super) fn render_message_block(
             // The typed message (with any `[Image #N]` markers) in the accent
             // colour, then -- when the message carries image attachments -- a
             // permanent yellow/orange warn-style card listing them. The card is
-            // ALWAYS yellow (a warn cue): koma can't guarantee the model read the
+            // ALWAYS yellow (a warn cue): titik can't guarantee the model read the
             // image, and the model-visible strip warning is injected separately at
             // send. Styled like a tool-call card (icon + dim text) but in warn.
             let mut lines = render_block(

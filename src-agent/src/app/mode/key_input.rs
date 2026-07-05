@@ -55,6 +55,9 @@ pub struct KeyInputForm {
     /// `true` when this form was entered from the `--resume` session picker.
     /// Esc returns to the picker instead of Quit / Chat.
     pub from_picker: bool,
+    /// `true` when the form is being used only to pick a new Main model
+    /// (`/model` with no args). Skips the connection step entirely.
+    pub is_model_select: bool,
 }
 
 impl Default for KeyInputForm {
@@ -77,6 +80,7 @@ impl KeyInputForm {
             result_sel: 0,
             first_run: true,
             from_picker: false,
+            is_model_select: false,
         }
     }
 
@@ -102,6 +106,28 @@ impl KeyInputForm {
             result_sel: 0,
             first_run,
             from_picker,
+            is_model_select: false,
+        }
+    }
+
+    /// Open the model picker directly: skip the connection step, start on the
+    /// model omnisearch step, and cancel back to Chat on Esc.
+    pub fn for_model_select(endpoint: String, api_key: String, model: String) -> Self {
+        Self {
+            step: 1,
+            field: 0,
+            endpoint,
+            api_key,
+            model: if model.is_empty() {
+                DEFAULT_MODEL.to_string()
+            } else {
+                model
+            },
+            query: String::new(),
+            result_sel: 0,
+            first_run: false,
+            from_picker: false,
+            is_model_select: true,
         }
     }
 

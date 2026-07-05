@@ -1,4 +1,4 @@
-//! Self-update awareness: know the compiled-in koma version and, on every new
+//! Self-update awareness: know the compiled-in titik version and, on every new
 //! session spawn, fire a NON-BLOCKING check against the public version endpoint.
 //!
 //! [`spawn_check`] mirrors `tool::internet::http_get_blocking`'s concurrency
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 /// The public version manifest served at `https://koma.run/api/v1/version`.
 ///
-/// `version` is the latest published koma version; `message` is an optional
+/// `version` is the latest published titik version; `message` is an optional
 /// human-readable note (release blurb) the UI may surface. Only the `version`
 /// field is required to parse — a manifest without `message` still deserializes.
 // Fields are populated by serde from the fetched manifest; they are READ by the
@@ -72,7 +72,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
-/// Spawn a NON-BLOCKING background check for a newer koma version.
+/// Spawn a NON-BLOCKING background check for a newer titik version.
 ///
 /// Runs the blocking HTTP GET on a dedicated OS thread (no tokio context — same
 /// reason as `http_get_blocking`), parses the JSON manifest, and on FULL success
@@ -87,7 +87,7 @@ pub fn spawn_check(tx: tokio::sync::mpsc::UnboundedSender<VersionInfo>) {
         let fetched = (|| -> Result<VersionInfo, ()> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(FETCH_TIMEOUT)
-                .user_agent(concat!("koma/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("titik/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|_| ())?;
 

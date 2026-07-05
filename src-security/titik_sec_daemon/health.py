@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 
-from koma_sec_daemon.install_manifest import MANIFEST
+from titik_sec_daemon.install_manifest import MANIFEST
 
 # Fields safe to send over the wire (install internals are intentionally omitted).
 _WIRE_KEYS = ("key", "name", "tier", "method", "tools", "hint")

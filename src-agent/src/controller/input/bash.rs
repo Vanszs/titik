@@ -36,7 +36,7 @@ pub fn handle_bash(s: &mut BashState, rest: &mut AppStateRest, key: KeyEvent) ->
         return Action::Quit;
     }
 
-    // Ctrl+X kills the selected running job — koma's kill convention (matches the
+    // Ctrl+X kills the selected running job — titik's kill convention (matches the
     // sub-agent abort in chat, the session hub, etc.). No-op on a finished/killed/
     // errored job (no signal, no toast). Checked before the keycode match because
     // is_ctrl inspects modifiers.

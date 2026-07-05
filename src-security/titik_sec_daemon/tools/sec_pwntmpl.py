@@ -44,7 +44,7 @@ DESCRIPTOR = {
 
 
 def _handler(args: dict, sessions) -> str:
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     binary = args.get("binary")
     host = args.get("host")

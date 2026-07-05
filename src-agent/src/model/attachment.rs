@@ -20,12 +20,12 @@ use anyhow::{anyhow, Result};
 
 use crate::dto::chat::Attachment;
 
-/// The image extensions koma recognises for attachment (lowercased, no dot).
+/// The image extensions titik recognises for attachment (lowercased, no dot).
 /// Used by the extension-first mime sniff AND by the paste/`@` callers to decide
 /// whether a path is an image before routing it through ingest.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
-/// Whether `path`'s extension marks it as one of the [`IMAGE_EXTS`] koma ingests.
+/// Whether `path`'s extension marks it as one of the [`IMAGE_EXTS`] titik ingests.
 /// Pure string check — does NOT touch the filesystem (no existence test).
 pub fn has_image_extension(path: &str) -> bool {
     Path::new(path)

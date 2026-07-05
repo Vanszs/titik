@@ -13,8 +13,9 @@ impl ModelRole {
         }
     }
 
-    pub const ALL: [ModelRole; 4] = [
-        ModelRole::Main,
+    /// Roles selectable in the settings UI. `Main` is intentionally excluded:
+    /// the Main model is set via the `/model` slash command instead.
+    pub const ALL: [ModelRole; 3] = [
         ModelRole::Awareness,
         ModelRole::Safeguard,
         ModelRole::Compactor,

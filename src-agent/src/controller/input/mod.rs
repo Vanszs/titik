@@ -69,7 +69,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
     // QEMU and serial consoles send Backspace as ^H (byte 0x08), which crossterm
     // decodes as Ctrl+H. Normalize it to a real Backspace so every mode's existing
     // KeyCode::Backspace handler works (a proper terminal sends 0x7f → Backspace
-    // directly). Nothing in koma binds Ctrl+H, so this never shadows a real binding.
+    // directly). Nothing in titik binds Ctrl+H, so this never shadows a real binding.
     let key = if key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL) {
         KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
     } else {

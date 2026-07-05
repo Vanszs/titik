@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 // ── Path + schema helpers ────────────────────────────────────────────────────
 
-/// Path of the global usage ledger: `~/.koma/usage.sqlite`.
+/// Path of the global usage ledger: `~/.titik/usage.sqlite`.
 pub fn usage_db_path() -> Option<std::path::PathBuf> {
     crate::model::store::base_dir()
         .ok()
@@ -29,10 +29,10 @@ pub(crate) fn open() -> Option<Connection> {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(&path)
-        .map_err(|e| eprintln!("koma: usage ledger open error: {e}"))
+        .map_err(|e| eprintln!("titik: usage ledger open error: {e}"))
         .ok()?;
     ensure_schema(&conn)
-        .map_err(|e| eprintln!("koma: usage ledger schema error: {e}"))
+        .map_err(|e| eprintln!("titik: usage ledger schema error: {e}"))
         .ok()?;
     Some(conn)
 }
@@ -84,6 +84,6 @@ pub fn record_usage(
             tokens_in as i64, tokens_cached as i64, tokens_out as i64, cost
         ],
     ) {
-        eprintln!("koma: usage ledger insert error: {e}");
+        eprintln!("titik: usage ledger insert error: {e}");
     }
 }

@@ -2,12 +2,12 @@ This directory contains a vendored and modified copy of scrapion
 (https://github.com/aula-id/scrapion), licensed under the Apache License 2.0.
 See LICENSE for the full license text.
 
-Modifications made for koma:
+Modifications made for titik:
 - Package renamed from `scrapion` to `scrapion_agent`
 - All intra-package imports converted to relative imports
 - Added `__main__.py` entrypoint for headless one-shot invocation via
   `python -m scrapion_agent --json "<query>"`
 - Removed pyvirtualdisplay dependency (Display code was already commented out
   in the original; the dependency is omitted from requirements.txt)
-- Firefox auto-install suppressed at runtime (koma --install-internet handles
+- Firefox auto-install suppressed at runtime (titik --install-internet handles
   provisioning separately via SCRAPION_SKIP_BROWSER_CHECK=1)

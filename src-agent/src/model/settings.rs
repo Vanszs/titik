@@ -115,7 +115,7 @@ impl Default for Compaction {
 /// upgrades `web_fetch` to the opt-in scrapion browser backend (a Firefox
 /// subprocess that renders JS and beats Cloudflare), which costs more tokens
 /// and spawns an external process; `web_search` is unchanged. Full requires the
-/// environment to be provisioned (`koma --internet-fullmode-install`); until
+/// environment to be provisioned (`titik --internet-fullmode-install`); until
 /// then `web_fetch` silently stays on the raw-HTTP path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

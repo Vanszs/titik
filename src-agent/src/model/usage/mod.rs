@@ -1,4 +1,4 @@
-//! Global usage ledger: one sqlite at `~/.koma/usage.sqlite` that persists
+//! Global usage ledger: one sqlite at `~/.titik/usage.sqlite` that persists
 //! every model-call's token/cost spend across ALL sessions and working dirs.
 //!
 //! See the submodules for details: `types` for data structs, `ledger` for

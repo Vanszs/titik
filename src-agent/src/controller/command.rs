@@ -23,6 +23,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/effort", "Set model reasoning/thinking effort"),
     ("/internet", "Toggle internet mode (simple | full)"),
     ("/settings", "Edit key, model, provider, theme, name"),
+    ("/model", "Change the Main model (picker or direct)"),
     ("/agents", "Create, modify, or delete agent definitions"),
     ("/mcp", "Add, edit, or remove MCP servers"),
     ("/security", "Security daemon control panel"),
@@ -35,7 +36,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename the current session"),
     ("/select", "Dump history to the terminal to copy/paste"),
     ("/help", "List the available commands"),
-    ("/quit", "Quit koma"),
+    ("/quit", "Quit titik"),
 ];
 
 /// User-facing keyboard shortcuts shown in the `/help` reference, in display
@@ -112,6 +113,9 @@ pub enum Command {
     Mcp,
     /// Open the `/security` daemon control panel.
     Security,
+    /// Change the Main model. `None` opens the provider model picker;
+    /// `Some(model_id)` sets it directly.
+    Model(Option<String>),
     /// Run a named agent on a task in the background. Holds `<agent> <task>`.
     Task(String),
     /// Open the `/bash` background-job panel (read-only + kill). Takes no args.
@@ -181,6 +185,7 @@ pub fn parse(line: &str) -> Command {
         "agents" | "agent" => Command::Agents,
         "mcp" => Command::Mcp,
         "security" => Command::Security,
+        "model" => Command::Model(rest.split_whitespace().next().map(|s| s.to_string())),
         "task" => Command::Task(rest.to_string()),
         "bash" => Command::Bash,
         "cd" => Command::Cd(rest.to_string()),

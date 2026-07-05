@@ -1,7 +1,7 @@
 """
-koma_sec_daemon — long-lived security daemon for the koma TUI agent.
+titik_sec_daemon — long-lived security daemon for the titik TUI agent.
 
-Communicates with its parent process (koma) over newline-delimited JSON on
+Communicates with its parent process (titik) over newline-delimited JSON on
 stdin/stdout. stderr is used for logging and debug output.
 
 Tools shipped in this milestone:

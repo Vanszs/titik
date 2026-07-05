@@ -52,12 +52,12 @@ pub struct HelpState {
     pub filtered_idx: Vec<usize>,
     /// Cursor position within `filtered_idx` (not within `all`).
     pub selected: usize,
-    /// The compiled-in koma version ([`crate::model::store::current_version`]),
-    /// shown in the "Updating koma" block. Filled when `/help` opens; empty under
+    /// The compiled-in titik version ([`crate::model::store::current_version`]),
+    /// shown in the "Updating titik" block. Filled when `/help` opens; empty under
     /// [`HelpState::new`]/[`Default`] (which has no app-state access) until the
     /// command handler threads it in.
     pub current_version: String,
-    /// `Some((latest_version, message))` iff a newer koma version is available
+    /// `Some((latest_version, message))` iff a newer titik version is available
     /// (per [`crate::app::version::is_newer`]); `None` when up-to-date or no check
     /// has succeeded. Drives the "available [latest]" hint in the update block.
     pub update: Option<(String, Option<String>)>,
@@ -100,10 +100,10 @@ impl HelpState {
         s
     }
 
-    /// Populate the "Updating koma" version fields from app state, returning `self`
+    /// Populate the "Updating titik" version fields from app state, returning `self`
     /// so the `/help` command handler can build-then-fill in one expression.
     ///
-    /// `current_version` is the compiled-in koma version; `update` is set only when
+    /// `current_version` is the compiled-in titik version; `update` is set only when
     /// `latest` is strictly newer than it (per [`crate::app::version::is_newer`]).
     pub fn with_version(
         mut self,

@@ -37,11 +37,11 @@ mod session_mgmt;
 pub(crate) use event_loop::daemon::HubInbound;
 
 // Re-export the thin-attach-client entry so `app::client_run` reaches the
-// `koma --attach` path (defined in the `client` submodule).
+// `titik --attach` path (defined in the `client` submodule).
 pub use client::client_run;
 
 // Re-export the daemon management CLI entry + usage helper so `main` can short-circuit
-// `koma daemon <verb>` before the TUI (defined in the `manage` submodule, #118).
+// `titik daemon <verb>` before the TUI (defined in the `manage` submodule, #118).
 //
 // `daemon_alive` + `ensure_daemon_running` are the spawn-or-attach mechanism the
 // default-launch flip (Stage 7) consumes: `daemon_alive` is the bind-as-oracle probe

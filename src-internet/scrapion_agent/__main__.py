@@ -13,7 +13,7 @@ import os
 import json
 import argparse
 
-# Skip the Firefox auto-install check; koma --install-internet handles that separately.
+# Skip the Firefox auto-install check; titik --install-internet handles that separately.
 os.environ["SCRAPION_SKIP_BROWSER_CHECK"] = "1"
 
 

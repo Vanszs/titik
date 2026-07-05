@@ -87,7 +87,7 @@ fn draw_header(frame: &mut Frame, nav: &UsageNavState, palette: &Palette, area: 
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
-        "koma / usage  ",
+        "titik / usage  ",
         Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(

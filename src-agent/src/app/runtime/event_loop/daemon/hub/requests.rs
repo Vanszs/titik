@@ -111,7 +111,7 @@ impl DaemonHub {
             ClientRequest::Attach { cwd, .. } => {
                 // pwd-AWARE attach selection (stage 3): BEFORE snapshotting, point the
                 // foreground at a session for the ATTACHING CLIENT's working directory,
-                // so launching `koma` from a NEW dir lands on a session for THAT dir —
+                // so launching `titik` from a NEW dir lands on a session for THAT dir —
                 // not the daemon's unrelated last session. Runs ONLY for the controller
                 // (the single writer): session selection mutates state (it can SWAP /
                 // LOAD / CREATE a session), which an observer must not do. An observer,
@@ -314,7 +314,7 @@ impl DaemonHub {
                 self.send_to(idx, DaemonEvent::Ack);
             }
 
-            // The client was launched with --resume / koma agents: open the session
+            // The client was launched with --resume / titik agents: open the session
             // hub immediately, same as the /resume slash command. Ack on success or
             // Error on failure (e.g. spawn_pending is set mid-/new).
             ClientRequest::OpenSessionHub => {

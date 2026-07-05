@@ -1,4 +1,4 @@
-//! Thin attach client — the `koma --attach` core (daemon stage 6).
+//! Thin attach client — the `titik --attach` core (daemon stage 6).
 //!
 //! [`client_run`] connects to a running daemon's unix socket, attaches, and then
 //! renders the daemon's state + forwards input. It does NONE of the real work:
@@ -52,13 +52,13 @@ use crate::app::runtime::terminal::TerminalGuard;
 ///
 /// # Build-skew auto-restart (task #142)
 ///
-/// The koma daemon outlives a rebuild, so a freshly-built client can attach to a
+/// The titik daemon outlives a rebuild, so a freshly-built client can attach to a
 /// daemon still running OLD code and silently render its stale frames (this already
 /// caused a phantom `/agents` bug). On connect the client compares its OWN build
 /// fingerprint ([`store::build_fingerprint`], computed fresh now) against the
 /// daemon's reported one (the `Hello` value, which the daemon captured AT ITS
 /// STARTUP). On a mismatch it restarts the stale daemon via the SAME machinery
-/// `koma daemon restart` uses ([`super::manage::restart_daemon`]) and reconnects.
+/// `titik daemon restart` uses ([`super::manage::restart_daemon`]) and reconnects.
 ///
 /// LOOP GUARD: the auto-restart fires AT MOST ONCE per launch. If the freshly-spawned
 /// daemon STILL mismatches (it shouldn't — it was just built from the current binary),
@@ -100,12 +100,12 @@ pub fn client_run(opts: crate::cli::Opts) -> Result<()> {
             // shouldn't happen (it was spawned from the current binary); don't loop
             // forever — warn and render against it.
             eprintln!(
-                "koma: daemon still reports a different build after a restart; \
+                "titik: daemon still reports a different build after a restart; \
                  continuing against it"
             );
             break;
         }
-        eprintln!("koma: daemon running stale code — restarting...");
+        eprintln!("titik: daemon running stale code — restarting...");
         already_restarted = true;
 
         // Tear down the stale connection's bridge before restarting: drop our request
@@ -115,10 +115,10 @@ pub fn client_run(opts: crate::cli::Opts) -> Result<()> {
         drop(conn.req_tx);
         drop(conn.frame_rx);
 
-        // Reuse the EXACT `koma daemon restart` path (kill escalation + spawn-and-
+        // Reuse the EXACT `titik daemon restart` path (kill escalation + spawn-and-
         // confirm). A failure here is fatal — we can't recover a usable daemon.
         super::manage::restart_daemon()
-            .map_err(|e| anyhow::anyhow!("failed to restart the stale koma daemon: {e:#}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to restart the stale titik daemon: {e:#}"))?;
 
         // Reconnect to the freshly-spawned daemon and re-handshake.
         conn = connect_attach_and_handshake(&handle, &sock_path)?;

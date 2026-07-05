@@ -103,9 +103,9 @@ pub fn draw(frame: &mut Frame, state: &LoadingState, palette: &Palette) {
         ])
         .split(area);
 
-    // --- Title: "koma" in accent, centered ---
+    // --- Title: "titik" in accent, centered ---
     let title = Paragraph::new(Line::from(Span::styled(
-        "koma",
+        "titik",
         Style::default().fg(palette.accent),
     )))
     .alignment(Alignment::Center);

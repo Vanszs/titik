@@ -29,14 +29,14 @@ use crate::view::theme::Palette;
 
 /// The three button labels, left→right, in `button_rects`/`selected` index order
 /// (`0` = quit & kill, `1` = minimize, `2` = cancel). The chip is the label wrapped
-/// in literal brackets with inner padding (`[ quit & kill ]`) — koma button style — so the chip width is
+/// in literal brackets with inner padding (`[ quit & kill ]`) — titik button style — so the chip width is
 /// `label.len() + 4`, matching the click-rect math below.
 const LABELS: [&str; 3] = ["quit & kill", "minimize", "cancel"];
 
 /// One-line description for each button, same index order as [`LABELS`].
 const DESCS: [&str; 3] = [
-    "Abort every session's in-flight work, then exit koma.",
-    "Save each conversation to disk to resume later, then exit koma. \
+    "Abort every session's in-flight work, then exit titik.",
+    "Save each conversation to disk to resume later, then exit titik. \
      In-flight work still stops on exit.",
     "Back to chat — keep everything running.",
 ];
@@ -80,7 +80,7 @@ pub fn draw(frame: &mut Frame, s: &QuitConfirmState, palette: &Palette) {
     let sel = s.selected.min(2);
 
     // Build the chip Span for a button: the label wrapped in literal brackets
-    // (`[like this]`, koma button style), rendered highlighted when focused (reversed
+    // (`[like this]`, titik button style), rendered highlighted when focused (reversed
     // onto the accent colour, BOLD — the brackets stay visible as part of the chip
     // text) or subdued (dim) otherwise. `sel_fg` is the on-accent foreground
     // (true-black/white), legible under BOLD — matching the footer + selection

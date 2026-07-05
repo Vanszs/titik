@@ -11,13 +11,13 @@
 //! - [`mode`] – [`Mode`] enum and associated per-mode state types
 //! - [`resolve`] – per-role route resolution (model + provider + endpoint + key)
 //! - [`runtime`] – event loop, terminal setup/teardown, and the main `run` function that ties controller + view together
-//! - [`sec`] – security daemon client: spawn the Python `koma_sec_daemon`, discover its tools, advertise + dispatch them over newline-delimited JSON
+//! - [`sec`] – security daemon client: spawn the Python `titik_sec_daemon`, discover its tools, advertise + dispatch them over newline-delimited JSON
 //! - [`state`] – [`AppState`] (mode + rest) and [`AppStateRest`] (shared fields used across all modes: messages, input, client, …)
 //! - [`subagent`] – self-contained autonomous sub-agent runtime (LLM-tool loop in a background task)
 //! - [`version`] – self-update awareness: compiled-in version + non-blocking check against the public version endpoint
 //!
 //! [`run`] is re-exported at this level so callers only need `app::run(opts)`.
-//! [`run_daemon`] is likewise re-exported for the headless `koma --daemon` path.
+//! [`run_daemon`] is likewise re-exported for the headless `titik --daemon` path.
 
 pub mod awareness;
 pub mod bgbash;

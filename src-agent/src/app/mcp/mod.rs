@@ -1,6 +1,6 @@
 //! MCP (Model Context Protocol) CLIENT.
 //!
-//! koma can act as an MCP *client*: for each enabled `mcp_servers` entry in the
+//! titik can act as an MCP *client*: for each enabled `mcp_servers` entry in the
 //! global config it spawns/connects an [`rmcp`] client, discovers that server's
 //! tools, advertises them to the model as ordinary function-calling tools, and
 //! routes the model's calls back to the owning server.

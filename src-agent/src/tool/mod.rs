@@ -185,8 +185,8 @@ pub fn main_tool_names() -> Vec<String> {
 /// containment. A bare path like `src/main.rs` resolves against workspace 0.
 /// A prefixed path like `[2]src/main.rs` resolves against workspace 2.
 ///
-/// SCRATCH BYPASS: if `rel` is an absolute path that starts with the koma
-/// scratch root (`<temp>/koma`), it is returned as-is (no workspace required).
+/// SCRATCH BYPASS: if `rel` is an absolute path that starts with the titik
+/// scratch root (`<temp>/titik`), it is returned as-is (no workspace required).
 /// Only absolute paths get this bypass; relative paths still resolve against
 /// the workspace as normal.
 pub fn resolve(workspaces: &[PathBuf], rel: &str) -> Result<PathBuf> {

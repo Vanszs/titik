@@ -34,7 +34,7 @@ mod settings;
 // is otherwise private to `actions`, so this single re-export is the only surface.
 pub(in crate::app::runtime) use session::attach_select_for_pwd;
 pub(in crate::app::runtime) use chat::drain_one_pending_submit;
-mod settings_creds;
+pub(in crate::app::runtime) mod settings_creds;
 
 /// Apply one `Action` (the decoded result of a keystroke) by mutating state and,
 /// where needed, spawning/aborting the request task.
@@ -101,6 +101,10 @@ pub(in crate::app::runtime) fn apply_action(
 
         Action::SaveCreds { endpoint, api_key, model } => {
             settings_creds::handle_save_creds(endpoint, api_key, model, state, client, handle)?;
+        }
+
+        Action::SaveModel { model_id } => {
+            settings_creds::handle_save_model(model_id, state, client, handle)?;
         }
 
         Action::CancelKeyInput => {

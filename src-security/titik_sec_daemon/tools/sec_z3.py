@@ -40,7 +40,7 @@ DESCRIPTOR = {
 
 def _handler(args: dict, sessions) -> str:
     # Lazy import — keeps registry loadable without the daemon package on sys.path
-    from koma_sec_daemon import sandbox  # noqa: PLC0415
+    from titik_sec_daemon import sandbox  # noqa: PLC0415
 
     code = args["code"]
 

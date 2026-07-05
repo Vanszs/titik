@@ -221,7 +221,7 @@ fn rebuild_hub(
 }
 
 /// pwd-AWARE attach selection (stage 3): point the daemon's foreground at a session
-/// for the ATTACHING CLIENT's working directory (`cwd`), so relaunching `koma` from a
+/// for the ATTACHING CLIENT's working directory (`cwd`), so relaunching `titik` from a
 /// NEW directory lands on a session for THAT directory — not the daemon's unrelated
 /// last session. Driven by the controller's [`ClientRequest::Attach`] `cwd` field.
 ///

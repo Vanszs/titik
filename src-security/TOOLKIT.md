@@ -1,4 +1,4 @@
-# koma-sec Toolkit — System Binary Dependencies
+# titik-sec Toolkit — System Binary Dependencies
 
 This document lists the external binaries the security daemon shells out to,
 grouped by domain. The daemon starts and the IPC socket binds regardless of
